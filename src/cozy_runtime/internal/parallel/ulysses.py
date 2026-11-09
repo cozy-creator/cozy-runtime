@@ -3,9 +3,9 @@ names, and the exchange around a head-local kernel (`attention_ulysses`). Sequen
 to whole sequences per head subset, `compute` runs, and its output crosses back.
 
 Two rounds of metadata over the group's store come first. Every rank proposes its rows and the
-level native selection takes for it; every rank takes the finest proposed, admits it and allocates
-its first buffers; every rank reports ready or refused. No rank enters a collective alone, and a
-refusal there selects the next finer level on every rank. Once a tensor crosses nothing runs again.
+level native selection takes for it, its room made; every rank takes the finest proposed, admits it
+and allocates its first buffers; every rank reports ready or refused. No rank enters a collective
+alone: a refusal on any rank is every rank's, before anything crosses, and nothing runs twice.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import _get_process_group_store
 
-from cozy_runtime.author._errors import Fault, fault
+from cozy_runtime.author._errors import DoesNotFit, Fault, fault
 from cozy_runtime.internal import attention_ulysses
 from cozy_runtime.internal.execution import catch, sizing
 from cozy_runtime.internal.parallel import copy_engine
@@ -112,12 +112,18 @@ def _refusal(rows: Sequence[dict[str, Any]]) -> None:
     """Raise a refusal some rank reported, as what it was."""
     failed = [row for row in rows if row.get("error")]
     if failed:
-        kind = torch.OutOfMemoryError if any(row["oom"] for row in failed) else RuntimeError
+        kinds = {row["kind"] for row in failed}
+        kind: type[Exception] = RuntimeError
+        if "fit" in kinds:
+            kind = DoesNotFit
+        elif "oom" in kinds:
+            kind = torch.OutOfMemoryError
         raise kind(f"Ulysses refused before its first crossing: {[r['error'] for r in failed]}")
 
 
 def _failure(exc: BaseException) -> dict[str, Any]:
-    return {"error": f"{type(exc).__name__}: {exc}", "oom": fault(exc) is Fault.OOM}
+    kind = "fit" if isinstance(exc, DoesNotFit) else "oom" if fault(exc) is Fault.OOM else ""
+    return {"error": f"{type(exc).__name__}: {exc}", "kind": kind}
 
 
 def _cross(
@@ -220,38 +226,32 @@ def _exchange(
         assert request is not None
         stream = int(torch.cuda.current_stream(device).cuda_stream)
         request.memory.remember_working_phase(site, catch.owners(request))
-    floor = 0
-    while True:
-        proposal: dict[str, Any] = {"rows": mine, "at": max(floor, catch.LEVELS.get(site, 0))}
-        selection = None
-        try:
-            if native:
-                proposal["at"], selection = catch.select(device, site, menu, stream, floor)
-        except Exception as exc:
-            proposal |= _failure(exc)
-        proposals = meet.gather(f"propose/{floor}", proposal)
-        _refusal(proposals)
-        sizes = [int(row["rows"]) for row in proposals]
-        at = max(int(row["at"]) for row in proposals)
-        step, total, local = steps[at], sum(sizes), steps[at] // world
-        token, buffers, ready = None, None, {}
-        try:
-            if native:
-                token = catch.begin(device, site, at, selection, stream)
-            out = query.new_empty((batch, mine, padded, dim))
-            buffers = _buffers(query, world, total, local)
-        except Exception as exc:
-            ready = _failure(exc)
-        answers = meet.gather(f"ready/{floor}", ready)
-        if not any(row.get("error") for row in answers):
-            break
+    proposal: dict[str, Any] = {"rows": mine, "at": catch.LEVELS.get(site, 0)}
+    selection: dict[str, Any] = {}
+    try:
+        if native:
+            selection = catch.select(device, site, "ulysses", menu, stream)
+            proposal["at"] = int(selection["choice_id"])
+    except Exception as exc:
+        proposal |= _failure(exc)
+    proposals = meet.gather("propose", proposal)
+    _refusal(proposals)
+    sizes = [int(row["rows"]) for row in proposals]
+    at = max(int(row["at"]) for row in proposals)
+    step, total, local = steps[at], sum(sizes), steps[at] // world
+    token, buffers, ready = None, None, {}
+    try:
+        if native:
+            token = catch.begin(device, site, "ulysses", menu, at, selection, stream)
+        out = query.new_empty((batch, mine, padded, dim))
+        buffers = _buffers(query, world, total, local)
+    except Exception as exc:
+        ready = _failure(exc)
+    answers = meet.gather("ready", ready)
+    if any(row.get("error") for row in answers):
         if token is not None:
             vt.split_end(device, token, submitted=False)
-        buffers = out = None  # type: ignore[assignment]
-        if at + 1 == len(steps) or not all(row["oom"] for row in answers if row.get("error")):
-            _refusal(answers)
-        catch.went_finer("ulysses", at)
-        floor = at + 1
+        _refusal(answers)
     catch.LEVELS[site] = at
     if request is not None:
         catch.note(request, site, "ulysses", at)

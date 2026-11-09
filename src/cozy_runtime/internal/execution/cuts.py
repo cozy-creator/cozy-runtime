@@ -15,6 +15,7 @@ import functools
 import math
 import sys
 from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
 from typing import cast
 
 import torch
@@ -461,7 +462,7 @@ def _attend(
     if hp >= count and rp >= length:
         return call(q, k, v, mask)
     whole = mask.expand(-1, count, length, -1) if mask is not None else None
-    out = catch.whole(q)
+    out = q.new_empty(q.shape)
     for h in range(0, count, hp):
         n, lo, hi = min(hp, count - h), h // group, (min(h + hp, count) - 1) // group + 1
         for s in range(0, length, rp):
@@ -488,11 +489,10 @@ def split[T](
     most `most` of its `total` elements; `finest` is the least a window can hold. Its author
     must preserve global statistics/quantizers and declare any overlap approximation; merely
     having no side effects does not make differently sized windows numerically equivalent.
-    Package code runs once: a refusal fails the call, unless `pure` says `run` is a Runtime leaf's
-    and goes finer. `out_bytes` is the whole output held beside
-    the windows, `item_bytes` a window's output per element, `holds` how many of that its op's
-    peak holds, its author's estimate: allocator reclaim covers a short one, and a completed
-    pass's measured sample replaces it."""
+    Package code runs once; `pure` says `run` is a Runtime leaf's, which runs again finer only
+    when varena answers a refusal in it so (`catch.retry`). `out_bytes` is the whole output held
+    beside the windows, `item_bytes` a window's output per element, `holds` how many of that its
+    op's peak holds: its author's estimate, which a completed pass's measured sample replaces."""
     deepest = levels(-(-total // max(finest, 1)))
 
     def window(level: int) -> int:
@@ -502,3 +502,13 @@ def split[T](
         return (out_bytes, *[int(window(level) * item_bytes)] * holds)
 
     return catch.cut(f"split:{key}", deepest, need, lambda level: run(window(level)), pure=pure)
+
+
+def windows(
+    name: str, key: str, needs: Sequence[int]
+) -> tuple[int, Callable[[], AbstractContextManager[None]]]:
+    """A package's `windows` (`cozy_runtime.author.windows`): which of its layouts, fewest
+    windows first, a loop keeps (`needs`: each one's peak bytes), chosen once before it, and the
+    context its every window's work runs in, so the choice is measured for the next call."""
+    chosen = catch.fixed(f"windows:{key}", len(needs) - 1, lambda n: (needs[n],))
+    return chosen.level, chosen.piece

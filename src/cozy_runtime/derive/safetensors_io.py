@@ -56,47 +56,12 @@ ITEMSIZE: dict[str, int] = {
     "BOOL": 1,
 }
 
-#: The largest header this module will parse. A safetensors header is metadata; a
-#: 100 MB one is a claim about the file, not a header, and it refuses before allocation.
-MAX_HEADER = 100 << 20
-
 
 def numel(shape: list[int]) -> int:
     total = 1
     for d in shape:
         total *= int(d)
     return total
-
-
-def read_header(path: Path) -> tuple[dict[str, Any], int]:
-    """(header, data_region_offset). A BOUNDED read: the data region is never touched."""
-    with path.open("rb") as handle:
-        prefix = handle.read(8)
-        if len(prefix) != 8:
-            raise UnsupportedInput(f"{path.name}: shorter than a safetensors length prefix")
-        (length,) = struct.unpack("<Q", prefix)
-        if length > MAX_HEADER:
-            raise UnsupportedInput(f"{path.name}: {length}-byte header is not a header")
-        try:
-            doc = json.loads(handle.read(length))
-        except json.JSONDecodeError as exc:
-            raise UnsupportedInput(f"{path.name}: header is not JSON ({exc})") from exc
-    if not isinstance(doc, dict):
-        raise UnsupportedInput(f"{path.name}: header is not an object")
-    doc.pop("__metadata__", None)
-    return doc, 8 + length
-
-
-def read_raw(path: Path, header: dict[str, Any], base: int, key: str) -> bytes:
-    """The exact stored bytes of one tensor. Seek + one read — no whole-file load."""
-    row = header[key]
-    start, end = (int(x) for x in row["data_offsets"])
-    with path.open("rb") as handle:
-        handle.seek(base + start)
-        raw = handle.read(end - start)
-    if len(raw) != end - start:
-        raise UnsupportedInput(f"{path.name}: {key!r} is truncated in the data region")
-    return raw
 
 
 def to_f32(raw: bytes | bytearray | memoryview, dtype: str, shape: list[int]) -> np.ndarray:
@@ -287,14 +252,6 @@ class StreamingWriter:
         if key in self._written:
             raise UnsupportedInput(f"{key!r} written twice")
         return start, end
-
-
-def shape_only(header: dict[str, Any]) -> dict[str, Any]:
-    """A header stripped to what a PREDICTION can assert: names, dtypes, shapes. Offsets
-    are a packing fact and belong to the writer, not to the plan."""
-    return {
-        k: {"dtype": v["dtype"], "shape": [int(d) for d in v["shape"]]} for k, v in header.items()
-    }
 
 
 def row_chunks(rows: int, cols: int, budget_elements: int = 1 << 22) -> Iterator[slice]:

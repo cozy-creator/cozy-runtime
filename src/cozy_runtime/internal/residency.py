@@ -27,13 +27,14 @@ import tensorfs
 import tensorfs.varena.torch as vt
 import torch
 from tensorfs.raw import parts as stored_parts
+from tensorfs.varena import Exhausted
 from tensorfs.varena import _runtime as varena
 from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
 
 from cozy_runtime import graphs
 from cozy_runtime.author import _retained
-from cozy_runtime.author._errors import DoesNotFit, Fault, fault
+from cozy_runtime.author._errors import DoesNotFit, Fault, fault, is_capacity
 from cozy_runtime.author._model import WARNINGS
 from cozy_runtime.internal import cache_owners, pacing, proctree
 from cozy_runtime.internal.accel import (
@@ -43,7 +44,6 @@ from cozy_runtime.internal.accel import (
     host_memory,
     release_cached,
 )
-from cozy_runtime.internal.hostfacts import physical_memory
 
 __all__ = [
     "Binding",
@@ -427,6 +427,8 @@ class _Block:
     )
     #: where its forward's allocations are born in the escaped-memory tally (`vt.set_site`)
     escape_site: int = 0
+    #: the birth site its entry replaced, back at its exit: what runs after it is not its
+    born_before: int | None = None
 
     def paged(self) -> bool:
         """Whether a page a fill wrote may still serve: bound data or a native region."""
@@ -643,12 +645,6 @@ class Model:
                 for block in groups:
                     self.memory._enter(block, reclaim=not free_only)
                     entered.append(block)
-            except torch.OutOfMemoryError:
-                for block in reversed(entered):
-                    self.memory._exit(block)
-                if free_only:
-                    return None
-                raise
             except BaseException:
                 for block in reversed(entered):
                     self.memory._exit(block)
@@ -994,13 +990,10 @@ class Region:
 
 
 def _pages(index: int, shared: bool) -> Any:
-    """This GPU's host tier. A shared machine's (a person's computer) leaves free what the computer
-    keeps for its other programs, not `_HOST_HEADROOM`, and pins nothing while it stalls."""
-    cap = max(physical_memory(), 0) // 2
-    try:
-        return varena.Pages(index, cap=cap, headroom=_HOST_HEADROOM, shared=shared)
-    except TypeError:  # a TensorFS before the shared host tier
-        return varena.Pages(index, cap=cap, headroom=_HOST_HEADROOM)
+    """This GPU's host tier. TensorFS sizes it and shares the host with every executor's tiers
+    through the host's ledger page; on a shared machine (a person's computer) it pins nothing
+    while the host stalls."""
+    return varena.Pages(index, shared=shared)
 
 
 class Memory:
@@ -1028,6 +1021,10 @@ class Memory:
         self._phase_names: frozenset[str] | None = None
         self._phase_request: str | None = None
         self._forward_depth = 0
+        #: models whose own forward (or a hooked child's) is running, by how many deep
+        self._executing: dict[Model, int] = {}
+        #: the birth site last set on this device (`_born`)
+        self._site = 0
         if self.cuda:
             try:
                 if budget_bytes is not None:
@@ -1420,6 +1417,11 @@ class Memory:
         identity = model.wanted_identity()
         if identity != model.identity or identity is None:
             graphs.retire_stale(torch, model.module)
+            if any(b.retained for b in model.groups()) and model.retire_graphs is not None:
+                # Programs recorded against the old fill (a kept loop baked, now per_step) still
+                # bind its blocks: they go, their pools with them, and record again under the new
+                # fill. Never with the metadata lock held: closing joins CUDA.
+                model.retire_graphs()
             if any(b.retained for b in model.groups()):
                 raise StaleBinding("retire old graph bindings before changing a weight fill")
             for hold in list(model.holds):
@@ -1660,19 +1662,12 @@ class Memory:
             need = nbytes + min(nbytes, _HOST_STAGING)
             if need > self._free():
                 self.reclaim(need)
-        try:
-            return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
-        except RuntimeError as error:
-            # MPS reports allocator refusal as RuntimeError. Classify only this failed
-            # allocation; reads, transforms and model execution are outside the retry.
-            if not isinstance(error, torch.OutOfMemoryError) and not (
-                self.device.type == "mps" and fault(error) is Fault.OOM
-            ):
-                raise
-            if not reclaim or self.capturing() or not self.reclaim():
-                raise
-            # Only the failed allocation is retried. No read, fill transform or forward ran.
-            return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
+            if need > (free := self._free()):
+                raise DoesNotFit(
+                    f"weights need {_gib(need)} on this Mac's GPU and {_gib(free)} is free with "
+                    "everything evictable gone: rent a card: `cozy run … --on new`"
+                )
+        return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
 
     def _active_beside(self, request: Request | None) -> bool:
         """Live request concurrency; the caller holds lock across its policy decision."""
@@ -1995,11 +1990,11 @@ class Memory:
                 request = _REQUEST.get()
                 reclaim = reclaim and not (request is not None and request.idle)
                 if block.escape_site and request is not None and not request.idle and not capturing:
-                    self._entered(block, request)
+                    block.born_before = self._entered(block, request)
                 try:
                     self._ensure(block, reclaim, overlay)
                     block.gathered = None
-                except torch.OutOfMemoryError:
+                except Exhausted:  # varena refused its region before its forward ran
                     if not (block.table and reclaim and self.cuda and not capturing):
                         raise
                     self._gather(block, overlay)
@@ -2050,6 +2045,9 @@ class Memory:
                     for site, previous in reversed(block.saved):
                         site.table[site.name] = previous
                     block.saved.clear()
+                    if block.born_before is not None:
+                        self._born(block.born_before)
+                        block.born_before = None
                     block.last = time.monotonic_ns()
                     self._idle(block)
 
@@ -2117,6 +2115,7 @@ class Memory:
             with self.lock:
                 outer_forward = self._forward_depth == 0
                 self._forward_depth += 1
+                self._executing[model] = self._executing.get(model, 0) + 1
         try:
             if not depth:
                 self._declare(model)
@@ -2138,6 +2137,7 @@ class Memory:
             if executing:
                 with self.lock:
                     self._forward_depth -= 1
+                    self._leave(model)
             if request is not None and not depth:
                 request.current.discard(model.name)
             model._release()
@@ -2148,7 +2148,7 @@ class Memory:
             model.local.depth -= 1
             if model.local.depth == 0:
                 if model.escape_site:
-                    vt.set_site(self.device.index or 0, 0)
+                    self._born(0)
                 try:
                     if model.common is not None:
                         self._exit(model.common)
@@ -2161,25 +2161,47 @@ class Memory:
             if executing:
                 with self.lock:
                     self._forward_depth -= 1
+                    self._leave(model)
             model._release()
 
-    def _entered(self, block: _Block, request: Request) -> None:
-        """Its allocations are born here. A model whose forward runs no hook of its own (its
-        package calls into its blocks) begins a pass at its first block, and at each block it enters
-        again after others: a forward enters each of its blocks once, in whatever order they were
-        registered (a mid block's attention before its resnet), and a weight read enters its block
-        again with none between."""
+    def _leave(self, model: Model) -> None:
+        if (left := self._executing[model] - 1) == 0:
+            del self._executing[model]
+        else:
+            self._executing[model] = left
+
+    def _born(self, site: int) -> int:
+        """Allocations on this device are born at `site` from now; the site they were born at."""
+        before, self._site = self._site, site
+        vt.set_site(self.device.index or 0, site)
+        return before
+
+    def _entered(self, block: _Block, request: Request) -> int:
+        """Its allocations are born here (the site before it, returned, comes back at its exit). A
+        model whose forward runs no hook of its own (its package calls into its blocks) begins a
+        pass at its first block, and at each block it enters again after others: a forward enters
+        each of its blocks once, in whatever order they were registered (a mid block's attention
+        before its resnet), and a weight read enters its block again with none between. A model
+        whose blocks run inside another's forward (an overlay's tables and factors) is part of that
+        forward's pass: marking its own at its first block would count what that forward made
+        before it (its packed rows) as kept from the last pass."""
         model = block.model
-        vt.set_site(self.device.index or 0, block.escape_site)
+        before = self._born(block.escape_site)
         if model in request.forwards:
-            return
+            return before
+        with self.lock:
+            inside = any(other is not model for other in self._executing)
+        if inside:
+            return before
         seen, last = request.heads.get(model, (None, None))
         if seen is None or (block.index in seen and block.index != last):
             request.heads[model] = ({block.index}, block.index)
             self._pass(model, request, 0)
+            self._born(block.escape_site)
         elif block.index != last:
             seen.add(block.index)
             request.heads[model] = (seen, block.index)
+        return before
 
     def _pass(self, model: Model, request: Request, shape: int) -> None:
         """A forward of `model` begins, a pass of its loop (`vt.pass_mark`; `shape` 0: unknown):
@@ -2194,7 +2216,7 @@ class Memory:
             )
         device = self.device.index or 0
         refused = vt.pass_mark(device, model.escape_site, shape, model.escape_floor)
-        vt.set_site(device, model.escape_site)
+        self._born(model.escape_site)
         if refused is not None:
             raise DoesNotFit(_does_not_fit(model.component, refused))
 
@@ -2233,7 +2255,9 @@ class Memory:
                     request.record_fills()
                     self.pages.request_ended()  # the pages it refilled are their worth
                 if _ESCAPES and self.cuda and not idle and torch.cuda.is_initialized():
-                    failed = request.failed or sys.exc_info()[0] is not None  # or raised through here
+                    # or a capacity failure raised through here, never a package's own error
+                    raised = sys.exc_info()[1]
+                    failed = request.failed or (raised is not None and is_capacity(raised))
                     request.escaped = vt.escapes_take(self.device.index or 0, failed=failed)
                     _escaped_warnings(request.escaped)
                 request.sample()
@@ -2339,7 +2363,10 @@ class _Kept:
 class _Retaining:
     def retained(self, nbytes: int) -> Retained | None:
         request = _REQUEST.get()
-        return Retained(None) if request is None else request.memory.retained(nbytes)
+        if request is None:
+            return Retained(None)
+        request.retained_bytes += nbytes
+        return request.memory.retained(nbytes)
 
 
 _retained.install(_Retaining())
@@ -2397,14 +2424,19 @@ class Request:
         self.heads: dict[Model, tuple[set[int], int]] = {}
         #: the attempt failed (its executor says): a refused allocation in its last pass is learned
         self.failed = False
-        #: refusals that took a pure site finer than its estimate chose: zero in a normal run
+        #: pure ops varena told to run again finer after refusing their leaf: zero in a normal run
         self.finer_splits = 0
+        #: refusals a package scope returned past (`contract._Scopes`): zero in a conforming run
+        self.swallowed_ooms = 0
+        #: cross-step state its loops declared (`author.retained`)
+        self.retained_bytes = 0
         #: Working allocation peak over the whole request, kept across cut-site resets. Weights
         #: are not in it, and no sum of it with them ever happened: the driver reads the card.
         self.torch_peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
-        self.moved = self.read_ns = 0
-        self.baked_hits = self.baked_bytes = self.baked_ns = 0
+        #: origin -> [bytes, fills, ns]: the store, a kept page (`baked`), or another set's stored
+        #: bytes on this GPU (`resident`) or in its kept page (`host`)
+        self.moved = {origin: [0, 0, 0] for origin in ("store", "baked", "resident", "host")}
         #: each baked fill's trace entry and its bake (`Bake`), resolved when the request ends
         self.bakes: list[tuple[dict[str, object], Bake]] = []
         self.final_fills = self.final_hits = 0
@@ -2461,16 +2493,13 @@ class Request:
     def fill(
         self, name: str, block: int, nbytes: int, origin: str, ahead: bool, ns: int, at_ms: float
     ) -> None:
-        """A block filled: from the store, or (`baked`) from its kept bytes. A demand fill's
-        entry carries its read's host time and when it ended, so a step's fills and bakes are
-        told apart (cr-242). `ahead`: the core filled it before any use asked."""
-        if origin == "store":
-            self.moved += nbytes
-            self.read_ns += ns
-        else:
-            self.baked_hits += 1
-            self.baked_bytes += nbytes
-            self.baked_ns += ns
+        """A block's bytes filled from one origin (`moved`). A demand fill's entry carries its
+        read's host time and when it ended, so a step's fills and bakes are told apart (cr-242).
+        `ahead`: the core filled it before any use asked."""
+        moved = self.moved.setdefault(origin, [0, 0, 0])
+        moved[0] += nbytes
+        moved[1] += 1
+        moved[2] += ns
         self.prefetch_completed += ahead
         self._trace.append(
             {
@@ -2523,8 +2552,10 @@ class Request:
                 m.name: sum(b.nbytes for b in m.groups()) for m in self.memory.models.values()
             },
             "moved": {
-                "store": {"bytes": self.moved, "ns": self.read_ns},
-                "baked": {"bytes": self.baked_bytes, "fills": self.baked_hits, "ns": self.baked_ns},
+                **{
+                    origin: {"bytes": nbytes, "fills": fills, "ns": ns}
+                    for origin, (nbytes, fills, ns) in self.moved.items()
+                },
                 "bake": self._bakes(),
             },
             "baked_pages": self.memory.pages.stats() if self.memory.pages is not None else None,
@@ -2535,6 +2566,8 @@ class Request:
             "working_splits": list(self.working_splits.values()),
             "escaped": list(self.escaped),
             "finer_splits": self.finer_splits,
+            "swallowed_ooms": self.swallowed_ooms,
+            "retained_bytes": self.retained_bytes,
             "gathered": self.gathered,
             "host": None,
         }
@@ -2957,13 +2990,14 @@ def _escaped_warnings(records: list[dict[str, Any]]) -> None:
         WARNINGS.append((said, {"code": "escaped_memory"}))
 
 
-def _uncached(module: nn.Module) -> None:
+def uncached(module: nn.Module) -> None:
     """A forward that does not ask for a cache keeps none. A text encoder's call through a library
     (Diffusers' `encode_prompt`) left its `DynamicCache` live as plain tensors, about 1 GiB for a
     long prompt; decoding asks with `use_cache=True` itself (`cozy_runtime.lm`, `generate`)."""
     for sub in module.modules():
         config = getattr(sub, "config", None)
-        if type(config).__module__.startswith("transformers.") and getattr(config, "use_cache", None):
+        transformers = any(c.__module__.startswith("transformers.") for c in type(config).__mro__)
+        if transformers and getattr(config, "use_cache", None):
             config.use_cache = False
 
 
@@ -2972,7 +3006,6 @@ def _hooks(model: Model) -> None:
     tally = _ESCAPES and memory.cuda
     if tally:
         model.escape_site = vt.site_id(model.component)
-    _uncached(model.module)
     for entry, sub in (("", model.module), *model.module.named_children()):
 
         def opened(args: tuple[object, ...], kwargs: dict[str, object], name: str = entry) -> None:

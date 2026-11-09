@@ -71,6 +71,7 @@ from cozy_runtime.author._errors import (
     ConformanceError,
     DeadlineExceeded,
     DefaultResolutionError,
+    DoesNotFit,
     InvalidRequest,
     Outcome,
     OutputError,
@@ -195,7 +196,7 @@ from cozy_runtime.author._services import (
 )
 from cozy_runtime.author._node import Node
 from cozy_runtime.author._signature import ModelBinding, Surface
-from cozy_runtime.author._split import Cut, split
+from cozy_runtime.author._split import Cut, Windows, split, windows
 from cozy_runtime.author._spread import spread
 from cozy_runtime.author._video import (
     ContinueFrom,
@@ -272,6 +273,7 @@ __all__ = [
     "DerivationHook",
     "DerivedCache",
     "Device",
+    "DoesNotFit",
     "Egress",
     "EgressResponse",
     "EncodingRule",
@@ -364,6 +366,7 @@ __all__ = [
     "VideoProbe",
     "Weights",
     "WeightsOutput",
+    "Windows",
     "active_attention_layout",
     "assert_declaration_shape",
     "attach_assessment",
@@ -405,6 +408,7 @@ __all__ = [
     "uncaptured",
     "upload_checkpoint",
     "uses_components",
+    "windows",
 ]
 
 #: Names a Runtime removed, the release that removed them, and what replaces each. A package built
