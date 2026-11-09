@@ -29,6 +29,7 @@ import math
 import shutil
 import site
 import sys
+import time
 from collections import deque
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
@@ -1549,6 +1550,55 @@ def _unfit(
     return ""
 
 
+def prime(device: DeviceFacts, bits: int | Mapping[str, int]) -> None:
+    """Opens, beside the construction, the kernels a dense site's walk on this card tries first at
+    the model's `bits`, in its order on one thread, each one built here already, until one serves
+    (`kernel_ready.prime_first`): selection then finds them opened or failed. A kernel still to
+    build, and what follows it, is selection's to ask."""
+    if device.kind != "cuda":
+        return
+    found, row = known(), device_row(device)
+    levels = sorted({bits} if isinstance(bits, int) else {*bits.values(), 16})
+    chain = []
+    for name in dict.fromkeys(n for at in levels if at in LEVELS for n in walk(row, at)):
+        candidate = found[name]
+        if not (candidate.artifact or candidate.import_name) or not _built(candidate, device):
+            break
+        chain.append((_slot(name, device), partial(_open, candidate, device)))
+    kernel_ready.prime_first(chain)
+
+
+def _built(candidate: Candidate, device: DeviceFacts) -> bool:
+    """Whether opening CANDIDATE here starts or waits for no build."""
+    if candidate.producer is not None or candidate.dense or candidate.kernels or candidate.sparse:
+        return False
+    if candidate.artifact == PREBUILT or _wheel(candidate, device) is not None:
+        return True
+    if not candidate.import_name:
+        return False
+    store = kernel_cache.configured()
+    found = util.find_spec(candidate.import_name.split(".")[0])
+    origin = str(found.origin or "") if found is not None else ""
+    roots = () if store is None else tuple(str(n) for n in (store.own, store.trusted) if n)
+    if store is None or (found is not None and not origin.startswith(roots)):
+        return True  # the environment's own module, or no store: no build either way
+    try:
+        return kernel_compile.status(store, _job(candidate, device)).state in ("ready", "failed")
+    except AttentionRefusal:
+        return True  # absent: it refuses at once
+
+
+#: Each kernel selection opened here and its ms (`legs`), for the construction's ledger.
+_LEGS: list[tuple[str, float]] = []
+
+
+def legs() -> list[tuple[str, float]]:
+    """Selection's opens since the last read."""
+    taken = list(_LEGS)
+    del _LEGS[: len(taken)]
+    return taken
+
+
 def _first(
     order: Sequence[str],
     row: arch.Row | None,
@@ -1574,6 +1624,7 @@ def _first(
         if name not in resolved:
             if device is None:
                 continue
+            started = time.perf_counter()
             try:
                 resolved[name] = _opened(candidate, device)
             except Exception as exc:
@@ -1582,6 +1633,8 @@ def _first(
                 # typed refusals (`pinned`).
                 refused[name] = f"{type(exc).__name__}: {exc}"[:300]
                 continue
+            finally:
+                _LEGS.append((name, round((time.perf_counter() - started) * 1000, 1)))
         entry = resolved[name]
         for passed in order[: order.index(name)]:
             fallback = execution_evidence.AttentionFallback(

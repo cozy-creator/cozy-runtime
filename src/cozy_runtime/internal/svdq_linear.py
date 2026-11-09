@@ -458,6 +458,12 @@ def native(torch: ModuleType, index: int) -> bool:
     return True
 
 
+def ask(torch: ModuleType, index: int) -> None:
+    """A leaf's bind: the prebuilt kernels' probe begun beside its fill, never waited for here."""
+    if not kernel_ready.begun(f"{NATIVE} cuda:{index}"):
+        native(torch, index)
+
+
 def _native_opened(torch: ModuleType, index: int, wait: bool) -> object:
     sm = int8_linear.capability(torch, index)
     probe = partial(probe_native, torch, torch.device("cuda", index))

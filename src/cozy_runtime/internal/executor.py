@@ -2742,6 +2742,7 @@ class Executor:
         rows = command.models if command.models is not UNSET else (command.single(),)
         kept: dict[str, float] = {}
         refused: dict[str, str] = {}
+        keys = ""
         # Its CPU ops run on this thread: an intra-op pool's threads would outlive them.
         threads = torch.get_num_threads()
         torch.set_num_threads(1)
@@ -2764,6 +2765,12 @@ class Executor:
                 build.parent = os.getpid()
                 self.prebuilt[key] = build
                 kept[path] = round((time.perf_counter() - began) * 1000, 1)
+            if kept:
+                from cozy_runtime.internal import triton_kernels
+
+                began = time.perf_counter()
+                triton_kernels.warm_host()
+                keys = f"; kernel keys read in {(time.perf_counter() - began) * 1000:.0f} ms"
         finally:
             torch.set_num_threads(threads)
         # TensorFS read its headers and assets on its fetch runtime and dropped natives on its
@@ -2773,6 +2780,7 @@ class Executor:
         said = (
             f"built ahead {kept or 'nothing'} in {(time.perf_counter() - started) * 1000:.0f} ms"
             + (f"; not kept {refused}" if refused else "")
+            + keys
             + f"; rss {_rss() >> 20} MiB"
         )
         why = f"; cannot fork: {unsafe}" if unsafe else ""
@@ -2884,6 +2892,7 @@ class Executor:
         # these imports, the package's and the headers. Its first use below awaits it. A kernel
         # integration import that queries the device (Diffusers importing TorchAO's optional
         # Triton kernels) waits for it (`zygote.driverless`).
+        from cozy_runtime.internal import triton_kernels
         from cozy_runtime.internal.triton_kernels import load as load_kernels
         from cozy_runtime.internal.triton_kernels import ready as kernels_ready
         from cozy_runtime.internal.weights import Backend, Placement
@@ -2969,11 +2978,16 @@ class Executor:
             # counter noise's kernel, which a recorded step's draw needs before its capture.
             leaves.prime(torch, torch.cuda.current_device())
             philox.prime(torch.cuda.current_device())
+            # The package's fused kernels load beside the fill, for its execution plan below.
+            triton_kernels.prime(self._rank_device(torch))
         device_index = self.rank if self.world > 1 else 0
         device_facts = measure_device(torch, device_index)
         # The request this executor loads for pins a kernel: its build is imported first.
         if command.attention_pin:
             attention.reserve(command.attention_pin, device_facts)
+        elif self.world == 1:
+            # Selection's first kernels open beside the fill (`attention.prime`).
+            attention.prime(device_facts, model_cls.__attention_bits__)
         stage("measure_device")
         hardware_variant = binding.variant
         if not hardware_variant and device_facts.kind in ("mps", "cpu"):
@@ -3133,6 +3147,7 @@ class Executor:
             backend.install_execution()
             roots = backend.roots
             stage("execution_plan")
+            stages.extend((f"execution_plan.{name}", ms) for name, ms in triton_kernels.legs())
             # EACH SITE'S KERNEL FROM THE GROUP'S FAMILY CELL AT THE MODEL'S ATTENTION LEVEL,
             # PINNED POST-FILL (cr-124), before any warm step (`attention.select`).
             sms = [accel.device_capability(entry) for entry in _sealed_entries()]
@@ -3147,6 +3162,7 @@ class Executor:
             applied = self._reselect()
             self.device_facts = device_facts
             stage("attention_pin")
+            stages.extend((f"attention_pin.{name}", ms) for name, ms in attention.legs())
         except (attention.AttentionRefusal, _PlanRefusal) as exc:
             backend.poison(())
             self.poisoned = f"execution plan refused: {exc.code}"
@@ -3270,6 +3286,9 @@ class Executor:
                 }
         self.attention_defaults = attention.snapshot(dict(backend.roots))
         group_facts = dict(self.facts)
+        if self._group_parent is None:
+            self._settle_leaves([self])
+            stage("leaves_settle")
         # The GPU libraries' first launches ran beside this construction: its figures follow them.
         refused = self.host._await_device(warm=True)
         if refused is not None:
@@ -3321,6 +3340,14 @@ class Executor:
             "entrypoints": sorted(self.surface_names),
             "facts": self.facts,
         }
+
+    def _settle_leaves(self, members: Sequence[Executor]) -> None:
+        """The ops the members' leaves began at their bind (`leaves.settle`): asked once the whole
+        construction is built, so their primes run beside all of it."""
+        torch = self.torch
+        providers = {p for m in members if m.backend is not None for _, p in m.backend.gemm_sites}
+        if providers and torch is not None and self.device_kind == "cuda":
+            leaves.settle(torch, self._rank_device(torch).index or 0, providers)
 
     def _deferred(self, binding: Binding) -> bool:
         """Whether this model is built on first use (`on_demand=`)."""
@@ -3514,6 +3541,9 @@ class Executor:
             "delivery": delivery,
             "models": {parameter: facts for parameter, facts in facts_rows},
         }
+        settled = time.perf_counter()
+        self._settle_leaves(self.model_executors)
+        self.facts["stages"].append(("leaves_settle", round((time.perf_counter() - settled) * 1e3, 1)))
         self.ready = True
         return {
             "ok": True,
@@ -3536,6 +3566,7 @@ class Executor:
             self.poisoned = self.poisoned or member.poisoned
             detail = f"model {parameter} refused: {reply.get('detail', '')}"
             raise RuntimeFailure(detail[:900], code=str(reply.get("code") or "runtime_failure"))
+        self._settle_leaves([member])
         member.load_reply = reply
         self.built_on_demand[parameter] = member.facts
         self.torch = self.torch or member.torch

@@ -32,6 +32,8 @@ import json
 import os
 import sys
 import sysconfig
+import threading
+import time
 from collections.abc import Callable, Iterable
 from importlib import import_module
 from pathlib import Path
@@ -43,6 +45,7 @@ from msgspec import Struct
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._model import LANDED
 from cozy_runtime.author.kernels import (
+    _SETS,
     KernelsUnavailable,
     Launch,
     TritonEntry,
@@ -477,6 +480,94 @@ class _Launcher:
 
 #: Loaded sets by (name, device index).
 _LOADED: dict[tuple[str, int], _Launcher] = {}
+#: Sets a `prime` thread is loading, by (name, device index): an ask waits for it.
+_PRIMING: dict[tuple[str, int], threading.Event] = {}
+#: Where each set's load spent its time, `(set.step, ms)`, for the construction's ledger (`legs`).
+_LEGS: list[tuple[str, float]] = []
+
+
+def legs() -> list[tuple[str, float]]:
+    """The loads' legs since the last read, summed by name."""
+    taken = list(_LEGS)
+    del _LEGS[: len(taken)]
+    summed: dict[str, float] = {}
+    for name, ms in taken:
+        summed[name] = round(summed.get(name, 0.0) + ms, 1)
+    return list(summed.items())
+
+
+def _leg(name: str, since: float) -> float:
+    now = time.perf_counter()
+    primed = threading.current_thread().name == _PRIMER
+    _LEGS.append((f"primed.{name}" if primed else name, round((now - since) * 1000, 1)))
+    return now
+
+
+def _primed(key: tuple[str, int]) -> None:
+    event = _PRIMING.get(key)
+    if event is not None and threading.current_thread().name != _PRIMER:
+        started = time.perf_counter()
+        event.wait()
+        _leg(f"{key[0]}.primed_wait", started)
+
+
+_PRIMER = "kernel-ready: triton sets"
+
+
+def warm_host() -> None:
+    """What every set's key reads from the host, cached for the process and with no device: the
+    toolchains' versions (a `ptxas` run each), the driver's directories (an `ldconfig` run) and
+    each declared kernel's source hash. An import-only parent runs it, so its forks find them."""
+    if TRITON_ABSENT:
+        return
+    from triton import knobs
+
+    reads: list[Callable[[], object]] = [
+        lambda: knobs.nvidia.ptxas.version,
+        lambda: knobs.nvidia.ptxas_blackwell.version,
+        _cuda_driver.libcuda_dirs,
+    ]
+    reads += [
+        functools.partial(getattr, entry.kernel, "cache_key")
+        for kernels in list(_SETS.values())
+        for entry in kernels.entries
+    ]
+    for read in reads:
+        try:
+            read()
+        except Exception:  # each is read again where it is needed, and refuses there
+            continue
+
+
+def prime(device: object) -> None:
+    """`ready` for each package's set on `device`, on a thread of its own beside the
+    construction: its execution plan finds them loaded, and an ask waits for this one."""
+    if TRITON_ABSENT:
+        return
+    index = torch.device(device).index or 0
+    sets = [
+        k
+        for k in list(_SETS.values())
+        if k.entries
+        and home(k) != "cozy_runtime"
+        and (k.name, index) not in _LOADED
+        and (k.name, index) not in _PRIMING
+    ]
+    for kernels in sets:
+        _PRIMING[(kernels.name, index)] = threading.Event()
+
+    def run() -> None:
+        for kernels in sets:
+            try:
+                with kernel_ready.EXECUTION[0]():
+                    ready(kernels, device=device)
+            except Exception:  # the plan asks again and reports why
+                pass
+            finally:
+                _PRIMING.pop((kernels.name, index)).set()
+
+    if sets:
+        threading.Thread(target=run, name=_PRIMER, daemon=True).start()
 
 
 def load(kernels: TritonKernels, *, device: object) -> Launch:
@@ -488,14 +579,18 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
     if target.type != "cuda":
         raise KernelsUnavailable("kernels_absent", f"{kernels.name} serves CUDA, not {target}")
     index = target.index or 0
+    _primed((kernels.name, index))
     if (kernels.name, index) in _LOADED:
         return _LOADED[(kernels.name, index)]
+    leg = time.perf_counter()
     _seed_launcher()  # this environment's key: an image boot's builder seeded its own
     major, minor = torch.cuda.get_device_capability(index)
     arch, store = major * 10 + minor, _store()
     found = job(kernels, arch)
+    leg = _leg(f"{kernels.name}.job", leg)
     _submit(store, found)
     state = kernel_compile.wait(store, found, kernels.name)
+    leg = _leg(f"{kernels.name}.built", leg)
     if state.state != "ready":
         raise KernelsUnavailable("kernels_failed", f"{kernels.name} sm{arch}: {state.line()}")
     compiled: dict[str, CompiledKernel] = {}
@@ -510,6 +605,7 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
                 f"{entry.key}: the store marks sm{arch} built, Triton's cache lacks {digest[:12]}",
             )
         kernel = CompiledKernel(_source(entry), group, digest)
+        leg = _leg(f"{kernels.name}.read", leg)
         try:
             with torch.cuda.device(index):  # Triton loads onto the thread's current device
                 kernel._init_handles()
@@ -517,6 +613,7 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
             raise KernelsUnavailable(
                 "kernels_corrupt", f"{entry.key} does not load on sm{arch}: {exc}"
             ) from exc
+        leg = _leg(f"{kernels.name}.handles", leg)
         compiled[entry.key] = kernel
         names[entry.kernel.__name__] = tuple(sorted(entry.constexprs))
     aligned = {entry.key: entry.aligned for entry in kernels.entries}
@@ -535,13 +632,19 @@ def ready(kernels: TritonKernels, wait: bool = False, *, device: object) -> Laun
     target = torch.device(device)
     if target.type != "cuda":
         raise KernelsUnavailable("kernels_absent", f"{kernels.name} serves CUDA, not {target}")
-    if (kernels.name, target.index or 0) in _LOADED:
-        return _LOADED[(kernels.name, target.index or 0)]
+    key = (kernels.name, target.index or 0)
+    if key not in _LOADED and not torch.cuda.is_current_stream_capturing():
+        _primed(key)
+    if key in _LOADED:
+        return _LOADED[key]
     if torch.cuda.is_current_stream_capturing():  # a load would end the graph being recorded
         return None
+    leg = time.perf_counter()
     major, minor = torch.cuda.get_device_capability(target.index or 0)
     found = job(kernels, major * 10 + minor)
-    if _submit(_store(), found).state == "compiling" and not _prebuilt(found):
+    state = _submit(_store(), found).state
+    _leg(f"{kernels.name}.ready", leg)
+    if state == "compiling" and not _prebuilt(found):
         return None
     launch = load(kernels, device=device)
     LANDED[0] += 1

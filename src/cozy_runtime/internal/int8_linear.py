@@ -142,8 +142,24 @@ def native(torch: ModuleType, index: int) -> Op | None:
 
 def prime(torch: ModuleType, index: int) -> None:
     """Opens the op on this card on its own thread at device init, beside the weight fill: its
-    first ask (`native`) waits for it rather than serve a fallback (`kernel_ready.prime`)."""
-    kernel_ready.prime(f"{NATIVE} cuda:{index}", partial(_library, torch, index))
+    first ask (`native`) waits for it rather than serve a fallback (`kernel_ready.prime`). Where
+    it refuses, comfy-kitchen's open starts there."""
+    kernel_ready.prime(f"{NATIVE} cuda:{index}", partial(_primed, torch, index))
+
+
+def ask(torch: ModuleType, index: int) -> None:
+    """A leaf's construction on this card: the op's open, else comfy-kitchen's, begun beside the
+    fill. It never waits for the op's prime: the construction's end does (`leaves.settle`)."""
+    if not kernel_ready.begun(f"{NATIVE} cuda:{index}") and native(torch, index) is None:
+        kitchen(torch, index)
+
+
+def _primed(torch: ModuleType, index: int, wait: bool) -> prebuilt.Prebuilt:
+    try:
+        return _library(torch, index, wait)
+    except Exception:
+        kitchen(torch, index)
+        raise
 
 
 def _library(torch: ModuleType, index: int, wait: bool) -> prebuilt.Prebuilt:

@@ -38,6 +38,7 @@ from cozy_runtime.author.kernels import (
 from cozy_runtime.internal import (
     fp8_linear,
     int8_linear,
+    kernel_ready,
     nvfp4_linear,
     prebuilt,
     svdq_linear,
@@ -120,6 +121,16 @@ def prime(torch: Any, index: int) -> None:
     RTX 5090, 79 s against 29 s)."""
     for module in dict.fromkeys(_MODULES.values()):
         module.prime(torch, index)
+
+
+def settle(torch: Any, index: int, providers: set[str]) -> None:
+    """The ops a construction's leaves (`providers`) began at their bind without waiting, asked
+    once at its end, after their primes: its first request finds them, as it did when each bind
+    waited for them."""
+    if providers & {INT8_CONVROT, W4A8}:
+        int8_linear.native(torch, index)
+    if SVDQ in providers and kernel_ready.begun(f"{svdq_linear.NATIVE} cuda:{index}"):
+        svdq_linear.native(torch, index)
 
 
 def sites(leaves: Mapping[str, tuple[Any, ...]]) -> Counter[tuple[str, str]]:
@@ -519,11 +530,9 @@ class Int8ConvRotNativeLeaf:
     def leaf(
         self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
     ) -> Tensor:
-        placed = placed_device()
-        if placed.type == "cuda" and int8_linear.native(torch, placed.index or 0) is None:
-            # The op is built at boot; until it lands the reviewed comfy-kitchen binary serves
-            # (its build starts here, beside the weight fill), else the eager int8 GEMM.
-            int8_linear.kitchen(torch, torch.cuda.current_device())
+        if (placed := placed_device()).type == "cuda":
+            # Until the op lands the reviewed comfy-kitchen binary serves, else the eager GEMM.
+            int8_linear.ask(torch, placed.index or 0)
         data = parts["weight"]
         in_features, out_features, bias = _leaf_geometry(replaced, data)
         return _native_leaf_class(torch)(
@@ -672,8 +681,7 @@ class W4a8NativeLeaf:
         self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
     ) -> Tensor:
         if (placed := placed_device()).type == "cuda":
-            # The 8-bit op is built at boot; asking starts its load beside the weight fill.
-            int8_linear.native(torch, placed.index or 0)
+            int8_linear.ask(torch, placed.index or 0)
         codes = parts["weight"]
         roles = {
             "weight": codes,
@@ -1030,7 +1038,7 @@ class SvdqNvfp4NativeLeaf:
         placed = placed_device()
         tiled = placed.type == "cuda" and svdq_linear.tiled(torch, placed.index or 0, out_features)
         if tiled:  # the prebuilt kernels' tiles (RTX 50); asking starts their probe beside the fill
-            svdq_linear.native(torch, placed.index or 0)
+            svdq_linear.ask(torch, placed.index or 0)
             roles["weight"], roles["scale"] = svdq_linear.tiles(torch, weight, scale)
         for role in ("channel_scale", "input_scale"):
             if role in parts:

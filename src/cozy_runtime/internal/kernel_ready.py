@@ -30,7 +30,7 @@ from __future__ import annotations
 import re
 import sys
 import threading
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -153,6 +153,51 @@ def prime[T](name: str, opener: Opener[T]) -> None:
             primed.set()
 
     threading.Thread(target=open_it, name=f"{THREAD}{name}", daemon=True).start()
+
+
+def prime_first(chain: Sequence[tuple[str, Opener[object]]]) -> None:
+    """`prime` for alternatives an asker tries in order: one thread opens each in turn until one
+    serves, and the rest go unasked (their slots go). One whose build is not done stops it: its
+    slot goes, and the asker opens it and what follows as it would have."""
+    with _LOCK:
+        slots = [
+            (name, opener, _SLOTS.setdefault(name, _Slot("opening", primed=threading.Event())))
+            for name, opener in chain
+            if name not in _SLOTS
+        ]
+    if not slots:
+        return
+
+    def drop(name: str, slot: _Slot) -> None:
+        with _LOCK:
+            if _SLOTS.get(name) is slot:
+                del _SLOTS[name]
+        cast("threading.Event", slot.primed).set()
+
+    def open_all() -> None:
+        kernel_compile.told.set(False)
+        done = False
+        for name, opener, slot in slots:
+            if done:
+                drop(name, slot)
+                continue
+            try:
+                with _opening(name):
+                    value = opener(False)
+            except Exception as exc:
+                _ended(name, slot, exc)
+                done = is_capacity(exc)
+                cast("threading.Event", slot.primed).set()
+                continue
+            if value is None:
+                drop(name, slot)
+                done = True
+                continue
+            _landed(name, slot, value, "ready" if _GROUP[0] is None else "landed")
+            cast("threading.Event", slot.primed).set()
+            done = True
+
+    threading.Thread(target=open_all, name=f"{THREAD}{slots[0][0]}", daemon=True).start()
 
 
 def _primed(name: str) -> None:
@@ -334,6 +379,12 @@ def failed(name: str) -> Exception | None:
     """Why `name`'s kernel does not serve in this process, or None."""
     slot = _SLOTS.get(name)
     return slot.error if slot is not None and slot.state == "failed" else None
+
+
+def begun(name: str) -> bool:
+    """Whether `name`'s kernel began to open here (`prime`d, asked, or done): what asks only to
+    start it leaves it be, and never waits for its prime."""
+    return name in _SLOTS
 
 
 def opening(name: str) -> bool:
