@@ -15,10 +15,12 @@ if TYPE_CHECKING:
     from torch.cuda import Stream
 
 
-def stream(torch: ModuleType, device: Device | str | int | None = None) -> Stream:
-    """A new stream on `device`, the current GPU by default."""
+def stream(
+    torch: ModuleType, device: Device | str | int | None = None, priority: int = 0
+) -> Stream:
+    """A new stream on `device`, the current GPU by default; a lower `priority` runs first."""
     at = torch.device("cuda" if device is None else device)
     if at.index is None:
         at = torch.device("cuda", torch.cuda.current_device())
-    made: Stream = torch.cuda.Stream(at)
+    made: Stream = torch.cuda.Stream(at, priority=priority)
     return made

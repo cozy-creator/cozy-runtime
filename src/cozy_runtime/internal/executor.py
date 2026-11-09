@@ -1181,10 +1181,15 @@ class Executor:
                 gpus.append({**row, "attention": {**row["attention"], "requested": pin}})
         facts = self.facts
         transport = self.host.transport
+        crossing: dict[str, Any] = {}
+        if transport is not None:
+            from cozy_runtime.internal.parallel import ulysses
+
+            crossing = {"transport": {**transport.document(), "exchange": ulysses.taken()}}
         return {
             "degree": self.world,
             "gpus": gpus,
-            **({"transport": transport.document()} if transport is not None else {}),
+            **crossing,
             # per spread method: the calls each rank ran, and why a rank declined
             "spread": dict(self.group.spread_log) if self.group is not None else {},
             "executor": dict(self.host.boot),
@@ -1291,7 +1296,7 @@ class Executor:
         reply = {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
         if command.calibrate:
             exchange, reply["calibration"] = copy_engine.calibrate(
-                self.torch, self.pg, self.rank, self.world
+                self.torch, self.pg, self.rank, self.world, command.calibrate
             )
             copy_engine.install(exchange, self.pg)
         return reply
@@ -1306,12 +1311,19 @@ class Executor:
             "traceback": prepare_diagnostics.exception_trace(exc),
         }
 
+    def _exchanges(self) -> tuple[str, ...]:
+        """The exchanges this group's formation times against NCCL (`links.Links.exchanges`)."""
+        nccl = self.group is not None and self.group.backend == "nccl"
+        return self.transport.links.exchanges if nccl and self.transport is not None else ()
+
     def _calibrated(self, pg: Any) -> None:
-        """Rank 0's half of the formation's calibration: NCCL against the copy engines."""
+        """Rank 0's half of the formation's calibration: NCCL against `_exchanges`."""
         assert self.transport is not None
-        exchange, self.transport.calibration = copy_engine.calibrate(self.torch, pg, 0, self.world)
+        exchange, self.transport.calibration = copy_engine.calibrate(
+            self.torch, pg, 0, self.world, self._exchanges()
+        )
         copy_engine.install(exchange, pg)
-        self.transport.route = "copy-engine" if exchange is not None else "nccl"
+        self.transport.route = exchange.name if exchange is not None else "nccl"
 
     def _watch_abort(self, watcher: socket.socket) -> None:
         """A follower's collectives end when rank 0 says so (`RankGroup.interrupt`): its main
@@ -1329,10 +1341,13 @@ class Executor:
         """Rank 0's half of `mirror.mirror_component`: after a GPU ran short of memory in a
         call, the group forms again for the next attempt (§5.5)."""
         assert self.group is not None and self.torch is not None
-        transport = self.host.transport
-        recalibrate = transport is not None and transport.links.copy_engines
+        exchanges = self.host._exchanges()
         self.host.pg = self.group.form(
-            self.torch, _SEALED, again=True, formed=self.host._calibrated if recalibrate else None
+            self.torch,
+            _SEALED,
+            again=True,
+            calibrate=exchanges,
+            formed=self.host._calibrated if exchanges else None,
         )
         if self.host.comms is not None:
             self.host.comms.pg = self.host.pg
@@ -1887,11 +1902,13 @@ class Executor:
                     self.transport = links.Transport(
                         degree, _gpu_numbers(degree), "nccl", measured.nccl(), measured
                     )
+                    exchanges = self._exchanges()
                     self.pg = self.group.form(
                         self.torch,
                         _SEALED,
                         nccl=self.transport.nccl,
-                        formed=self._calibrated if measured.copy_engines else None,
+                        calibrate=exchanges,
+                        formed=self._calibrated if exchanges else None,
                     )
                     stage("group_form")
         except GroupRefusal as exc:
