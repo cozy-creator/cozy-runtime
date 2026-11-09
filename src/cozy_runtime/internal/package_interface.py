@@ -1,4 +1,4 @@
-"""The package interface generated from one frozen application.
+"""The package interface: one document per release, read from source by `static_interface`.
 
 Its one identity is SHA-256 over canonical JSON. Creator obtains those exact bytes from
 `cozy-runtime --json describe`; nothing is written into the package repository.
@@ -11,7 +11,6 @@ import os
 import re
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
 
@@ -32,11 +31,8 @@ from cozy_runtime.author._model import ENCODED_LEAVES
 from cozy_runtime.author._model_defaults import model_default
 from cozy_runtime.author._recipes import DeclaredRecipe
 from cozy_runtime.author._signature import AssetInputValue, Declaration, Slot
-from cozy_runtime.internal import canonical, invocable_interface, memo_implementation, schema
+from cozy_runtime.internal import canonical, invocable_interface, schema
 from cozy_runtime.internal.canonical import Json
-
-if TYPE_CHECKING:
-    from cozy_runtime.internal.discovery import Discovered
 
 SCHEMA = "cozy.package.interface/1"
 DIGEST_KEY = "package_interface_digest"
@@ -46,7 +42,7 @@ TOP_LEVEL_KEYS = frozenset({"format", "application", "entrypoints"})
 
 
 class StalePackageInterface(ConformanceError):
-    """Supplied package-interface bytes are malformed or differ from the installed release."""
+    """Supplied package-interface bytes are malformed."""
 
     default_code = "stale_package_interface"
 
@@ -213,20 +209,6 @@ class PackageInterface(msgspec.Struct, frozen=True, kw_only=True):
 # ------------------------------------------------------------------------ the document
 
 
-def build(found: Discovered, *, installed: bool = False) -> dict[str, Json]:
-    """Derive one package interface from the frozen (imported) application."""
-    # A writer's identity keys TensorFS derivation replay, as a memoized one's keys the memo.
-    declared = [
-        replace(surface, identity=memo_implementation.describe(surface.fn))
-        if surface.memoize or surface.weights_outputs
-        else surface
-        for surface in found.surfaces
-        if not surface.hidden
-    ]
-    recipes = [msgspec.to_builtins(recipe) for recipe in found.recipes]
-    return assemble(found.application, declared, installed=installed, recipes=recipes)
-
-
 def assemble(
     application: str,
     declared: Sequence[Declaration],
@@ -234,8 +216,8 @@ def assemble(
     installed: bool = False,
     recipes: Sequence[dict[str, Json]] = (),
 ) -> dict[str, Json]:
-    """One package interface from its callables' records, whichever reader filled them: each
-    passes the one rule set (`validate`), then renders its entry.
+    """One package interface from the static reader's records of its callables: each passes
+    the one rule set (`validate`), then renders its entry.
 
     `installed` describes a published wheel, so it holds that release to the rules it was
     published under."""
@@ -485,72 +467,6 @@ def descriptor_id(body: Mapping[str, Json], name: str) -> str:
         f"{', '.join(str(e['name']) for e in entries if isinstance(e, dict)) or 'none'}",
         code="unknown_function",
     )
-
-
-#: Facts only the installed environment can state: a memoized callable's operation identity
-#: hashes its installed helpers, so a source reading never carries it.
-INSTALLED_FACTS = frozenset({"operation_identity", "operation_identity_unavailable"})
-
-
-def source_facts(doc: Mapping[str, Json]) -> dict[str, Json]:
-    """The document as a source reading knows it: installed-environment facts removed."""
-
-    def callable_facts(entry: Json) -> Json:
-        if not isinstance(entry, dict) or not isinstance(entry.get("invocable"), dict):
-            return entry
-        invocable = {k: v for k, v in entry["invocable"].items() if k not in INSTALLED_FACTS}
-        return {**entry, "invocable": invocable}
-
-    return {
-        key: [callable_facts(entry) for entry in value]
-        if key == "entrypoints" and isinstance(value, list)
-        else value
-        for key, value in doc.items()
-    }
-
-
-def compare(left: Mapping[str, Json], right: Mapping[str, Json], names: tuple[str, str]) -> None:
-    """Refuse unless two package interfaces have the same content."""
-    if canonical_bytes(left) == canonical_bytes(right):
-        return
-    detail = "; ".join(_differences(left, right)) or "the documents differ"
-    raise StalePackageInterface(
-        f"{names[0]} and {names[1]} are different documents: {detail}",
-        code="stale_package_interface",
-    )
-
-
-def _differences(left: Json, right: Json, path: str = "") -> list[str]:
-    """The first few disagreements, deepest key named — a reviewer needs the FIELD."""
-    if isinstance(left, Mapping) and isinstance(right, Mapping):
-        out: list[str] = []
-        for key in sorted(set(left) | set(right)):
-            if key not in left:
-                out.append(f"{path}.{key} only in the second")
-            elif key not in right:
-                out.append(f"{path}.{key} only in the first")
-            else:
-                out += _differences(left[key], right[key], f"{path}.{key}")
-            if len(out) >= 4:
-                break
-        return out[:4]
-    if (
-        isinstance(left, Sequence)
-        and isinstance(right, Sequence)
-        and not isinstance(left, (str, bytes))
-        and not isinstance(right, (str, bytes))
-    ):
-        if len(left) != len(right):
-            return [f"{path or 'root'}: {len(left)} vs {len(right)} entries"]
-        out = []
-        for index, (a, b) in enumerate(zip(left, right, strict=True)):
-            out += _differences(a, b, f"{path}[{index}]")
-            if len(out) >= 4:
-                break
-        return out[:4]
-    if left != right:
-        return [f"{path or 'root'}: {left!r} vs {right!r}"]
-    return []
 
 
 def parse(raw: bytes, source: str = "package interface") -> PackageInterface:

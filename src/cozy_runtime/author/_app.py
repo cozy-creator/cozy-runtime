@@ -212,7 +212,7 @@ class App:
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
             if self._frozen:
                 raise RegistrationError(
-                    f"{target.__name__}: the registry is frozen — after describe, "
+                    f"{target.__name__}: the registry is frozen — once served, "
                     "registration is immutable"
                 )
             registered = name or target.__name__
@@ -265,5 +265,5 @@ class App:
             ) from None
 
     def freeze(self) -> None:
-        """After describe, registration is immutable (§1.0)."""
+        """Once served, registration is immutable (§1.0)."""
         self._frozen = True

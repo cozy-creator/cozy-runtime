@@ -291,9 +291,9 @@ def _models(declared: Declaration) -> None:
 
 
 def check(surface: Surface) -> Surface:
-    """The imported callable's build refusals: `validate`, plus the two only an import can
-    state — its release's media decoder, and its preflight hook, whose byte reads and
-    demand tables are code the source reader never evaluates."""
+    """The served callable's refusals at the executor's import: `validate`, plus the two only
+    an import can state — its release's media decoder, and its preflight hook, whose byte reads
+    and demand tables are code the source reader never evaluates."""
     validate(surface)
     _media_decode_bounds(surface)
     if surface.preflight is not None:
@@ -356,8 +356,8 @@ def _two_producers(surface: Surface, specs: Sequence[FeatureSpec]) -> None:
         )
 
 
-def describe(app: App) -> tuple[Surface, ...]:
-    """The whole app's surface, or the first refusal. Freezes registration (§1.0)."""
+def freeze(app: App) -> tuple[Surface, ...]:
+    """The served app's checked surfaces, or the first refusal. Freezes registration (§1.0)."""
     surfaces = []
     for registration in app.registrations():
         surfaces.append(check(registration.surface))
