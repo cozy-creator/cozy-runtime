@@ -62,7 +62,7 @@ from cozy_runtime.author._decode import (
 )
 from cozy_runtime.author._defaults import Overlay, decode_request
 from cozy_runtime.author._demand import RequestFeatures
-from cozy_runtime.author._describe import assert_declaration_shape, describe
+from cozy_runtime.author._describe import assert_declaration_shape
 from cozy_runtime.author._errors import (
     NEUTRAL_ERROR_SET,
     AuthorError,
@@ -378,7 +378,6 @@ __all__ = [
     "data_values",
     "decode_request",
     "denoise_loop",
-    "describe",
     "device",
     "expect_attention",
     "graph_keys",

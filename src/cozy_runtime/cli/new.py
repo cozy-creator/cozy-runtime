@@ -114,16 +114,12 @@ The fakes are capability adapters over the PRODUCTION invocation kernel — the 
 injection, validation and encode below are the ones a served request runs.
 """
 
-from cozy_runtime.author import describe
 from cozy_runtime.author.fakes import invoke_with_fakes
 
 from __PKG__ import app
 
 
 def main() -> None:
-    for surface in describe(app):
-        caps = ", ".join(sorted(surface.capabilities)) or "(none)"
-        print(f"registered: {surface.name}  gpu={surface.accelerator}  capabilities: {caps}")
     envelope, outcome, _ = invoke_with_fakes(
         app.get("generate"), {"prompt": "a cozy cabin in the woods", "seed": 7}
     )

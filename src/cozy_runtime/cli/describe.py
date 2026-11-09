@@ -3,34 +3,24 @@
 Always read-only. Full `--json` output is the canonical publication input; there is no
 committed interface projection and therefore no writer or staleness-check mode.
 
-The default reader is `internal/static_interface.py`: `ast` over the package tree, a closed
-vocabulary, typed refusals (decision #713 — package code is untrusted). Weights are
-structurally unreachable: nothing here imports the package, let alone constructs a `Loader`.
-
-`--conformance` is the locked-environment ORACLE: it additionally imports the app in THIS
-interpreter — which must be the package's own locked venv — and refuses unless the two
-derivations are byte-identical. That is what a package's own CI runs; publish runs the
-static reader alone.
+The one reader is `internal/static_interface.py`: `ast` over the package tree, a closed
+vocabulary, typed refusals (decision #713 — package code is untrusted). Nothing here imports
+the package, so describing never runs it.
 """
 
 from __future__ import annotations
 
-import typing
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.cli.io import CliError, Options, Result
-from cozy_runtime.derive.recipes import declared_plan
 from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.canonical import Json
-from cozy_runtime.internal.discovery import assert_locked_environment, discover
 from cozy_runtime.internal.exits import Exit
 
 
 def run(function: str | None, opts: Options) -> Result:
-    project = Path(opts.dir).expanduser()
-    rows: tuple[tuple[str, str], ...] = ()
     try:
         if opts.builtin:
             body = static_interface.build_builtin(opts.builtin)
@@ -50,13 +40,11 @@ def run(function: str | None, opts: Options) -> Result:
             )
         else:
             body = static_interface.build(
-                project,
+                Path(opts.dir).expanduser(),
                 environment_python=Path(opts.environment_python)
                 if opts.environment_python
                 else None,
             )
-            if opts.conformance:
-                rows = (("conformance", _conformance(project, body)),)
     except ConformanceError as exc:
         raise CliError(
             "validation",
@@ -66,27 +54,7 @@ def run(function: str | None, opts: Options) -> Result:
         ) from exc
     if function is not None:
         return _one(body, function)
-    listed = _list(body)
-    return Result(
-        rows + listed.rows, next=listed.next, document=body, canonical_json=listed.canonical_json
-    )
-
-
-def _conformance(project: Path, static: Mapping[str, Json]) -> str:
-    """Import the app here and refuse unless it agrees with the source reading."""
-    environment = assert_locked_environment(project)
-    recipes = package_interface.parse(package_interface.canonical_bytes(static)).recipes
-    found = discover(project, recipes=recipes)
-    for row in recipes:
-        declared_plan(row)  # the imported module binds the recipe the source reading found
-    imported = package_interface.source_facts(package_interface.build(found))
-    # What a function calls is read from the source of the packages it locked, not imported.
-    read = {**static, "entrypoints": [
-        {key: value for key, value in entry.items() if key != "calls"}
-        for entry in typing.cast(list[dict[str, Json]], static["entrypoints"])
-    ]}  # fmt: skip
-    package_interface.compare(read, imported, ("the source reading", "the imported app"))
-    return f"equal: imported {static['application']} ({environment})"
+    return _list(body)
 
 
 def _list(body: Mapping[str, Json]) -> Result:

@@ -196,26 +196,14 @@ class Invocable(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     memo_requires: tuple[str, ...] | msgspec.UnsetType = msgspec.UNSET
     """Optional parameters a request must explicitly provide to be memoizable."""
     operation_identity: str | msgspec.UnsetType = msgspec.UNSET
-    operation_identity_unavailable: str | msgspec.UnsetType = msgspec.UNSET
 
 
 def validate(value: Invocable, request: object, result: object) -> None:
     """Validate every token the pure generator can turn into Python source."""
-    outcomes = (value.operation_identity is not msgspec.UNSET) + (
-        value.operation_identity_unavailable is not msgspec.UNSET
-    )
-    if outcomes > 1:
-        raise ConformanceError(
-            "operation identity has one outcome at most", code="invocable_interface"
-        )
     if value.operation_identity is not msgspec.UNSET and (
         re.fullmatch(r"sha256:[0-9a-f]{64}", value.operation_identity) is None
     ):
         raise ConformanceError("invalid operation identity", code="invocable_interface")
-    if value.operation_identity_unavailable is not msgspec.UNSET and not (
-        1 <= len(value.operation_identity_unavailable) <= 256
-    ):
-        raise ConformanceError("invalid operation identity reason", code="invocable_interface")
     if value.memoize and set(value.capabilities) & {"egress", "secrets"}:
         raise ConformanceError(
             "memoized interface declares external or secret-dependent work",

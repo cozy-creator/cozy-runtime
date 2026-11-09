@@ -72,7 +72,7 @@ from tensorfs.varena import _runtime as varena
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, stepcache, weights_store
-from cozy_runtime.author import ModelRegistry, _activity, _split, describe
+from cozy_runtime.author import ModelRegistry, _activity, _split
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import Registration
@@ -81,6 +81,7 @@ from cozy_runtime.author._attention import _close as close_producer_states
 from cozy_runtime.author._calls import Nudges, _Broker, _CallType, _export
 from cozy_runtime.author._context import CURRENT, AdapterRef, Device, place
 from cozy_runtime.author._demand import shape_cell
+from cozy_runtime.author._describe import freeze
 from cozy_runtime.author._errors import (
     DEVICE_FAULT,
     DEVICE_OOM,
@@ -3198,7 +3199,7 @@ class Executor:
             contract.seal(torch, release.application)
         path = release.package_interface
         recipes = package_interface.parse(Path(path).read_bytes(), path).recipes
-        discovered = discover_installed(release.application, seconds=None, recipes=recipes)
+        discovered = discover_installed(release.application, recipes=recipes)
         if torch is not None:
             contract.seal_libraries()
             contract.check_flags(torch, f"the import of {release.application}")
@@ -4564,7 +4565,7 @@ class Executor:
                 if row.builtin != "operations":
                     raise CapabilityError("unknown Runtime builtin", code="child_interface")
                 builtin_operations.validate_binding(module, export)
-                describe(builtin_operations_app)
+                freeze(builtin_operations_app)
                 builtin = builtin_operations_app.get(export).surface
                 bindings[(module, export)] = _serving(module, export, builtin)
             elif row.self_call:
