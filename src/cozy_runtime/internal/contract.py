@@ -5,7 +5,9 @@ imports (a zygote's forks inherit it); nothing is checked per op.
 A call is the package's when the innermost frame that is not the standard library or a library
 (a distribution other than the package's) is package code; the Runtime's own frames, and anything
 under `owned()`, pass. So a library's call on the package's behalf is the package's, and a
-library's call under a Runtime frame is the Runtime's. The room readers raise for every caller:
+library's call under a Runtime frame is the Runtime's. Code the Runtime builds and loads on the
+package's behalf is the Runtime's by where it lives: a kernel tree in the kernel store
+(SageAttention, comfy-kitchen), and what it calls. The room readers raise for every caller:
 the Runtime reads varena (`vt.stats`, `vt.room`). An env write that leaves the variable as it
 is passes for every caller, since it changes nothing: torch's `cache_dir()` writes TensorD's own
 `TORCHINDUCTOR_CACHE_DIR` back at import.
@@ -30,7 +32,7 @@ from typing import Any, NoReturn
 from cozy_runtime.author import _model
 from cozy_runtime.author._errors import ContractViolation
 from cozy_runtime.author._model import WARNINGS, WarningRow
-from cozy_runtime.internal import numerical_environment
+from cozy_runtime.internal import kernel_cache, numerical_environment
 
 #: The API each rule's construct is replaced by (static_contract's refusals say the same).
 USE = {
@@ -84,7 +86,7 @@ def _site(frame: FrameType | None, *, through: bool = True) -> str | None:
         return None
     while frame is not None:
         top = str(frame.f_globals.get("__name__") or "").partition(".")[0]
-        if top in _RUNTIME:
+        if top in _RUNTIME or kernel_cache.holds(frame.f_code.co_filename):
             return None
         library = not top or top in libraries
         if not library and top not in _STDLIB:
