@@ -77,6 +77,7 @@ from cozy_runtime.accel.attention import _close as close_producer_states
 from cozy_runtime.accel.kernels import _SETS as KERNEL_SETS
 from cozy_runtime.accel.kernels import Launch, Plan, TritonKernels
 from cozy_runtime.author import _activity, _split
+from cozy_runtime.author import _console as console
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import Registration
@@ -5176,6 +5177,7 @@ def main(argv: list[str] | None = None) -> int:
             return int(Exit.structural)
 
     _capture_seal()
+    console.install()
     _remember_distributions()
     declared_recipes.install(run_recipe)
     kernel_cache.configure(kernel_cache.from_sealed(_SEALED))

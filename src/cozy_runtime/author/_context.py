@@ -150,6 +150,8 @@ class Context:
     #: `progress(step, total)`'s frame, and a model method call's (`uses_components`) activity
     _progress: Callable[[int, int], None] | None = field(default=None, repr=False)
     _called: Callable[[str], None] | None = field(default=None, repr=False)
+    #: one of the run's log lines and its level: what `print`, `logging` and `warnings` write
+    _log: Callable[[str, str], None] | None = field(default=None, repr=False)
 
     def tensorfs_source(self, weights: Weights[Any]) -> Checkpoint:
         """An admitted `Weights` argument's checkpoint: its pipeline, components and stored
