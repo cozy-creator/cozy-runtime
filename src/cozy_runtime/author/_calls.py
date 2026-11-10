@@ -223,7 +223,7 @@ class _Broker:
         exchange: Exchange,
         watch: Callable[[], Nudges],
     ) -> None:
-        self.request_id, self.bindings, self.exchange = request_id, dict(bindings), exchange
+        self.request_id, self.bindings, self.exchange = request_id, bindings, exchange
         #: Opens the worker's nudges, at the first wait on a call; None once opened.
         self.watch: Callable[[], Nudges] | None = watch
         self.nudges: Nudges | None = None

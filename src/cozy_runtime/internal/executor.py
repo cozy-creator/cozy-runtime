@@ -285,8 +285,40 @@ _SEALED: dict[str, str] = {}
 _OPEN_MAX = 10240
 
 
-#: Each callable an attempt may call, by (module, export).
-type CallBindings = dict[tuple[str, str], _CallType]
+class CallBindings(Mapping[tuple[str, str], _CallType]):
+    """Each callable an attempt may call, by (module, export). Another package's function is bound
+    from its own code at its first call, so a dependency nothing calls is never imported."""
+
+    def __init__(
+        self, bound: dict[tuple[str, str], _CallType], installed: Collection[tuple[str, str]]
+    ) -> None:
+        self._bound, self._installed = bound, frozenset(installed) - bound.keys()
+
+    def __getitem__(self, key: tuple[str, str]) -> _CallType:
+        binding = self._bound.get(key)
+        if binding is None:
+            if key not in self._installed:
+                raise KeyError(key)
+            module, export = key
+            try:
+                function = getattr(importlib.import_module(module), export, None)
+            except ImportError as exc:
+                raise CapabilityError(
+                    f"{module}:{export} can't be imported here: {exc}", code="child_interface"
+                ) from exc
+            if not callable(function):
+                raise CapabilityError(
+                    f"{module}:{export} is not installed in this environment",
+                    code="child_interface",
+                )
+            binding = self._bound[key] = _serving(module, export, analyze(function, name=export))
+        return binding
+
+    def __iter__(self) -> Iterator[tuple[str, str]]:
+        return iter((*self._bound, *self._installed))
+
+    def __len__(self) -> int:
+        return len(self._bound) + len(self._installed)
 
 
 def _capture_seal() -> None:
@@ -4382,6 +4414,7 @@ class Executor:
                 "call interface inventory exceeds its bound", code="child_interface"
             )
         bindings: dict[tuple[str, str], _CallType] = {}
+        installed: set[tuple[str, str]] = set()
         own = effect_interfaces.bindings()
         for row in rows:
             module, export = row.module, row.export
@@ -4408,22 +4441,12 @@ class Executor:
                     )
                 bindings[(module, export)] = _serving(module, export, own_surface)
             else:
-                # Another package's function, installed beside this one: bound from its own code.
-                function = getattr(importlib.import_module(module), export, None)
-                if not callable(function):
-                    raise CapabilityError(
-                        f"{module}:{export} is not installed in this environment",
-                        code="child_interface",
-                    )
-                binding = _serving(module, export, analyze(function, name=export))
-                prior = bindings.get((module, export))
-                if prior is not None and prior != binding:
-                    raise CapabilityError("ambiguous managed export", code="child_interface")
-                bindings[(module, export)] = binding
+                # Another package's function, installed beside this one: bound at its first call.
+                installed.add((module, export))
         for export in own:
             key = (effect_interfaces.MODULE, export)
             bindings.setdefault(key, effect_interfaces.unserved(export))
-        return bindings
+        return CallBindings(bindings, installed)
 
     def _store(self) -> Path:
         host = self.host
