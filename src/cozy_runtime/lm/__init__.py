@@ -1172,13 +1172,14 @@ class _RowByRow(TorchFunctionMode):
     another kernel for a few rows, whose sums differ in the last bit (Qwen3.5's `in_proj_a` and
     `in_proj_b`), and a drafted token must keep decode's bits. It is faster for those, too."""
 
-    def __torch_function__(
+    # torch's mode hook sees every torch function, its arguments and its result.
+    def __torch_function__(  # type: ignore[explicit-any]  # every torch function
         self,
-        func: Callable[..., Any],  # Any: torch's mode hook sees every torch function
+        func: Callable[..., Any],
         types: tuple[type, ...],
-        args: tuple[Any, ...] = (),  # Any: that function's arguments
-        kwargs: dict[str, Any] | None = None,  # Any: that function's arguments
-    ) -> Any:  # Any: that function's result
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
         kwargs = kwargs or {}
         x = args[0] if args else None
         if (

@@ -291,10 +291,10 @@ def processor(
         def read(name: str) -> bytes:
             return files.read(folder + name)
 
-    def held(name: str) -> dict[str, Any]:  # Any: JSON settings, Transformers' keywords
+    def held(name: str) -> dict[str, Any]:  # type: ignore[explicit-any]  # JSON settings, Transformers' keywords
         return json.loads(read(name)) if name in names else {}
 
-    given: dict[str, Any] = dict(config or {})  # Any: as `held`'s
+    given: dict[str, Any] = dict(config or {})  # type: ignore[explicit-any]  # as `held`'s
     extra = held("processor_config.json") or (given if "image_processor" in given else {})
     images = dict(extra.pop("image_processor", None) or held("preprocessor_config.json") or given)
     video = dict(extra.pop("video_processor", None) or held("video_preprocessor_config.json"))
@@ -311,7 +311,7 @@ def processor(
         extra["video_processor"] = getattr(transformers, kind)(**video)
     kind = images.pop("image_processor_type", "Qwen2VLImageProcessor")
     image_processor = getattr(transformers, kind)(**images)
-    tokenizer_config: dict[str, Any] = json.loads(read("tokenizer_config.json"))  # Any: as `held`'s
+    tokenizer_config: dict[str, Any] = json.loads(read("tokenizer_config.json"))  # type: ignore[explicit-any]  # as `held`'s
     added = tokenizer_config.get("added_tokens_decoder", {})
     chat = tokenizer_config.get("chat_template")
     for key in TOKENIZER_METADATA:
