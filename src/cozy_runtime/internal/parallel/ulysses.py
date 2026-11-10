@@ -298,10 +298,14 @@ def _pack(
 
 
 class _Arriving:
-    """A head group's Q, K, V crossing: its receivers, and the operands its unpacking writes."""
+    """A head group's Q, K, V crossing: its receivers (Q, K, V and their scales, each stacked in
+    one tensor), and the operands its unpacking writes (stacked too: one launch unpacks all)."""
 
-    def __init__(self, wait: Wait, receives: list[Tensor], operands: list[Tensor], mark: Any):
-        self.wait, self.receives, self.operands, self.mark = wait, receives, operands, mark
+    def __init__(
+        self, wait: Wait, values: Tensor, scales: Tensor | None, operands: Tensor, mark: Any
+    ) -> None:
+        self.wait, self.values, self.scales, self.operands = wait, values, scales, operands
+        self.mark = mark
 
 
 def _send(
@@ -321,14 +325,18 @@ def _send(
     where `narrow` (K less the turned `shift`), and its operands, allocated now."""
     batch, rows, _, dim = (int(n) for n in sources[0].shape)
     world = len(matrix)
-    dtype = torch.int8 if narrow else sources[0].dtype
-    sends = [s.new_empty((world * rows, batch, local, dim), dtype=dtype) for s in sources]
-    receives = [s.new_empty((total, batch, local, dim), dtype=dtype) for s in sources]
+    like = sources[0]
+    dtype = torch.int8 if narrow else like.dtype
+    sends = [like.new_empty((world * rows, batch, local, dim), dtype=dtype) for _ in sources]
+    values = like.new_empty((3, total, batch, local, dim), dtype=dtype)
+    receives = list(values.unbind())
     scales: list[Tensor] = []
+    received = None
     if narrow:
-        scales = [s.new_empty((world * rows, batch, local, 1)) for s in sources]
-        receives += [s.new_empty((total, batch, local, 1)) for s in sources]
-    operands = [s.new_empty((batch, total, local, dim)) for s in sources]
+        scales = [like.new_empty((world * rows, batch, local, 1)) for _ in sources]
+        received = like.new_empty((3, total, batch, local, 1))
+        receives += received.unbind()
+    operands = like.new_empty((3, batch, total, local, dim))
     mark = packer.mark()
     with packer.on(packer.out, mark):
         for index in (0, 2, 1):  # K last: its shift may still be on its way
@@ -336,23 +344,22 @@ def _send(
             offset = shift() if shift is not None and index == 1 else None
             _pack(packer, sources[index], sends[index], start, world, scale, offset)
         wait = _start(handle, engines, sends + scales, receives, matrix, rank)
-    return _Arriving(wait, receives, operands, mark)
+    return _Arriving(wait, values, received, operands, mark)
 
 
 def _unpack(packer: _Packer, group: _Arriving) -> list[Tensor]:
     """A group's received q, k and v unpacked on `inbound` into its operands, as the kernel takes
     them ([batch, sequence, heads, dim]); the calling stream waits for them."""
-    values, scales = group.receives[:3], group.receives[3:]
+    rows, scales, into = group.values.transpose(1, 2), group.scales, group.operands
     with packer.on(packer.inbound, group.mark):
         group.wait()
-        for index, (rows, into) in enumerate(zip(values, group.operands, strict=True)):
-            if scales:
-                turn.widen(packer.launch, rows.transpose(0, 1), scales[index].transpose(0, 1), into)
-            else:
-                into.copy_(rows.transpose(0, 1))
-    packer.held.append((group.wait, group.receives))
+        if scales is None:
+            into.copy_(rows)
+        else:
+            turn.widen(packer.launch, rows, scales.transpose(1, 2), into)
+    packer.held.append((group.wait, group.values, scales))
     packer.caught_up()
-    return group.operands
+    return list(into.unbind())
 
 
 def _land(
