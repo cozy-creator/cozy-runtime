@@ -32,7 +32,7 @@ from array import array
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from functools import partial
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
 import torch
 from torch import nn
@@ -98,6 +98,20 @@ class _Int8Leaf(Protocol):
 
     data: torch.Tensor
     scale: torch.Tensor
+
+
+class _FusedExperts(Protocol):
+    """A Transformers fused-experts module (`split`)."""
+
+    gate_up_proj: nn.Parameter
+    act_fn: Callable[[torch.Tensor], torch.Tensor]
+
+
+if TYPE_CHECKING:
+
+    class _Like(TypedDict):
+        device: torch.device
+        dtype: torch.dtype
 
 
 class _NoSplit(Protocol):
@@ -393,17 +407,17 @@ def split(model: nn.Module) -> int:
     its device and dtype, numbered in module order; `RoutedExpert` joins the model's
     `_no_split_modules`. Returns how many layers were split."""
     fused = [
-        (name, module)
+        (name, cast("_FusedExperts", module))  # both projections checked 3-D Parameters
         for name, module in model.named_modules()
         if isinstance(getattr(module, "gate_up_proj", None), nn.Parameter)
         and isinstance(getattr(module, "down_proj", None), nn.Parameter)
-        and module.gate_up_proj.dim() == 3
+        and cast("nn.Parameter", module.gate_up_proj).dim() == 3  # checked just above
     ]
     for layer, (name, module) in enumerate(fused):
         count, double, hidden = module.gate_up_proj.shape
         if getattr(module, "is_transposed", False) or not getattr(module, "is_concatenated", True):
             raise ValueError(f"{name}: only [E, 2I, H] gate-then-up experts are split")
-        like = {"device": module.gate_up_proj.device, "dtype": module.gate_up_proj.dtype}
+        like: _Like = {"device": module.gate_up_proj.device, "dtype": module.gate_up_proj.dtype}
         experts = Experts(
             (
                 RoutedExpert(hidden, double // 2, gate_first=True, act=module.act_fn, **like)

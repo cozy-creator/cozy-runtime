@@ -333,8 +333,8 @@ class _Gate:
         self.state = state = run.claim(self.blocks)
         out: BlockOutput | None = None
         if isinstance(run.policy, FirstBlockCache):
-            out = self.first(*args, **kwargs)
-            self.head = installed.outputs(out)
+            out = first = cast("BlockOutput", self.first(*args, **kwargs))  # a block of the Stack
+            self.head = installed.outputs(first)
             self.r0 = tuple(h - x for h, x in zip(self.head, xs, strict=True))
             if not state.ref:
                 state.ref, state.residual = _like(self.r0), _like(self.head)

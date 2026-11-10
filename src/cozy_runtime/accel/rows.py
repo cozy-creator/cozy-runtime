@@ -32,7 +32,7 @@ from cozy_runtime.internal.encoding.leaves import NVFP4
 
 class Rows(Protocol):
     def __call__(
-        self, x: Tensor | PreQuantized, start: int, stop: int, out: Tensor | None = None
+        self, x: Tensor | PreQuantized, start: int, stop: int, /, out: Tensor | None = None
     ) -> Tensor: ...
 
 

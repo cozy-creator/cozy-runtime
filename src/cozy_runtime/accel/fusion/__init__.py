@@ -48,7 +48,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import FrameType
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from cozy_runtime.accel.fusion import _kernels
 from cozy_runtime.accel.kernels import (
@@ -308,18 +308,6 @@ class _Eager(Protocol):
     def __call__(self, *args: object, **kwargs: object) -> object: ...
 
 
-class _AttentionCall(Protocol):
-    def __call__(self, hidden_states: Tensor, /, **kwargs: object) -> Tensor: ...
-
-
-class _LinearCall(Protocol):
-    def __call__(self, x: Tensor | PreQuantized, /) -> Tensor: ...
-
-
-class _TensorCall(Protocol):
-    def __call__(self, x: Tensor, /) -> Tensor: ...
-
-
 class _Processor(Protocol):
     """A Diffusers attention processor's backend and parallel config."""
 
@@ -334,7 +322,7 @@ if TYPE_CHECKING:
     class _Linear(nn.Module):
         """A linear, or the encoded leaf in its place."""
 
-        __call__: _LinearCall
+        def __call__(self, x: Tensor | PreQuantized, /) -> Tensor: ...
 
     class _Norm(nn.Module):
         weight: Tensor | None
@@ -346,12 +334,14 @@ if TYPE_CHECKING:
         eps: float
         _cozy_rope: _RopeCall | None
         _cozy_eager: Callable[[Tensor], Tensor]
-        __call__: _TensorCall
+
+        def __call__(self, x: Tensor, /) -> Tensor: ...
 
     class _Attention(nn.Module):
         heads: int
         processor: _Processor
-        __call__: _AttentionCall
+
+        def __call__(self, hidden_states: Tensor, /, **kwargs: object) -> Tensor: ...
 
     class _FusedBlock(nn.Module):
         _cozy_dit: _Site
@@ -371,10 +361,6 @@ if TYPE_CHECKING:
         groups: int
         _cozy_lone: tuple[int, int]
         _cozy_eager: Callable[[Tensor, Tensor | None], Tensor]
-
-    class _NormCounts(TypedDict):
-        norms: int
-        with_silu: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -827,7 +813,9 @@ def install(plan: Plan, layout: DiTBlock, *roots: nn.Module) -> str:
         return ""
     before = [_census(root) for root in roots]
     # An attention module calls its q/k norms; a composed one launches them.
-    heads = [norm for _, site in sites for norm in site.qk] if not layout.composed else []
+    heads: list[nn.Module] = (
+        [norm for _, site in sites for norm in site.qk] if not layout.composed else []
+    )
     eager = [(m, type(m)) for m in (*(block for block, _ in sites), *heads)]
     for norm in heads:
         norm.__class__ = _fused(type(norm), "head")
@@ -952,7 +940,7 @@ def install_norms(plan: Plan, layout: ChannelNorm, *roots: nn.Module) -> str:
     if _kernels.TRITON_ABSENT:
         return report(f"kernels_absent: {_kernels.TRITON_ABSENT}")
     norms = [
-        (f"{index}.{path}", cast("_FusedChannelNorm", module))  # `_norm_site` checks each
+        (f"{index}.{path}", module)
         for index, root in enumerate(roots)
         for path, module in root.named_modules()
         if type(module) is layout.norm
@@ -983,7 +971,13 @@ def install_norms(plan: Plan, layout: ChannelNorm, *roots: nn.Module) -> str:
     switch = _Switch()
     try:
         sites = [
-            (norm, _norm_site(norm, layout, switch, id(norm) in fused_silu, path))
+            # `_norm_site` checks each is a channel-first norm.
+            (
+                norm,
+                _norm_site(
+                    cast("_FusedChannelNorm", norm), layout, switch, id(norm) in fused_silu, path
+                ),
+            )
             for path, norm in norms
         ]
     except _Mismatch as exc:
@@ -992,16 +986,16 @@ def install_norms(plan: Plan, layout: ChannelNorm, *roots: nn.Module) -> str:
     eager = [(m, type(m)) for m in (*(n for n, _ in sites), *activations.values())]
     for norm, site in sites:
         norm.__class__ = _fused(type(norm), "channel")
-        norm._cozy_norm = site
+        cast("_FusedChannelNorm", norm)._cozy_norm = site  # its class is the fused one now
     for activation in activations.values():
         activation.__class__ = _fused(type(activation), "identity")
     if [_census(root) for root in roots] != before:
         raise RuntimeError("the fused substitution moved a parameter or buffer")
-    counts: _NormCounts = {"norms": len(sites), "with_silu": len(fused_silu)}
+    counts = {"norms": len(sites), "with_silu": len(fused_silu)}
 
     def activate(launch: Launch) -> None:
         switch.launch = launch
-        report(**counts)
+        report("", **counts)
 
     try:
         if plan.when_ready is None:
