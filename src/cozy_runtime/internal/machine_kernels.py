@@ -45,7 +45,7 @@ from cozy_runtime.internal import (
     svdq_linear,
     triton_kernels,
 )
-from cozy_runtime.internal.parallel import links
+from cozy_runtime.internal.parallel import links, turn
 
 
 def cards(devices: str) -> dict[int, str]:
@@ -71,12 +71,13 @@ def boot(row: arch.Row) -> list[attention.Candidate]:
 def triton_sets(row: arch.Row) -> list[TritonKernels]:
     """The Runtime's own Triton sets this row runs: its boot kernels' (`Candidate.kernels`, named
     as `attention` opens them: Sage3's fixed means, Sage2's fixed K mean, the E4M3 quantizers),
-    the encoded linears' (nvfp4 on every row, SVDQuant on FP4 rows) and counter noise's
-    (`philox`). None without Triton."""
+    the encoded linears' (nvfp4 on every row, SVDQuant on FP4 rows), counter noise's (`philox`)
+    and Ulysses' int8 wire's (`parallel.turn`). None without Triton."""
     if triton_kernels.TRITON_ABSENT:
         return []
     found = [import_module(c.kernels).KERNELS for c in boot(row) if c.kernels]
     found += [nvfp4_linear.KERNELS, *([svdq_linear.KERNELS] if row.fp4 else []), philox.KERNELS]
+    found += [turn.KERNELS] if row.family else []  # bf16 MMA: Ampere on
     return list({kernels.name: kernels for kernels in found if kernels.entries}.values())
 
 

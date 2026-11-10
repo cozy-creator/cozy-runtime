@@ -2551,6 +2551,10 @@ class Executor:
             # counter noise's kernel, which a recorded step's draw needs before its capture.
             leaves.prime(torch, torch.cuda.current_device())
             philox.prime(torch.cuda.current_device())
+            if self.world > 1:  # a group's int8 wire (`ulysses`)
+                from cozy_runtime.internal.parallel import turn
+
+                turn.prime(torch.cuda.current_device())
         if self.world > 1 and self.rank == 0:
             # THE FOLLOWERS RESOLVE BESIDE RANK 0, not after it: the load goes to every rank
             # before this one reads a header, and the plans are compared at the residence
