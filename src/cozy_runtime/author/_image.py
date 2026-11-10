@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 import random
 import re
+import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass
 from fractions import Fraction
@@ -21,6 +22,7 @@ from typing import Annotated
 
 import msgspec
 
+from cozy_runtime.author import _group
 from cozy_runtime.author._errors import InvalidRequest
 from cozy_runtime.author._files import ImageFile
 from cozy_runtime.author._markers import FileBound, ModelDefault
@@ -173,7 +175,10 @@ class ImageRequest(msgspec.Struct):
 
     def drawn_seed(self) -> int:
         """The seed given, else a fresh one the result reports."""
-        return self.seed if self.seed is not None else random.getrandbits(53)
+        if self.seed is not None:
+            return self.seed
+        # Every GPU of a group draws the same one: their `random` starts from the attempt's entropy.
+        return random.getrandbits(53) if _group.CURRENT[0] is not None else secrets.randbits(53)
 
 
 class ImageResult(msgspec.Struct):
