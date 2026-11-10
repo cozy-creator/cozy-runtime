@@ -400,7 +400,12 @@ def _produced(producer: AttentionProducer) -> Candidate:
         base,
         name=producer.name,
         backend="_cozy_" + producer.name.replace("-", "_"),
-        local=Local(base.local.forward, base.local.impl, producer.context_parallel),
+        local=Local(
+            base.local.forward,
+            base.local.impl,
+            producer.context_parallel,
+            narrow=base.local.narrow,
+        ),
         producer=producer,
     )
     _PRODUCED[producer.name] = (producer, candidate)
