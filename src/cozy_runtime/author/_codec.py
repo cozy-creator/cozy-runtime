@@ -1275,7 +1275,7 @@ class FragmentedJoin:
                 for packet in audio:
                     packet.pts -= origin  # type: ignore[operator]  # encoded: stamped
                     packet.dts -= origin  # type: ignore[operator]  # encoded: stamped
-                    packet.stream = sound
+                    packet.stream = sound  # type: ignore[assignment]  # audio packets: an AAC track
                 shift = 0 if first or not pictures else -int(pictures[0].dts)
                 for packet in pictures:
                     packet.pts += shift
