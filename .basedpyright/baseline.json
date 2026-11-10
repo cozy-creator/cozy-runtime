@@ -1238,16 +1238,6 @@
                 }
             }
         ],
-        "./src/cozy_runtime/internal/parallel/mirror.py": [
-            {
-                "code": "reportPossiblyUnboundVariable",
-                "range": {
-                    "startColumn": 31,
-                    "endColumn": 37,
-                    "lineCount": 1
-                }
-            }
-        ],
         "./src/cozy_runtime/internal/parallel/ulysses.py": [
             {
                 "code": "reportPrivateImportUsage",
@@ -1262,24 +1252,6 @@
                 "range": {
                     "startColumn": 17,
                     "endColumn": 21,
-                    "lineCount": 1
-                }
-            }
-        ],
-        "./src/cozy_runtime/internal/parallel/wire.py": [
-            {
-                "code": "reportAttributeAccessIssue",
-                "range": {
-                    "startColumn": 25,
-                    "endColumn": 41,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportAttributeAccessIssue",
-                "range": {
-                    "startColumn": 25,
-                    "endColumn": 41,
                     "lineCount": 1
                 }
             }
