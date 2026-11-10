@@ -203,6 +203,10 @@ def _first(*args: object, **kwargs: object) -> object:
     return args[0] if args else next(iter(kwargs.values()), None)
 
 
+def _words(names: str) -> tuple[str, ...]:
+    return tuple(names.split())
+
+
 def _unguarded[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
     original: Callable[P, R] = getattr(fn, "__contract_original__", fn)
     return original
@@ -211,13 +215,9 @@ def _unguarded[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
 # ------------------------------------------------------------------------------- the seal
 
 #: Room readers: memory is varena's, and nothing sizes work from these.
-_ROOM = (
-    "mem_get_info",
-    "memory_stats",
-    "memory_allocated",
-    "memory_reserved",
-    "max_memory_allocated",
-    "max_memory_reserved",
+_ROOM = _words(
+    "mem_get_info memory_stats memory_allocated memory_reserved max_memory_allocated "
+    "max_memory_reserved"
 )
 #: Allocator calls that mean nothing under varena, each with why.
 _MEMORY_NOOPS = {
@@ -287,7 +287,11 @@ def seal(torch: ModuleType, application: str = "") -> None:
     _construction("cuda_graph", getattr(cuda, "CUDAGraph", None), "torch.cuda.CUDAGraph")
     _construction("cuda_graph", getattr(cuda, "graph", None), "torch.cuda.graph", "__init__")
     said = f"torch.cuda.make_graphed_callables returns its callables unchanged: {_COMPILE}"
-    _swap((cuda, graphs), "make_graphed_callables", _ignoring("graphed", said, _first))
+    _swap(
+        (cuda, graphs),
+        "make_graphed_callables",
+        _ignoring("torch.cuda.make_graphed_callables", said, _first),
+    )
     said = f"torch.compile does nothing here: {_COMPILE}"
     _swap((torch,), "compile", _ignoring("torch.compile", said, _compiled))
     module_compile = vars(torch.nn.Module).get("compile")
@@ -519,31 +523,13 @@ def _fresh_seed() -> int:
 # ------------------------------------------------------------------------------- random streams
 
 #: torch's draws that take a `generator`: module functions, then tensor methods.
-_DRAWS = (
-    "rand",
-    "rand_like",
-    "randn",
-    "randn_like",
-    "randint",
-    "randint_like",
-    "randperm",
-    "normal",
-    "bernoulli",
-    "multinomial",
-    "poisson",
-    "binomial",
+_DRAWS = _words(
+    "rand rand_like randn randn_like randint randint_like randperm normal bernoulli multinomial "
+    "poisson binomial"
 )
-_TENSOR_DRAWS = (
-    "normal_",
-    "uniform_",
-    "random_",
-    "bernoulli_",
-    "bernoulli",
-    "exponential_",
-    "geometric_",
-    "cauchy_",
-    "log_normal_",
-    "multinomial",
+_TENSOR_DRAWS = _words(
+    "normal_ uniform_ random_ bernoulli_ bernoulli exponential_ geometric_ cauchy_ log_normal_ "
+    "multinomial"
 )
 
 
