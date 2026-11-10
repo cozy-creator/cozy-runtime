@@ -12,12 +12,12 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from contextlib import ExitStack
-from typing import Any
 
 import msgspec
 
 from cozy_runtime.author import (
     Context,
+    Model,
     ModelArtifact,
     Telemetry,
     UnsupportedInput,
@@ -30,6 +30,7 @@ from .quantization import (
     _ENCODINGS,
     ArtifactQuantizationPlan,
     ArtifactQuantizationRequest,
+    QuantizationTensor,
     bf16_source_dtypes,
     column_block,
     prepare_bf16,
@@ -142,7 +143,7 @@ def plan(
 
 
 def quantize(
-    source: Weights[Any] | Checkpoint,
+    source: Weights[Model[object]] | Checkpoint,
     plan: QuantizePlan,
     /,
     *,
@@ -156,7 +157,7 @@ def quantize(
 
 
 def quantize_artifact(
-    source: Weights[Any] | Checkpoint,
+    source: Weights[Model[object]] | Checkpoint,
     plan: QuantizePlan,
     /,
     *,
@@ -188,7 +189,7 @@ def _artifact_result(
 
 
 def _quantize(
-    source: Weights[Any] | Checkpoint,
+    source: Weights[Model[object]] | Checkpoint,
     plan: QuantizePlan,
     /,
     *,
@@ -217,7 +218,7 @@ def _quantize(
     encoded = len(selected)
     inherited = len(bf16.order) - len(converted) - encoded
 
-    def logical(tensor: Any) -> str:
+    def logical(tensor: QuantizationTensor) -> str:
         if tensor.logical_dtype in plan.bf16_sources and not preserve_precision:
             return "bf16"
         return str(tensor.logical_dtype)

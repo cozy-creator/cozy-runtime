@@ -8,7 +8,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from types import ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author import (
@@ -186,7 +186,7 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
 async def quantize(
     ctx: Context,
     *,
-    source: Weights[Any],
+    source: Weights[Model[object]],
     plan: QuantizationPlan,
     tel: Telemetry,
     max_relative_frobenius: float | None = None,

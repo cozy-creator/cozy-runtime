@@ -19,7 +19,7 @@ from __future__ import annotations
 import importlib
 import sys
 from collections.abc import Sequence
-from typing import Any, Protocol
+from typing import Protocol
 
 from cozy_runtime.author import (
     App,
@@ -47,7 +47,7 @@ from cozy_runtime.author._recipes import (
 async def quantize(
     ctx: Context,
     *,
-    source: Weights[Any],
+    source: Weights[Model[object]],
     lane: str,
     package: str,
     release: str,
@@ -63,8 +63,8 @@ async def quantize(
 async def quantize_calibrated(
     ctx: Context,
     *,
-    source: Weights[Any],
-    model: Model[Any],
+    source: Weights[Model[object]],
+    model: Model[object],
     lane: str,
     package: str,
     release: str,
@@ -83,8 +83,8 @@ class Runner(Protocol):
         self,
         ctx: Context,
         tel: Telemetry,
-        source: Weights[Any],
-        model: Model[Any] | None,
+        source: Weights[Model[object]],
+        model: Model[object] | None,
         *,
         lane: str,
         package: str,
@@ -104,8 +104,8 @@ def install(runner: Runner | None) -> None:
 def _run(
     ctx: Context,
     tel: Telemetry,
-    source: Weights[Any],
-    model: Model[Any] | None,
+    source: Weights[Model[object]],
+    model: Model[object] | None,
     *,
     lane: str,
     package: str,
