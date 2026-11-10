@@ -1615,7 +1615,7 @@ def _prove_components(cls: type, record: ConstructionRecord) -> None:
             code="unknown_component",
             fields=unknown,
         )
-    if undeclared_methods(cls):
+    if undeclared_methods(cls) or not contract:
         return  # an omitted declaration means ALL: conservatively safe, nothing to prove
     declared = {c for names in contract.values() for c in names}
     surplus = sorted(censused - declared)

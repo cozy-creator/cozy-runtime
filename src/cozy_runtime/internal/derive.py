@@ -37,6 +37,7 @@ from cozy_runtime.author._loader import (
     FILLED,
     _members,
 )
+from cozy_runtime.internal import stock
 
 
 class DeriveError(Exception):
@@ -240,10 +241,11 @@ _EGRESS = frozenset(
     {"item", "numpy", "__array__", "tolist", "__bool__", "__int__", "__float__", "__index__"}
 )
 
-#: Ops that MOVE a tensor, or pin it. There are no developer-facing placement knobs (§1) —
-#: where work runs is platform policy derived from measurement — so naming a device during
-#: construction is not a knob the harness tolerates, it is a fact the author does not own.
-_MOVE = frozenset({"cpu", "cuda", "pin_memory", "to_empty"})
+#: Ops that pin a tensor or make it again on a device: placement is the Runtime's, so they refuse.
+_MOVE = frozenset({"pin_memory", "to_empty"})
+#: Ops that move a tensor. The Runtime places every tensor, so in `load()` a move keeps the tensor
+#: where it is, as stock code's `pipe.to("cuda")` expects (a dtype it names still applies).
+_STAY = frozenset({"cpu", "cuda", "to"})
 
 
 def _named_device(args: tuple[object, ...], kwargs: Mapping[str, object]) -> str | None:
@@ -402,6 +404,14 @@ def _guard_mode(seen: Observations) -> Any:
             if getattr(_PLACEMENT, "on", False):
                 return func(*args, **(kwargs or {}))
             name = getattr(func, "__name__", "")
+            if (
+                name in _STAY
+                and args
+                and isinstance(args[0], torch.Tensor)
+                and (name != "to" or _named_device(args, kwargs or {}) is not None)
+            ):
+                dtype = stock.dtype_of(args[1:], kwargs or {}) if name == "to" else None
+                return args[0] if dtype is None else func(args[0], dtype)
             if name in _MOVE:
                 raise ConstructionFault(
                     f"device move via {name}()",
@@ -410,7 +420,11 @@ def _guard_mode(seen: Observations) -> Any:
                     site=_author_site(),
                 )
             named = _named_device(args, kwargs or {})
-            if named is not None:
+            if named is not None and kwargs and "device" in kwargs:
+                # A tensor made on a device: `load()` keeps every real tensor on the host, and
+                # the Runtime moves the ones it keeps (`weights.materialize`).
+                kwargs = {key: value for key, value in kwargs.items() if key != "device"}
+            elif named is not None:
                 raise ConstructionFault(
                     f"device pin `device={named}`",
                     "cozy places a model's tensors itself, so `load()` names no device: remove "
@@ -518,6 +532,7 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         if persistent and isinstance(held, torch.Tensor):
             seen.register(held)
 
+    stock.prepare()
     swap = torch.__future__.get_swap_module_params_on_conversion()
     with ExitStack() as stack:
         torch.__future__.set_swap_module_params_on_conversion(False)

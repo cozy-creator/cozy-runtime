@@ -168,6 +168,7 @@ from cozy_runtime.internal import (
     schema,
     spawn,
     stage_memo,
+    stock,
     tolerant,
     tools,
     w4a8_linear,
@@ -2869,6 +2870,7 @@ class Executor:
         # shared `use` of its components, and each block binds its weights while it runs.
         self.residency = Placement(host.memory, backend)
         object.__setattr__(model, "_cozy_residency", self.residency)
+        stock.place({name: m.module for name, m in backend.models.items()})
         # Its components' calls replay CUDA graphs once recorded (`graphs`), unless uncaptured.
         graphs.install(self.torch, model, {name: m.module for name, m in backend.models.items()})
         stage_memo.install(
