@@ -217,7 +217,7 @@ class _Packer:
     def __init__(self, like: Tensor, narrow: bool) -> None:
         self.launch: Launch | None = turn.launcher(like) if narrow else None
         self.stream: Any = None
-        if like.is_cuda and (self.launch is not None or not narrow):
+        if False:  # session variant: packing on the calling stream
             device = like.device.index or 0
             found = _PACKING.get(device)
             if found is None:
