@@ -832,78 +832,15 @@ src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is n
 src/cozy_runtime/internal/encoding/leaves.py: [unused-ignore] Unused "type: ignore" comment
 src/cozy_runtime/internal/encoding/selection.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/encoding/selection.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/__init__.py: [no-untyped-call] Call to untyped function "Event" in typed context
-src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/execution/catch.py: [misc] Type of decorated function contains type "Any" ("_Wrapped[[VarArg(Any), KwArg(Any)], Any, [VarArg(object), KwArg(object)], object]")
-src/cozy_runtime/internal/execution/catch.py: [no-untyped-call] Call to untyped function "is_initialized" in typed context
-src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 1 to "len" has incompatible type "Tensor | Module"; expected "Sized"
-src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 1 to "peak" has incompatible type "Tensor | int"; expected "int"
-src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 2 to "peak" has incompatible type "tuple[int, Tensor | int]"; expected "Sequence[int]"
-src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 2 to "zip" has incompatible type "tuple[int, ...] | Tensor | Module"; expected "Iterable[Any]"
-src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 3 to "zip" has incompatible type "Tensor | Module"; expected "Iterable[Any]"
-src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 4 to "zip" has incompatible type "Tensor | Module"; expected "Iterable[Any]"
-src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 5 to "zip" has incompatible type "Tensor | Module"; expected "Iterable[Any]"
-src/cozy_runtime/internal/execution/cuts.py: [assignment] Incompatible types in assignment (expression has type "Callable[[Tensor, Tensor, Tensor | None], Tensor]", variable has type "def _conv_forward(self, input: Tensor, weight: Tensor, bias: Tensor | None) -> Any")
-src/cozy_runtime/internal/execution/cuts.py: [attr-defined] "type[Module]" has no attribute "_conv_forward"
-src/cozy_runtime/internal/execution/cuts.py: [attr-defined] "type[Module]" has no attribute "_conv_forward"
 src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/cuts.py: [method-assign] Cannot assign to a method
-src/cozy_runtime/internal/execution/cuts.py: [operator] Unsupported operand types for * ("int" and Module)
 src/cozy_runtime/internal/execution/phase.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/phase.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/phase.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/phase.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/phase.py: [misc] Type of decorated function contains type "Any" ("Callable[[int | None, Literal['eager', 'capture', 'replay', 'preparation'], list[dict[str, Any]] | None, str | None], _GeneratorContextManager[Observation | None, None, None]]")
 src/cozy_runtime/internal/execution_evidence.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/execution_evidence.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/execution_evidence.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [arg-type] Argument 1 to "append" of "_Warnings" has incompatible type "tuple[str, dict[str, str]]"; expected "tuple[str, dict[str, str | bool | int | float | None]]"
-src/cozy_runtime/internal/executor.py: [arg-type] Argument 1 to "boundary" has incompatible type "object"; expected "Iterable[str] | None"
-src/cozy_runtime/internal/executor.py: [assignment] Incompatible types in assignment (expression has type "dict[str, Any] | None", variable has type "Request | None")
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
@@ -987,8 +924,6 @@ src/cozy_runtime/internal/executor.py: [redundant-expr] If condition is always t
 src/cozy_runtime/internal/executor.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/internal/executor.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/internal/executor.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/internal/executor.py: [unreachable] Statement is unreachable
-src/cozy_runtime/internal/executor.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/fp8_linear.py: [redundant-expr] Left operand of "and" is always true
 src/cozy_runtime/internal/int8_linear.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/interface_wheel.py: [assignment] Incompatible types in assignment (expression has type "object", variable has type "str")
