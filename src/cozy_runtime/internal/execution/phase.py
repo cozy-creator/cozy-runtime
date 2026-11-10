@@ -10,15 +10,35 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict, cast
 
 import tensorfs.varena.torch as vt
 import torch
 
 Mode = Literal["eager", "capture", "replay", "preparation"]
 
-#: Any: varena's plan and phase records, plain dicts in the TensorFS stub.
+#: Any: varena's split selection, a plain dict in the TensorFS 0.22.1 stub.
 type Record = dict[str, Any]
+
+
+class WorkingPhase(TypedDict):
+    """One working-demand row (`observing`): varena's phase observation without its split
+    observations, plus the cut choices, sites and passes it counted."""
+
+    observation_id: int
+    mode: Mode
+    key: str | None
+    peak_bytes: int
+    total_peak_bytes: int
+    backing_peak_bytes: int
+    published: bool
+    invalidated: bool
+    reason: str
+    successful_peak_bytes: int
+    successful_passes: int
+    cut_choices: int
+    sites: int
+    passes: int
 
 
 def _semantic(value: object) -> object:
@@ -72,7 +92,7 @@ class Observation:
     ) -> None:
         self.device, self.token = device, token
         self.completion_stream = completion_stream
-        self.result: Record | None = None
+        self.result: WorkingPhase | None = None
         self.completed = False
         self.choices = 0
 
@@ -132,7 +152,7 @@ def begin_split(
 def observing(
     device: int | None,
     mode: Mode,
-    records: list[Record] | None,
+    records: list[WorkingPhase] | None,
     key: str | None = None,
 ) -> Iterator[Observation | None]:
     """One execution's observation; none where another owns the device (an enclosing loop)."""
@@ -160,9 +180,10 @@ def observing(
                 completed=succeeded and (mode != "eager" or observation.completed),
             )
             sites = record.pop("split_observations", ())
-            observation.result = {
-                **record, "cut_choices": observation.choices, "sites": len(sites), "passes": 1,
-            }
+            observation.result = cast(
+                "WorkingPhase",  # varena's phase observation and these three
+                {**record, "cut_choices": observation.choices, "sites": len(sites), "passes": 1},
+            )
             last = records[-1] if records else None
             if last is not None and key is not None and last.get("key") == key:
                 # Repeated passes of one key are one row: an LM's tokens, a DiT's steps.
