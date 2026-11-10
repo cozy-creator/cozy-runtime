@@ -558,7 +558,7 @@ SAGE = _sage(
         "mma.sync+fp4": ("sageattn_qk_int8_pv_fp8_cuda", "per_warp", "fp32+fp16"),
     }
 )
-KITCHEN = Local(kitchen_int8, _named("comfy_kitchen.int8_attention"))
+KITCHEN = Local(kitchen_int8, _named("comfy_kitchen.int8_attention"), narrow=True)
 SAGE3 = Local(
     sage3_fp4,
     lambda *_: f"sageattn3 {_SAGE3_VARIANT}.sageattn3_blackwell(nvfp4, per_block_mean)",
