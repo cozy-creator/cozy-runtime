@@ -31,12 +31,25 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NoReturn,
+    Protocol,
+    TypeVar,
+    cast,
+    final,
+    runtime_checkable,
+)
 
 import msgspec
 
 from cozy_runtime.author._context import AdapterRef, Device, device
 from cozy_runtime.author._errors import CapabilityError, ConformanceError, InvalidRequest
+
+if TYPE_CHECKING:
+    from cozy_runtime.internal.fill import FitVerdict
 
 T = TypeVar("T")
 S = TypeVar("S", bound=msgspec.Struct)
@@ -406,10 +419,9 @@ class Artifact:
     """The originally admitted base when a prepared view becomes the serving snapshot."""
 
 
-#: The `Fit` document `tensorfs.fit` returns, verbatim: `code` (one of the eight),
-#: `detail` (the §3 text), `component`, `key`, `encoding`, `device`, `custody`, `ignored`,
-#: `routes` and `ok`. The runtime never authors one and never rephrases one.
-Fit = Mapping[str, object]
+#: The `Fit` document `tensorfs.fit` returns, verbatim (`fill.FitVerdict`). The runtime never
+#: authors one and never rephrases one.
+type Fit = FitVerdict
 
 
 UNNORMALIZED = "checkpoint_unnormalized"
@@ -883,9 +895,9 @@ class Loader:
         fit = self._backend.fit(walked, encoded_leaves=self._consent())
         if fit is not None and not fit.get("ok"):
             raise ModelFitRefused(fit, self._artifact.unnormalized)
-        ignored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("ignored", ())))
-        warned = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("warnings", ())))
-        unstored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("unstored", ())))
+        ignored = tuple(str(k) for k in fit.get("ignored", ())) if fit else ()
+        warned = tuple(str(k) for k in fit.get("warnings", ())) if fit else ()
+        unstored = tuple(str(k) for k in fit.get("unstored", ())) if fit else ()
         walked = walked.without(frozenset(k.replace("/", ".", 1) for k in unstored))
         _legs.append(("fit", round((time.perf_counter() - _t0) * 1000, 1)))
         _t0 = time.perf_counter()
