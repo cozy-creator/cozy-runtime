@@ -110,13 +110,10 @@ spellings — are redacted at the emit boundary and counted. Nothing is refused:
 may not fail the thing it observes, and field NAMES are not inspected at all, because the
 name regex that used to be here false-positived on `output_tokens` and `eos_token`.
 
-Progress names the package's execution stage. `tel.progress(stage_fraction, stage=...,
-overall_fraction=...)` keeps resettable within-stage progress distinct from optional monotonic
-whole-invocation progress. `tel.step_callback(total, stage=..., overall_range=(start, end))`
-adds exact work-unit coordinates and maps counted steps into a package-owned overall range;
-`tel.stage(name, overall_range=...)` reports only entry/success boundaries, never an invented
-within-stage percentage. Invalid progress is omitted and diagnosed on the same bounded lossy
-lane; it cannot route, settle, bill, or otherwise control an attempt.
+Progress is one optional call: `ctx.progress(step, total)` after each step of a loop, under the
+innermost `tel.stage(name)`. The machine places the whole run's bar from its own time estimate.
+Invalid progress is omitted and diagnosed on the same bounded lossy lane; it cannot route,
+settle, bill, or otherwise control an attempt.
 
 The machine owns durable run outcomes and output custody. Runtime returns
 structured executor facts and consumes the native capabilities it is granted.
@@ -196,9 +193,8 @@ sequence, and a CLOSED vocabulary — `msgspec.Struct` classes with their
 unions, `list`/`tuple`/`dict`/`Sequence`/`Mapping`/`Set`, the asset classes, `Files[...]` with
 `FileLimits`, `Tree`, `ModelArtifact`, `Model` subclasses (`encoded_leaves=`,
 `min_bits=`, `phase=`, `@sequence_parallel`, `@uses_components`), `Weights[M]`, and `@app.entrypoint` with literal
-keywords and `WeightsOutput(...)` tuples. Explicit function registrations and async
-`@invocable` exports use the same schema builders, with their declared capabilities and
-immutable defaults. A value the package owns as DATA rather than as
+keywords and `WeightsOutput(...)` tuples. A function's request is its one struct parameter, or
+else its plain parameters as fields (immutable scalar defaults). A value the package owns as DATA rather than as
 code — MiniMax-H3's served denoise steps are its committed task plan's, and decision #705
 forbids a second copy in serving code — is spelled `data_values(__file__, "plan.json",
 "schedules", "transformer_evaluations")`: the reader and the imported app take it from the
@@ -238,9 +234,9 @@ the launch and invocation facts with current readers. It carries no Runtime-glob
 inventory, diagnostics, config UI metadata, or tensor requirements, and
 `_fixed_point` proves over the built document that no release digest, build timestamp,
 machine path or mutable selection reached it. The document has one `entrypoints` list; an entry
-writes `description` (its docstring's first paragraph, on one line), `publishes`, `internal` (a
-child task) and `weights_outputs` when set and `accelerator` only as `false`, and its memo flag
-rides `invocable.memoize`. A slot is `{path, class, component_use,
+writes `description` (its docstring's first paragraph, on one line), `internal` (a private
+function) and `weights_outputs` when set and `accelerator` only as `false`, and its memo flag
+rides `invocable.memoize`, with `invocable.memo_requires` naming its optional `Seed` fields. A slot is `{path, class, component_use,
 encoded_leaves}`, plus `default`, `min_bits` and `phase` when declared and `weights: true` for a
 `Weights[M]` argument. `descriptor_id` (sha256 of
 one entry) is derived by `cozy-runtime describe <function>`, never stored. Deleted members are simply unknown fields; there is no legacy decoder or
@@ -256,8 +252,7 @@ annotation (cr-077): `model: M` is constructed in a warm session; `source: Weigh
 `Weights`: any layout) is the raw checkpoint, never constructed, read through
 `components()`/`tensor()`/`read_into()`/`read_values_into()` or handed to
 `ctx.tensorfs_source` and `derive.quantize_artifact`. Authors may name
-a slot's default release through `@invocable(defaults={"model": "sdxl@1.0.0"})` or
-`@app.entrypoint(defaults=...)`: `[org/]model@release`, never a lane. Omitting the org names a
+a slot's default release through `@app.entrypoint(defaults={"model": "sdxl@1.0.0"})`: `[org/]model@release`, never a lane. Omitting the org names a
 first-party model, the root namespace's (`sdxl@1.0.0`). A run's `model.<slot>=` wins over the default. Selection resolves before
 dispatch; the executor receives exact artifacts. See [authored defaults](docs/authored-model-defaults.md).
 The same decorators take `components={"model": ("dit", "vae")}`: the slot's `components` names
@@ -503,12 +498,11 @@ fill without the reader is a typed `reader_unavailable` refusal naming the insta
 model — and it is what the end-to-end suite builds, installs and runs.
 
 **Registration (xs-040).** `@app.entrypoint` registers a public function and `@app.entrypoint(private=True)`
-one only its own package's calls run ([docs/child-tasks.md](docs/child-tasks.md)). Both take
-`weights=`, `publishes=`/`emits_media=`, `accelerator=` (False: CPU only; True or absent: the
-machine's GPU when it has one), `preflight=`, `demand=`, `defaults=`, `components=` and
-`memoize=`; `entrypoint` adds `hidden=`. A writer (`weights=`, `publishes=`,
-`emits_media=`) is never memoized (`memoized_writer`); TensorFS derivation replay answers a
-repeat.
+one only its own package's calls run; `await call(fn, ...)` runs either as its own job
+([docs/managed-calls.md](docs/managed-calls.md)). Both take `weights=`, `accelerator=` (False:
+CPU only; True or absent: the machine's GPU when it has one), `preflight=`, `defaults=`,
+`components=`, `on_demand=` and `memoize=`. A writer (`weights=`) is never memoized
+(`memoized_writer`); TensorFS derivation replay answers a repeat.
 
 **A tool is a struct plus a function** ([design/tools.md](https://github.com/cozy-creator/tracker/blob/master/design/tools.md)).
 `@app.tool(label=, named=, reserved=, ui=)` takes `entrypoint`'s options and registers a public
@@ -528,10 +522,9 @@ it. Markers are `msgspec.Meta`, so they stack: `Range(min, max, step=, unit=)`, 
 field a box can't draw keeps its default, off the box, and so does an optional group with a
 required member a box can't draw. Marker arguments are read from source: literals, arithmetic and
 module-level constants (`STRENGTHS[0]` too), never a call, so write `Snap(first=124)`, not
-`Snap(first=frames_for(5))`. An invocable's tuple fields are `tuple[int, ...]`. The interface carries each tool's `tool`
-record and each entry point's `calls`: the functions it reaches that run as calls, its own
-`@invocable`s and other packages' functions, read at the release it locked, with their models,
-`accelerator` and `gpus`.
+`Snap(first=frames_for(5))`. A keyword request's tuple fields are `tuple[int, ...]`. The interface carries each tool's `tool`
+record and each entry point's `calls`: the functions it reaches with `call(fn, ...)`, its own and
+other packages', read at the release it locked, with their models, `accelerator` and `gpus`.
 
 Model-producing functions declare `WeightsOutput` slots and use `Context.tensorfs_source`,
 `Context.output`, and `Context.adopt_model`. TensorFS owns the typed `Derivation`, `Target`,

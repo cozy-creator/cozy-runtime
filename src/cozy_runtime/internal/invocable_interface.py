@@ -12,10 +12,9 @@ from typing import Any, get_args, get_origin
 
 import msgspec
 
-from cozy_runtime.author import Memoize
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._tool import Prompt
+from cozy_runtime.author._tool import Prompt, Seed
 from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.internal import canonical, schema
 
@@ -29,7 +28,7 @@ def from_types(
     context: str,
     parameters: Sequence[str] | None,
     parameter_defaults: Mapping[str, object],
-    memoize: Memoize | None,
+    memoize: bool,
     capabilities: Sequence[str],
 ) -> dict[str, Any]:
     """Portable names/defaults from resolved types, shared by both interface readers.
@@ -91,6 +90,7 @@ def from_types(
     walk(payload_type, "request")
     walk(result_type, "result")
     defaults.update({"request/" + name: value for name, value in parameter_defaults.items()})
+    seeds = _unset_seeds(payload_type) if memoize else []
     return {
         "module": module,
         "export": export,
@@ -99,18 +99,27 @@ def from_types(
         "defaults": defaults,
         "type_names": names,
         "enum_members": enums,
-        "memoize": memoize is not None,
+        "memoize": memoize,
         "capabilities": sorted(capabilities),
-        **({"memo_requires": list(memoize.requires)} if memoize and memoize.requires else {}),
+        **({"memo_requires": seeds} if seeds else {}),
     }
 
 
-def check_memo_requires(value: Invocable, request: object, *, authoring: bool = False) -> None:
-    """Each memo condition names an optional request parameter a caller may omit.
+def _unset_seeds(payload_type: object) -> list[str]:
+    """A request's optional seeds (`seed: Seed | None = None`): a request that leaves one unset
+    asks for a new draw, so the machine runs it without the memo."""
+    base, _ = strip(payload_type)
+    if not is_struct(base):
+        return []
+    return [
+        field.encode_name
+        for field in msgspec.structs.fields(typing.cast(type[msgspec.Struct], base))
+        if field.default is None and Seed in get_args(strip(field.type)[0])
+    ]
 
-    Authoring also requires a None default: a client may fill an omitted concrete field (the
-    CLI seeds a plain `int` seed), which would memoize every request. Readers accept older
-    interfaces declared before that rule."""
+
+def check_memo_requires(value: Invocable, request: object) -> None:
+    """Each memo condition names an optional request parameter a caller may omit."""
     if value.memo_requires is msgspec.UNSET:
         return
     if not value.memoize:
@@ -131,20 +140,6 @@ def check_memo_requires(value: Invocable, request: object, *, authoring: bool = 
                 "optional parameter (one with a default) can be omitted",
                 code="invocable_memoize",
             )
-        if authoring and not ("default" in field and field["default"] is None):
-            raise ConformanceError(
-                f'memoize requires "{name}", so {value.export} must default it to None: '
-                f"declare `{name}: {_hint(field.get('type'))} | None = None` and draw the "
-                f"{name} in the function when it's None",
-                code="invocable_memoize",
-            )
-
-
-def _hint(node: object) -> str:
-    if isinstance(node, dict) and isinstance(node.get("union"), list):
-        members = [member for member in node["union"] if member != "null"]
-        node = members[0] if len(members) == 1 else node
-    return node if isinstance(node, str) else "T"
 
 
 def _identifier(value: object) -> bool:
@@ -154,7 +149,7 @@ def _identifier(value: object) -> bool:
 def project_serving_models(document: dict[str, Any]) -> None:
     """Expose injected Model parameters once, in the serving Model plane.
 
-    Only the trusted builders of registered @invocable entrypoints call this.
+    Only the interface builder calls it, for a function whose request is its own parameters.
     The source proxy retains its original typed flat request for self calls.
     Ordinary request structs with colliding field names still fail generation.
     """

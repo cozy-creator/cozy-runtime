@@ -382,12 +382,12 @@ def _run_native(
             progress = execution.poll()
             if progress.completed_steps != observed:
                 observed = progress.completed_steps
-                tel.progress(observed / max(1, pending), stage=stage)
+                tel._progress(observed / max(1, pending), stage=stage)
             if progress.done:
                 break
             time.sleep(0.05)  # Observation never advances native reads/encoding/publication.
         (result,) = execution.wait()
-        tel.progress(1.0, stage=stage)
+        tel._progress(1.0, stage=stage)
         return cast("dict[str, object]", result)
     except BaseException as error:
         failure = error

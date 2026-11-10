@@ -91,9 +91,9 @@ def _top_level(payload_type: object) -> list[Node]:
 
 def _declaring(payload_type: object) -> list[tuple[str, Node]]:
     """The fields an axis may be declared on, each with its parent ("" for the request's own):
-    the request's fields and those of each struct-typed field. An invocable's request is its
-    keyword parameters, so its `payload: T` holds the shape one level down (run 1560: every
-    H3 segment shared one cell and a 345-frame call ran on a 158-frame peak)."""
+    the request's fields and those of each struct-typed field. A request of keyword parameters
+    may hold the shape one level down, in a `spec: T` (run 1560: every H3 segment shared one
+    cell and a 345-frame call ran on a 158-frame peak)."""
     own = _top_level(payload_type)
     return [("", node) for node in own] + [
         (node.name, child)
