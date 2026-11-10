@@ -878,7 +878,7 @@ class _Bakes:
             ):
                 continue
             bake = _Bake(stored, repr((encoded.scheme, encoded.params)), leaf=leaf)
-            hooks = list(module._forward_hooks.values()) if module is not None else []
+            hooks: list[object] = list(module._forward_hooks.values()) if module is not None else []
             if any(site.startswith(block + ".") for block in blocks):
                 bake.hooks = [hook for hook in hooks if isinstance(hook, LoRASource)]
             target = site.removesuffix(".base_layer")

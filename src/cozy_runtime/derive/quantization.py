@@ -20,6 +20,7 @@ from typing import IO, TYPE_CHECKING, NamedTuple
 
 import msgspec
 import numpy as np
+from numpy.typing import NDArray
 
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import Context, Telemetry, UnsupportedInput, _numeric
@@ -61,7 +62,7 @@ class _Encoding(NamedTuple):
     same. `pack` weights share a stored element (w4a8's codes are `[rows, cols / 2]` bytes)."""
 
     round_trip_bound: float
-    encode: Callable[[str, np.ndarray, float], Encoded]
+    encode: Callable[[str, NDArray[np.float32], float], Encoded]
     weight_dtype: str
     block: int
     companions: Callable[[int, int], tuple[tuple[str, str, tuple[int, ...]], ...]]
@@ -79,8 +80,8 @@ def _row_scale(rows: int, cols: int) -> tuple[tuple[str, str, tuple[int, ...]], 
 
 
 def _rowwise(
-    encode: Callable[[str, np.ndarray], Encoded],
-) -> Callable[[str, np.ndarray, float], Encoded]:
+    encode: Callable[[str, NDArray[np.float32]], Encoded],
+) -> Callable[[str, NDArray[np.float32], float], Encoded]:
     return lambda key, values, _amax: encode(key, values)
 
 
@@ -608,7 +609,7 @@ def _in_order(
 
 def _read_chunks(
     source: Checkpoint, component: str, key: str, logical_dtype: str, shape: tuple[int, ...]
-) -> Iterator[np.ndarray]:
+) -> Iterator[NDArray[np.float32]]:
     """Whole rows of float32 values, about `_SOURCE_READ_CHUNK` source bytes at a time: a per-row
     encoded weight's decoded values (`model_values`), a plain tensor's converted."""
     if source.components[component].tensors[key].encoding is not None:
@@ -630,7 +631,7 @@ def _read_chunks(
 
 def _decoded_chunks(
     source: Checkpoint, component: str, key: str, shape: tuple[int, ...]
-) -> Iterator[np.ndarray]:
+) -> Iterator[NDArray[np.float32]]:
     rows, columns = shape
     step = max(1, _SOURCE_READ_CHUNK // max(columns * 4, 1))
     for first in range(0, rows, step):

@@ -11,6 +11,7 @@ from typing import NamedTuple
 
 import numpy as np
 import tensorfs
+from numpy.typing import ArrayLike, NDArray
 from tensorfs import raw
 
 from cozy_runtime.author import UnsupportedInput
@@ -24,7 +25,7 @@ CACHE_ELEMENTS = 1 << 18
 # --------------------------------------------------------------------- element tables
 
 
-def _e4m3_magnitudes() -> np.ndarray:
+def _e4m3_magnitudes() -> NDArray[np.float64]:
     """Byte 0x00..0x7E in ascending magnitude; 0x7F is NaN and is not representable here.
     exp==0 is the subnormal run man*2^-9; otherwise (1+man/8)*2^(exp-7). Max 448."""
     mags = np.empty(127, dtype=np.float64)
@@ -45,8 +46,8 @@ E4M3_DECODE32 = np.concatenate([E4M3_MAG32[np.minimum(np.arange(128), 126)]] * 2
 E4M3_DECODE32[128:] *= -1
 
 
-def e4m3_decode(raw: np.ndarray) -> np.ndarray:
-    out: np.ndarray = E4M3_DECODE32.take(np.asarray(raw, dtype=np.uint8), mode="clip")
+def e4m3_decode(raw: ArrayLike) -> NDArray[np.float32]:
+    out: NDArray[np.float32] = E4M3_DECODE32.take(np.asarray(raw, dtype=np.uint8), mode="clip")
     return out
 
 
@@ -97,7 +98,7 @@ class _Accum:
         self.sat += measured["saturated"]
 
 
-def _require_2d(key: str, values: np.ndarray, block: int) -> tuple[int, int]:
+def _require_2d(key: str, values: NDArray[np.float32], block: int) -> tuple[int, int]:
     if values.ndim != 2:
         raise UnsupportedInput(
             f"{key!r} is rank {values.ndim}: this family encodes 2-D GEMM weights, and a "
@@ -115,7 +116,7 @@ def _require_2d(key: str, values: np.ndarray, block: int) -> tuple[int, int]:
 
 def _measured(
     key: str,
-    values: np.ndarray,
+    values: NDArray[np.float32],
     scheme: str,
     strategy: str,
     params: dict[str, object],
@@ -142,7 +143,7 @@ def _measured(
 NVFP4_BLOCK = 16
 
 
-def encode_nvfp4(key: str, values: np.ndarray, amax: float | None = None) -> Encoded:
+def encode_nvfp4(key: str, values: NDArray[np.float32], amax: float | None = None) -> Encoded:
     """TensorFS's explicit min-SSE NVFP4 producer, exposed through the existing U8 carrier."""
     rows, cols = _require_2d(key, values, NVFP4_BLOCK)
     if not rows:
@@ -219,7 +220,7 @@ def encode_nvfp4(key: str, values: np.ndarray, amax: float | None = None) -> Enc
 # ---------------------------------------------------------------------- fp8 rowwise
 
 
-def encode_fp8_rowwise(key: str, values: np.ndarray) -> Encoded:
+def encode_fp8_rowwise(key: str, values: NDArray[np.float32]) -> Encoded:
     """TensorFS's versioned F32 row-scale and E4M3 RNE producer."""
     rows, cols = _require_2d(key, values, 1)
     if not rows:
@@ -268,7 +269,7 @@ CONVROT_GROUP = 256
 INT8_MAX = 127.0
 
 
-def hadamard256(values: np.ndarray) -> np.ndarray:
+def hadamard256(values: NDArray[np.int32]) -> NDArray[np.int32]:
     """Each 256-group of `[rows, K]` times the regular Hadamard H4⊗H4⊗H4⊗H4, entries ±1 and
     UNNORMALIZED (orthonormal is this / 16). H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]]
     is symmetric, so H is its own transpose and H·H = 256·I. Additions only: an integer input
@@ -281,7 +282,9 @@ def hadamard256(values: np.ndarray) -> np.ndarray:
     return work.reshape(rows, cols)
 
 
-def decode_int8_convrot256(payload: np.ndarray, scale: np.ndarray) -> np.ndarray:
+def decode_int8_convrot256(
+    payload: NDArray[np.int8], scale: NDArray[np.float32]
+) -> NDArray[np.float64]:
     """`int8-convrot256/1`'s value law, exactly: `scale[i] * (data[i] · H)[j] / 16` in f64.
     The Hadamard sum of int8 is an exact integer and every factor after it is exact in f64,
     so the only rounding is the caller's one cast into the logical dtype."""
@@ -289,7 +292,7 @@ def decode_int8_convrot256(payload: np.ndarray, scale: np.ndarray) -> np.ndarray
     return sums * scale.astype(np.float64)[:, None] / 16.0
 
 
-def encode_int8_convrot256(key: str, values: np.ndarray) -> Encoded:
+def encode_int8_convrot256(key: str, values: NDArray[np.float32]) -> Encoded:
     """TensorFS's versioned H256/16 rowwise ConvRot producer and measured acceptance facts."""
     rows, cols = _require_2d(key, values, CONVROT_GROUP)
     if not rows:
@@ -343,7 +346,7 @@ W4A8_CODEBOOK = np.array(
 W4A8_GROUP = 16
 
 
-def encode_w4a8(key: str, values: np.ndarray) -> Encoded:
+def encode_w4a8(key: str, values: NDArray[np.float32]) -> Encoded:
     """TensorFS's fixed-codebook F64 ConvRot and two-pass group-scale producer."""
     rows, cols = _require_2d(key, values, CONVROT_GROUP)
     if not rows:
