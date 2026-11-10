@@ -1387,7 +1387,7 @@ class Memory:
                 for hold in list(model.holds):
                     hold.shed()
                 with self.lock:
-                    if model.users or any(  # type: ignore[redundant-expr]  # the calls above may open a user
+                    if model.users or any(
                         b.count or b.retained or b.loading for b in model.groups()
                     ):
                         raise StaleBinding(
