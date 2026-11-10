@@ -1,50 +1,26 @@
-"""Install Ulysses hooks and guard collectives on declared sharded components.
+"""Install Ulysses hooks on declared sharded components.
 
-Runtime mirrors each component call before torch and diffusers hooks execute.
-Every rank enters the same call gate and owning component scope. Sampling, text
-encoding and VAE work remain on the leader. Select the attention backend before
-installing CP; existing accelerate wrappers on sharded components are refused.
+Every GPU of the group calls the component itself (`spmd`); Diffusers' hooks split its inputs and
+gather its outputs inside the call. Select the attention backend before installing CP; existing
+accelerate wrappers on sharded components are refused.
 """
 
 from __future__ import annotations
 
-import contextlib
 import re
-import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
 from cozy_runtime.author._model import _declared_state
+from cozy_runtime.internal.parallel import spmd
 from cozy_runtime.internal.parallel.plan import GroupRefusal
-
-_tls = threading.local()
-
-
-class gated_call:
-    """Mark the dynamic extent in which collectives have participants on every rank."""
-
-    def __enter__(self) -> None:
-        _tls.active = getattr(_tls, "active", 0) + 1
-
-    def __exit__(self, *exc: object) -> None:
-        _tls.active = max(0, getattr(_tls, "active", 1) - 1)
-
-
-def in_gated_call() -> bool:
-    return bool(getattr(_tls, "active", 0))
 
 
 class ContextParallelUnavailable(GroupRefusal):
     """This generation cannot be sharded, named exactly."""
 
     default_code = "context_parallel_unavailable"
-
-
-class UngatedShardedForward(GroupRefusal):
-    """A forward through a CP-sharded module outside the group's call gate."""
-
-    default_code = "ungated_sharded_forward"
 
 
 @dataclass(slots=True)
@@ -96,7 +72,6 @@ class _GroupMesh:
 
 
 _CP_PLAN_ATTR = "_cp_plan"
-_GUARD_ATTR = "_cozy_cp_gate_guard"
 
 
 def _modules_of(model: Any) -> Iterator[tuple[str, Any]]:
@@ -152,26 +127,9 @@ def install_context_parallel(model: Any, *, degree: int, comms: CpComms | None) 
     for name, component in components:
         refuse_unless_heads_divisible(heads=_declared_heads(component), degree=int(degree))
         _install_on_component(component, degree=int(degree), comms=comms)
-        _install_gate_guard(component, name)
+        spmd.install_call_check(component, name)
         installed.append(name)
     return tuple(installed)
-
-
-def _install_gate_guard(component: Any, name: str) -> None:
-    if getattr(component, _GUARD_ATTR, None) is not None:
-        return
-
-    def guard(module: Any, args: Any, kwargs: Any = None) -> None:
-        if in_gated_call():
-            return
-        raise UngatedShardedForward(
-            f"sharded component {name!r} needs the Runtime call gate inside an active "
-            "component scope, so every rank participates in its collectives"
-        )
-
-    handle = component.register_forward_pre_hook(guard, with_kwargs=True)
-    with contextlib.suppress(Exception):  # a frozen module keeps the hook anyway
-        setattr(component, _GUARD_ATTR, handle)
 
 
 def _install_on_component(component: Any, *, degree: int, comms: CpComms) -> None:
