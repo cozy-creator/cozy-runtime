@@ -2,10 +2,11 @@
 
 Each follower has a framed JSON command socket and joins the group's distributed
 collectives. A failed run or lost follower breaks the group and terminates its
-remaining followers, allowing blocked collectives to unwind. Nothing here waits on a clock:
-every wait ends with the reply or the follower's death, and one that blocks says which GPU it waits
-on. A group forms only after every follower said it is ready; a follower that fails while GPU 0 is
-inside group init (which nothing can interrupt) ends GPU 0's process, so TensorD sees the exit at
+remaining followers, allowing blocked collectives to unwind. A wait ends with the reply or the
+follower's death, and one that blocks says which GPU it waits on; only a store meeting has a clock
+(`gather`), since a GPU that left the call sets no key. A group forms only after every follower
+said it is ready; a follower that fails while GPU 0 is inside group init (which nothing can
+interrupt) ends GPU 0's process, so TensorD sees the exit at
 once. torch's own deadlines (`NEVER`) never end a group.
 """
 
@@ -18,8 +19,9 @@ import signal
 import socket
 import sys
 import threading
+import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import ModuleType
@@ -50,6 +52,13 @@ ENDED = "group_call_ended"
 #: its members instead: a follower's death or refusal (`RankGroup._break`), or a GPU fault TensorD
 #: sees. Longer than any run, and within what torch's clocks hold.
 NEVER = timedelta(days=36500)
+#: How long a GPU waits at a store meeting for the others (`gather`). They run the same call, so one
+#: arrives within its peers' work on that call; past this the GPUs no longer run the same calls.
+GATHER = timedelta(minutes=5)
+#: A store wait's slice: how soon an ended formation ends it.
+_SLICE = timedelta(seconds=1)
+#: This process's formation ended (`abort_process_group`); cleared as the next one forms.
+_ENDED = threading.Event()
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +213,7 @@ def form_rank(torch: Any, spec: RankSpec, store: Any) -> Any:
     """A follower's half of the group, on the store `ready_rank` reached. Returns the group
     handle every collective is given explicitly."""
     dist = torch.distributed
+    formed()
     dist.init_process_group(
         spec.backend,
         store=store,
@@ -247,9 +257,42 @@ def warm(torch: ModuleType, backend: str, rank: int, world: int) -> None:
     torch.cuda.synchronize()
 
 
+def gather(store: Any, keys: Sequence[str], what: str) -> list[bytes]:
+    """Every key's value, once every GPU has set its own. The store's own read waits for a missing
+    key for as long as the store lives; this ends as a collective does when the formation ends
+    (`abort_process_group`: an interrupt, or a GPU that failed), and after `GATHER` names the
+    GPUs that never arrived (`keys` are in GPU order)."""
+    import torch.distributed as dist
+
+    keys = list(keys)
+    deadline = time.monotonic() + GATHER.total_seconds()
+    while True:
+        if _ENDED.is_set():
+            raise dist.DistBackendError(f"{what}: another GPU ended this call")
+        try:
+            store.wait(keys, _SLICE)
+        except dist.DistStoreError:  # the slice passed
+            if time.monotonic() < deadline:
+                continue
+            missing = [f"GPU {rank}" for rank, key in enumerate(keys) if not store.check([key])]
+            raise GroupRefusal(
+                f"{what}: {', '.join(missing)} did not arrive in "
+                f"{int(GATHER.total_seconds())} s; the GPUs no longer run the same calls",
+                code="group_diverged",
+            ) from None
+        return list(store.multi_get(keys))
+
+
+def formed() -> None:
+    """A formation begins: the last one's end no longer ends this process's waits."""
+    _ENDED.clear()
+
+
 def abort_process_group() -> None:
     """Abort this process's communicator, so a collective in flight raises instead of waiting
-    on a GPU that left it. Best effort (NCCL; a gloo group is only dropped)."""
+    on a GPU that left it, and end its store waits (`gather`). Best effort (NCCL; a gloo group
+    is only dropped)."""
+    _ENDED.set()
     try:
         import torch.distributed.distributed_c10d as c10d
 
@@ -509,6 +552,7 @@ class RankGroup:
         if again and dist.is_initialized():
             dist.destroy_process_group()
         self.pg, self.formed = None, False
+        _ENDED.clear()  # as `formed()`, which this method's `formed` argument shadows
         self.store = dist.TCPStore(
             "127.0.0.1", 0, self.degree, is_master=True, wait_for_workers=False, timeout=NEVER
         )

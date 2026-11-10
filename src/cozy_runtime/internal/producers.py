@@ -99,7 +99,9 @@ class Processor:
         ) -> Tensor:
             if group is None:
                 raise ValueError(f"{self.producer.name}: no Ulysses group to exchange over")
-            return attention_ulysses.exchange(query, key, value, group, compute)
+            return attention_ulysses.exchange(
+                query, key, value, group, compute, f"{self.component}/{self.path}"
+            )
 
         def served(implementation: str) -> None:
             attention_ulysses.record(self.backend, implementation)
