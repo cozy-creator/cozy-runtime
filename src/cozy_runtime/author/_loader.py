@@ -323,7 +323,7 @@ class Config:
     def as_bool(self, name: str, default: bool | None = None) -> bool:
         return self._scalar(name, bool, default)
 
-    def mapping(self) -> dict[str, Any]:  # Any: `**config` into third-party typed keywords
+    def mapping(self) -> dict[str, Any]:  # type: ignore[explicit-any]  # **config for libraries
         """The whole section as a plain, canonically ordered COPY.
 
         The typed accessors are the door for the author's own code; this one is the door

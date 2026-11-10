@@ -27,7 +27,6 @@ from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._handler import Handler
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._weights import _OUTPUT_NAME, MAX_WEIGHTS_NEW_BYTES, Weights, WeightsOutput
-from cozy_runtime.canonical_json import JsonValue
 
 if TYPE_CHECKING:
     from torch import nn
@@ -35,7 +34,9 @@ if TYPE_CHECKING:
     from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._context import Context
     from cozy_runtime.author._services import Telemetry
-
+    from cozy_runtime.canonical_json import JsonValue
+else:
+    JsonValue = object  # msgspec cannot analyze a recursive alias (`DeclaredRecipe.plan`)
 
 #: The entrypoint that runs a package's recipes (`cozy_runtime.derive.recipes`).
 ENTRYPOINT = "quantize"
