@@ -356,7 +356,7 @@ class RankGroup:
         #: rank, until the attempt's record takes them
         self.began: list[tuple[int, str]] = []
         self._readers: list[threading.Thread] = []
-        self._leases = threading.Lock()
+        self._lock = threading.Lock()
 
     def gpu(self, rank: int) -> str:
         """How people name the GPU process `rank` drives: `GPU 3`, as nvidia-smi numbers it."""
@@ -468,7 +468,7 @@ class RankGroup:
         caller (the reader thread and the call's own thread both may) returns only once the
         first one's abort is done, so the group is never formed again under an abort still
         in progress (that deadlocks torch's process-group teardown)."""
-        with self._leases:
+        with self._lock:
             first = not self.interrupted
             if first:
                 self.interrupted = True
