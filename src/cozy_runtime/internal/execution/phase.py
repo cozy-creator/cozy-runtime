@@ -17,6 +17,9 @@ import torch
 
 Mode = Literal["eager", "capture", "replay", "preparation"]
 
+#: Any: varena's plan and phase records, plain dicts in the TensorFS stub.
+type Record = dict[str, Any]
+
 
 def _semantic(value: object) -> object:
     if value is None or type(value) in (bool, int, str):
@@ -64,10 +67,12 @@ def execution_key(configuration: str | None, namespace: str) -> str | None:
 
 
 class Observation:
-    def __init__(self, device: int, token: int, completion_stream: Any = None) -> None:
+    def __init__(
+        self, device: int, token: int, completion_stream: torch.cuda.Stream | None = None
+    ) -> None:
         self.device, self.token = device, token
         self.completion_stream = completion_stream
-        self.result: dict[str, Any] | None = None
+        self.result: Record | None = None
         self.completed = False
         self.choices = 0
 
@@ -108,7 +113,7 @@ def begin_split(
     device: int,
     key: str,
     choice: str,
-    selection: dict[str, Any],
+    selection: Record,
     *,
     stream: int,
 ) -> int:
@@ -125,7 +130,10 @@ def begin_split(
 
 @contextmanager
 def observing(
-    device: int | None, mode: Mode, records: list[dict[str, Any]] | None, key: str | None = None
+    device: int | None,
+    mode: Mode,
+    records: list[Record] | None,
+    key: str | None = None,
 ) -> Iterator[Observation | None]:
     """One execution's observation; none where another owns the device (an enclosing loop)."""
     if device is None or records is None:
