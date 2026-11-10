@@ -9,7 +9,7 @@ only in reduction order.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol
 
 from cozy_runtime.accel.kernels import TritonEntry
 
@@ -19,7 +19,7 @@ try:
 except ImportError as _absent:  # pragma: no cover - a CPU-only or non-Linux environment
     if TYPE_CHECKING:
         raise
-    TRITON_ABSENT = f"triton does not import ({_absent})"
+    TRITON_ABSENT = f"triton does not import ({_absent})"  # type: ignore[unreachable]  # absent Triton
 else:
     TRITON_ABSENT = ""
 
@@ -150,7 +150,13 @@ if not TRITON_ABSENT:
             tl.store(out_ptr + at * DV + rv, tl.sum(state * q[:, None], axis=0).to(tl.bfloat16))
 
 
-def _signature(kernel: Any, **types: str) -> dict[str, str]:
+class _Kernel(Protocol):
+    """A `triton.jit` kernel, as `_signature` reads it."""
+
+    arg_names: list[str]
+
+
+def _signature(kernel: _Kernel, **types: str) -> dict[str, str]:
     return {
         name: types.get(name)
         or ("constexpr" if name.isupper() else "*bf16" if name.endswith("_ptr") else "i32")
