@@ -46,7 +46,7 @@ class Steps:
     current stream at each step, the device time between two read once it passed both."""
 
     def mark(self) -> object:
-        event = torch.cuda.Event(enable_timing=True)
+        event = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]  # bare in torch
         event.record()
         return event
 

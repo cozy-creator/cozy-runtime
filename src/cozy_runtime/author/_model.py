@@ -325,6 +325,10 @@ class Residency(Protocol):
         """A fact about how this attempt executed, reported with its memory facts."""
         ...
 
+    def open_attempt(self) -> None:
+        """An attempt begins on this placement."""
+        ...
+
     def retain(self, component: str, paths: tuple[str, ...]) -> Any:
         """Retain ordinary weight storage after prepare(), until the binding closes."""
         ...

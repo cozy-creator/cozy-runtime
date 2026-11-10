@@ -13,11 +13,14 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 from cozy_runtime.author._loader import TORCH_DTYPES as _TORCH_DTYPES
 from cozy_runtime.internal.decode_schemes import BY_SCHEME as _CORE_SCHEMES
 from cozy_runtime.internal.decode_schemes import parts_rule as _core_parts_rule
+
+if TYPE_CHECKING:
+    import torch
 
 # `Any` below is a torch module, tensor, dtype or nn.Module: torch is absent from the check venv.
 
@@ -288,6 +291,24 @@ class Provider(Protocol):
     ) -> None: ...
 
 
+class Leaf(Protocol):
+    """An installed encoded leaf (`leaves`): an `nn.Module` whose weight is its role buffers."""
+
+    #: a role's buffer where it is not the role's own name
+    BUFFERS: ClassVar[dict[str, str]]
+    _cozy_roles: tuple[str, ...]
+    _buffers: dict[str, torch.Tensor | None]
+    _non_persistent_buffers_set: set[str]
+
+    def __call__(self, x: Tensor, /) -> Tensor:
+        """The linear op it replaced, on its encoded weight."""
+        ...
+
+    def roles(self) -> dict[str, Tensor]:
+        """Each role's tensor as the leaf keeps it (cast or swizzled from the stored part)."""
+        ...
+
+
 @runtime_checkable
 class LeafProvider(Provider, Protocol):
     """A module-replacing provider: the stored parts stay resident as the weight and the
@@ -309,7 +330,15 @@ class LeafProvider(Provider, Protocol):
         """The destination dtypes its kernels write; a tensor of another decodes."""
         ...
 
-    def leaf(self, torch: Any, parts: Mapping[str, Any], replaced: Any, out_dtype: Any) -> Any: ...
+    def leaf(
+        self,
+        torch: ModuleType,
+        parts: Mapping[str, Tensor],
+        replaced: object,
+        out_dtype: torch.dtype,
+    ) -> Leaf:
+        """The leaf replacing `replaced` (a linear op), multiplying by `parts` into `out_dtype`."""
+        ...
 
     def resident_bytes(self, parts: Mapping[str, RolePart]) -> int: ...
 
