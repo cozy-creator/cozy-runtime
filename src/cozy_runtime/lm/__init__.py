@@ -727,12 +727,11 @@ def _draw(scores: Any, temperature: Any, top_p: Any, seed: Any, index: Any) -> A
     key = _mix(base ^ _mix(index[..., None] & _LOW32))
     entry = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.long)
     bits = _mix(key ^ _mix(entry))
-    uniform = ((bits >> 8).float() + 0.5) * (1.0 / (1 << 24))
+    # Below 1: float32 rounds the top hash value to 1, whose noise is +inf (that entry would win
+    # at any score, or give NaN, which argmax takes, on a score at -inf).
+    uniform = (((bits >> 8).float() + 0.5) * (1.0 / (1 << 24))).clamp_(max=1 - 2**-24)
     noise = -torch.log(-torch.log(uniform))
-    # The top hash value rounds `uniform` to 1 and its noise to +inf (one entry in 2**24): on a
-    # score already at -inf (a token the constraint or `top_k` took out) that sum is NaN, which
-    # argmax would take.
-    return (z + noise).masked_fill_(outside | torch.isneginf(z), float("-inf")).argmax(-1)
+    return (z + noise).masked_fill_(outside, float("-inf")).argmax(-1)
 
 
 class _Draw:
