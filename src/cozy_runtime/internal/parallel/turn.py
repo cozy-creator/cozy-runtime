@@ -131,8 +131,11 @@ def _lead(lead: torch.Size) -> tuple[int, ...]:
 
 
 def _whole(*rows: Tensor) -> bool:
-    """Each row contiguous, at most 4 leading dimensions: what the kernels read and write."""
-    return all(t.stride(-1) == 1 and t.dim() <= 5 for t in rows)
+    """Each row contiguous, at most 4 leading dimensions and 2**31 rows: what the kernels read
+    and write."""
+    return rows[0][..., 0].numel() < 1 << 31 and all(
+        t.stride(-1) == 1 and t.dim() <= 5 for t in rows
+    )
 
 
 def _strides(t: Tensor) -> tuple[int, ...]:
@@ -158,12 +161,23 @@ def launcher(x: Tensor) -> Launch | None:
 if not TRITON_ABSENT:
 
     @triton.jit  # type: ignore[untyped-decorator]
-    def _rows(r, n1, n2, n3, s0, s1, s2, s3):  # type: ignore[no-untyped-def]
+    def _index(r, n1, n2, n3):  # type: ignore[no-untyped-def]
+        """Row `r`'s four indices: int32 division, once a row (64-bit division is a long
+        software routine on the card)."""
         i3 = r % n3
         t = r // n3
         i2 = t % n2
         t = t // n2
-        return (t // n1) * s0 + (t % n1) * s1 + i2 * s2 + i3 * s3
+        return t // n1, t % n1, i2, i3
+
+    @triton.jit  # type: ignore[untyped-decorator]
+    def _at(i0, i1, i2, i3, s0, s1, s2, s3):  # type: ignore[no-untyped-def]
+        return (
+            i0.to(tl.int64) * s0
+            + i1.to(tl.int64) * s1
+            + i2.to(tl.int64) * s2
+            + i3.to(tl.int64) * s3
+        )
 
     @triton.jit  # type: ignore[untyped-decorator]
     def _narrow_kernel(  # type: ignore[no-untyped-def]
@@ -172,22 +186,26 @@ if not TRITON_ABSENT:
         tiny, c, D: tl.constexpr, SHIFT: tl.constexpr, T: tl.constexpr, ROWS: tl.constexpr,
     ):  # fmt: skip
         """`law` for `ROWS` rows; `c` is the order's -1/2 power."""
-        r = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
+        r = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
         whole = r < n0 * n1 * n2 * n3
         live = whole[:, None]
+        i0, i1, i2, i3 = _index(r, n1, n2, n3)
         cols = tl.arange(0, D)[None, :]
-        at = _rows(r, n1, n2, n3, x0, x1, x2, x3)[:, None] + cols
-        rows = tl.load(x + at, mask=live, other=0.0)
+        rows = tl.load(
+            x + _at(i0, i1, i2, i3, x0, x1, x2, x3)[:, None] + cols, mask=live, other=0.0
+        )
         turn = tl.load(sign + tl.arange(0, D)[:, None] * D + cols).to(x.dtype.element_ty)
         t = tl.dot(rows, turn, out_dtype=tl.float32) * c
         if SHIFT:
-            at = _rows(r, n1, n2, n3, h0, h1, h2, h3)[:, None] + cols
-            t -= tl.load(h + at, mask=live, other=0.0)
+            t -= tl.load(
+                h + _at(i0, i1, i2, i3, h0, h1, h2, h3)[:, None] + cols, mask=live, other=0.0
+            )
         scale = tl.maximum(tl.max(tl.abs(t) * (1.0 / 127.0), axis=1), tiny).to(s.dtype.element_ty)
         q = tl.minimum(tl.maximum(t / scale.to(tl.float32)[:, None], -127.0), 127.0)
         q = tl.where(q < 0, -1.0, 1.0) * tl.floor(tl.abs(q) + 0.5)
-        tl.store(y + _rows(r, n1, n2, n3, y0, y1, y2, y3)[:, None] + cols, q.to(tl.int8), mask=live)
-        tl.store(s + _rows(r, n1, n2, n3, s0, s1, s2, s3), scale, mask=whole)
+        at = _at(i0, i1, i2, i3, y0, y1, y2, y3)[:, None] + cols
+        tl.store(y + at, q.to(tl.int8), mask=live)
+        tl.store(s + _at(i0, i1, i2, i3, s0, s1, s2, s3), scale, mask=whole)
 
     @triton.jit  # type: ignore[untyped-decorator]
     def _widen_kernel(  # type: ignore[no-untyped-def]
@@ -196,17 +214,19 @@ if not TRITON_ABSENT:
         D: tl.constexpr, T: tl.constexpr, ROWS: tl.constexpr,
     ):  # fmt: skip
         """`law_back` for `ROWS` rows; `c` is the order's -1/2 power."""
-        r = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
+        r = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
         whole = r < n0 * n1 * n2 * n3
         live = whole[:, None]
+        i0, i1, i2, i3 = _index(r, n1, n2, n3)
         cols = tl.arange(0, D)[None, :]
-        at = _rows(r, n1, n2, n3, q0, q1, q2, q3)[:, None] + cols
-        values = tl.load(q + at, mask=live, other=0)
+        values = tl.load(
+            q + _at(i0, i1, i2, i3, q0, q1, q2, q3)[:, None] + cols, mask=live, other=0
+        )
         turn = tl.load(sign + tl.arange(0, D)[:, None] * D + cols).to(out.dtype.element_ty)
         summed = tl.dot(values.to(out.dtype.element_ty), turn, out_dtype=tl.float32)
-        scale = tl.load(s + _rows(r, n1, n2, n3, s0, s1, s2, s3), mask=whole, other=0.0)
+        scale = tl.load(s + _at(i0, i1, i2, i3, s0, s1, s2, s3), mask=whole, other=0.0)
         rows = summed * (scale.to(tl.float32) * c)[:, None]
-        at = _rows(r, n1, n2, n3, o0, o1, o2, o3)[:, None] + cols
+        at = _at(i0, i1, i2, i3, o0, o1, o2, o3)[:, None] + cols
         tl.store(out + at, rows.to(out.dtype.element_ty), mask=live)
 
 
@@ -214,7 +234,7 @@ def _entries() -> tuple[TritonEntry, ...]:
     if TRITON_ABSENT:
         return ()
     strides = {f"{t}{i}": "i64" for t in "xysh" for i in range(4)}
-    sizes = {f"n{i}": "i64" for i in range(4)}
+    sizes = {f"n{i}": "i32" for i in range(4)}
     narrowing = tuple(
         TritonEntry(
             _narrow_kernel,
