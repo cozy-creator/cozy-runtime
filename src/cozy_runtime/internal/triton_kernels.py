@@ -418,12 +418,13 @@ def _copy(store: kernel_cache.Store, found: kernel_compile.Job) -> bool:
     if lock is None:
         return False
     try:
-        root = str(found.spec["shipped"])
+        spec = cast("_Spec", found.spec)  # a triton job's (`job`)
+        root = str(spec["shipped"])
 
         def fill(staging: Path) -> dict[str, object]:
-            _seed(root, found.spec["entries"].values())
+            _seed(root, spec["entries"].values())
             _seed_launcher()
-            return {"entries": len(found.spec["kernels"]), "prebuilt": True, "compile_ms": 0.0}
+            return {"entries": len(spec["kernels"]), "prebuilt": True, "compile_ms": 0.0}
 
         store.publish(found.key, fill)
     finally:
@@ -531,8 +532,9 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
         raise KernelsUnavailable("kernels_failed", f"{kernels.name} sm{arch}: {state.line()}")
     compiled: dict[str, CompiledKernel] = {}
     names: dict[str, tuple[str, ...]] = {}
+    keyed = cast("_Spec", found.spec)["entries"]  # a triton job's (`job`)
     for entry in kernels.entries:
-        digest = found.spec["entries"][entry.key]
+        digest = keyed[entry.key]
         name = f"{entry.kernel.__name__}.json"
         group = get_cache_manager(digest).get_group(name) or {}
         if name not in group:

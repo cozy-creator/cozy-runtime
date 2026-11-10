@@ -47,6 +47,8 @@ class Calibration:
     uniform reservoir of `ROWS` in pinned host memory. Runtime's CUDA graphs are bypassed while
     it is open, so every call runs the hooks."""
 
+    _picks: dict[torch.device, torch.Generator]
+
     def __init__(
         self, torch: ModuleType, components: Mapping[str, nn.Module], keys: Iterable[str]
     ) -> None:
@@ -67,7 +69,7 @@ class Calibration:
         self._handles: list[RemovableHandle] = []
         self._bypass: Token[bool] | None = None
         self._slots = random.Random(0)
-        self._picks: dict[torch.device, torch.Generator] = {}
+        self._picks = {}
         self.completed = False
 
     def __enter__(self) -> Calibration:

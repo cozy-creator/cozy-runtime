@@ -35,7 +35,7 @@ def configure(pace: _Pace | None) -> bool:
     """This process's pace: Start's `display_pace`, None (or a zero pause) for none."""
     global _work, _pause, _since
     on = pace is not None and pace.pause_ms > 0
-    _work, _pause = (pace.work_ms / 1e3, pace.pause_ms / 1e3) if on else (0.0, 0.0)
+    _work, _pause = (pace.work_ms / 1e3, pace.pause_ms / 1e3) if on and pace else (0.0, 0.0)
     _since = time.perf_counter()
     return _pause > 0
 

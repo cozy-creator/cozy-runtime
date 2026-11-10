@@ -101,7 +101,7 @@ def _device_files() -> list[str]:
     return sorted(found)
 
 
-def unsafe(torch: ModuleType) -> str:
+def unsafe(torch: ModuleType | None) -> str:
     """Why this process must not fork, or "". Every fact is read, none assumed."""
     if len(_threads()) > 1:
         # A throwaway fork runs every pthread_atfork prepare handler; OpenBLAS stops its pool.

@@ -39,7 +39,8 @@ from cozy_runtime.author._loader import (
 )
 
 if TYPE_CHECKING:
-    from torch import Tensor, nn
+    from torch import Tensor
+    from torch.nn import Module, Parameter
     from torch.overrides import TorchFunctionMode
 
 
@@ -492,11 +493,9 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
     cap = _Capability(variant)
     original = nn.Module.register_parameter
     original_buffer = nn.Module.register_buffer
-    constants: list[tuple[nn.Module, str, nn.Parameter]] = []
+    constants: list[tuple[Module, str, Parameter]] = []
 
-    def weightless(
-        module: nn.Module, name: str, held: nn.Parameter, made: dict[int, nn.Parameter]
-    ) -> None:
+    def weightless(module: Module, name: str, held: Parameter, made: dict[int, Parameter]) -> None:
         # A device move, performed BY THE RUNTIME, so the guard steps aside exactly here —
         # the fence is on WHO moves bytes, not on what (see `placing`).
         if id(held) not in made:
@@ -506,13 +505,13 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         seen.register(made[id(held)])
 
     def built() -> None:
-        made: dict[int, nn.Parameter] = {}
+        made: dict[int, Parameter] = {}
         for module, name, held in constants:
             if module._parameters.get(name) is held:
                 weightless(module, name, held, made)
         constants.clear()
 
-    def register(module: nn.Module, name: str, param: nn.Parameter | None) -> None:
+    def register(module: Module, name: str, param: Parameter | None) -> None:
         original(module, name, param)
         held = module._parameters.get(name)
         if held is None:
@@ -527,7 +526,7 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
             weightless(module, name, held, {})
 
     def register_buffer(
-        module: nn.Module, name: str, value: Tensor | None, persistent: bool = True
+        module: Module, name: str, value: Tensor | None, persistent: bool = True
     ) -> None:
         original_buffer(module, name, value, persistent=persistent)
         held = module._buffers.get(name)
