@@ -66,6 +66,12 @@ class Ranks:
         self.lock = threading.Lock()
         self.nccl = dist.get_backend(pg) == "nccl"
 
+    def working(self) -> None:
+        """This GPU computes what its next meeting crosses (a hosted call's result, a spread
+        call): the others wait for it past the divergence clock (`gather`'s `working`)."""
+        with self.lock:
+            self.store.set(f"work/{self.sequence + 1}/{self.rank}", "1")
+
     def meet(self, value: Mapping[str, Json], what: str) -> list[Row]:
         """Every GPU's `value` at this point of the program. GPUs at different points raise,
         naming each; a GPU whose handler already ended is named at once (`gather`)."""
@@ -75,9 +81,14 @@ class Ranks:
             keys = [f"{n}/{rank}" for rank in range(self.world)]
             self.store.set(keys[self.rank], json.dumps({"what": what, **value}))
             ended = [f"end/{rank}" for rank in range(self.world)]
-            rows: list[Row] = [json.loads(raw) for raw in gather(self.store, keys, what, ended)]
+            working = [f"work/{n}/{rank}" for rank in range(self.world)]
+            rows: list[Row] = [
+                json.loads(raw) for raw in gather(self.store, keys, what, ended, working)
+            ]
             if n > 1:
                 self.store.delete_key(f"{n - 1}/{self.rank}")
+            with contextlib.suppress(Exception):
+                self.store.delete_key(working[self.rank])
         if len({row["what"] for row in rows}) > 1:
             raise GroupRefusal(
                 "the GPUs are not at one call: "
@@ -95,6 +106,7 @@ class Ranks:
         """GPU 0, once every GPU answered: the attempt's last keys go."""
         keys = [f"end/{rank}" for rank in range(self.world)]
         keys += [f"{n}/{rank}" for rank, n in meetings.items() if n]
+        keys += [f"work/{n + 1}/{rank}" for rank, n in meetings.items()]
         for key in keys:
             with contextlib.suppress(Exception):
                 self.store.delete_key(key)
@@ -130,6 +142,8 @@ class Ranks:
         name = getattr(method, "__qualname__", getattr(method, "__name__", "spread"))
         calls, at = iter(arguments), 0
         while batch := list(itertools.islice(calls, self.world)):
+            if self.rank < len(batch):
+                self.working()
             mine = method(*batch[self.rank]) if self.rank < len(batch) else None
             sent = wire.one_tensor(mine) if self.rank < len(batch) else None
             tensors: list[torch.Tensor] = []
@@ -238,6 +252,7 @@ def _hosted[**P](call: Callable[P, object], what: str, home: int, rank: int) -> 
             )
         if ranks.rank != home:
             return ranks.cross(None, home, f"hosted {what}")
+        ranks.working()
         _hosting.inside = True
         try:
             result = call(*args, **kwargs)
