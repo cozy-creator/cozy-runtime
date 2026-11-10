@@ -7,9 +7,14 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any
+from types import ModuleType
+from typing import TYPE_CHECKING, Concatenate, Protocol
 
 from cozy_runtime.accel.kernels import PreQuantized
+
+if TYPE_CHECKING:
+    from torch import Tensor, nn
+    from torch.distributed import ProcessGroup
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,10 +94,10 @@ def active_attention_layout() -> AttentionLayout | None:
 
 
 #: What the runtime does with an early length statement; the executor's attention installs it.
-_EXPECTED: list[Callable[[int, Any], None]] = []
+_EXPECTED: list[Callable[[int, nn.Module], None]] = []
 
 
-def expect_attention(live_tokens: int, module: Any) -> None:
+def expect_attention(live_tokens: int, module: nn.Module) -> None:
     """State, before inference reaches it, the live document length `module`'s attention sites
     will see, so a kernel specialized on that length can start preparing now (h3a-087).
 
@@ -103,25 +108,35 @@ def expect_attention(live_tokens: int, module: Any) -> None:
             listener(live_tokens, module)
 
 
+class Processor(Protocol):
+    """A site's own attention processor, bound to its module: it takes whatever arguments the
+    module's call was given."""
+
+    def __call__(self, *args: object, **kwargs: object) -> Tensor: ...
+
+
+type Attend = Callable[[Tensor, Tensor, Tensor], Tensor]
+
+
 @dataclass(frozen=True, slots=True)
 class ProducerCall:
     """One call of an attention module at a site Runtime selected a producer for."""
 
-    module: Any
+    module: nn.Module
     component: str
     path: str
     layout: AttentionLayout
-    kernel: Any
+    kernel: ModuleType | None
     """The base backend's imported kernel module (e.g. `comfy_kitchen`)."""
-    state: Any
+    state: object
     """The producer's `state()` for this request on this GPU."""
-    group: Any
+    group: ProcessGroup | None
     """The Ulysses process group under context parallelism; None on one GPU."""
-    original: Callable[..., Any]
+    original: Processor
     """The site's own processor: dense steps and dense paths, served by the base backend."""
-    quantize: Callable[[Any], PreQuantized]
+    quantize: Callable[[Tensor], PreQuantized]
     """The `fp8.rowwise` leaf's activation quantizer: one operand all three projections share."""
-    exchange: Callable[[Any, Any, Any, Callable[[Any, Any, Any], Any]], Any]
+    exchange: Callable[[Tensor, Tensor, Tensor, Attend], Tensor]
     """`exchange(q, k, v, compute)`: the Ulysses all-to-all to whole sequences per head
     subset, `compute` there, and back."""
     served: Callable[[str], None]
@@ -157,14 +172,17 @@ class AttentionProducer:
 
     name: str
     base: str
-    produce: Callable[..., Any]
-    validate: Callable[[Any], None]
+    produce: Callable[Concatenate[ProducerCall, ...], Tensor]
+    """`produce(call, *args, **kwargs)`: the site's call, with its Diffusers processor's own
+    arguments (each model's differ)."""
+    validate: Callable[[object], None]
+    """Raises ValueError for a module (whatever the site holds) it does not serve."""
     requires: tuple[str, ...] = ()
-    state: Callable[[], Any] = dict
+    state: Callable[[], object] = dict
     context_parallel: bool = False
     stateless: Callable[[AttentionLayout], bool] | None = None
 
-    def request_state(self) -> Any | None:
+    def request_state(self) -> object | None:
         """This request's state on this GPU, made on first use; None outside a request."""
         store = _REQUEST.get()
         if store is None:
@@ -178,13 +196,13 @@ class AttentionProducer:
 class ProducerSite:
     """An attention module whose calls the Runtime routes to a producer."""
 
-    module: Any
+    module: nn.Module
     component: str
     path: str
     producer: AttentionProducer
 
 
-def producer_sites(root: Any) -> tuple[ProducerSite, ...]:
+def producer_sites(root: nn.Module) -> tuple[ProducerSite, ...]:
     """The attention modules under `root` a producer serves now (their site's backend is the
     producer's), in module order: where a package finds a producer's per-site state."""
     sites = []
@@ -207,11 +225,11 @@ def register_attention(producer: AttentionProducer) -> AttentionProducer:
     return producer
 
 
-_REQUEST: ContextVar[dict[str, Any] | None] = ContextVar("cozy_attention_request", default=None)
+_REQUEST: ContextVar[dict[str, object] | None] = ContextVar("cozy_attention_request", default=None)
 
 
 @contextmanager
-def _request(held: dict[str, Any] | None = None) -> Iterator[dict[str, Any]]:
+def _request(held: dict[str, object] | None = None) -> Iterator[dict[str, object]]:
     """Runtime's: one request's producer states on this GPU. A fresh store closes them when
     the scope ends; a `held` one (a follower's attempt, across its calls) by `_close`."""
     store = {} if held is None else held
@@ -224,7 +242,7 @@ def _request(held: dict[str, Any] | None = None) -> Iterator[dict[str, Any]]:
             _close(store)
 
 
-def _close(store: dict[str, Any]) -> None:
+def _close(store: dict[str, object]) -> None:
     states = list(store.values())
     store.clear()
     for state in states:

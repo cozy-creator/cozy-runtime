@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import copy
 import sys
-from typing import Any, Protocol
+from collections.abc import Mapping
+from typing import Protocol, TypeGuard, cast
 
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -31,8 +32,36 @@ from cozy_runtime.internal.encoding.leaves import NVFP4
 
 class Rows(Protocol):
     def __call__(
-        self, x: Tensor | PreQuantized, start: int, stop: int, out: Tensor | None = None
+        self, x: Tensor | PreQuantized, start: int, stop: int, /, out: Tensor | None = None
     ) -> Tensor: ...
+
+
+class _Leaf(Protocol):
+    """An encoded leaf (`internal.encoding.leaves`), as `_leaf` reads and copies it."""
+
+    provider: str
+    BUFFERS: Mapping[str, str]
+    WRITES_INTO: bool
+    bias: Tensor | None
+    out_features: int
+    _buffers: dict[str, Tensor | None]
+
+    def roles(self) -> Mapping[str, Tensor]: ...
+
+    def linear(
+        self, x: Tensor | PreQuantized, prequantized: PreQuantized | None, out: Tensor | None = None
+    ) -> Tensor: ...
+
+
+class _Composed(Protocol):
+    """A user LoRA's layer `lora_composition` built (PEFT's `lora.Linear`)."""
+
+    _cozy_baked: bool
+    base_layer: nn.Module
+    active_adapters: list[str]
+    lora_A: nn.ModuleDict
+    lora_B: nn.ModuleDict
+    scaling: dict[str, float]
 
 
 #: Encoded leaves whose rows compute alone: their stored roles, and the output rows a tile of
@@ -58,9 +87,13 @@ def rows(linear: nn.Module) -> Rows | None:
         return lambda x, a, b, out=None: _adapted(linear, x, base(x, a, b, out), a, b)
     if type(linear) is nn.Linear:
         return lambda x, a, b, out=None: _hooked(linear, x, _plain(linear, x, a, b, out), a, b)
-    cuts = _ROWWISE.get(getattr(linear, "provider", None))
-    if cuts is not None and set(linear.roles()) == cuts[0]:
-        return lambda x, a, b, out=None: _hooked(linear, x, _leaf(linear, x, a, b, out), a, b)
+    provider: str | None = getattr(linear, "provider", None)
+    cuts = None if provider is None else _ROWWISE.get(provider)
+    if cuts is None:
+        return None
+    leaf = cast("_Leaf", linear)  # its provider is an encoded leaf's
+    if set(leaf.roles()) == cuts[0]:
+        return lambda x, a, b, out=None: _hooked(linear, x, _leaf(leaf, x, a, b, out), a, b)
     return None
 
 
@@ -78,7 +111,7 @@ def _plain(
 
 
 def _leaf(
-    leaf: nn.Module, x: Tensor | PreQuantized, start: int, stop: int, out: Tensor | None
+    leaf: _Leaf, x: Tensor | PreQuantized, start: int, stop: int, out: Tensor | None
 ) -> Tensor:
     """The leaf's own forward over a copy holding its rows, in whole tiles of its scales (a slice
     stops at the weight's end where its last tile is padded): one code path for its GEMM, its
@@ -109,7 +142,7 @@ def _leaf(
     return out
 
 
-def _composed(linear: nn.Module) -> bool:
+def _composed(linear: nn.Module) -> TypeGuard[_Composed]:
     """A layer `lora_composition` built: PEFT's linear with the Runtime's forward (`_cozy_baked`),
     whose update is `lora.accumulate` per active adapter. Another PEFT layer's forward (dropout,
     DoRA) is not known to cut."""
@@ -117,7 +150,9 @@ def _composed(linear: nn.Module) -> bool:
     return peft is not None and isinstance(linear, peft) and hasattr(type(linear), "_cozy_baked")
 
 
-def _adapted(layer: Any, x: Tensor | PreQuantized, out: Tensor, start: int, stop: int) -> Tensor:
+def _adapted(
+    layer: _Composed, x: Tensor | PreQuantized, out: Tensor, start: int, stop: int
+) -> Tensor:
     """A composed layer's update over rows [start, stop): each active adapter's rows of `lora_B`
     (`lora.accumulate`, as its forward adds the whole's); none once baked."""
     if layer._cozy_baked:
@@ -125,8 +160,9 @@ def _adapted(layer: Any, x: Tensor | PreQuantized, out: Tensor, start: int, stop
     if not isinstance(x, Tensor):
         raise ValueError("an unbaked LoRA update needs the float input, not its operand")
     for name in layer.active_adapters:
-        up = layer.lora_B[name].weight
-        lora.accumulate(x, out, layer.lora_A[name].weight, up[start:stop], layer.scaling[name])
+        up = cast("nn.Linear", layer.lora_B[name]).weight  # PEFT's factors are linears
+        down = cast("nn.Linear", layer.lora_A[name]).weight
+        lora.accumulate(x, out, down, up[start:stop], layer.scaling[name])
     return out
 
 
@@ -134,7 +170,8 @@ def _hooked(
     linear: nn.Module, x: Tensor | PreQuantized, out: Tensor, start: int, stop: int
 ) -> Tensor:
     """An armed overlay's update, its rows of `up` (`lora.Hook`); none once baked."""
-    for hook in linear._forward_hooks.values():
+    for found in linear._forward_hooks.values():
+        hook = cast("lora.Hook", found)  # `rows` cuts only a linear whose hooks are all these
         if hook._cozy_baked:
             continue
         armed = hook.lora_factors()

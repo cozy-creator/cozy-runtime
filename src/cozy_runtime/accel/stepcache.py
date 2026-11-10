@@ -46,17 +46,19 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol, cast
 
 from cozy_runtime.accel.kernels import Plan
 from cozy_runtime.author._model import WARNINGS, WarningRow
 
-try:
+if TYPE_CHECKING:
     import torch
-except ImportError:  # pragma: no cover - the base package is torch-free
-    if TYPE_CHECKING:
-        raise
-    torch = None
+    from torch import Tensor, nn
+else:
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - the base package is torch-free
+        torch = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +104,7 @@ class Stack:
     """A transformer's block stack: `blocks` its `nn.ModuleList`, `carried` the block arguments
     (index or keyword) its output returns, in that order."""
 
-    model: type
+    model: type[nn.Module]
     blocks: str = "transformer_blocks"
     carried: tuple[int | str, ...] = (0,)
 
@@ -111,16 +113,21 @@ class Stack:
         return f"stepcache.{self.model.__name__.lower()}"
 
 
+#: What a block returns: its hidden states, or a tuple of them (the stack's `carried`).
+type BlockOutput = Tensor | tuple[Tensor, ...]
+
+
 @dataclass(slots=True)
 class _Installed:
     stack: Stack
     #: per carried argument: (its positional index, its keyword)
     places: tuple[tuple[int, str], ...]
 
-    def inputs(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...]:
-        return tuple(kwargs[name] if name in kwargs else args[index] for index, name in self.places)
+    def inputs(self, args: tuple[object, ...], kwargs: dict[str, object]) -> tuple[Tensor, ...]:
+        found = (kwargs[name] if name in kwargs else args[index] for index, name in self.places)
+        return cast("tuple[Tensor, ...]", tuple(found))  # the Stack's carried hidden states
 
-    def outputs(self, out: Any) -> tuple[Any, ...]:
+    def outputs(self, out: BlockOutput) -> tuple[Tensor, ...]:
         found = (out,) if len(self.places) == 1 and isinstance(out, torch.Tensor) else tuple(out)
         if len(found) != len(self.places):
             raise ValueError(
@@ -129,23 +136,31 @@ class _Installed:
             )
         return found
 
-    def pack(self, like: Any, tensors: tuple[Any, ...]) -> Any:
+    def pack(self, like: BlockOutput, tensors: tuple[Tensor, ...]) -> BlockOutput:
         return tensors[0] if isinstance(like, torch.Tensor) else type(like)(tensors)
 
 
-def install(plan: Plan, stack: Stack, transformer: Any) -> str:
+class _Listed(Protocol):
+    """A stack's `nn.ModuleList` once installed (`_listed`'s class)."""
+
+    _modules: dict[str, nn.Module | None]
+    _cozy_installed: _Installed
+
+
+def install(plan: Plan, stack: Stack, transformer: nn.Module) -> str:
     """Make `transformer`'s block stack cacheable on `plan`'s device: the plan's identity, or ""
     when it does not hold the declared stack (reported). Nothing changes until a loop names a
     policy."""
-    blocks: Any = getattr(transformer, stack.blocks, None)
+    found: object = getattr(transformer, stack.blocks, None)
     why = ""
     if torch is None or not isinstance(transformer, stack.model):
         why = f"not a {stack.model.__name__}"
-    elif not isinstance(blocks, torch.nn.ModuleList) or len(blocks) < 2:
+    elif not isinstance(found, torch.nn.ModuleList) or len(found) < 2:
         why = f"{stack.blocks} is not a list of two or more blocks"
     if why:
         plan.report(stack.name, {"applied": False, "reason": why})
         return ""
+    blocks = cast("nn.ModuleList", found)  # the elif above found it one
     parameters = _parameters(type(blocks[0]))
     places = []
     for argument in stack.carried:
@@ -155,7 +170,7 @@ def install(plan: Plan, stack: Stack, transformer: Any) -> str:
         index = argument if isinstance(argument, int) else parameters.index(argument)
         places.append((index, parameters[index] if index < len(parameters) else ""))
     blocks.__class__ = _listed(type(blocks))
-    blocks._cozy_installed = _Installed(stack, tuple(places))
+    cast("_Listed", blocks)._cozy_installed = _Installed(stack, tuple(places))
     plan.report(stack.name, {"applied": True, "blocks": len(blocks)})
     return f"{stack.name}:{stack.blocks}:{','.join(map(str, stack.carried))}"
 
@@ -173,20 +188,21 @@ def _parameters(block: type) -> list[str]:
     return []
 
 
-_LISTED: dict[type, type] = {}
+_LISTED: dict[type[nn.ModuleList], type[nn.ModuleList]] = {}
 
 
-def _listed(base: type) -> type:
+def _listed(base: type[nn.ModuleList]) -> type[nn.ModuleList]:
     """The stack's list: under a cached loop, its iterations go through the call's cache."""
     if base not in _LISTED:
 
-        def __iter__(self: Any) -> Iterator[Any]:
+        def __iter__(self: _Listed) -> Iterator[_Block | None]:
             run = _RUN.get()
             if run is None:
                 return iter(self._modules.values())
             return run.forward(self, self._cozy_installed)
 
-        _LISTED[base] = type(f"StepCached{base.__name__}", (base,), {"__iter__": __iter__})
+        listed = type(f"StepCached{base.__name__}", (base,), {"__iter__": __iter__})
+        _LISTED[base] = cast("type[nn.ModuleList]", listed)  # a subclass of `base`
     return _LISTED[base]
 
 
@@ -198,33 +214,33 @@ class _State:
     has-computed and has-rate; `hits` EasyCache's skips in a row. The flags are a row of the
     run's (`Run.flags`), zeroed with every `running`."""
 
-    has: Any
-    hits: Any
-    ref: tuple[Any, ...] = ()
-    residual: tuple[Any, ...] = ()
-    previous: tuple[Any, ...] = ()
-    inputs_c: tuple[Any, ...] = ()
-    outputs_c: tuple[Any, ...] = ()
-    rate: Any = None
-    acc: Any = None
-    like: Any = None
+    has: Tensor
+    hits: Tensor
+    ref: tuple[Tensor, ...] = ()
+    residual: tuple[Tensor, ...] = ()
+    previous: tuple[Tensor, ...] = ()
+    inputs_c: tuple[Tensor, ...] = ()
+    outputs_c: tuple[Tensor, ...] = ()
+    rate: Tensor | None = None
+    acc: Tensor | None = None
+    like: BlockOutput | None = None
 
 
-def _sum(tensors: Sequence[Any]) -> Any:
+def _sum(tensors: Sequence[Tensor]) -> Tensor:
     """Σ|t| over every element, in float32, a fixed-order reduction."""
     return torch.stack([t.abs().sum(dtype=torch.float32) for t in tensors]).sum()
 
 
-def _mean(tensors: Sequence[Any]) -> Any:
+def _mean(tensors: Sequence[Tensor]) -> Tensor:
     return _sum(tensors) / sum(t.numel() for t in tensors)
 
 
-def _diff(a: Sequence[Any], b: Sequence[Any], mean: bool = False) -> Any:
+def _diff(a: Sequence[Tensor], b: Sequence[Tensor], mean: bool = False) -> Tensor:
     deltas = [x - y for x, y in zip(a, b, strict=True)]
     return _mean(deltas) if mean else _sum(deltas)
 
 
-def _like(tensors: Sequence[Any]) -> tuple[Any, ...]:
+def _like(tensors: Sequence[Tensor]) -> tuple[Tensor, ...]:
     """Unset buffers: an allocation alone, which a recording does not replay."""
     return tuple(torch.empty_like(t) for t in tensors)
 
@@ -253,11 +269,11 @@ class Run:
         self.current, self.slot = i, 0
         self.index = torch.full((1,), i, dtype=torch.int64, device=self.flags.device)
 
-    def forward(self, blocks: Any, installed: _Installed) -> Iterator[Any]:
+    def forward(self, blocks: _Listed, installed: _Installed) -> Iterator[_Block]:
         """An iteration of the stack. Its first item stands for block 0 (attribute reads pass
         through); an iteration that calls it is the stack's forward, any other (a read of each
         block's processor) sees the blocks as they are."""
-        modules = list(blocks._modules.values())
+        modules = cast("list[nn.Module]", list(blocks._modules.values()))  # a list holds no None
         gate = _Gate(self, blocks, installed, modules[0])
         yield gate
         if gate.state is None:
@@ -266,7 +282,7 @@ class Run:
             yield from modules[1:-1]
             yield _Last(self, gate.state, installed, modules[-1], gate)
 
-    def claim(self, blocks: Any) -> _State:
+    def claim(self, blocks: _Listed) -> _State:
         """The state of the stack's next forward in this step (its slot)."""
         key = (id(blocks), self.slot)
         self.slot += 1
@@ -296,29 +312,29 @@ class Run:
 class _Gate:
     """The stack's first call each forward: the signal, the verdict, block 0 when it runs."""
 
-    def __init__(self, run: Run, blocks: Any, installed: _Installed, first: Any) -> None:
+    def __init__(self, run: Run, blocks: _Listed, installed: _Installed, first: nn.Module) -> None:
         self.run, self.blocks, self.installed, self.first = run, blocks, installed, first
         self.state: _State | None = None
         self.computed = True
-        self.inputs: tuple[Any, ...] = ()
-        self.head: tuple[Any, ...] = ()
-        self.r0: tuple[Any, ...] = ()
+        self.inputs: tuple[Tensor, ...] = ()
+        self.head: tuple[Tensor, ...] = ()
+        self.r0: tuple[Tensor, ...] = ()
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> object:
         if name.startswith("__"):
             raise AttributeError(name)
         return getattr(self.__dict__["first"], name)
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, *args: object, **kwargs: object) -> BlockOutput:
         run, installed = self.run, self.installed
         if run.current is None:
             raise ValueError("a step-cached loop calls `run.step(i)` before each step's forwards")
         self.inputs = xs = installed.inputs(args, kwargs)
         self.state = state = run.claim(self.blocks)
-        out = None
+        out: BlockOutput | None = None
         if isinstance(run.policy, FirstBlockCache):
-            out = self.first(*args, **kwargs)
-            self.head = installed.outputs(out)
+            out = first = cast("BlockOutput", self.first(*args, **kwargs))  # a block of the Stack
+            self.head = installed.outputs(first)
             self.r0 = tuple(h - x for h, x in zip(self.head, xs, strict=True))
             if not state.ref:
                 state.ref, state.residual = _like(self.r0), _like(self.head)
@@ -326,20 +342,29 @@ class _Gate:
                 _diff(self.r0, state.ref) > run.policy.threshold * _sum(state.ref).clamp_min(1e-8)
             )
         else:
-            computed = self._easy(run.policy, state, xs, run.index)
+            # `run.step(i)` set the index with the current step checked above.
+            computed = self._easy(run.policy, state, xs, cast("Tensor", run.index))
         self.computed = bool(computed.item())
         run.verdicts.append((run.current, self.computed))
         if not self.computed:
             skipped = self.skip()
-            return installed.pack(out if out is not None else state.like, skipped)
-        return out if out is not None else self.first(*args, **kwargs)
+            # EasyCache skips only after a computed forward, which kept its output (`like`).
+            like = out if out is not None else cast("BlockOutput", state.like)
+            return installed.pack(like, skipped)
+        if out is not None:
+            return out
+        computed_out: BlockOutput = self.first(*args, **kwargs)
+        return computed_out
 
-    def _easy(self, policy: EasyCache, state: _State, xs: tuple[Any, ...], relative: Any) -> Any:
+    def _easy(
+        self, policy: EasyCache, state: _State, xs: tuple[Tensor, ...], relative: Tensor
+    ) -> Tensor:
         if not state.previous:
             state.previous, state.inputs_c, state.outputs_c, state.residual = (
                 _like(xs), _like(xs), _like(xs), _like(xs)
             )
             state.rate, state.acc = (torch.empty(1, device=xs[0].device) for _ in range(2))
+        rate, acc = cast("Tensor", state.rate), cast("Tensor", state.acc)  # made just above
         last = self.run.steps - 1
         forced = (
             (relative < policy.retain)
@@ -348,13 +373,13 @@ class _Gate:
             | (state.hits >= policy.max_hits)
         )
         change = _diff(xs, state.previous, mean=True) / _mean(state.outputs_c).clamp_min(1e-8)
-        accumulated = state.acc + state.rate * change
-        state.acc.copy_(torch.where(forced, state.acc, accumulated))
+        accumulated = acc + rate * change
+        acc.copy_(torch.where(forced, acc, accumulated))
         for previous, x in zip(state.previous, xs, strict=True):
             previous.copy_(x)
         return forced | (accumulated >= policy.threshold)
 
-    def skip(self) -> tuple[Any, ...]:
+    def skip(self) -> tuple[Tensor, ...]:
         """The cached forward: block 0's output (FirstBlockCache) or its input plus the
         residual."""
         state = self.state
@@ -369,7 +394,7 @@ class _Last:
     """The stack's last block on a computed forward: its output, then the references."""
 
     def __init__(
-        self, run: Run, state: _State, installed: _Installed, last: Any, gate: _Gate
+        self, run: Run, state: _State, installed: _Installed, last: nn.Module, gate: _Gate
     ) -> None:
         self.run, self.state, self.installed, self.last, self.gate = (
             run,
@@ -379,13 +404,13 @@ class _Last:
             gate,
         )
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> object:
         if name.startswith("__"):
             raise AttributeError(name)
         return getattr(self.__dict__["last"], name)
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        out = self.last(*args, **kwargs)
+    def __call__(self, *args: object, **kwargs: object) -> BlockOutput:
+        out: BlockOutput = self.last(*args, **kwargs)
         ys, state, gate = self.installed.outputs(out), self.state, self.gate
         if isinstance(self.run.policy, FirstBlockCache):
             for ref, r0 in zip(state.ref, gate.r0, strict=True):
@@ -398,19 +423,22 @@ class _Last:
             rate = _diff(ys, state.outputs_c, mean=True) / _diff(
                 xs, state.inputs_c, mean=True
             ).clamp_min(1e-8)
-            state.rate.copy_(torch.where(state.has[1] != 0, rate, state.rate))
+            kept_rate = cast("Tensor", state.rate)  # `_Gate._easy` made it this forward
+            kept_rate.copy_(torch.where(state.has[1] != 0, rate, kept_rate))
             state.has[2].copy_(state.has[2] | state.has[1])
             pairs = (*zip(state.inputs_c, xs, strict=True), *zip(state.outputs_c, ys, strict=True))
             for kept, value in pairs:
                 kept.copy_(value)
             for residual, y, x in zip(state.residual, ys, xs, strict=True):
                 residual.copy_(y - x)
-            state.acc.zero_()
+            cast("Tensor", state.acc).zero_()  # `_Gate._easy` made it this forward
             state.hits.zero_()
             state.has[1].fill_(1)
             state.like = out
         return out
 
+
+type _Block = nn.Module | _Gate | _Last
 
 _RUN: ContextVar[Run | None] = ContextVar("cozy_stepcache", default=None)
 

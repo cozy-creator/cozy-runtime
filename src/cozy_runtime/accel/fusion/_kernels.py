@@ -14,9 +14,9 @@ Adapted from MiniMax-H3's glue (itself from NVlabs/Sana `sol-engine`, Apache-2.0
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, cast
 
-from cozy_runtime.accel.kernels import Launch, TritonEntry
+from cozy_runtime.accel.kernels import JitKernel, Launch, TritonEntry, jit
 
 try:
     import torch
@@ -26,7 +26,7 @@ try:
 except ImportError as _absent:  # pragma: no cover - a CPU-only or non-Linux environment
     if TYPE_CHECKING:
         raise
-    TRITON_ABSENT = f"torch and triton do not import ({_absent})"
+    TRITON_ABSENT = f"torch and triton do not import ({_absent})"  # type: ignore[unreachable]  # TYPE_CHECKING re-raises
 else:
     TRITON_ABSENT = ""
 
@@ -66,7 +66,7 @@ if not TRITON_ABSENT:
             pack=1,
         )
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton ships no types
     def _round(x, ROUND: tl.constexpr):  # type: ignore[no-untyped-def]
         if ROUND == 1:
             x = _rb(x)
@@ -74,7 +74,7 @@ if not TRITON_ABSENT:
             x = _rh(x)
         return x
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton ships no types
     def _normed(x, inv, weight, WEIGHT: tl.constexpr, ONCE: tl.constexpr, ROUND: tl.constexpr):  # type: ignore[no-untyped-def]
         # `x * inv [* weight]` as the model's norm rounds it: Diffusers' RMSNorm rounds the
         # normalized row, then its product with the weight; torch's (ONCE) only the product.
@@ -85,7 +85,7 @@ if not TRITON_ABSENT:
             x = x * weight
         return _round(x, ROUND)
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @jit
     def norm_modulate_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         branch_ptr,
@@ -151,7 +151,7 @@ if not TRITON_ABSENT:
                 out = _round(out + shift, 1 + F16)
             tl.store(out_ptr + offset, out.to(out_ptr.dtype.element_ty), mask=mask)
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @jit
     def swiglu_kernel(  # type: ignore[no-untyped-def]
         gate_ptr,
         up_ptr,
@@ -173,7 +173,7 @@ if not TRITON_ABSENT:
         out = _round(activated * up, 1 + F16)
         tl.store(out_ptr + row * stride_out + cols, out.to(out_ptr.dtype.element_ty), mask=mask)
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @jit
     def head_norm_rope_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         out_ptr,
@@ -245,7 +245,7 @@ def _next_pow2(n: int) -> int:
 
 
 def _entry(
-    kernel: Any, constexprs: dict[str, int], warps: int, aligned: tuple[str, ...], **types: str
+    kernel: JitKernel, constexprs: dict[str, int], warps: int, aligned: tuple[str, ...], **types: str  # noqa: E501 (a line between kernels: their line numbers are their identity)
 ) -> TritonEntry:
     """`kernel`'s entry: UPPERCASE parameters are constexprs, the rest i32 unless `types` says."""
     signature = {
@@ -256,7 +256,7 @@ def _entry(
 
 if not TRITON_ABSENT:
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @jit
     def channel_norm_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         weight_ptr,
@@ -322,7 +322,7 @@ def channel_entries(dtype: str, bias: bool, silu: bool) -> tuple[TritonEntry, ..
 # ---------------------------------------------------------------------------- launches
 
 
-def _aligned(t: Any) -> Any:
+def _aligned(t: torch.Tensor) -> torch.Tensor:
     """A row operand as the entries assume it (`tt.divisibility` 16): unit column stride, a
     16-byte aligned base and a row stride divisible by 16."""
     if t.stride(-1) != 1 or (t.dim() > 1 and t.stride(-2) % 16):
@@ -330,18 +330,18 @@ def _aligned(t: Any) -> Any:
     return t if t.data_ptr() % 16 == 0 else t.clone()
 
 
-def _rows(x: Any, width: int) -> Any:
+def _rows(x: torch.Tensor, width: int) -> torch.Tensor:
     """`[rows, width]` with any aligned row stride."""
     return _aligned(x.reshape(-1, width))
 
 
-def _dense(x: Any, width: int) -> Any:
+def _dense(x: torch.Tensor, width: int) -> torch.Tensor:
     """`[rows, width]`, contiguous: the row kernel addresses every operand at `row * width`."""
     rows = x.reshape(-1, width)
     return _aligned(rows if rows.is_contiguous() else rows.contiguous())
 
 
-def _tables(*tables: Any) -> list[Any]:
+def _tables(*tables: torch.Tensor | None) -> list[torch.Tensor]:
     """Modulation tables as one kernel addresses them: aligned, sharing one row stride."""
     found = [_aligned(t) for t in tables if t is not None]
     if len({t.stride(0) for t in found}) > 1:
@@ -352,17 +352,17 @@ def _tables(*tables: Any) -> list[Any]:
 def norm_modulate(
     launch: Launch,
     entry: TritonEntry,
-    x: Any,
-    weight: Any,
-    scale: Any,
-    shift: Any,
-    index: Any,
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    scale: torch.Tensor | None,
+    shift: torch.Tensor | None,
+    index: torch.Tensor,
     eps: float,
     *,
-    branch: Any = None,
-    other: Any = None,
-    gate: Any = None,
-) -> tuple[Any, Any]:
+    branch: torch.Tensor | None = None,
+    other: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """`entry`'s chain over rows of `x`: `(hidden, out)`. `hidden` is `x + act(gate) * (branch
     [+ other])` (or `x` without a residual); `out` the [modulated] norm (None for a residual
     alone). Tables are `[rows, width]` views (any row stride) read at `index[token]`."""
@@ -374,8 +374,9 @@ def norm_modulate(
     hidden = rows.new_empty(rows.shape, dtype=residual) if c["BRANCHES"] else rows
     normed = c["NORM"] != NONE
     out = rows.new_empty(rows.shape, dtype=row) if normed else hidden
-    branch = _dense(branch, width) if c["BRANCHES"] else rows
-    other = _dense(other, width) if c["BRANCHES"] == 2 else branch
+    # A residual entry (`BRANCHES`) is launched with its branch [and the other].
+    branch = _dense(cast("torch.Tensor", branch), width) if c["BRANCHES"] else rows
+    other = _dense(cast("torch.Tensor", other), width) if c["BRANCHES"] == 2 else branch
     tables = iter(_tables(gate, scale, shift))
     gate, scale, shift = (next(tables) if t is not None else None for t in (gate, scale, shift))
     first = next((t for t in (scale, gate) if t is not None), rows)
@@ -401,7 +402,9 @@ def norm_modulate(
     return hidden.view_as(x), out.view_as(x) if normed else None
 
 
-def swiglu(launch: Launch, entry: TritonEntry, gate: Any, up: Any) -> Any:
+def swiglu(
+    launch: Launch, entry: TritonEntry, gate: torch.Tensor, up: torch.Tensor
+) -> torch.Tensor:
     """`silu(gate) * up`, one read of each and one write."""
     width = int(gate.shape[-1])
     gate_rows, up_rows = _rows(gate, width), _rows(up, width)
@@ -424,8 +427,14 @@ def swiglu(launch: Launch, entry: TritonEntry, gate: Any, up: Any) -> Any:
 
 
 def channel_norm(
-    launch: Launch, entry: TritonEntry, x: Any, weight: Any, bias: Any, scale: float, eps: float
-) -> Any:
+    launch: Launch,
+    entry: TritonEntry,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    scale: float,
+    eps: float,
+) -> torch.Tensor:
     """`entry`'s channel norm of `[batch, channels, ...]` `x` (weights `[channels, 1, ...]`)."""
     batch, channels = int(x.shape[0]), int(x.shape[1])
     plane = x.numel() // max(batch * channels, 1)
@@ -450,12 +459,12 @@ def channel_norm(
 def head_norm_rope(
     launch: Launch,
     entry: TritonEntry,
-    x: Any,
-    weight: Any,
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
     eps: float,
-    tables: Any,
-    dtype: Any,
-) -> Any:
+    tables: RopeTables,
+    dtype: torch.dtype,
+) -> torch.Tensor:
     """Per-head RMSNorm of `[batch, seq, heads, head_dim]` `x`, then `entry`'s RoPE by
     `tables` (`rope_tables`), in `dtype`."""
     batch, seq, heads, head_dim = (int(d) for d in x.shape)
@@ -481,7 +490,13 @@ def head_norm_rope(
     return out.view(batch, seq, heads, head_dim)
 
 
-def rope_tables(value: Any, *, interleaved: bool, rotary: int) -> tuple[Any, Any, int, int]:
+#: A rotary operand as the kernel reads it: (cos, sin, token stride, column stride).
+type RopeTables = tuple[torch.Tensor, torch.Tensor, int, int]
+
+
+def rope_tables(
+    value: torch.Tensor | tuple[torch.Tensor, torch.Tensor], *, interleaved: bool, rotary: int
+) -> RopeTables:
     """A model's rotary operand as the kernel reads it: `(cos, sin, token stride, column
     stride)` in fp32. Interleaved: complex `[seq, rotary/2]`, or a `(cos, sin)` pair of
     `[seq, rotary/2]` or of `[seq, rotary]` with each value repeated for its pair (Diffusers'

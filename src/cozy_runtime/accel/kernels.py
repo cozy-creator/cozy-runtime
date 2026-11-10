@@ -29,9 +29,14 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, cast
+from types import FunctionType
+from typing import TYPE_CHECKING, Protocol, cast
 
 from cozy_runtime import _kernels
+
+if TYPE_CHECKING:
+    import torch
+    from torch import Tensor, nn
 
 ROWWISE_FP8 = "cozy.fp8-rowwise.native-leaf/1"
 INT8_CONVROT = "cozy.int8-convrot256.native-leaf/1"
@@ -51,6 +56,27 @@ class KernelsUnavailable(RuntimeError):
         self.code = code
 
 
+class JitKernel(Protocol):
+    """What the build reads of a module-level `@triton.jit` kernel (Triton ships no types)."""
+
+    __name__: str
+    arg_names: list[str]
+
+    @property
+    def fn(self) -> FunctionType: ...
+
+    @property
+    def cache_key(self) -> str: ...
+
+
+def jit[**P](fn: Callable[P, object]) -> JitKernel:
+    """`triton.jit` for a kernel a set declares, typed (Triton ships no types)."""
+    import triton
+
+    kernel: JitKernel = triton.jit(fn)
+    return kernel
+
+
 @dataclass(frozen=True, slots=True)
 class TritonEntry:
     """One compiled specialization of a module-level `@triton.jit` kernel: Triton's signature
@@ -58,7 +84,7 @@ class TritonEntry:
     and integer arguments it may assume 16-aligned, its warps, its pipeline stages, and whether
     the compiler may fuse a multiply and an add (`fp_fusion`; False keeps each one rounded)."""
 
-    kernel: Any
+    kernel: JitKernel
     signature: Mapping[str, str]
     constexprs: Mapping[str, int] = field(default_factory=dict)
     aligned: tuple[str, ...] = ()
@@ -120,9 +146,16 @@ class TritonKernels:
         return "sha256:" + hashlib.sha256("\n".join(rows).encode()).hexdigest()
 
 
-Launch = Callable[..., None]
-"""`launch(kernel, grid, *args)`: run the entry whose constexpr values `args` carries, every
-argument positional as the kernel declares it."""
+type KernelArgument = Tensor | int | float | None
+
+
+class Launch(Protocol):
+    """`launch(kernel, grid, *args)`: run the entry whose constexpr values `args` carries, every
+    argument positional as the kernel declares it."""
+
+    def __call__(
+        self, kernel: JitKernel, grid: tuple[int, ...], /, *args: KernelArgument
+    ) -> None: ...
 
 
 def _unreported(name: str, document: Mapping[str, object]) -> None:
@@ -134,7 +167,7 @@ class Plan:
     """What Runtime hands `Model.execution_plan`: the GPU this construction serves on, the
     package's compiled kernels for it, and where its outcome is reported."""
 
-    device: Any
+    device: torch.device
     load: Callable[[TritonKernels], Launch]
     """Wait for this machine's build of the set for `device` (started when the executor did)
     and return its launcher. Raises `KernelsUnavailable`."""
@@ -159,8 +192,8 @@ class PreQuantized:
     its GEMM. `shape` is the bf16 activation's, so the leaf's output reshape is unchanged.
     """
 
-    payload: Any
-    scale: Any
+    payload: Tensor
+    scale: Tensor
     shape: tuple[int, ...]
     provider: str = ROWWISE_FP8
 
@@ -168,7 +201,7 @@ class PreQuantized:
 class _Shared:
     __slots__ = ("operands", "tensor")
 
-    def __init__(self, tensor: Any) -> None:
+    def __init__(self, tensor: Tensor) -> None:
         self.tensor = tensor
         self.operands: dict[str, PreQuantized | None] = {}
 
@@ -177,7 +210,7 @@ _SHARED: ContextVar[tuple[_Shared, ...]] = ContextVar("cozy_quantize_once", defa
 
 
 @contextmanager
-def quantize_once(*tensors: Any) -> Iterator[None]:
+def quantize_once(*tensors: Tensor | None) -> Iterator[None]:
     """Inside, the encoded leaves that take one of `tensors` (that object) as input quantize it
     once between them, as a fused qkv GEMM would: q, k and v of one normed input, or an MLP's
     gate and up. None is skipped. A tensor must not change in place inside the scope."""
@@ -195,20 +228,43 @@ class _Recent:
     read the same input: `tensor` unchanged (its version, storage and geometry) and `provider`'s.
     `left` is how many more its maker's group read (learned), None until it is known."""
 
-    tensor: weakref.ref[Any] | None
+    tensor: weakref.ref[Tensor] | None
     version: int
     key: tuple[object, ...]
     provider: str
     operand: PreQuantized | None
-    maker: Any
+    maker: _Learns | None
     uses: int
     left: int | None
+
+
+class _Learns(Protocol):
+    """A leaf that reads shared operands: `_cozy_siblings`, once learned, is how many leaves read
+    its input (an int torch's `Module.__setattr__` typing cannot admit)."""
+
+    _cozy_siblings: int
+
+
+class _Prologue(Protocol):
+    """The native int8 leaf's producer prologue (`int8_rows`)."""
+
+    def int8_prologue(
+        self,
+        x: Tensor,
+        consumers: tuple[nn.Module, ...],
+        norm: str | None,
+        eps: float,
+        scale: Tensor | None,
+        shift: Tensor | None,
+        activation: str | None,
+        up: Tensor | None = None,
+    ) -> PreQuantized | None: ...
 
 
 _RECENT = threading.local()
 
 
-def _geometry(x: Any) -> tuple[object, ...]:
+def _geometry(x: Tensor) -> tuple[object, ...]:
     return (x.data_ptr(), tuple(x.shape), tuple(x.stride()), x.dtype)
 
 
@@ -227,7 +283,10 @@ _RECENT.last = None
 
 
 def shared_operand(
-    x: Any, provider: str, make: Callable[[], PreQuantized | None], consumer: Any = None
+    x: Tensor,
+    provider: str,
+    make: Callable[[], PreQuantized | None],
+    consumer: nn.Module | None = None,
 ) -> PreQuantized | None:
     """`provider`'s operand for `x`, `make()` by the first leaf to ask, the rest reading it: inside
     a `quantize_once` scope that holds `x`, and otherwise for the sibling leaves that read one
@@ -282,7 +341,7 @@ def shared_operand(
         _geometry(x),
         provider,
         operand,
-        consumer,
+        cast("_Learns", consumer),  # it learns its group on retiring (`_retire`)
         1,
         None if group is None else group - 1,
     )
@@ -291,15 +350,15 @@ def shared_operand(
 
 
 def int8_rows(
-    x: Any,
-    consumers: tuple[Any, ...],
+    x: Tensor,
+    consumers: tuple[nn.Module, ...],
     *,
     norm: str | None = None,
     eps: float = 0.0,
-    scale: Any = None,
-    shift: Any = None,
+    scale: Tensor | None = None,
+    shift: Tensor | None = None,
     activation: str | None = None,
-    up: Any = None,
+    up: Tensor | None = None,
 ) -> PreQuantized | None:
     """The rows a producer would hand `consumers`, `activation(norm(x) * (1 + scale) + shift)`,
     rotated and quantized for int8 in one pass of the Runtime's op: pass the result to each
@@ -316,10 +375,9 @@ def int8_rows(
     or w4a8 leaf) of x's width and the op serves this card: the caller then runs its own ops."""
     if not consumers or getattr(consumers[0], "operand", None) != INT8_CONVROT:
         return None
-    rows: PreQuantized | None = consumers[0].int8_prologue(
-        x, consumers, norm, eps, scale, shift, activation, up
-    )
-    return rows
+    # Only the native int8 leaf's operand is int8.convrot's, and it has the prologue.
+    leader = cast("_Prologue", consumers[0])
+    return leader.int8_prologue(x, consumers, norm, eps, scale, shift, activation, up)
 
 
 def native() -> str:
@@ -337,21 +395,21 @@ def readable[*Ts](*tensors: *Ts) -> Iterator[tuple[*Ts]]:
     yield cast("tuple[*Ts]", tuple(read(t) for t in tensors))
 
 
-def read(tensor: Any) -> Any:
+def read[T](tensor: T) -> T:
     """`readable` for one operand, without its context: a hot launch's (an int8 decode GEMV)."""
-    bind = getattr(tensor, "_varena_read", None)
+    bind: Callable[[], T] | None = getattr(tensor, "_varena_read", None)
     return tensor if bind is None else bind()
 
 
 def rms_rope_split_half(
-    q: Any,
-    k: Any,
-    freqs: Any,
-    q_scale: Any,
-    k_scale: Any,
+    q: Tensor,
+    k: Tensor,
+    freqs: Tensor,
+    q_scale: Tensor,
+    k_scale: Tensor,
     epsilon: float = 1e-6,
     rot_dim: int = 0,
-) -> tuple[Any, Any]:
+) -> tuple[Tensor, Tensor]:
     """Per-head RMSNorm of `q` and `k` (scaled by `q_scale`/`k_scale`), then split-half RoPE by
     the `[..., rot_dim // 2, 2, 2]` rotation matrix `freqs`, out of place, in one launch.
     `native()` says why this machine cannot (its Runtime wheel carries no kernels).
