@@ -7,9 +7,10 @@ has one graph per signature, keyed by its inputs' layout, the values of the attr
 package declares steer its forward (`Model.__graph_keys__`), and the kernels serving
 (`LANDED`). Until a signature has a graph, its calls run as written with nothing around them
 but their key and two timing events. Nothing records on a request's path: an idle period
-records a signature on seeded inputs of its layout if its eager calls were launch-bound, its
-replay matches eager bit for bit and saves time, and recording changed no state of the model
-(`capture_idle`); the next call replays. Every graph has its own static buffers in the device's
+records a signature on seeded inputs of its layout unless its warm-up kept the host waiting on
+the device, and keeps it if its replay matches eager bit for bit and saves time, and recording
+changed no state of the model (`capture_idle`); the next call replays. One that found no room
+queues again at its next call. Every graph has its own static buffers in the device's
 one capture pool (`domain`), opened only for a capture that may keep it. A cached binding owns
 virtual addresses only; its physical lease covers preparation through output copies, and a
 completion event orders reuse across execution streams.
@@ -89,14 +90,15 @@ def safeguard(code: str, why: str) -> None:
 
 
 def no_room(device: int, what: str, need: int, error: BaseException) -> str:
-    """Why varena refused room before anything ran (`varena.Exhausted`), for the run's record."""
+    """Why there was no room (varena refused it, or an allocation failed), for the record."""
     room = vt.room(device)
 
     def gib(n: int) -> str:
         return f"{n / (1 << 30):.1f} GiB"
 
+    need = need or getattr(error, "requested_bytes", 0)
     return (
-        f"{what} needs {gib(need or getattr(error, 'requested_bytes', 0))} beside "
+        f"{what} {f'needs {gib(need)}' if need else 'found no room'} beside "
         f"{gib(room['working_live'])} live and {gib(room['pinned'])} of weights in use, of "
         f"{gib(room['capacity'])} ({error})"
     )
@@ -474,10 +476,12 @@ class _Recorder:
         #: why one runs as written for the process: measured, it would save nothing
         #: (device-bound, or a replay no faster than its eager call)
         self.judged: dict[tuple[object, ...], str] = {}
+        #: per signature, its idle recordings in a row that found no room (`_short`)
+        self.short: dict[tuple[object, ...], int] = {}
         self.waiting: dict[tuple[object, ...], int] = {}
-        #: per signature its idle measure: host submission, device-busy and (recorded) replay
-        #: ms a call
-        self.bound: dict[tuple[object, ...], tuple[float, float | None, float | None]] = {}
+        #: per signature its idle measure: host submission, the warm-up's host time and its
+        #: waits on the device, and (recorded) replay ms a call
+        self.bound: dict[tuple[object, ...], tuple[float, float, float, float | None]] = {}
         self.binding: Any = None
         #: its graphs' capture pool (`domain.Pool`), made at its first capture
         self.pool: domain.Pool | None = None
@@ -491,8 +495,8 @@ class _Recorder:
         self.gap = ""
         self.landed = LANDED[0]
         self.domain: domain.Domain | None = None
-        #: host time preparing and capturing at idle (warm-up, its busy measure and the
-        #: instantiation included), each capture's apart, and each way it ran
+        #: host time preparing and capturing at idle (warm-up and instantiation included),
+        #: each capture's apart, and each way it ran
         self.capture_ms = 0.0
         self.capture_each: list[float] = []
         #: host time of every call through the region (its checks, preparation, replay or eager
@@ -541,6 +545,7 @@ class _Recorder:
         self.pool = None
         self.queued.clear()
         self.failed.clear()
+        self.short.clear()
         self.waiting.clear()
         self.landed = LANDED[0]
 
@@ -555,20 +560,10 @@ UNDECLARED: dict[str, set[str]] = {}
 _CLASSES: dict[type, type] = {}
 
 
-class _Lagging(Yielded):
-    """A busy measure's device fell `_Idle.lag_ms` behind its host: the region is device-bound."""
-
-
 #: an idle job's ops still queued on the device as its host reaches its next one (`_Idle.meter`):
 #: a command that arrives waits for at most these there
 _QUEUED = 2
-#: how far past its gate a busy measure's device may fall behind its host before it ends
-#: device-bound (`_busy`)
-_LAG_MS = 10.0
-#: a busy measure's events, at most one per this much host time: the lag check costs its host
-#: (and so the measure) nothing it would notice
-_LAG_MARK_S = 0.002
-#: the host's poll while idle work waits on the device (`_Idle.meter`, `_settled`)
+#: the host's poll while idle work waits on the device to finish (`_settled`)
 _POLL_S = 0.0002
 
 
@@ -594,35 +589,28 @@ class _Idle:
         self.spare: list[Any] = []
         #: host ms the jobs' ops waited for the device (`meter`)
         self.metered_ms = 0.0
-        #: in a busy measure, how far (ms) its device may fall behind its host (`_busy`)
-        self.lag_ms: float | None = None
 
     def meter(self) -> None:
         """Before a job's next op on the device: wait, yielding, while `_QUEUED` of its ops are
-        queued there. In a busy measure the device runs ahead unmetered instead, and falling
-        `lag_ms` behind ends the measure (`_Lagging`)."""
+        queued there. Its waits are the device's time, which says whether a call is
+        device-bound (`_record`), so it only yields the CPU between polls: a 0.2 ms sleep per wait
+        counted its oversleep as the device's (SDXL's UNet: 96 to 163 ms of waits a call, against
+        a 78 ms replay)."""
         self._settle()
-        if self.lag_ms is not None:
-            if self.queued and (time.perf_counter() - self.queued[0][1]) * 1e3 > self.lag_ms:
-                raise _Lagging
-            return
         if len(self.queued) < _QUEUED:
             return
         began = time.perf_counter()
         while len(self.queued) >= _QUEUED:
             self.check()
-            time.sleep(_POLL_S)
+            time.sleep(0)
             self._settle()
         self.metered_ms += (time.perf_counter() - began) * 1e3
 
     def mark(self, torch: Any) -> None:
         """A job's op was queued on the current stream."""
-        now = time.perf_counter()
-        if self.lag_ms is not None and self.queued and now - self.queued[-1][1] < _LAG_MARK_S:
-            return
         event = self.spare.pop() if self.spare else torch.cuda.Event()
         event.record()
-        self.queued.append((event, now))
+        self.queued.append((event, time.perf_counter()))
 
     def _settle(self) -> None:
         while self.queued and self.queued[0][0].query():
@@ -910,8 +898,8 @@ def describe(root: Any) -> dict[str, Any]:
 
 
 def _receipt(recorder: _Recorder) -> dict[str, Any]:
-    """A region's graph economics so far: each idle capture's cost (warm-up, busy measure,
-    capture and instantiation), what each signature measured, a replay's saving over an eager
+    """A region's graph economics so far: each idle capture's cost (warm-up, capture and
+    instantiation), what each signature measured, a replay's saving over an eager
     call (device time between their events, beyond each way's first call) and the calls that
     repay the captures. A device-bound signature never records."""
     eager, replay = recorder.eager.wall_ms(), recorder.replayed.wall_ms()
@@ -922,10 +910,11 @@ def _receipt(recorder: _Recorder) -> dict[str, Any]:
         "measured": [
             {
                 "submit_ms": round(submit, 3),
-                "busy_ms": None if busy is None else round(busy, 3),
+                "warm_up_ms": round(warm_up, 3),
+                "waited_ms": round(waited, 3),
                 "replay_ms": None if replayed is None else round(replayed, 3),
             }
-            for submit, busy, replayed in recorder.bound.values()
+            for submit, warm_up, waited, replayed in recorder.bound.values()
         ],
         "saving_ms": None if saving is None else round(saving, 3),
         "payback_calls": math.ceil(cost / saving) if saving and saving > 0 else None,
@@ -1189,7 +1178,8 @@ def _replay(
 def _capture_pending(pending: _Pending) -> bool:
     """An idle period's job: `pending`'s signature recorded, or ruled out (`_record`). False
     waits for a later period: only its first call measured, or a placed region's pages not
-    resident. Anything else that fails it ends it, and the run says why: never retried."""
+    resident. No room queues it again at its next call (`_short`); anything else that fails it
+    ends it, and the run says why: never retried."""
     torch, module = pending.torch, pending.module()
     recorder = _RECORDERS.get(module) if module is not None else None
     if recorder is None or recorder.queued.get(pending.key) is not pending:
@@ -1224,8 +1214,12 @@ def _capture_pending(pending: _Pending) -> bool:
         except Exception as exc:  # the signature runs as written; the period goes on
             if isinstance(exc, Yielded) or fault(exc) in (Fault.STICKY, Fault.DEVICE):
                 raise
-            _failed(module, recorder, pending.key, f"{type(exc).__name__}: {exc}"[:300])
-            done = True
+            why = f"{type(exc).__name__}: {exc}"[:300]
+            if is_capacity(exc):
+                done = _short(module, recorder, pending.key, why)
+            else:
+                _failed(module, recorder, pending.key, why)
+                done = True
         if done:
             recorder.queued.pop(pending.key, None)
         return done
@@ -1240,11 +1234,12 @@ def _record(
     submit: float,
 ) -> bool:
     """Records `pending`'s signature at idle on seeded inputs of its layout, in the device's
-    capture pool: a warm-up run, measured, its device-busy time (`_busy`), then the capture only
-    when its eager calls were launch-bound: their host submission took longer than the device's
-    work, so the device sat idle inside them. Its pool is `vt.pool_bytes` of the warm-up's peak
-    beside what the pool holds already; varena refusing it or its weights room, it runs as
-    written, and the run says what it needed. False tries again at a later period (a kernel
+    capture pool: a warm-up run, measured, then the capture unless the warm-up's host waited on
+    the device half its time (device-bound: a graph saves nothing). The replay decides the rest:
+    bit for bit equal to eager, and faster than its eager calls (`_no_gain`). Its pool is
+    `vt.pool_bytes` of the warm-up's peak beside what the pool holds already. No room for its
+    weights, warm-up, pool or capture: it runs as written, the run says what it needed, and its
+    next call queues it again (`_short`). False tries again at a later period (a kernel
     building, its weights left)."""
     # This path is restricted to the shipped pure contracts. It does not time or select kernels,
     # or run arbitrary package code.
@@ -1254,6 +1249,7 @@ def _record(
     graph = None
     recorder.capture_attempts += 1
     began = time.perf_counter()
+    stage, need = "its weights", 0
     try:
         if why := _hooked(module):
             recorder.judged[key] = why
@@ -1264,13 +1260,17 @@ def _record(
         scope = placed[0].graph_pass(placed[1], "") if placed is not None else nullcontext()
         lease = recorder.binding.prepare(current) if recorder.binding is not None else nullcontext()
         with ExitStack() as entered:
-            try:
-                entered.enter_context(scope)
-                entered.enter_context(lease)
-            except varena.Exhausted as exc:  # its admission: nothing ran
-                _failed(module, recorder, key, no_room(owner.device, "its weights", 0, exc))
-                return True
-            state = entered.enter_context(_capture_state(torch, module, owner.stream))
+            entered.enter_context(scope)
+            entered.enter_context(lease)
+            stage = "its warm-up"
+            # Its weights are inputs, checked by identity and version: a copy of each held
+            # beside them took the room a capped card's warm-up needed (SDXL at 6 GiB).
+            weights = (
+                recorder.binding.immutable_buffer_ids()
+                if recorder.binding is not None
+                else frozenset()
+            )
+            state = entered.enter_context(_capture_state(torch, module, owner.stream, weights))
             stream = owner.stream
             stream.wait_stream(current)
             with torch.cuda.stream(stream):
@@ -1291,18 +1291,15 @@ def _record(
                         if not _clonable(torch, eager):
                             _failed(module, recorder, key, "output is not a tensor tree", None)
                             return True
-                        # A device that kept the warm-up's host waiting half its time is the
-                        # bottleneck: no busy measure, which queues the device ahead.
-                        busy = (
-                            None
-                            if 2 * (IDLE.metered_ms - metered) >= took
-                            else _busy(torch, lambda: call(module, *cargs, **ckwargs), took)
-                        )
                 finally:
                     _WARMING.reset(warming)
-                recorder.bound[key] = (submit, busy, None)
-                if why := _device_bound(submit, busy):
-                    recorder.judged[key] = why
+                waited = IDLE.metered_ms - metered
+                recorder.bound[key] = (submit, took, waited, None)
+                if 2 * waited >= took:  # the device, not the host, set its pace
+                    recorder.judged[key] = (
+                        f"device-bound: its warm-up's host waited {waited:.3f} of {took:.3f} ms "
+                        "on the device"
+                    )
                     return True
                 if not peak:
                     recorder.judged[key] = "its warm-up's working memory was not measured"
@@ -1310,13 +1307,13 @@ def _record(
                 reserve = vt.pool_bytes(peak[0]) + sum(
                     entry.held_bytes for entry in recorder.recordings.values()
                 )
-                if recorder.pool is None:
-                    recorder.pool = (
+                pool = recorder.pool
+                if pool is None:
+                    pool = recorder.pool = (
                         placed[0].graph_pool(placed[1])
                         if placed is not None
                         else domain.Pool(torch.cuda.graph_pool_handle())
                     )
-                pool = recorder.pool
                 # Its static inputs are the pool's, made in the capture (an allocation launches
                 # nothing), so their storage stays owned with the graph.
                 statics: list[Any] = []
@@ -1329,13 +1326,10 @@ def _record(
                     sargs, skwargs = _arguments(torch, pending, statics)
                     outputs.append(call(module, *sargs, **skwargs))
 
-                took = time.perf_counter_ns()
                 IDLE.check()
-                try:
-                    graph, why = capture(torch, step, pool, owner, reserve)
-                except varena.Exhausted as exc:  # its admission: nothing was captured
-                    _failed(module, recorder, key, no_room(owner.device, "its pool", reserve, exc))
-                    return True
+                stage, need = "its capture", reserve
+                graph, why = capture(torch, step, pool, owner, reserve)
+                stage, need = "its replay check", 0
                 if graph is None:
                     _failed(module, recorder, key, why)
                     return True
@@ -1365,19 +1359,22 @@ def _record(
                     graph = None
                     raise
                 why, replayed = _no_gain(torch, entry, recorder.eager)
-                recorder.bound[key] = (submit, busy, replayed)
+                recorder.bound[key] = (submit, took, waited, replayed)
                 if why:
                     recorder.judged[key] = why
                     entry.close()
                     graph = None
                     return True
         recorder.recordings[key] = entry
+        recorder.short.pop(key, None)
         recorder.captures += 1
         recorder.capture_each.append(round((time.perf_counter() - began) * 1e3, 3))
         return True
     except Exception as exc:
         if isinstance(exc, Building | StaleBinding):
             return False  # a kernel still building, or its weights left: a later period
+        if is_capacity(exc):
+            return _short(module, recorder, key, no_room(owner.device, stage, need, exc))
         if not isinstance(exc, domain.Unavailable):
             raise
         _failed(module, recorder, key, f"{type(exc).__name__}: {exc}".splitlines()[0][:300])
@@ -1398,11 +1395,13 @@ def _record(
 
 
 @contextmanager
-def _capture_state(torch: Any, module: Any, stream: Any) -> Iterator[_State]:
+def _capture_state(
+    torch: Any, module: Any, stream: Any, weights: frozenset[int]
+) -> Iterator[_State]:
     """Restore warm-up state and join its stream before the prepared weight lease ends."""
     current, state = torch.cuda.current_stream(), None
     try:
-        state = _State(torch, module)
+        state = _State(torch, module, immutable_buffers=weights)
         yield state
     finally:
         current.wait_stream(stream)
@@ -1537,17 +1536,6 @@ def _no_gain(torch: Any, entry: _Recording, eager: _Timing) -> tuple[str, float 
     return f"no gain: replay {replay:.3f} ms a call against eager {called:.3f} ms", replay
 
 
-def _device_bound(submit: float, busy: float | None) -> str:
-    """Why a signature never records: the device's work a call takes at least as long as the
-    host's submission of it, so the device never waited on the host inside it and a graph
-    saves nothing (None: the device fell behind its host while measured). "" when launch-bound."""
-    if busy is None:
-        return f"device-bound: the device fell behind its host ({submit:.3f} ms to submit a call)"
-    if busy < submit:
-        return ""
-    return f"device-bound: {busy:.3f} ms of device work a call, {submit:.3f} ms to submit it"
-
-
 #: the idle inputs' seed: any fixed one (the verify needs the same inputs twice, not these)
 _SEED = 0
 
@@ -1578,47 +1566,6 @@ def _input(torch: Any, leaf: _Leaf, generator: Any) -> Any:
     elif flat.dtype == torch.bool:
         flat.copy_(torch.randint(0, 2, (span,), generator=generator, device=leaf.device))
     return flat.as_strided(leaf.shape, leaf.stride)
-
-
-#: per device, its sleep kernel's cycles a millisecond (`_busy`'s gate)
-_CYCLES: dict[int, float] = {}
-#: cycles of the calibrating sleep: ~2 ms at 2 GHz, far above the events' 0.5 us resolution
-_CALIBRATE = 1 << 22
-#: the gate's longest sleep: time for the host to queue about a launch queue's worth of kernels
-#: (~1k). A longer one measures no better: the host only blocks inside a launch, past a request.
-_GATE_MS = 20.0
-
-
-def _busy(torch: Any, run: Callable[[], object], gate_ms: float) -> float | None:
-    """Device-busy ms of one `run` on the current stream: its launches queue behind a sleep as
-    long as its last host submission (`gate_ms`, at most `_GATE_MS`), so the device runs them
-    back to back. A host slower than the gate leaves the device waiting inside: the time is then
-    an upper bound, which only ever keeps a region eager. None once the device falls `_LAG_MS`
-    past the gate behind its host (`_Idle.meter`): device-bound, with no more than that queued
-    for an arriving command to wait on. Its waits yield to one (`_Idle.check`)."""
-    device, stream = torch.cuda.current_device(), torch.cuda.current_stream()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    start.record(stream)
-    _settled(start)  # the warm-up's last ops ran: the lag is this run's alone
-    if device not in _CYCLES:
-        start.record(stream)
-        torch.cuda._sleep(_CALIBRATE)
-        end.record(stream)
-        _settled(end)
-        _CYCLES[device] = _CALIBRATE / start.elapsed_time(end)
-    gate = min(gate_ms, _GATE_MS)
-    torch.cuda._sleep(int(gate * _CYCLES[device]))
-    start.record(stream)
-    IDLE.lag_ms = gate + _LAG_MS
-    try:
-        run()
-    except _Lagging:
-        return None
-    finally:
-        IDLE.lag_ms = None
-    end.record(stream)
-    _settled(end)
-    return float(start.elapsed_time(end))
 
 
 def _settled(event: Any) -> None:
@@ -1674,6 +1621,22 @@ def _failed(
     recorder.gap = why
     if code is not None:
         safeguard(code, f"{_name(module)}: {why}")
+
+
+def _short(module: Any, recorder: _Recorder, key: tuple[object, ...], why: str) -> bool:
+    """An idle recording found no room: the signature runs as written and its next call queues
+    it again, since each request moves what holds the card (a component's weights leave, a peer
+    ends). `_ROOM_TRIES` such recordings in a row and it is refused for good (`_failed`)."""
+    tries = recorder.short[key] = recorder.short.get(key, 0) + 1
+    if tries >= _ROOM_TRIES:
+        _failed(module, recorder, key, why, "no_room")
+    else:
+        recorder.gap = why
+    return True
+
+
+#: idle recordings of one signature in a row that may find no room before it is refused
+_ROOM_TRIES = 3
 
 
 def _changed(
