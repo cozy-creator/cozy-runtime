@@ -398,13 +398,14 @@ def exchange(
     handle: ProcessGroup,
     compute: Compute,
     site: str = "",
-    narrow: bool = False,
+    narrow: bool | Callable[[int], bool] = False,
 ) -> Tensor:
     """`compute` over whole sequences per head subset, back to this GPU's rows of every head.
     `site` names the caller's attention module where it knows it: every GPU must be there.
-    `narrow`: the kernel quantizes Q and V to int8 or narrower itself, so they and its output
-    cross as int8, each head's row Hadamard-turned and scaled to its own absmax (about 5/8 of
-    the bytes). K crosses as it is: its mean dominates its rows until the kernel's shift."""
+    `narrow`: the kernel quantizes Q and V to int8 or narrower itself (a callable: for a call of
+    `total` tokens), so they and its output cross as int8, each head's row Hadamard-turned and
+    scaled to its own absmax (about 5/8 of the bytes). K crosses as it is: its mean dominates
+    its rows until the kernel's shift."""
     meet = _rendezvous(handle)
     held = catch.LEAF.acquire(blocking=False)
     try:
@@ -426,12 +427,11 @@ def _exchange(
     compute: Compute,
     held: bool,
     called: str,
-    narrow: bool,
+    narrow: bool | Callable[[int], bool],
 ) -> Tensor:
     rank, world = meet.rank, meet.world
     batch, mine, heads, dim = (int(n) for n in query.shape)
     b = query.element_size()
-    narrow = narrow and dim & (dim - 1) == 0  # a Hadamard turn's order
     padded = heads + (-heads % world)
     steps = _steps(padded, world)
     geometry = (batch, padded, dim, b)
@@ -458,8 +458,7 @@ def _exchange(
     proposal: dict[str, Any] = {
         "rows": mine,
         "at": max(catch.LEVELS.get(site, floor), floor),
-        "site": f"{called or 'attention'} [{batch} x {padded} heads x {dim}, {b} B"
-        + (", int8 wire]" if narrow else "]"),
+        "site": f"{called or 'attention'} [{batch} x {padded} heads x {dim}, {b} B]",
     }
     selection: dict[str, Any] = {}
     try:
@@ -472,6 +471,8 @@ def _exchange(
     _refusal(proposals)
     sizes = [int(row["rows"]) for row in proposals]
     total = sum(sizes)
+    # Every GPU's kernel and total agree; a Hadamard turn needs a power-of-two order.
+    narrow = dim & (dim - 1) == 0 and (narrow(total) if callable(narrow) else narrow)
     pipelined = meet.floors[geometry] = _pipelined(steps, sizes, batch, dim, b)
     at = max(pipelined, *(int(row["at"]) for row in proposals))
     step, local = steps[at], steps[at] // world
