@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from diffusers.models.attention_dispatch import AttentionBackendName
 
 
-def register(
+def register(  # type: ignore[explicit-any]  # Diffusers takes any backend function and checks
     name: str,
-    function: Callable[..., object],  # type: ignore[explicit-any]  # Diffusers takes any backend
+    function: Callable[..., object],
     *,
-    constraints: Sequence[Callable[..., bool]] = (),  # type: ignore[explicit-any]  # Diffusers' checks
+    constraints: Sequence[Callable[..., bool]] = (),
     supports_context_parallel: bool = False,
 ) -> AttentionBackendName:
     """Register once without changing Diffusers' global active backend.
@@ -28,7 +28,7 @@ def register(
     if found is not None:
         if _AttentionBackendRegistry._backends.get(found) is not function:
             raise ValueError(f"attention backend {name!r} already has another implementation")
-        return found
+        return cast("AttentionBackendName", found)  # its own map's member
     member = str.__new__(AttentionBackendName, name)
     member._name_ = name.upper()
     member._value_ = name
