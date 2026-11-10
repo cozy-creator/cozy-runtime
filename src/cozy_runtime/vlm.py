@@ -18,7 +18,7 @@ import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 
 import msgspec
 import torch
@@ -54,6 +54,11 @@ from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._model import WARNINGS
 from cozy_runtime.fields import FileBound
 from cozy_runtime.media import DecodedVideoFrame, ImageFile, VideoFile
+
+if TYPE_CHECKING:
+    from transformers import BatchFeature, PreTrainedModel, ProcessorMixin
+
+    from cozy_runtime.accel.kernels import Plan
 
 COMPONENT = "model"
 DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
@@ -223,14 +228,15 @@ def watch(
     return Watched(shown, seconds)
 
 
-def construct(model_config: Mapping[str, Any], config: Config) -> torch.nn.Module:
+def construct(model_config: Mapping[str, object], config: Config) -> PreTrainedModel:
     """The model, experts split per expert; every parameter in its stored dtype (Qwen3.5 keeps
     `A_log` and its gated norms in f32, and Runtime fills stored bytes as they are). Where the
     checkpoint keeps its multi-token-prediction head (`mtp.*`), that too, as the model's `mtp`:
     its decode drafts with the `lm.Draft` around it (`lm.HEADS`)."""
     with no_init_weights():
-        model = AutoModelForImageTextToText.from_config(
-            AutoConfig.for_model(**model_config), dtype=torch.bfloat16
+        model: PreTrainedModel = AutoModelForImageTextToText.from_config(  # type: ignore[no-untyped-call]  # unannotated in Transformers
+            AutoConfig.for_model(**model_config),  # type: ignore[arg-type]  # config.json's keys
+            dtype=torch.bfloat16,
         )
         model.tie_weights()
         text = model.config.get_text_config(decoder=True)
@@ -246,7 +252,8 @@ def construct(model_config: Mapping[str, Any], config: Config) -> torch.nn.Modul
             parameter.data = parameter.data.to(stored)
     if head is not None:
         lm.HEADS[model] = head.eval()
-    return model.eval()
+    evaluated: PreTrainedModel = model.eval()  # type: ignore[no-untyped-call]  # unannotated in Transformers
+    return evaluated
 
 
 def _held(config: Config, key: str) -> bool:
@@ -261,9 +268,9 @@ def _held(config: Config, key: str) -> bool:
 def processor(
     assets: ModelAssets | Path,
     folder: str = "",
-    config: Mapping[str, Any] | None = None,
-    image: Mapping[str, Any] | None = None,
-) -> Any:
+    config: Mapping[str, object] | None = None,
+    image: Mapping[str, object] | None = None,
+) -> ProcessorMixin:
     """The upstream processor from the checkpoint's files under `folder` (`processor/`), parsed in
     memory. The image and video processors' settings are their own files, one
     `processor_config.json`, or `config`: TensorFS keeps a component folder's config file as the
@@ -284,10 +291,10 @@ def processor(
         def read(name: str) -> bytes:
             return files.read(folder + name)
 
-    def held(name: str) -> dict[str, Any]:
+    def held(name: str) -> dict[str, Any]:  # Any: JSON settings, Transformers' keywords
         return json.loads(read(name)) if name in names else {}
 
-    given = dict(config or {})
+    given: dict[str, Any] = dict(config or {})  # Any: as `held`'s
     extra = held("processor_config.json") or (given if "image_processor" in given else {})
     images = dict(extra.pop("image_processor", None) or held("preprocessor_config.json") or given)
     video = dict(extra.pop("video_processor", None) or held("video_preprocessor_config.json"))
@@ -304,7 +311,7 @@ def processor(
         extra["video_processor"] = getattr(transformers, kind)(**video)
     kind = images.pop("image_processor_type", "Qwen2VLImageProcessor")
     image_processor = getattr(transformers, kind)(**images)
-    tokenizer_config = json.loads(read("tokenizer_config.json"))
+    tokenizer_config: dict[str, Any] = json.loads(read("tokenizer_config.json"))  # Any: as `held`'s
     added = tokenizer_config.get("added_tokens_decoder", {})
     chat = tokenizer_config.get("chat_template")
     for key in TOKENIZER_METADATA:
@@ -330,15 +337,16 @@ def processor(
     elif "chat_template.json" in names:
         chat = json.loads(read("chat_template.json"))["chat_template"]
     tokenizer.chat_template = chat
-    return getattr(transformers, named)(
+    made: ProcessorMixin = getattr(transformers, named)(
         image_processor=image_processor, tokenizer=tokenizer, chat_template=chat, **extra
     )
+    return made
 
 
 class Pipeline:
     def __init__(self, config: Config) -> None:
         model = construct(config.mapping(), config)
-        self.components: dict[str, torch.nn.Module] = {COMPONENT: model}
+        self.components: dict[str, PreTrainedModel] = {COMPONENT: model}
 
 
 class VisionLM(Model[Pipeline]):
@@ -348,18 +356,18 @@ class VisionLM(Model[Pipeline]):
     serving = Serving(min_bits=4, phase="decode")
 
     pipe: Pipeline
-    processor: Any
+    processor: ProcessorMixin
 
     def load(self, loader: Loader) -> None:
         self.pipe = loader.construct(Pipeline)
         self.processor = processor(loader.assets)
         if "generation_config.json" in loader.assets.names():
             model = self.pipe.components[COMPONENT]
-            model.generation_config = GenerationConfig(
+            model.generation_config = GenerationConfig(  # type: ignore[no-untyped-call]  # unannotated in Transformers
                 **json.loads(loader.assets.read("generation_config.json"))
             )
 
-    def execution_plan(self, plan: Any) -> str:
+    def execution_plan(self, plan: Plan) -> str:
         model = self.pipe.components[COMPONENT]
         return "+".join(filter(None, (lm.install(plan, model), moe.install(plan, model))))
 
@@ -389,7 +397,7 @@ class VisionLM(Model[Pipeline]):
         texts = [self._chat(question, system, thinking) for question in questions]
         images = [image for question in questions for image in question.images]
         videos = [video for question in questions for video in question.videos]
-        kwargs: dict[str, Any] = {"images": images} if images else {}
+        kwargs: dict[str, object] = {"images": images} if images else {}
         if videos:
             # The processor stamps a block with frame index / fps: millisecond indices keep seconds.
             kwargs |= {
@@ -404,7 +412,7 @@ class VisionLM(Model[Pipeline]):
                 ],
                 "do_sample_frames": False,
             }
-        decoding = {
+        decoding: _Decoding = {
             "max_new_tokens": max_new_tokens,
             "presence_penalty": presence_penalty,
             "temperature": temperature,
@@ -441,23 +449,25 @@ class VisionLM(Model[Pipeline]):
         ]
         messages = [{"role": "system", "content": system}] if system else []
         text: str = self.processor.apply_chat_template(
-            [*messages, {"role": "user", "content": content}],
+            # Transformers types a turn's content as text; a multimodal turn's is a list
+            [*messages, {"role": "user", "content": content}],  # type: ignore[arg-type]  # see above
             add_generation_prompt=True,
             tokenize=False,
             enable_thinking=thinking,
         )
         return text
 
-    def _inputs(self, **kwargs: Any) -> Any:
+    def _inputs(self, **kwargs: object) -> BatchFeature:
         model = self.pipe.components[COMPONENT]
         self.processor.tokenizer.padding_side = "left"
-        inputs = self.processor(padding=True, return_tensors="pt", **kwargs).to(model.device)
+        inputs: BatchFeature = self.processor(padding=True, return_tensors="pt", **kwargs)
+        inputs = inputs.to(model.device)
         for name in ("pixel_values", "pixel_values_videos"):
             if name in inputs:
                 inputs[name] = inputs[name].to(model.dtype)
         return inputs
 
-    def _generate(self, inputs: Any, stop: list[str], decoding: dict[str, Any]) -> list[str]:
+    def _generate(self, inputs: BatchFeature, stop: list[str], decoding: _Decoding) -> list[str]:
         """Decoded answers. A stop string that is one token also ends its row's decode."""
         model, tokenizer = self.pipe.components[COMPONENT], self.processor.tokenizer
         configured = model.generation_config.eos_token_id
@@ -479,7 +489,19 @@ class VisionLM(Model[Pipeline]):
             pad=tokenizer.pad_token_id or tokens[0],
             **decoding,
         )
-        return [str(reply) for reply in self.processor.batch_decode(out, skip_special_tokens=True)]
+        replies = self.processor.batch_decode(out, skip_special_tokens=True)  # type: ignore[no-untyped-call]  # unannotated in Transformers
+        return [str(reply) for reply in replies]
+
+
+class _Decoding(TypedDict):
+    """`ask`'s decoding arguments, as `lm.generate` takes them."""
+
+    max_new_tokens: int
+    presence_penalty: float
+    temperature: float
+    top_p: float
+    seed: int
+    progress: Callable[[int], None] | None
 
 
 def _cut(text: str, stop: list[str]) -> str:
