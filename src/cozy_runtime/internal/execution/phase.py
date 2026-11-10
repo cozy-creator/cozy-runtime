@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 Mode = Literal["eager", "capture", "replay", "preparation"]
 
+
 class WorkingPhase(TypedDict):
     """One working-demand row (`observing`): varena's phase observation without its split
     observations, plus the cut choices, sites and passes it counted."""

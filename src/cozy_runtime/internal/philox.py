@@ -17,7 +17,7 @@ import itertools
 import math
 from collections.abc import Sequence
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch import Tensor
@@ -62,7 +62,7 @@ def draw(
     serves, else `law`'s, the same values."""
     given = next((v.device for v in (step, seed) if isinstance(v, Tensor)), "cpu")
     where = torch.device(given if device is None else device)
-    if where.type == "cuda" and where.index is None:
+    if where.type == "cuda" and cast("int | None", where.index) is None:  # torch types it int
         where = torch.device("cuda", torch.cuda.current_device())
     launch = _served(where, dtype, seed, step)
     if launch is None:
@@ -231,7 +231,7 @@ def _entries() -> tuple[TritonEntry, ...]:
 KERNELS = TritonKernels("cozy-counter-noise", _entries())
 
 
-def _served(device: torch.device, dtype: torch.dtype, *values: Any) -> Launch | None:
+def _served(device: torch.device, dtype: torch.dtype, *values: int | Tensor) -> Launch | None:
     """This card's kernel once it serves (`kernel_ready.serve`), else None: `law` serves."""
     if device.type != "cuda" or dtype not in _OUT or TRITON_ABSENT or not kernel_ready.TRITON:
         return None
@@ -245,8 +245,8 @@ def _served(device: torch.device, dtype: torch.dtype, *values: Any) -> Launch | 
 def _launched(
     launch: Launch,
     shape: Sequence[int],
-    seed: Any,
-    step: Any,
+    seed: int | Tensor,
+    step: int | Tensor,
     stream: int,
     kind: int,
     dtype: torch.dtype,
@@ -284,7 +284,7 @@ def probe(device: torch.device, launch: Launch) -> verify.Verdict:
     """The kernel against `law` on this card, bit for bit: both kinds, every dtype, one and many
     programs with a ragged end, host and tensor seeds and steps, seeds past 2**63."""
     tensor = partial(torch.full, (1,), device=device)
-    keys = (
+    keys: tuple[tuple[int | Tensor, int | Tensor, int], ...] = (
         (0, 0, 0),
         (2**64 - 1, 2**32 + 7, 2**32 - 1),
         (tensor(int64(0x9E3779B97F4A7C15)), tensor(9), 3),

@@ -75,6 +75,8 @@ _AGREED: set[str] = set()
 _REPORTS: dict[int, dict[str, str]] = {}
 #: A background opener's thread name, before its kernel's.
 THREAD = "kernel-ready: "
+
+
 class TritonOpener(Protocol):
     """`triton_kernels.opened`: a Runtime Triton set's opener."""
 

@@ -108,8 +108,8 @@ def attention(
     requested: str = "",
     observed: str = "",
     impl: str = "",
-    kernels: Sequence[Mapping[str, Any]] = (),
-    segments: Sequence[Mapping[str, Any]] = (),
+    kernels: Sequence[Mapping[str, object]] = (),
+    segments: Sequence[Mapping[str, object]] = (),
     fallbacks: Sequence[AttentionFallback] = (),
 ) -> RankAttention:
     row = RankAttention(requested=requested, observed=observed, impl=impl)

@@ -21,12 +21,13 @@ import json
 import threading
 import weakref
 from collections.abc import Callable, Sequence
-from typing import Any, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
 import tensorfs.varena.torch as vt
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import _get_process_group_store
 
@@ -36,6 +37,9 @@ from cozy_runtime.internal.execution import catch, sizing
 from cozy_runtime.internal.parallel import copy_engine
 from cozy_runtime.internal.parallel.group import abort_process_group, gather
 
+if TYPE_CHECKING:
+    from torch._C._distributed_c10d import Work
+
 type Compute = Callable[[Tensor, Tensor, Tensor], Tensor]
 type Wait = Callable[[], None]
 
@@ -44,7 +48,18 @@ _ROUNDS = 4
 #: Each group's Q/K/V to one peer, at least, for a group's crossing to outlast its launches.
 _ROUND_BYTES = 16 << 20
 #: Hadamard matrices by device, dtype and order (`_narrow`).
-_TURNS: dict[tuple[Any, Any, int], Tensor] = {}
+_TURNS: dict[tuple[torch.device, torch.dtype, int], Tensor] = {}
+
+
+class _Proposal(TypedDict, total=False):
+    """One rank's word at an exchange's meeting (`_Rendezvous.gather`): its rows, the level it
+    asks for and its call's site, or why it refused (`error`, of `kind` fit, oom or other)."""
+
+    rows: int
+    at: int
+    site: str
+    error: str
+    kind: str
 
 
 def group(config: object) -> ProcessGroup:
@@ -67,7 +82,7 @@ class _Rendezvous:
     """Metadata rounds over the group's store; no tensor crosses here."""
 
     def __init__(self, handle: ProcessGroup) -> None:
-        self.store = dist.PrefixStore(
+        self.store = PrefixStore(
             f"cozy.ulysses/{handle.group_name}/", _get_process_group_store(handle)
         )
         self.rank, self.world = dist.get_rank(handle), dist.get_world_size(handle)
@@ -77,7 +92,7 @@ class _Rendezvous:
         #: same on every rank, so every rank's menu starts there
         self.floors: dict[tuple[int, ...], int] = {}
 
-    def gather(self, value: dict[str, Any]) -> list[dict[str, Any]]:
+    def gather(self, value: _Proposal) -> list[_Proposal]:
         """Every rank's `value` for this sequence: four store calls a rank. Each rank has read
         the last sequence's values before it proposes this one, so its own of them goes. A rank
         that never proposes ends the wait (`group.gather`); ranks whose values name different
@@ -145,7 +160,7 @@ def _pipelined(steps: Sequence[int], sizes: Sequence[int], batch: int, dim: int,
     return found
 
 
-def _refusal(rows: Sequence[dict[str, Any]]) -> None:
+def _refusal(rows: Sequence[_Proposal]) -> None:
     """Raise a refusal some rank reported, as what it was."""
     failed = [row for row in rows if row.get("error")]
     if failed:
@@ -158,7 +173,7 @@ def _refusal(rows: Sequence[dict[str, Any]]) -> None:
         raise kind(f"Ulysses refused before its first crossing: {[r['error'] for r in failed]}")
 
 
-def _failure(exc: BaseException) -> dict[str, Any]:
+def _failure(exc: BaseException) -> _Proposal:
     kind = "fit" if isinstance(exc, DoesNotFit) else "oom" if fault(exc) is Fault.OOM else ""
     return {"error": f"{type(exc).__name__}: {exc}", "kind": kind}
 
@@ -182,14 +197,18 @@ def _start(
             torch.cuda.current_stream(held[0][0].device).wait_event(done)
 
         return landed
+    # Each is its Work: `async_op=True` returns one.
     works = [
-        dist.all_to_all_single(
-            out,
-            value,
-            output_split_sizes=[row[rank] for row in matrix],
-            input_split_sizes=matrix[rank],
-            group=handle,
-            async_op=True,
+        cast(
+            "Work",
+            dist.all_to_all_single(
+                out,
+                value,
+                output_split_sizes=[row[rank] for row in matrix],
+                input_split_sizes=matrix[rank],
+                group=handle,
+                async_op=True,
+            ),
         )
         for value, out in zip(sends, receives, strict=True)
     ]
@@ -462,7 +481,7 @@ def _exchange(
         assert request is not None
         stream = int(torch.cuda.current_stream(device).cuda_stream)
         request.memory.remember_working_phase(site, catch.owners(request))
-    proposal: dict[str, Any] = {
+    proposal: _Proposal = {
         "rows": mine,
         "at": max(catch.LEVELS.get(site, floor), floor),
         "site": f"{called or 'attention'} [{batch} x {padded} heads x {dim}, {b} B]",

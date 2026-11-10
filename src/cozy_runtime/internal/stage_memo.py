@@ -32,7 +32,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import msgspec
 import numpy as np
@@ -40,7 +40,9 @@ from PIL import Image
 from tensorfs.executor import Answer, MemoSettings, Request, StageMemoLookup, StageMemoStore
 
 from cozy_runtime.author._files import File
+from cozy_runtime.author._handler import Handler
 from cozy_runtime.author._model import WARNINGS, deterministic
+from cozy_runtime.author._observations import Scalar
 from cozy_runtime.author._stage_memo import exactness
 from cozy_runtime.internal import attention, hostfacts, installed, memo_implementation
 from cozy_runtime.internal.hostfacts import HostFacts
@@ -90,7 +92,7 @@ class Tensor(Protocol):
     def reshape(self, shape: Sequence[int]) -> Tensor: ...
     def view(self, dtype: object) -> Tensor: ...
     def cpu(self) -> Tensor: ...
-    def numpy(self) -> np.ndarray[tuple[int, ...], np.dtype[np.generic]]: ...
+    def numpy(self) -> np.ndarray[tuple[int, ...], np.dtype[np.generic[object]]]: ...
     def to(self, device: object, *, copy: bool) -> Tensor: ...
 
 
@@ -98,7 +100,7 @@ class Unmemoizable(Exception):
     """This call cannot be keyed or stored; it runs as if unmarked. `str()` is the reason."""
 
 
-type Leaf = Tensor | np.ndarray[tuple[int, ...], np.dtype[np.generic]] | Image.Image
+type Leaf = Tensor | np.ndarray[tuple[int, ...], np.dtype[np.generic[object]]] | Image.Image
 
 
 def _raw(leaf: Leaf, torch: ModuleType) -> memoryview:
@@ -311,7 +313,15 @@ def arguments_digest(arguments: object, torch: ModuleType) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def _type(qualname: str) -> Callable[..., object]:
+class _Sink(Protocol):
+    """Where an attempt's memo observations go (`Observations.emit`)."""
+
+    def __call__(
+        self, kind: Literal["metric"], name: str, value: float, /, **fields: Scalar
+    ) -> object: ...
+
+
+def _type(qualname: str) -> type:
     """A result record's class, from the already-imported module that defined it."""
     module, _, path = qualname.partition(":")
     found: object = sys.modules.get(module)
@@ -437,7 +447,7 @@ class Engine:
         self._attempt: contextvars.ContextVar[_Attempt | None] = contextvars.ContextVar(
             "cozy_memo_attempt", default=None
         )
-        self._stages: dict[Callable[..., object], tuple[str | None, inspect.Signature]] = {}
+        self._stages: dict[Handler, tuple[str | None, inspect.Signature]] = {}
         self._keys: dict[str, tuple[threading.Lock, list[int]]] = {}
         self._lock = threading.RLock()
         self.configure(MemoSettings())
@@ -461,7 +471,7 @@ class Engine:
         live = exchange if self.settings.entry_bytes > 0 else None
         self._attempt.set(_Attempt(live, spool, []))
 
-    def close(self, sink: Callable[..., object]) -> None:
+    def close(self, sink: _Sink) -> None:
         """The attempt ends: its calls and its methods' running totals become observations."""
         attempt = self._attempt.get()
         self._attempt.set(None)
@@ -475,7 +485,7 @@ class Engine:
             row["skips"] = ",".join(f"{k}={v}" for k, v in sorted(self.stats[stage].skips.items()))
             sink("metric", "memo.method", round(row.pop("saved_s") * 1000, 3), stage=stage, **row)
 
-    def stage(self, fn: Callable[..., object]) -> tuple[str | None, inspect.Signature]:
+    def stage(self, fn: Handler) -> tuple[str | None, inspect.Signature]:
         found = self._stages.get(fn)
         if found is None:
             found = self._stages[fn] = (
@@ -625,7 +635,7 @@ class GenerationMemo:
     def call(
         self,
         model: object,
-        fn: Callable[..., object],
+        fn: Handler,
         components: tuple[str, ...],
         args: tuple[object, ...],
         kwargs: dict[str, object],

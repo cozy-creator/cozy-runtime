@@ -19,7 +19,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import cast
 
 #: What a module may need: glibc's own libraries; Windows' kernel, C runtime and stable ABI.
 SYSTEM = re.compile(
@@ -70,7 +70,7 @@ print(f"{sys.version.split()[0]}: gemv without a GPU -> {code} {_gemm.error_name
 CATALOG = Path(__file__).resolve().parents[1] / "src/cozy_runtime/_kernels/__init__.py"
 
 
-def declared(name: str) -> Any:
+def declared(name: str) -> object:
     """`cozy_runtime._kernels.<name>`, read from the source without running it."""
     target: ast.expr
     value: ast.expr | None
@@ -143,7 +143,8 @@ def main() -> int:
     options = parser.parse_args()
     package: Path = options.modules / "cozy_runtime" / "_kernels"
     failed: list[str] = []
-    archs = declared("ARCHS")
+    # The catalog annotates it so: module -> {"cubin": targets, "ptx": targets}.
+    archs = cast("dict[str, dict[str, tuple[str, ...]]]", declared("ARCHS"))
     stray = [p.name for p in package.iterdir() if p.name.split(".")[0] not in archs]
     if stray:
         failed.append(f"files beside the modules: {stray}")

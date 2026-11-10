@@ -26,7 +26,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import ModuleType
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import msgspec
 
@@ -35,6 +35,9 @@ from cozy_runtime.internal.config import inherited_environment, update_environme
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.parallel.plan import GroupRefusal
 from cozy_runtime.internal.seam import Channel, SeamError
+
+if TYPE_CHECKING:
+    from torch._C._distributed_c10d import ProcessGroup, Store, TCPStore
 
 #: NCCL reads this once, at communicator creation. NVLink SHARP multicast needs a privilege
 #: our containers do not have and Ulysses' all-to-all never uses it (pgw#929: CUDA 401 on
@@ -192,7 +195,7 @@ def route(nccl: Mapping[str, str]) -> None:
     update_environment(nccl)
 
 
-def ready_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
+def ready_rank(torch: ModuleType, spec: RankSpec, sealed: Mapping[str, str]) -> TCPStore:
     """A follower's first half of joining: its route set and rank 0's store reached. Returns the
     store `form_rank` forms the group on once every follower said it is ready.
 
@@ -202,9 +205,10 @@ def ready_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
     require_nvls_off(sealed, spec.backend)
     abortable(spec.backend)
     route(spec.nccl)
-    return torch.distributed.TCPStore(
+    store: TCPStore = torch.distributed.TCPStore(
         "127.0.0.1", spec.port, spec.world, is_master=False, timeout=NEVER
     )
+    return store
 
 
 def form_rank(torch: Any, spec: RankSpec, store: Any) -> Any:
@@ -255,7 +259,7 @@ def warm(torch: ModuleType, backend: str, rank: int, world: int) -> None:
     torch.cuda.synchronize()
 
 
-def gather(store: Any, keys: Sequence[str], what: str, ended: Sequence[str] = ()) -> list[bytes]:
+def gather(store: Store, keys: Sequence[str], what: str, ended: Sequence[str] = ()) -> list[bytes]:
     """Every key's value, once every GPU has set its own. The store's own read waits for a missing
     key for as long as the store lives; this ends (code `ENDED`) when the formation ends
     (`abort_process_group`: an interrupt, or a GPU that failed) or a missing GPU's `ended` key says
@@ -343,9 +347,9 @@ class RankGroup:
         #: rank 0's own environment, or the suite's launcher for the gloo arms
         self._launch = launch or self._spawn_follower
         self.followers: list[Follower] = []
-        self.store: Any = None
+        self.store: TCPStore | None = None
         self.port = 0
-        self.pg: Any = None
+        self.pg: ProcessGroup | None = None
         #: the NCCL route every formation of this group uses (`links.Links.nccl`)
         self.nccl: dict[str, str] = {}
         self.formed = False
@@ -533,8 +537,8 @@ class RankGroup:
         again: bool = False,
         nccl: Mapping[str, str] | None = None,
         exchange: str = "",
-        formed: Callable[[Any], None] | None = None,
-    ) -> Any:
+        formed: Callable[[ProcessGroup], None] | None = None,
+    ) -> ProcessGroup | None:
         """Form the process group in two steps, so a partial group never forms. `join`: every
         follower reaches the store on a kernel-chosen loopback port and says it is ready (or
         refuses, or dies), each followed by the socket its watcher reads (`interrupt`). `form`:
@@ -573,8 +577,8 @@ class RankGroup:
         torch: ModuleType,
         again: bool,
         exchange: str,
-        formed: Callable[[object], None] | None,
-    ) -> object:
+        formed: Callable[[ProcessGroup], None] | None,
+    ) -> ProcessGroup | None:
         dist = torch.distributed
         self.forming = "join"
         for follower in self.followers:
@@ -657,7 +661,7 @@ class RankGroup:
             sys.stderr.flush()
             os._exit(int(Exit.failed))
 
-    def _unformed(self, replies: list[dict[str, Any]], step: str) -> None:
+    def _unformed(self, replies: Sequence[Mapping[str, object]], step: str) -> None:
         """Refuse the group on any follower's refusal of `step`."""
         for follower, reply in zip(self.followers, replies, strict=True):
             if not reply.get("ok"):

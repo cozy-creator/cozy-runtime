@@ -16,7 +16,7 @@ import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import tensorfs.varena.torch as vt
 import torch
@@ -37,6 +37,13 @@ type Selection = SplitSelection
 
 type Args = Sequence[object]
 type Kwargs = Mapping[str, object]
+
+
+class Forward(Protocol):
+    """A module's forward: any arguments, as torch types `nn.Module.forward`."""
+
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
+
 
 #: the request being served: a site's weights and the phase it runs in
 CURRENT: ContextVar[Request | None] = ContextVar("cozy_execution_request", default=None)
@@ -372,9 +379,8 @@ def wrap(
     around: Callable[[nn.Module, Args, Kwargs], AbstractContextManager[None]] | None = None,
 ) -> None:
     """Name a block's execution sites and invoke its forward exactly once."""
-    forward = vars(module).get("forward") or current(module)
+    forward: Forward = vars(module).get("forward") or current(module)
 
-    @functools.wraps(module.forward)
     def named(*args: object, **kwargs: object) -> object:
         outer = _local.named, _local.ordinals
         _local.named, _local.ordinals = name, {}
@@ -385,17 +391,18 @@ def wrap(
         finally:
             _local.named, _local.ordinals = outer
 
+    functools.update_wrapper(named, module.forward)  # as `@functools.wraps` would
     module.forward = transparent(named)
     vars(module)["_cozy_execution_forward"] = named
 
 
-def transparent[F: Callable[..., object]](forward: F) -> F:
+def transparent[F](forward: F) -> F:
     """`forward` stands in for its module's own (the class's at each call) with its results,
     which `author.plain_forward` reads as plain."""
     vars(forward)[TRANSPARENT] = True
     return forward
 
 
-def current(module: nn.Module) -> Callable[..., object]:  # a forward: any signature
+def current(module: nn.Module) -> Forward:
     """`module`'s class forward as it is at each call."""
     return lambda *args, **kwargs: type(module).forward(module, *args, **kwargs)

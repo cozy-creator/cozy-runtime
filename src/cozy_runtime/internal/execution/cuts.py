@@ -16,7 +16,7 @@ import math
 import sys
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
-from typing import cast
+from typing import Protocol, cast
 
 import torch
 from torch import Tensor, nn
@@ -27,8 +27,14 @@ from cozy_runtime.internal.encoding.leaves import NVFP4
 from cozy_runtime.internal.execution.sizing import levelled, levels, pieces
 
 type Band = Callable[[int, int], Tensor]
-#: A module's forward: any signature, as torch's `nn.Module.forward` is typed.
-type Forward = Callable[..., object]
+
+
+class Forward(Protocol):
+    """A module's forward as a cut calls it: its input first, then whatever else it takes."""
+
+    def __call__(self, x: object, *args: object, **kwargs: object) -> object: ...
+
+
 type Attention = Callable[[Tensor, Tensor, Tensor, Tensor | None], Tensor]
 #: diffusers' token-wise feed-forwards and the activation projections inside them
 _FFN = frozenset({"FeedForward", "GELU", "GEGLU", "SwiGLU", "ApproximateGELU", "LinearActivation"})

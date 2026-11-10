@@ -152,9 +152,7 @@ def to_blocked(torch: ModuleType, scales: Tensor) -> Tensor:
     rows, cols = int(scales.shape[0]), int(scales.shape[1])
     padded_rows, padded_cols = _blocked_shape(rows, cols)
     row_blocks, col_blocks = padded_rows // 128, padded_cols // 4
-    padded: Tensor = torch.zeros(
-        padded_rows, padded_cols, dtype=scales.dtype, device=scales.device
-    )
+    padded: Tensor = torch.zeros(padded_rows, padded_cols, dtype=scales.dtype, device=scales.device)
     padded[:rows, :cols] = scales
     tiles = padded.view(row_blocks, 128, col_blocks, 4).permute(0, 2, 1, 3)
     return tiles.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1).contiguous()

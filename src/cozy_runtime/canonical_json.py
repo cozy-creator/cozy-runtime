@@ -8,7 +8,6 @@ Blob and artifact integrity must continue to hash their exact bytes instead.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
 
 import msgspec
 
@@ -21,7 +20,7 @@ type JsonScalar = str | int | float | bool | None
 type JsonValue = Mapping[str, JsonValue] | Sequence[JsonValue] | str | int | float | bool | None
 
 
-def encode(value: Any) -> bytes:
+def encode(value: object) -> bytes:
     """Return the canonical JSON bytes of a JSON value."""
     try:
         return canonical.write(value)
@@ -29,7 +28,7 @@ def encode(value: Any) -> bytes:
         raise ValueError(str(exc)) from exc
 
 
-def decode(data: bytes) -> Any:
+def decode(data: bytes) -> canonical.Json:
     """Parse bounded UTF-8 JSON, refusing duplicate keys and invalid numbers."""
     try:
         return canonical.parse(data)
@@ -48,7 +47,7 @@ def normalize(data: bytes) -> bytes:
     return encode(decode(data))
 
 
-def digest(value: Any) -> str:
+def digest(value: object) -> str:
     """Return ``sha256:<hex>`` over a JSON value's canonical semantic bytes."""
     try:
         return canonical.digest(value)
