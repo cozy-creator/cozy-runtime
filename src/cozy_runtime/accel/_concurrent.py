@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, overload
+from typing import overload
 
 
 @overload
@@ -20,7 +20,7 @@ def concurrently[A, B, C, D](
 ) -> tuple[A, B, C, D]: ...
 @overload
 def concurrently[T](*calls: Callable[[], T]) -> tuple[T, ...]: ...
-def concurrently(*calls: Callable[[], Any]) -> tuple[Any, ...]:
+def concurrently(*calls: Callable[[], object]) -> tuple[object, ...]:
     """Run independent calls; the results, in call order.
 
     The author's statement: no call reads what another writes before this returns, and each
