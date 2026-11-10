@@ -52,6 +52,8 @@ from cozy_runtime.internal.accel import StaleBinding
 
 if TYPE_CHECKING:
     import torch
+    import torch.utils._python_dispatch
+    import torch.utils._pytree
     from torch.utils._pytree import TreeSpec
 
     from cozy_runtime.author._model import Residency, WarningRow
@@ -687,7 +689,8 @@ class _Recorder:
     def since(self, name: _Counter) -> float:
         """Counter `name` since the attempt opened."""
         now: float = getattr(self, name)
-        return now - (self.base[name] if name in self.base else 0)  # noqa: SIM401  # mypy: a union key's .get is object
+        then = cast("float", self.base.get(name, 0))  # a counter's value: mypy reads object
+        return now - then
 
     def forget(self) -> bool:
         if any(not entry.idle() for entry in self.recordings.values()):
@@ -1515,13 +1518,13 @@ def _record(
                 reserve = vt.pool_bytes(peak[0]) + sum(
                     entry.held_bytes for entry in recorder.recordings.values()
                 )
-                if recorder.pool is None:
-                    recorder.pool = (
+                pool = recorder.pool
+                if pool is None:
+                    pool = recorder.pool = (
                         placed[0].graph_pool(placed[1])
                         if placed is not None
                         else domain.Pool(torch.cuda.graph_pool_handle())
                     )
-                pool = recorder.pool
                 # Its static inputs are the pool's, made in the capture (an allocation launches
                 # nothing), so their storage stays owned with the graph.
                 statics: list[torch.Tensor | None] = []
