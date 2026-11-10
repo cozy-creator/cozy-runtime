@@ -10,10 +10,13 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass
 from enum import Enum
-from typing import Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 import tensorfs.varena.torch as vt
 import torch
+
+if TYPE_CHECKING:
+    from tensorfs.varena._facts import SplitSelection
 
 Mode = Literal["eager", "capture", "replay", "preparation"]
 
@@ -133,7 +136,7 @@ def begin_split(
     device: int,
     key: str,
     choice: str,
-    selection: Record,
+    selection: SplitSelection,
     *,
     stream: int,
 ) -> int:
@@ -179,7 +182,7 @@ def observing(
                 observation.token,
                 completed=succeeded and (mode != "eager" or observation.completed),
             )
-            sites = record.pop("split_observations", ())
+            sites = record.pop("split_observations", ())  # type: ignore[misc]  # the observations become a count
             observation.result = cast(
                 "WorkingPhase",  # varena's phase observation and these three
                 {**record, "cut_choices": observation.choices, "sites": len(sites), "passes": 1},

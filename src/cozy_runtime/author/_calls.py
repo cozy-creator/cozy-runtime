@@ -605,7 +605,7 @@ class _Broker:
             if scope is None and call.broker.telemetry is not None:
                 scope = _ProgressScope(call.broker.telemetry, call.binding.export, None)
             if scope is not None:
-                scope.telemetry._child_progress(progress.payload, scope)
+                scope.telemetry._child_progress(progress.payload, scope)  # type: ignore[arg-type]  # a child's progress is a JSON object
 
     @staticmethod
     def _intent[T](call: PendingCall[T]) -> ChildCall:

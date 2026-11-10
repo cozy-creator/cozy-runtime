@@ -1206,7 +1206,7 @@ class Executor:
         if owner._identity is None:
             owner._identity = execution_evidence.identity(
                 self.torch,
-                self.device_kind == "cuda" and accel.present(self.torch, self.device_kind),
+                self.device_kind == "cuda" and accel.present(self.torch, self.device_kind),  # type: ignore[arg-type]  # torch is imported before a request reaches here
                 self.rank if self.world > 1 else 0,
                 _sealed_entries(),
             )
@@ -1366,7 +1366,7 @@ class Executor:
         reply = {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
         if command.exchange:
             exchange, reply["check"] = copy_engine.form(
-                self.torch, self.pg, self.rank, self.world, command.exchange, self._host_tier()
+                self.torch, self.pg, self.rank, self.world, command.exchange, self._host_tier()  # type: ignore[arg-type]  # torch is imported before a request reaches here
             )
             copy_engine.install(exchange, self.pg)
         return reply
@@ -1397,7 +1397,7 @@ class Executor:
         """Rank 0 maps the exchange of the group and checks its bytes (`copy_engine.form`)."""
         assert self.transport is not None
         exchange, self.transport.check = copy_engine.form(
-            self.torch, pg, 0, self.world, self._group_exchange(), self._host_tier()
+            self.torch, pg, 0, self.world, self._group_exchange(), self._host_tier()  # type: ignore[arg-type]  # torch is imported before a request reaches here
         )
         copy_engine.install(exchange, pg)
         self.transport.route = exchange.name if exchange is not None else "nccl"
@@ -3318,7 +3318,7 @@ class Executor:
                 for model in cast("Backend", member.backend).models.values():  # filtered above
                     for _, release in graphs.DECODERS:
                         release(model.module)
-                    graphs.retire(self.torch, model.module)
+                    graphs.retire(self.torch, model.module)  # type: ignore[arg-type]  # torch is imported before a request reaches here
 
     def awaiting_invoke(self) -> bool:
         """A prepared request waits for its invoke, which comes next (TensorD's lookahead or its
@@ -3447,7 +3447,7 @@ class Executor:
         try:
             prepared = prepare(
                 registration,
-                command.payload,
+                command.payload,  # type: ignore[arg-type]  # an invoke's payload is a JSON object
                 input_metadata={
                     path: InputMetadata(
                         file.input_id, file.media_type, file.digest, file.length, file.order
@@ -4542,7 +4542,7 @@ class Executor:
                 continue
             prepared.add(module)
             imported = importlib.import_module(module)
-            generated = interface_wheel.generate(package_interface.canonical_bytes(document))
+            generated = interface_wheel.generate(package_interface.canonical_bytes(document))  # type: ignore[arg-type]  # an interface document is a JSON object
             source = generated.get(module.replace(".", "/") + "/__init__.py")
             if source is None:
                 raise CapabilityError(
@@ -4802,7 +4802,7 @@ class Executor:
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
         recorded. The execution stream includes every explicitly joined consumer."""
-        return accel.streams_idle(self.torch, self.device_kind, stream=self.host.execution_stream)
+        return accel.streams_idle(self.torch, self.device_kind, stream=self.host.execution_stream)  # type: ignore[arg-type]  # torch is imported before a request reaches here
 
     def map(self, command: Map) -> Reply:
         """TensorD's warming: one loaded construction's models at `command.level`, on every GPU
@@ -4823,7 +4823,7 @@ class Executor:
                 if command.level == "ram":
                     # Map is ordered after every preceding invocation. Join its remaining
                     # consumer streams before retiring owners and returning allocator storage.
-                    accel.drain(self.torch, self.device_kind)
+                    accel.drain(self.torch, self.device_kind)  # type: ignore[arg-type]  # torch is imported before a request reaches here
                     # Every slot's decoders, graphs and holds go before any model leaves: a
                     # language model's engine retains its drafter's weights too, and Klein's
                     # drafter slot maps before its upsampler, so an idle Klein refused every
@@ -5367,7 +5367,7 @@ def serve(executor: Executor, channel: Channel) -> int:
 def _shut(executor: Executor, channel: Channel) -> int:
     with executor._execution_context():
         if executor.host.execution_stream is not None:
-            accel.drain(executor.torch, executor.device_kind)
+            accel.drain(executor.torch, executor.device_kind)  # type: ignore[arg-type]  # torch is imported before a request reaches here
         if executor.group is not None:
             executor.group.close()
     channel.send({"reply": "shutdown", "ok": True})

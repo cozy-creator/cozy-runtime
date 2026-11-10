@@ -510,7 +510,7 @@ class _AudioStreamDecoder:
 
         assert self._resampler is not None
         converted = self._resampler.resample(frame)
-        converted = list(converted) if converted is not None else []  # type: ignore[redundant-expr]  # PyAV < 19
+        converted = list(converted) if converted is not None else []
         if sum(int(out.samples) for out in converted) != samples:
             raise MediaDecodeError(
                 "native-rate audio conversion changed the sample clock", code="audio_format"
@@ -598,7 +598,7 @@ def _stream_audio_format(stream: AudioStream, limits: DecodeLimits) -> DecodedAu
     sample_rate = int(context.sample_rate or 0)
     time_base = _positive_fraction(stream.time_base, "audio stream time base")
     layout = context.layout
-    channel_layout, channel_names = _kept_layout(layout) if layout is not None else ("", ())  # type: ignore[redundant-expr]  # unset layout
+    channel_layout, channel_names = _kept_layout(layout) if layout is not None else ("", ())
     channels = len(channel_names)
     if sample_rate <= 0 or not channel_layout or not channels:
         raise MediaDecodeError("audio header has no valid native rate/layout", code="audio_format")
@@ -1902,7 +1902,7 @@ def _rotate_rgb(rgb: bytes, width: int, height: int, rotation: int) -> tuple[byt
 
 def _valid_audio_samples(frame: AudioFrame, samples: int, rate: int) -> int:
     duration = frame.duration
-    if duration is None or int(duration) <= 0:  # type: ignore[redundant-expr]  # PyAV's stub omits None
+    if duration is None or int(duration) <= 0:
         return samples
     time_base = frame.time_base
     if not time_base:

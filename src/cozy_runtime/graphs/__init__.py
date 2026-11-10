@@ -218,22 +218,22 @@ type _Sums = tuple[torch.Tensor, torch.cuda.Event | None]
 
 # Torch leaves these unannotated.
 def _event(timing: bool = False) -> torch.cuda.Event:
-    made: torch.cuda.Event = torch.cuda.Event(enable_timing=timing)  # type: ignore[no-untyped-call]  # unannotated in torch
+    made: torch.cuda.Event = torch.cuda.Event(enable_timing=timing)
     return made
 
 
 def _passed(event: torch.cuda.Event) -> bool:
-    done: bool = event.query()  # type: ignore[no-untyped-call]  # unannotated in torch
+    done: bool = event.query()
     return done
 
 
 def _cuda_initialized() -> bool:
-    ready: bool = torch.cuda.is_initialized()  # type: ignore[no-untyped-call]  # unannotated in torch
+    ready: bool = torch.cuda.is_initialized()
     return ready
 
 
 def _sleep(cycles: int) -> None:
-    torch.cuda._sleep(cycles)  # type: ignore[no-untyped-call]  # unannotated in torch
+    torch.cuda._sleep(cycles)
 
 
 class Finite:

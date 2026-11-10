@@ -46,7 +46,7 @@ class Steps:
     current stream at each step, the device time between two read once it passed both."""
 
     def mark(self) -> object:
-        event = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]  # bare in torch
+        event = torch.cuda.Event(enable_timing=True)
         event.record()
         return event
 
@@ -64,7 +64,7 @@ def record(
     return GpuMemory(
         gpu=gpu,
         ceiling=_ceiling(device, store),
-        stats=request.stats(),
+        stats=request.stats(),  # type: ignore[arg-type]  # a RequestStats is a str-keyed dict on the wire
         torch_peak=torch_peak if device is not None else None,
     )
 

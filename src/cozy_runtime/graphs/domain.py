@@ -133,7 +133,7 @@ class Domain:
                 self.stream = stream = accel.owned_stream(torch, self.device)
                 self.control = control = accel.owned_stream(torch, self.device)
                 fork, join, done = (
-                    torch.cuda.Event()  # type: ignore[no-untyped-call]  # unannotated in torch
+                    torch.cuda.Event()
                     for _ in range(3)
                 )
                 self.fork, self.join, self.done = fork, join, done

@@ -292,7 +292,7 @@ def _operands(receives: list[Tensor]) -> list[Tensor]:
 
 
 def _land(
-    out: Tensor, wait: Wait, returned: list[Tensor], start: int, world: int, waits: list[Any]
+    out: Tensor, wait: Wait, returned: list[Tensor], start: int, world: int, waits: list[_Span]
 ) -> None:
     """A group's attended rows, back on this GPU, into its heads of `out`."""
     batch, mine, _, dim = out.shape
@@ -303,7 +303,14 @@ def _land(
     part.copy_(rows.view(world, mine, batch, local, dim).permute(2, 1, 0, 3, 4))
 
 
-def _waited(on: Tensor, wait: Wait, waits: list[Any]) -> None:
+type _Event = torch.cuda.Event
+#: Two marks around a span of the calling stream (none where nothing is timed).
+type _Span = tuple[_Event | None, _Event | None]
+#: The attention, the waits for Q/K/V and the waits for output.
+type _Spans = tuple[list[_Span], list[_Span], list[_Span]]
+
+
+def _waited(on: Tensor, wait: Wait, waits: list[_Span]) -> None:
     """`wait`, between two marks: what the calling stream idled for a crossing."""
     before = _Clock.mark(on)
     wait()
@@ -319,11 +326,11 @@ class _Clock:
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.pending: list[tuple[Any, Any, tuple[list[Any], list[Any], list[Any]], int]] = []
+        self.pending: list[tuple[_Event, _Event, _Spans, int]] = []
         self.totals = dict.fromkeys(self._SUMS, 0.0)
 
     @staticmethod
-    def mark(on: Tensor) -> Any:
+    def mark(on: Tensor) -> _Event | None:
         if not on.is_cuda or torch.cuda.is_current_stream_capturing():
             return None
         event = torch.cuda.Event(enable_timing=True)
@@ -332,9 +339,9 @@ class _Clock:
 
     def add(
         self,
-        began: Any,
-        ended: Any,
-        spans: tuple[list[Any], list[Any], list[Any]],
+        began: _Event | None,
+        ended: _Event | None,
+        spans: _Spans,
         crossed: int,
     ) -> None:
         """`spans`: the attention, the waits for Q/K/V and the waits for output, as mark pairs."""
@@ -460,7 +467,7 @@ def _exchange(
         "at": max(catch.LEVELS.get(site, floor), floor),
         "site": f"{called or 'attention'} [{batch} x {padded} heads x {dim}, {b} B]",
     }
-    selection: dict[str, Any] = {}
+    selection = cast("catch.Selection", {})  # chosen where native, the only path that reads it
     try:
         if native:
             selection = catch.select(device, site, "ulysses", levels, stream)
@@ -488,9 +495,9 @@ def _exchange(
     starts = range(0, padded, step)
     crossed = submitted = False
     began = _Clock.mark(query)
-    inner: list[Any] = []
-    arrived: list[Any] = []
-    landed: list[Any] = []
+    inner: list[_Span] = []
+    arrived: list[_Span] = []
+    landed: list[_Span] = []
     try:
         out = query.new_empty((batch, mine, padded, dim))
         sources = (query, key, value)

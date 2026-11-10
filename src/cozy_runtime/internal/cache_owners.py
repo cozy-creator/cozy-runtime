@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import weakref
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from typing import TYPE_CHECKING, Protocol
 
@@ -18,7 +18,7 @@ class _Lock(Protocol):
 
 
 @contextmanager
-def try_locks(locks: list[_Lock | None]) -> Iterator[bool]:
+def try_locks(locks: Sequence[_Lock | None]) -> Iterator[bool]:
     """Claim actual owner/domain locks without waiting on the allocating caller."""
     acquired = []
     seen = set()

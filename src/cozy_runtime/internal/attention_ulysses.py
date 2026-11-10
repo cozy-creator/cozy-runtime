@@ -73,7 +73,16 @@ class Local:
 type Implementation = Callable[[Tensor, Tensor, Tensor, Options], str]
 #: Ulysses' exchange around a computation (`internal.parallel.ulysses.exchange`).
 type Exchange = Callable[
-    [Tensor, Tensor, Tensor, ProcessGroup, Callable[[Tensor, Tensor, Tensor], Tensor], str], Tensor
+    [
+        Tensor,
+        Tensor,
+        Tensor,
+        ProcessGroup,
+        Callable[[Tensor, Tensor, Tensor], Tensor],
+        str,
+        bool | Callable[[int], bool],
+    ],
+    Tensor,
 ]
 
 

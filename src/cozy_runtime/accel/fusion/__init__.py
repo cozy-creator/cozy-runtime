@@ -685,7 +685,7 @@ def _attend(
     layout, entries = site.layout, site.layout.entries
     heads = (site.attention.heads, layout.head_dim)
     # torch leaves `Tensor.unflatten` unannotated.
-    q, k, v = (t.unflatten(-1, heads) for t in (q, k, v))  # type: ignore[no-untyped-call]
+    q, k, v = (t.unflatten(-1, heads) for t in (q, k, v))
     if layout.rope is None or arguments[layout.rope.argument] is None:
         q, k = (norm(t) for norm, t in zip(site.qk, (q, k), strict=True))
     else:

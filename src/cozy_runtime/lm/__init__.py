@@ -1887,7 +1887,7 @@ class _Engine:
             stream = torch.cuda.current_stream()
             event = self.completions.get(stream)
             if event is None:
-                event = torch.cuda.Event()  # type: ignore[no-untyped-call]  # unannotated in Torch
+                event = torch.cuda.Event()
                 self.completions[stream] = event
                 event.record(stream)  # instantiate before any accepted step can run
             self.unfenced.add(stream)
@@ -2551,7 +2551,7 @@ class _Engine:
                         break
                     self._tell()
                     continue
-                event = torch.cuda.Event()  # type: ignore[no-untyped-call]  # unannotated in Torch
+                event = torch.cuda.Event()
                 event.record()
                 queued.append(event)
                 if len(queued) > lag:
@@ -3129,7 +3129,7 @@ class _Engine:
                 if not claimed:
                     return False
                 if self.unfenced or any(
-                    not event.query()  # type: ignore[no-untyped-call]  # unannotated in Torch
+                    not event.query()
                     for event in self.completions.values()
                 ):
                     return False

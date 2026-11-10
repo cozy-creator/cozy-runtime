@@ -16,7 +16,7 @@ import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
-from typing import Any, cast
+from typing import TYPE_CHECKING, cast
 
 import tensorfs.varena.torch as vt
 import torch
@@ -29,8 +29,11 @@ from cozy_runtime.author._model import TRANSPARENT
 from cozy_runtime.internal.execution import phase, sizing
 from cozy_runtime.internal.residency import Model, Request
 
-#: Any: varena's split record, a plain dict in the TensorFS stub.
-type Selection = dict[str, Any]
+if TYPE_CHECKING:
+    from tensorfs.varena._facts import SplitSelection
+
+#: varena's split choice (`split_select`, `split_refused`).
+type Selection = SplitSelection
 
 type Args = Sequence[object]
 type Kwargs = Mapping[str, object]
@@ -89,7 +92,7 @@ def checkpoint() -> None:
 
 
 def _capturing() -> bool:
-    initialized = torch.cuda.is_initialized()  # type: ignore[no-untyped-call]  # torch leaves it bare
+    initialized = torch.cuda.is_initialized()
     return bool(initialized and torch.cuda.is_current_stream_capturing())
 
 
