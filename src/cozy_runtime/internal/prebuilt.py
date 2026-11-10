@@ -611,11 +611,14 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
     for dtype in (torch.bfloat16, torch.float16):
         bias = randn(out_features).to(dtype)
         name = "bf16" if dtype == torch.bfloat16 else "fp16"
+        x: Tensor | None = None
+        want: Tensor | None = None
         for m in (3, rows):
             x = randn(m, width).to(dtype)
             want = law(torch, f, x.double(), data, scale, bias)
             got = (ops.fp8_linear if f.fp8 else ops.int8_linear)(x, data, scale, bias, dtype)
             errors[f"{name} linear M={m}"] = verify.error(torch, got, want)
+        assert x is not None and want is not None  # the rows' last pass: M=rows
         q, scales = (ops.fp8_quantize if f.fp8 else ops.int8_quantize)(x)
         first: tuple[int, Tensor] | None = None
         for config in range(8):
@@ -696,12 +699,15 @@ def probe_w4a8(torch: ModuleType, ops: Prebuilt) -> verify.Verdict:
         for dtype in (torch.bfloat16, torch.float16):
             bias = randn(out_features).to(dtype)
             label = f"{name} {'bf16' if dtype == torch.bfloat16 else 'fp16'}"
+            x: Tensor | None = None
+            want: Tensor | None = None
             for m in (3, rows):
                 x = randn(m, width).to(dtype)
                 want = law(torch, INT8, x.double(), data, grid.scale, bias)
                 errors[f"{label} linear M={m}"] = verify.error(
                     torch, ops.w4a8_linear(x, grid, bias, dtype), want
                 )
+            assert x is not None and want is not None  # the rows' last pass: M=rows
             q, scales = ops.int8_quantize(x)
             first: tuple[int, Tensor] | None = None
             for config in range(8):

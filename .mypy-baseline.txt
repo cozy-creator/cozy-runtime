@@ -52,10 +52,6 @@ src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is no
 src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/prebuilt.py: [possibly-undefined] Name "want" may be undefined
-src/cozy_runtime/internal/prebuilt.py: [possibly-undefined] Name "want" may be undefined
-src/cozy_runtime/internal/prebuilt.py: [possibly-undefined] Name "x" may be undefined
-src/cozy_runtime/internal/prebuilt.py: [possibly-undefined] Name "x" may be undefined
 src/cozy_runtime/internal/residency.py: [override] Signature of "__repr__" incompatible with supertype "torch._tensor.Tensor"
 src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/static_invocable.py: [explicit-any] Explicit "Any" is not allowed
