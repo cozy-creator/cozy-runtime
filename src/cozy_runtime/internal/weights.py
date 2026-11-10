@@ -1135,7 +1135,7 @@ class Placement:
         self.steps: list[frozenset[str]] = []
         #: components whose blocks are held bound, with the stream their binds queued on, and
         #: those this step found no free room to hold
-        self.holds: dict[str, tuple[Hold, Any]] = {}
+        self.holds: dict[str, tuple[Hold, torch.cuda.Stream | None]] = {}
         self.unheld: set[str] = set()
         for name, model in self.models.items():
             PLACED[model.module] = (self, name)
@@ -1198,7 +1198,7 @@ class Placement:
     def _shed(self, component: str) -> None:
         self.holds.pop(component, None)
 
-    def graph_held(self, component: str) -> Any:
+    def graph_held(self, component: str) -> torch.cuda.Stream | None:
         """The stream `component`'s held blocks bound on, or None when they are not held."""
         held = self.holds.get(component)
         return None if held is None else held[1]
@@ -1238,12 +1238,12 @@ class Placement:
                     stack.callback(bakes._choice.reset, token)
             yield
 
-    def retain(self, component: str, paths: tuple[str, ...]) -> Any:
+    def retain(self, component: str, paths: tuple[str, ...]) -> Binding:
         """The region's address ownership, independent of its physical replay lease."""
         return self.models[component].retain(paths)
 
     def represent(
-        self, component: str, dtype: Any, *, resident_only: bool = False
+        self, component: str, dtype: torch.dtype, *, resident_only: bool = False
     ) -> Callable[[], None]:
         """Preflight every requested cast before capture applies any representation change. A CPU
         executor serves every component in float32 (`_float32`), so a hold there changes nothing."""
@@ -1261,7 +1261,7 @@ class Placement:
     def graph_accounted(self) -> bool:
         return bool(self.memory.cuda)
 
-    def graph_domain(self, component: str) -> Any:
+    def graph_domain(self, component: str) -> graphs.domain.Domain:
         return graphs.capture_device(self.torch, self.memory)
 
     def region(
@@ -1280,7 +1280,7 @@ class Placement:
         """Stock Torch owns the graph pool; the recording retains its binding and tensors."""
         return graphs.domain.Pool(self.torch.cuda.graph_pool_handle())
 
-    def graph_pass(self, component: str, entry: str) -> Any:
+    def graph_pass(self, component: str, entry: str) -> AbstractContextManager[Model]:
         return self.models[component].passing(entry, executing=True)
 
     def graph_idle(self) -> AbstractContextManager[object]:

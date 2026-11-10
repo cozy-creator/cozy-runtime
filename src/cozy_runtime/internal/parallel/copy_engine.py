@@ -30,11 +30,14 @@ from __future__ import annotations
 import ctypes
 import math
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cozy_runtime.graphs import streams
 from cozy_runtime.internal.config import short_socket_directory
 from cozy_runtime.internal.parallel.group import gather
+
+if TYPE_CHECKING:
+    from tensorfs.varena._runtime import Pages, Staging
 
 #: The exchange the group formed with, by process group; absent: NCCL.
 _BY_GROUP: dict[int, Exchange] = {}
@@ -247,7 +250,7 @@ class HostStagedExchange(Exchange):
 
     name = "host-staged"
 
-    def __init__(self, torch: Any, pg: Any, rank: int, world: int, pages: Any) -> None:
+    def __init__(self, torch: Any, pg: Any, rank: int, world: int, pages: Pages | None) -> None:
         self.torch, self.pg, self.rank, self.world = torch, pg, rank, world
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.slot = INBOX_BYTES // (2 * world) // 4096 * 4096
@@ -257,23 +260,26 @@ class HostStagedExchange(Exchange):
         self.flag = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.half = 0
         self.inboxes: list[Any] = []
-        self.peers: list[Any] = []
-        self.own: Any = pages.staging(self.size) if pages is not None else None
-        if self.own is None:
+        self.peers: list[Staging] = []
+        own = pages.staging(self.size) if pages is not None else None
+        if own is None:
             raise MemoryError("varena's host number has no room for this GPU's exchange inbox")
+        #: its own inbox until `close`, which `map` names to the group
+        self.own: Staging | None = own
+        self.inbox: Staging = own
 
     def map(self, store: Any, agree: Callable[[bool], bool]) -> bool:
         """Collective, once per formation: every GPU maps every inbox for its own; each unlinks
         its inbox's name once all agreed. False on every GPU alike when any could not."""
         from tensorfs.varena import _runtime as varena
 
-        store.set(f"cozy.staged/{self.rank}", self.own.name)
+        store.set(f"cozy.staged/{self.rank}", self.inbox.name)
         keys = [f"cozy.staged/{r}" for r in range(self.world)]
         names = [bytes(name).decode() for name in gather(store, keys, "the exchange's inboxes")]
         ok = True
         try:
             for rank, name in enumerate(names):
-                staging = self.own
+                staging = self.inbox
                 if rank != self.rank:
                     staging = varena.Staging.open(self.device.index, name, self.size)
                     self.peers.append(staging)
@@ -281,7 +287,7 @@ class HostStagedExchange(Exchange):
         except Exception:
             ok = False
         agreed = agree(ok)
-        self.own.unlink()
+        self.inbox.unlink()
         if not agreed:
             self.close()
             return False
@@ -372,7 +378,7 @@ class HostStagedExchange(Exchange):
         return done
 
 
-def _host(torch: Any, staging: Any) -> Any:
+def _host(torch: Any, staging: Staging) -> Any:
     """`staging`'s bytes as a CPU uint8 tensor, valid while it is open."""
     return torch.frombuffer(
         (ctypes.c_uint8 * staging.bytes).from_address(staging.ptr), dtype=torch.uint8
@@ -384,7 +390,7 @@ _CHECK_BYTES = 8 << 20
 
 
 def form(
-    torch: Any, pg: Any, rank: int, world: int, name: str, pages: Any = None
+    torch: Any, pg: Any, rank: int, world: int, name: str, pages: Pages | None = None
 ) -> tuple[Exchange | None, dict[str, bool]]:
     """Collective, on every GPU of a just-formed group: `name` (`links.Links.exchange`) mapped,
     and one all-to-all through it checked against the bytes NCCL lands. An exchange any GPU cannot
@@ -430,7 +436,7 @@ def _open(
     world: int,
     agree: Callable[[bool], bool],
     store: Any,
-    pages: Any,
+    pages: Pages | None,
 ) -> Exchange | None:
     """`name`'s exchange mapped on every GPU of the group, or None on every one alike."""
     made: Exchange | None = None

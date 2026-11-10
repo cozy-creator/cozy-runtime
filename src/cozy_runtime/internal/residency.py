@@ -21,7 +21,7 @@ from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict
 
 import tensorfs
 import tensorfs.varena.torch as vt
@@ -31,11 +31,12 @@ from tensorfs.varena import Exhausted
 from tensorfs.varena import _runtime as varena
 from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
+from torch.utils.hooks import RemovableHandle
 
 from cozy_runtime import graphs
 from cozy_runtime.author import _retained
 from cozy_runtime.author._errors import DoesNotFit, Fault, fault, is_capacity
-from cozy_runtime.author._model import WARNINGS
+from cozy_runtime.author._model import WARNINGS, WarningRow
 from cozy_runtime.internal import cache_owners, pacing, proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
@@ -44,6 +45,9 @@ from cozy_runtime.internal.accel import (
     host_memory,
     release_cached,
 )
+
+if TYPE_CHECKING:
+    from tensorfs.varena._facts import DeviceStats, EscapeRecord, Verdict
 
 __all__ = [
     "Binding",
@@ -109,7 +113,7 @@ _INDEX = re.compile(r"(?<![^.])\d+(?![^.])")
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
 _OPENING = threading.Lock()
 # A failed graph completion must retain the actual storage owners until executor exit.
-_UNPROVEN: list[Any] = []
+_UNPROVEN: list[Binding] = []
 
 
 class Level(Enum):
@@ -397,16 +401,16 @@ class _Block:
     retained: int = 0
     loading: bool = False
     last: int = 0
-    ready: Any = None
-    region: Any = None
+    ready: torch.cuda.Event | None = None
+    region: varena.Region | None = None
     native_storage: int | None = None
     #: the Varena Uses behind the raw and final views; `_used` declares their consumer streams
-    native_use: Any = None
-    final_native_use: Any = None
+    native_use: varena.Use | None = None
+    final_native_use: varena.Use | None = None
     aliases: dict[str, dict[str, str]] | None = None
     raw_views: dict[tuple[int, str], tuple[int, _Part]] = field(default_factory=dict)
     finals: dict[str, dict[str, _Part]] = field(default_factory=dict)
-    final_region: Any = None
+    final_region: varena.Region | None = None
     final_data: dict[str, dict[str, Tensor]] | None = None
     final_storage: int | None = None
     final_fills: int = 0
@@ -414,7 +418,7 @@ class _Block:
     #: the fill overlay (`Filling.overlay`) its page was written with
     overlay: Hashable = None
     #: native pages of other overlays, parked for reuse (`_switch_overlay`): (raw, final) regions
-    parked: dict[Hashable, tuple[Any, Any]] = field(default_factory=dict)
+    parked: dict[Hashable, tuple[varena.Region | None, varena.Region | None]] = field(default_factory=dict)
     #: an `nn.Embedding`'s table: one that does not fit the room gathers its rows on the host
     table: bool = False
     #: its host copy while it gathers, by overlay: (overlay, raw views, final views)
@@ -494,7 +498,7 @@ class _Block:
             ):
                 yield tensor
 
-    def regions(self) -> list[Any]:
+    def regions(self) -> list[varena.Region]:
         """The Regions a use of it reads."""
         raw = self.region if self.storage_bytes and not self.final_only() else None
         final = self.final_region if self.final_bytes else None
@@ -521,7 +525,7 @@ class Model:
         self.retire_graphs: Callable[[], None] | None = None
         self.sites = _sites(module)
         self._block_sites: dict[str, list[_Site]] | None = None
-        self.handles: list[Any] = []
+        self.handles: list[RemovableHandle] = []
         self.holds: list[Hold] = []
         self.blocks: dict[str, _Block] = {}
         self.common: _Block | None = None
@@ -705,7 +709,7 @@ class Hold:
         self.release()
 
 
-def _state(region: Any) -> str:
+def _state(region: varena.Region | None) -> str:
     """A block region's residency, as a refusal names it."""
     return "none" if region is None else "resident" if region.resident else "cold"
 
@@ -742,10 +746,10 @@ class Binding:
         self.completion_lost = False
         self.used = False
         #: from its first preparation on, what its graphs read
-        self.regions: list[Any] | None = None
+        self.regions: list[varena.Region] | None = None
         self.computed: list[Tensor] = []
         self.lock = threading.RLock()
-        self.last: Any = None
+        self.last: torch.cuda.Event | None = None
 
     def valid(self) -> bool:
         return not self._invalid()
@@ -804,7 +808,9 @@ class Binding:
         return ""
 
     @contextmanager
-    def prepare(self, stream: Any = None, *, replay: bool = False) -> Iterator[dict[Any, Any]]:
+    def prepare(
+        self, stream: torch.cuda.Stream | None = None, *, replay: bool = False
+    ) -> Iterator[dict[varena.Region, varena.Use | None]]:
         """Its weights for one use, and no longer. A capture or an eager use binds them to the
         modules' slots. A `replay` reads its Regions at their addresses and binds nothing: it
         yields each Region's Use, None for one that left (`graphs.replaying` fills those)."""
@@ -841,14 +847,14 @@ class Binding:
                         )
                 self.used = True
                 with torch.cuda.stream(stream) if memory.cuda else nullcontext():
-                    if self.last is not None:
+                    if self.last is not None and stream is not None:
                         stream.wait_event(self.last)
                     # Claimed whole before any of it fills: no fill can change a later block.
                     with memory.lock:
                         for block in self.groups:
                             block.retained += 1
                     entered: list[_Block] = []
-                    uses: dict[Any, Any] = {}
+                    uses: dict[varena.Region, varena.Use | None] = {}
                     try:
                         if replay:
                             assert self.regions is not None
@@ -884,7 +890,7 @@ class Binding:
         error.error_code = 999
         raise error from cause
 
-    def _finish(self, stream: Any) -> None:
+    def _finish(self, stream: torch.cuda.Stream | None) -> None:
         try:
             event = torch.cuda.Event()
             event.record(stream)
@@ -985,7 +991,7 @@ class Region:
             self._cache_owner.close()  # drains only after releasing the Region lock
 
 
-def _pages(index: int, shared: bool) -> Any:
+def _pages(index: int, shared: bool) -> varena.Pages:
     """This GPU's host tier. TensorFS sizes it and shares the host with every executor's tiers
     through the host's ledger page; on a shared machine (a person's computer) it pins nothing
     while the host stalls."""
@@ -995,7 +1001,9 @@ def _pages(index: int, shared: bool) -> Any:
 class Memory:
     """One executor's weight residency, beside Torch's activation allocator."""
 
-    def __init__(self, device: Any, budget_bytes: int | None = None, shared: bool = False) -> None:
+    def __init__(
+        self, device: torch.device | str | int, budget_bytes: int | None = None, shared: bool = False
+    ) -> None:
         self.device = torch.device(device)
         self.cuda: bool = self.device.type == "cuda"
         self.budget_bytes = budget_bytes
@@ -1005,12 +1013,12 @@ class Memory:
         self.regions: weakref.WeakSet[Region] = weakref.WeakSet()
         self.requests: set[Request] = set()
         self.last: dict[str, Any] | None = None
-        self.native: Any = None
+        self.native: varena.Device | None = None
         #: This GPU's host tier: TensorFS keeps weight pages in pinned host RAM.
-        self.pages: Any = None
+        self.pages: varena.Pages | None = None
         self.granularity = 512
-        self._phase_plan: Any = None
-        self._phase_plan_signature: tuple[Any, ...] | None = None
+        self._phase_plan: varena.Plan | None = None
+        self._phase_plan_signature: tuple[tuple[list[str] | _PhaseSignature, ...], ...] | None = None
         self._phase_plan_keys: dict[frozenset[str], str] = {}
         self._phase_plan_models: set[Model] = set()
         self._phase_plan_status: tuple[object, ...] | None = None
@@ -1034,7 +1042,9 @@ class Memory:
                 raise ResidencyError(f"native CUDA weight residency is unavailable: {exc}") from exc
 
     @classmethod
-    def open(cls, gpu: Any = 0, *, budget_bytes: int | None = None, shared: bool = False) -> Memory:
+    def open(
+        cls, gpu: torch.device | str | int = 0, *, budget_bytes: int | None = None, shared: bool = False
+    ) -> Memory:
         device = torch.device("cuda", gpu) if isinstance(gpu, int) else torch.device(gpu)
         if device.type == "cuda":
             device = torch.device("cuda", device.index or 0)
@@ -1056,8 +1066,27 @@ class Memory:
             vt.set_limit(self.device.index or 0, budget_bytes)
             self.budget_bytes = budget_bytes
 
-    def stream(self) -> Any:
+    def stream(self) -> torch.cuda.Stream | None:
         return torch.cuda.current_stream(self.device) if self.cuda else None
+
+    def _cuda_stream(self) -> torch.cuda.Stream:
+        """`stream()` where only a CUDA device gets: native Regions exist only there."""
+        stream = self.stream()
+        if stream is None:
+            raise ResidencyError("a CUDA stream was asked of a device that is not CUDA")
+        return stream
+
+    def _device_native(self) -> varena.Device:
+        """This GPU's varena Device, opened with this Memory on CUDA and only asked for there."""
+        if self.native is None:
+            raise ResidencyError("native CUDA weight residency is not open on this device")
+        return self.native
+
+    def _tier(self) -> varena.Pages:
+        """This GPU's host tier, opened with its Device."""
+        if self.pages is None:
+            raise ResidencyError("native CUDA weight residency is not open on this device")
+        return self.pages
 
     def capturing(self) -> bool:
         return bool(
@@ -1442,9 +1471,9 @@ class Memory:
     def pin_idle(self, waiting: Callable[[], bool]) -> None:
         """TensorFS pins the pages that left the card while the executor is idle, until a command
         arrives (`waiting`). A failed read only leaves a page's refills on the store."""
-        self.pages.pin_idle(waiting)
-        stats = self.pages.stats()
-        rows = []
+        self._tier().pin_idle(waiting)
+        stats = self._tier().stats()
+        rows: list[WarningRow] = []
         if stats["pin_failed"]:
             rows.append(("a host page did not pin: its refills stay on the store", {}))
         if stats["refused"] is not None:
@@ -1667,17 +1696,17 @@ class Memory:
         """Live request concurrency; the caller holds lock across its policy decision."""
         return any(other is not request and not other.idle for other in self.requests)
 
-    def _native_region(self, block: _Block, *, final: bool = False) -> Any:
+    def _native_region(self, block: _Block, *, final: bool = False) -> varena.Region:
         """Its Region under its overlay: a stable address and a Source, no bytes yet."""
         field = "final_region" if final else "region"
-        region = getattr(block, field)
+        region: varena.Region | None = getattr(block, field)
         if region is None:
             size = block.final_bytes if final else block.storage_bytes
-            region = self.native.region(size, self._source(block, final=final))
+            region = self._device_native().region(size, self._source(block, final=final))
             setattr(block, field, region)
         return region
 
-    def _source(self, block: _Block, *, final: bool) -> Any:
+    def _source(self, block: _Block, *, final: bool) -> varena.Source:
         """Where a Region of `block` gets its bytes. The tier keeps its stored bytes, or those a
         bake wrote, or its cast bytes where those are all a use needs (`_host_final`)."""
         model = block.model
@@ -1686,7 +1715,7 @@ class Memory:
         owner = weakref.ref(block)  # a Region owns its Source: never the block back
         if final:
             return varena.Source(
-                self.pages, model.name, block.index, block.final_bytes, page=page,
+                self._tier(), model.name, block.index, block.final_bytes, page=page,
                 derive=functools.partial(_derive, owner, "final_region", _write_final),
             )
         offset, parts = 0, []
@@ -1699,11 +1728,11 @@ class Memory:
         if model.fill is not None:
             derive = functools.partial(_derive, owner, "region", _bake)
         return varena.Source(
-            self.pages, model.name, block.index, block.storage_bytes,
+            self._tier(), model.name, block.index, block.storage_bytes,
             checkpoint=model.source.ck, parts=parts, page=page, derive=derive,
         )
 
-    def _use(self, block: _Block, *, final: bool = False) -> Any:
+    def _use(self, block: _Block, *, final: bool = False) -> varena.Use:
         """`block`'s bytes pinned for this stream. An idle request takes only what is resident."""
         request = _REQUEST.get()
         if request is not None and request.idle:
@@ -1712,7 +1741,7 @@ class Memory:
             if use is None:
                 raise StaleBinding("idle graph preparation cannot fill native weight backing")
             return use
-        return self._native_region(block, final=final).use(self.stream().cuda_stream)
+        return self._native_region(block, final=final).use(self._cuda_stream().cuda_stream)
 
     def _note_phase_plan(self, status: str, reason: str = "", **facts: Any) -> None:
         request = _REQUEST.get()
@@ -1737,7 +1766,9 @@ class Memory:
                 self._phase_plan_models.clear()
                 self._note_phase_plan("unplanned", reason)
 
-    def _phase_regions(self, names: frozenset[str]) -> tuple[list[Any], list[Any], str]:
+    def _phase_regions(
+        self, names: frozenset[str]
+    ) -> tuple[list[varena.Region], list[_PhaseSignature], str]:
         """A phase's Regions in order, under the overlays its blocks last used, what identifies
         them, and why it cannot be planned, if it can't. A Region is an address and a Source."""
         models = [model for model in self.models.values() if model.name in names]
@@ -1790,13 +1821,14 @@ class Memory:
         if not any(step == names for step, _ in planned):
             self._retire_phase_plan("no_regions")  # A model with no weights plans nothing.
             return
-        represented = tuple((sorted(step), *signature)
-                            for step, _, signature, why in phases if not why and signature)
+        represented: tuple[tuple[list[str] | _PhaseSignature, ...], ...] = tuple(
+            (sorted(step), *signature) for step, _, signature, why in phases if not why and signature
+        )
         if self._phase_plan is None or represented != self._phase_plan_signature:
             self._retire_phase_plan("phase_inventory_changed")
             digest = hashlib.sha256(repr(represented).encode()).hexdigest()
             keys = {step: f"runtime.phase.regions/1:{digest}/{i}" for i, (step, _) in enumerate(planned)}
-            self._phase_plan = varena.Plan(self.native, [(keys[step], regions) for step, regions in planned])
+            self._phase_plan = varena.Plan(self._device_native(), [(keys[step], regions) for step, regions in planned])
             self._phase_plan_signature, self._phase_plan_keys = represented, keys
             self._phase_plan_models = {
                 model for model in self.models.values()
@@ -1945,7 +1977,7 @@ class Memory:
         if (request := _REQUEST.get()) is not None:
             request.gathered += 1
 
-    def _read_into(self, tensors: Any, key: str, raw: Tensor, role: str | None) -> None:
+    def _read_into(self, tensors: tensorfs.Tensors, key: str, raw: Tensor, role: str | None) -> None:
         if self.device.type != "mps":
             tensors.read_into(key, raw, role=role)
             return
@@ -1997,7 +2029,7 @@ class Memory:
             # Capture's owner joined the prepared stream before capture began. Waiting on
             # its external readiness event now would violate CUDA capture isolation.
             if block.ready is not None and not capturing:
-                self.stream().wait_event(block.ready)
+                self._cuda_stream().wait_event(block.ready)
             if not nested:
                 if block.assigned is None:
                     assigned = _assign(block)
@@ -2020,7 +2052,7 @@ class Memory:
 
     def _used(self, block: _Block) -> None:
         if self.cuda:
-            stream = self.stream()
+            stream = self._cuda_stream()
             # Varena records its own last-consumer event on each declared stream when the
             # storage's final alias goes, so reclaim waits on that region, not the context.
             for use in (block.native_use, block.final_native_use):
@@ -2267,7 +2299,7 @@ class Memory:
     def stats(self) -> dict[str, Any] | None:
         return self.last
 
-    def torch_stats(self) -> dict[str, Any]:
+    def torch_stats(self) -> TorchStats:
         allocated, reserved = self._figures()
         peak = self._reading()[2]
         return {
@@ -2278,6 +2310,46 @@ class Memory:
             "allocator_scope": "process",
             "weights": self.native.stats() if self.native is not None else None,
         }
+
+
+class SplitChoice(TypedDict):
+    """What a split site's level was chosen against (`execution.catch.note`), in bytes."""
+
+    full: int
+    budget: int
+    capacity: int
+    live: int
+    weights: int
+    required: int
+    available: int
+    target: str | None
+
+
+class SplitRefusal(TypedDict):
+    level: int
+    pure: bool
+
+
+class SplitRecord(TypedDict):
+    """One split site's calls this request, for the run record: calls per level, each level's last
+    choice, and the level whose allocation was refused last, if one was."""
+
+    site: str
+    levels: dict[str, int]
+    chosen: dict[str, SplitChoice]
+    refused: NotRequired[SplitRefusal]
+
+
+class TorchStats(TypedDict):
+    """`Memory.torch_stats`: working bytes, by process and by open request, and the weight Regions'."""
+
+    allocated: int
+    mapped: int
+    peak: int
+    #: request id: (allocated, peak)
+    requests: dict[str, tuple[int, int]]
+    allocator_scope: str
+    weights: DeviceStats | None
 
 
 class Retained:
@@ -2317,8 +2389,8 @@ class Retained:
             parts.append((end, tensor.data_ptr(), tensor.nbytes))
             views.append((end, tensor.nbytes, tensor.dtype, tensor.shape))
             end = (end + tensor.nbytes + 255) // 256 * 256
-        region = varena.Retained(memory.native, memory.pages, end)
-        region.write(memory.stream().cuda_stream, parts, spill=self.spill)
+        region = varena.Retained(memory._device_native(), memory._tier(), end)
+        region.write(memory._cuda_stream().cuda_stream, parts, spill=self.spill)
         del dense
         self.states.append(_Kept(memory, region, views))
         return self.states[-1]
@@ -2337,8 +2409,16 @@ class _Held:
         self.tensors = None
 
 
+#: A phase's model in a plan's identity: name, content, fill identity, layout identity, and each Region
+#: it binds as (block path, role, address, bytes).
+type _PhaseSignature = tuple[str, str, str, str, tuple[tuple[str, str, int, int], ...]]
+
+
 class _Kept:
-    def __init__(self, memory: Memory, region: Any, views: list[tuple[int, int, Any, Any]]) -> None:
+    def __init__(
+        self, memory: Memory, region: varena.Retained | None,
+        views: list[tuple[int, int, torch.dtype, torch.Size]],
+    ) -> None:
         self.memory, self.region, self.views = memory, region, views
 
     def close(self) -> None:
@@ -2348,7 +2428,7 @@ class _Kept:
     def get(self) -> tuple[Tensor, ...]:
         if self.region is None:
             raise RuntimeError("retained state read after its loop ended")
-        raw = self.region.use(self.memory.stream().cuda_stream).tensor
+        raw = self.region.use(self.memory._cuda_stream().cuda_stream).tensor
         return tuple(raw[at:at + n].view(dtype).view(shape) for at, n, dtype, shape in self.views)
 
 
@@ -2370,19 +2450,19 @@ class Bake:
     CUDA between events on the stream its kernels ran on."""
 
     began_ns: int
-    start: Any = None
+    start: torch.cuda.Event | None = None
     host_ns: int = 0
-    stop: Any = None
+    stop: torch.cuda.Event | None = None
 
     @classmethod
-    def begin(cls, stream: Any) -> Bake:
+    def begin(cls, stream: torch.cuda.Stream | None) -> Bake:
         start = None
         if stream is not None:
             start = torch.cuda.Event(enable_timing=True)
             start.record(stream)
         return cls(time.perf_counter_ns(), start)
 
-    def end(self, stream: Any) -> Bake:
+    def end(self, stream: torch.cuda.Stream | None) -> Bake:
         self.host_ns = time.perf_counter_ns() - self.began_ns
         if self.start is not None:
             self.stop = torch.cuda.Event(enable_timing=True)
@@ -2390,7 +2470,7 @@ class Bake:
         return self
 
     def device_ns(self) -> int | None:
-        if self.stop is None:
+        if self.stop is None or self.start is None:
             return None
         self.stop.synchronize()
         return int(self.start.elapsed_time(self.stop) * 1e6)
@@ -2407,11 +2487,11 @@ class Request:
         self.phase_changes: list[dict[str, Any]] = []
         self.working_phases: list[dict[str, Any]] = []
         self.working_phase_keys: set[str] = set()
-        self.working_splits: dict[str, dict[str, Any]] = {}
+        self.working_splits: dict[str, SplitRecord] = {}
         #: each loop's record of what its passes left live outside any owner (`vt.escapes_take`);
         #: the models whose forwards mark their passes, and of the others, the blocks each entered
         #: this pass, in order
-        self.escaped: list[dict[str, Any]] = []
+        self.escaped: list[EscapeRecord] = []
         self.forwards: set[Model] = set()
         self.heads: dict[Model, tuple[set[int], int]] = {}
         #: the attempt failed (its executor says): a refused allocation in its last pass is learned
@@ -2508,7 +2588,7 @@ class Request:
 
     def record_fills(self) -> None:
         """The fills TensorFS logged since the last look."""
-        for row in self.memory.pages.drain():
+        for row in self.memory._tier().drain():
             self.fill(*row)
         self.sample()
 
@@ -2620,7 +2700,7 @@ def _allocator(memory: Memory) -> dict[str, int]:
 
 def _ahead(memory: Memory) -> dict[str, int]:
     """Cumulative fills ahead of demand that came to nothing."""
-    if not memory.cuda or memory.native is None:
+    if not memory.cuda or memory.native is None or memory.pages is None:
         return {}
     stats = memory.pages.stats()
     return {
@@ -2826,7 +2906,7 @@ def _placeholder(
     model: Model,
     block: _Block,
     sites: list[_Site],
-    dtype: Any,
+    dtype: torch.dtype,
     raw_views: Mapping[tuple[int, str], tuple[int, _Part]],
 ) -> Tensor:
     meta = sites[0].table[sites[0].name]
@@ -2950,7 +3030,7 @@ def _gib(n: int) -> str:
     return f"{n / (1 << 30):.1f} GiB"
 
 
-def _does_not_fit(component: str, refused: dict[str, Any]) -> str:
+def _does_not_fit(component: str, refused: Verdict) -> str:
     """One line: the op, what it needs and of what, the card's room, and what to do."""
     held, kept = refused["held_bytes"], refused["escaped_bytes"]
     sites = ", ".join(site for site, _ in refused["sites"])
@@ -2969,7 +3049,7 @@ def _does_not_fit(component: str, refused: dict[str, Any]) -> str:
     )
 
 
-def _escaped_warnings(records: list[dict[str, Any]]) -> None:
+def _escaped_warnings(records: list[EscapeRecord]) -> None:
     """One line per loop whose passes kept a significant amount as plain tensors."""
     for row in records:
         if row["escaped_peak_bytes"] < _NOTED:
@@ -3039,7 +3119,7 @@ def _hooks(model: Model) -> None:
             model.handles.extend(_gathering(sub, memory))
 
 
-def _gathering(module: nn.Module, memory: Memory) -> list[Any]:
+def _gathering(module: nn.Module, memory: Memory) -> list[RemovableHandle]:
     """A gathered table's forward runs on the host (`Memory._gather`): its inputs go there, and
     only the rows it read come back."""
 
@@ -3053,7 +3133,7 @@ def _gathering(module: nn.Module, memory: Memory) -> list[Any]:
 
     def pre(
         sub: nn.Module, args: tuple[object, ...], kwargs: dict[str, object]
-    ) -> tuple[Any, Any] | None:
+    ) -> tuple[tuple[object, ...], dict[str, object]] | None:
         weight = getattr(sub, "weight", None)
         on_host.now = memory.cuda and isinstance(weight, Tensor) and not weight.is_cuda
         if not on_host.now:
@@ -3076,7 +3156,7 @@ def _gathering(module: nn.Module, memory: Memory) -> list[Any]:
 
 def _paired(
     module: nn.Module, enter: Callable[..., None], leave: Callable[[], None], owner: Model,
-) -> list[Any]:
+) -> list[RemovableHandle]:
     owed = threading.local()
 
     def pre(_: nn.Module, args: tuple[object, ...], kwargs: dict[str, object]) -> None:

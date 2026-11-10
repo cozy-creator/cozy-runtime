@@ -4,13 +4,21 @@ from __future__ import annotations
 import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
-from typing import Any
+from typing import TYPE_CHECKING, Protocol
 
 from tensorfs.varena import _runtime as varena
 
+if TYPE_CHECKING:
+    import torch
+
+
+class _Lock(Protocol):
+    def acquire(self, blocking: bool = ..., timeout: float = ...) -> bool: ...
+    def release(self) -> None: ...
+
 
 @contextmanager
-def try_locks(locks: list[Any]) -> Iterator[bool]:
+def try_locks(locks: list[_Lock | None]) -> Iterator[bool]:
     """Claim actual owner/domain locks without waiting on the allocating caller."""
     acquired = []
     seen = set()
@@ -30,7 +38,7 @@ def try_locks(locks: list[Any]) -> Iterator[bool]:
 
 
 class Registration:
-    def __init__(self, device: int, target: Any, method: str) -> None:
+    def __init__(self, device: int, target: object, method: str) -> None:
         reference = weakref.ref(target)
 
         def shrink(_requested_bytes: int) -> bool:
@@ -70,7 +78,7 @@ class Registration:
             self.native.close()
 
 
-def register(device: Any, target: Any, method: str) -> Registration | None:
+def register(device: torch.device, target: object, method: str) -> Registration | None:
     if device.type != "cuda":
         return None
     return Registration(device.index or 0, target, method)
