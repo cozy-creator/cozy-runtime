@@ -52,7 +52,7 @@ from cozy_runtime.author import _model
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._errors import ContractViolation
 from cozy_runtime.author._model import WARNINGS, WarningRow
-from cozy_runtime.internal import kernel_cache, numerical_environment
+from cozy_runtime.internal import child_env, kernel_cache, numerical_environment
 
 if TYPE_CHECKING:
     from numpy.random import RandomState
@@ -69,8 +69,8 @@ WHY = {
     "from the request, and cut a big op with cozy_runtime.author.split",
     "allocator": "memory is varena's: allocate with torch tensors",
     "cuda_graph": "the Runtime records each component's CUDA graphs itself: call the module",
-    "env_write": "TensorD sets the environment every call here shares: read variables, don't "
-    "change them",
+    "env_write": "the Runtime and TensorD steer devices, memory, compiler caches, network and the "
+    "store through it: leave it as TensorD set it (a library's own setting may change)",
     "weights_io": "weights come only from the bound artifact, where their memory is counted: "
     "build the model in load() with the loader",
     "process": "a child process is outside the sandbox and its memory: do the work in this "
@@ -78,6 +78,30 @@ WHY = {
     "internal_import": "Runtime internals bypass the contract and change without notice: use "
     "cozy_runtime's public modules",
 }
+
+#: Environment names a package may not change: they steer the Runtime's own devices, memory,
+#: numerics, compiler caches, network and store, or another request's. Every other write is the
+#: package's, with one run warning per name: it holds for the whole process.
+SEALED_ENV_PREFIXES = (
+    "CUDA_",  # devices, the driver's caches
+    "NCCL_",  # GPU groups
+    "PYTORCH_",  # the allocator (PYTORCH_CUDA_ALLOC_CONF), kernel caches, MPS fallback
+    "TORCH_",  # extension and hub caches, numerics overrides
+    "TORCHINDUCTOR_",  # compile caches
+    "TRITON_",  # compile caches
+    "HF_HUB_",  # network and offline
+    "COZY_",  # the Runtime's own
+    "TENSORFS_",  # the store
+)
+SEALED_ENV = frozenset(
+    {"HF_ENDPOINT", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", *child_env.ALLOWLIST}
+) - {"OMP_NUM_THREADS"}  # torch sized its threads at start; TensorD's cap comes back each reply
+
+
+def sealed_env(name: str) -> bool:
+    """Whether a package may not change `name` (`SEALED_ENV_PREFIXES`, `SEALED_ENV`)."""
+    return name in SEALED_ENV or name.startswith(SEALED_ENV_PREFIXES)
+
 
 #: The Runtime's own work done through a library on its behalf (`lm.generate`'s Transformers
 #: loop): its calls pass.
@@ -1409,7 +1433,8 @@ def _installed() -> tuple[str, ...]:
 
 def audit(event: str, args: tuple[Any, ...]) -> None:  # type: ignore[explicit-any]  # an audit event's arguments
     """One of `AUDITED`, called by the audit hook itself (its frame and the hook's are skipped):
-    refuse the package's env change, spawn or weight read; remember its thread (`_Scopes`). The
+    refuse the package's sealed env change, spawn or weight read (warn of any other env change);
+    remember its thread (`_Scopes`). The
     Runtime's own (zygote forks, compile children, media encodes) pass."""
     if _LIBRARIES[0] is None or OWNED.get():
         return
@@ -1436,4 +1461,17 @@ def audit(event: str, args: tuple[Any, ...]) -> None:  # type: ignore[explicit-a
         if event not in _ENV_WRITES:
             _refuse("process", f"{event}({str(args[:1])[1:-2][:80]})", site)
         if not _unchanged(event, args):
-            _refuse("env_write", f"{event}({str(args[:1])[1:-2][:80]}) changing it", site)
+            _env_write(args[0], set_=event == "os.putenv", site=site)
+
+
+def _env_write(key: object, *, set_: bool, site: str) -> None:
+    """A package's env change: a sealed name refuses, any other is one run warning per name."""
+    name = key.decode(errors="replace") if isinstance(key, bytes) else str(key)
+    if sealed_env(name):
+        _refuse("env_write", f"{'setting' if set_ else 'unsetting'} {name}", site)
+    held = (
+        "TensorD's value comes back after the call"
+        if name in child_env.ALLOWLIST
+        else ("it holds for every request here")
+    )
+    _warn(f"env {name}", f"{name} changed by the package: {held}")

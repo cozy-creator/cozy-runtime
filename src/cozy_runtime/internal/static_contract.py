@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import cozy_runtime.internal.static_interface as static_interface
-from cozy_runtime.internal.contract import WHY
+from cozy_runtime.internal.contract import WHY, sealed_env
 
 if TYPE_CHECKING:
     from cozy_runtime.internal.static_interface import Module, Reader
@@ -61,7 +61,6 @@ _NAMED: dict[str, str] = {
         torch.cuda.memory._set_allocator_settings cuda.bindings cuda.cuda cuda.cudart cuda.core
         pycuda""",
     ),
-    **_names("env_write", "os:putenv os:unsetenv"),
     **_names(
         "cuda_graph",
         """torch.cuda.CUDAGraph torch.cuda.graph torch.cuda.graph_pool_handle
@@ -85,7 +84,9 @@ _NAMED: dict[str, str] = {
 _READS = frozenset({"torch.cuda.CUDAGraph.get_currently_capturing_graph"})
 #: `cozy_runtime`'s own machinery: every other module of it is the author's to import.
 _INTERNAL = _words("internal graphs cli")
-_ENVIRON_WRITES = frozenset({"setdefault", "update", "pop", "popitem", "clear", "__setitem__"})
+#: `os.environ` methods that change it, and those that change every name (refused).
+_ENVIRON_WRITES = frozenset({"setdefault", "update", "pop", "__setitem__", "__delitem__"})
+_ENVIRON_WIPES = frozenset({"popitem", "clear"})
 _WEIGHT_FILES = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf")
 
 
@@ -347,8 +348,13 @@ class _File:
         if isinstance(func, ast.Attribute):
             if func.attr in ("from_pretrained", "from_single_file"):
                 self._add(node, "weights_io", f".{func.attr}(...)")
-            if func.attr in _ENVIRON_WRITES and self._resolve(func.value) == "os.environ":
-                self._add(node, "env_write", f"os.environ.{func.attr}(...)")
+            if self._resolve(func.value) == "os.environ":
+                if func.attr in _ENVIRON_WIPES:
+                    self._add(node, "env_write", f"os.environ.{func.attr}()")
+                elif func.attr in _ENVIRON_WRITES:
+                    self._env(node, _env_keys(func.attr, node))
+        if dotted in ("os.putenv", "os.unsetenv") and node.args:
+            self._env(node, [node.args[0]], dotted)
         name = func.id if isinstance(func, ast.Name) and func.id not in self.aliases else None
         opens = name == "open" or dotted in ("io.open", "builtins.open")
         if opens and node.args and (suffix := _literal_suffix(node.args[0])) is not None:
@@ -362,7 +368,7 @@ class _File:
         targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
         for target in (t for each in targets for t in _unpacked(each)):
             if isinstance(target, ast.Subscript) and self._resolve(target.value) == "os.environ":
-                self._add(target, "env_write", "os.environ[...]")
+                self._env(target, [target.slice])
             elif isinstance(target, ast.Attribute):
                 if target.attr == "PURE_WINDOWS":
                     self._add(target, "internal_import", "PURE_WINDOWS")
@@ -386,11 +392,35 @@ class _File:
                 self._add(node, "oom_catch", f'except ...: "{inner.value.strip()[:40]}"')
                 return
 
+    def _env(self, node: ast.AST, keys: Sequence[ast.expr], call: str = "") -> None:
+        """An env write naming a sealed variable (`contract.sealed_env`) by literal; any other
+        is the seal's to judge when it runs (one run warning)."""
+        for key in keys:
+            if (
+                isinstance(key, ast.Constant)
+                and isinstance(key.value, str)
+                and sealed_env(key.value)
+            ):
+                said = f"{call}({key.value!r})" if call else f"os.environ[{key.value!r}]"
+                self._add(node, "env_write", said)
+
     def _add(self, node: ast.AST, code: str, construct: str) -> None:
         line = getattr(node, "lineno", 0)
         if len(construct) > CONSTRUCT_CHARS:
             construct = construct[:CONSTRUCT_CHARS] + "…"
         self.found.setdefault((line, code), Finding(self.path, line, code, construct))
+
+
+def _env_keys(method: str, node: ast.Call) -> list[ast.expr]:
+    """The names an `os.environ.<method>(...)` call writes: its first argument, or for `update`
+    a dict literal's keys and its keywords."""
+    if method != "update":
+        return node.args[:1]
+    found: list[ast.expr] = [ast.Constant(k.arg) for k in node.keywords if k.arg is not None]
+    for arg in node.args[:1]:
+        if isinstance(arg, ast.Dict):
+            found.extend(k for k in arg.keys if k is not None)
+    return found
 
 
 def _unpacked(target: ast.expr) -> Iterator[ast.expr]:
