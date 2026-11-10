@@ -22,7 +22,8 @@ async def generate(ctx: Context, *, model: SDXL, prompt: str) -> Image: ...
 The Model class declares how far the lane rules may lower its precision:
 
 ```python
-class Qwen(Model, encoded_leaves="accept", min_bits=4, phase="decode"): ...
+class Qwen(Model[QwenGraph]):
+    serving = Serving(min_bits=4, phase="decode")
 ```
 
 - `min_bits`: 16, 8 (the default) or 4. The lowest weight precision the rules pick by
@@ -30,9 +31,9 @@ class Qwen(Model, encoded_leaves="accept", min_bits=4, phase="decode"): ...
   budget.
 - `phase`: `"compute"` (the default: diffusion, prefill) or `"decode"` (an LM's token loop,
   bound by weight bytes).
-- Subclasses inherit both. Any other value is refused.
+- A subclass's `serving` replaces its base's. Any other value is refused.
 
 Each slot in the package interface carries `default`, `min_bits` (omitted when 8) and
 `phase` (omitted when `"compute"`). The import and static readers produce identical bytes.
-The static reader never imports package code, and reads class keywords and their inheritance
-from source.
+The static reader never imports package code, and reads `serving` and its inheritance from
+source.

@@ -1,0 +1,1 @@
+- The author README opens with a complete package that runs as written and uses the ordinary forms (`self.device`, a tqdm loop, `logging`, a seeded `torch.Generator`). Refusals that named removed APIs (`cozy_runtime.author.hold_dtype`, `encoded_leaves="accept"`) or internal words ("generation", "lease", "override-marker plane") now say in one line what to write instead.

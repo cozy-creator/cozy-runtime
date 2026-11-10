@@ -307,10 +307,9 @@ class Backend:
         if native and encoded_leaves != "accept":
             raise _refuse(
                 "leaf_unconsented",
-                f"{len(native)} of this artifact's tensors ({', '.join(native[:3])}…) serve "
-                f"through a native encoded leaf on {device_line(self.device_facts)}, and this "
-                f"package declares encoded_leaves={encoded_leaves!r}: the leaf replaces the "
-                'linear op, so the package must state `encoded_leaves="accept"`',
+                f"{len(native)} of this checkpoint's tensors ({', '.join(native[:3])}…) need a "
+                f"kernel that replaces their linear op on {device_line(self.device_facts)}: "
+                "allow it with `serving = Serving(encoded_leaves=True)` on the Model class",
                 native[:6],
             )
         roots = dict(_members(obj))

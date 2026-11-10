@@ -15,7 +15,7 @@ from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import App
 from cozy_runtime.author._artifacts import Lora, ModelArtifact, ModelChoice, ObjectRef
 from cozy_runtime.author._calls import ChildCallError, PendingCall, invocable, prefetch
-from cozy_runtime.author._context import Context, Device, device
+from cozy_runtime.author._context import Context, device
 from cozy_runtime.author._errors import Cancelled, InvalidRequest, OutputError, UnsupportedInput
 from cozy_runtime.author._loader import Config, DerivedCache, Loader, ModelAssets
 from cozy_runtime.author._memo import Memoize
@@ -56,7 +56,6 @@ __all__ = [
     "Cut",
     "DerivationHook",
     "DerivedCache",
-    "Device",
     "EncodingRule",
     "ImageFrame",
     "InvalidRequest",

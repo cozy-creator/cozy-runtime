@@ -99,12 +99,13 @@ from cozy_runtime.accel.attention import _close as close_producer_states
 from cozy_runtime.accel.kernels import _SETS as KERNEL_SETS
 from cozy_runtime.accel.kernels import Launch, Plan, TritonKernels
 from cozy_runtime.author import _activity, _split
+from cozy_runtime.author import _console as console
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelChoice
 from cozy_runtime.author._calls import Exchange, Nudges, _Broker, _CallType, _export
-from cozy_runtime.author._context import CURRENT, Device, place
+from cozy_runtime.author._context import CURRENT, place
 from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.author._describe import freeze
 from cozy_runtime.author._errors import (
@@ -265,7 +266,6 @@ if TYPE_CHECKING:
     from torch import nn
     from torch._C._distributed_c10d import Store
 
-    from cozy_runtime.author._context import DeviceType
     from cozy_runtime.author._model import ModelRegistry, Residency
     from cozy_runtime.author._observations import Scalar
     from cozy_runtime.author._signature import Surface
@@ -1168,7 +1168,7 @@ class Executor:
             self._boundary()
         accel.first_launches(torch, self.device_kind)
         self._device_ready = True
-        place(self._device())
+        self._place()
         return None
 
     def _execution_context(self) -> contextlib.AbstractContextManager[object]:
@@ -3668,13 +3668,13 @@ class Executor:
                     said = f"attention kernel {removed} is gone: the normal choice runs"
                     WARNINGS.append((said, {"code": "attention_kernel_removed"}))
                 served_attention = self._attention_selection(served_attention)
+                self._place()
                 envelope, outcome, record = run_prepared(
                     prepared,
                     Invocation(
                         request_id=command.request_id,
                         spool=spool,
                         deadline=deadline,
-                        device=self._device(),
                         cancel=functools.partial(self.host.mux.cancelled, command.request_id),
                         # An on-demand proxy stands for its model (`_OnDemand.__getattr__`).
                         models=cast("Mapping[str, Model[object]]", self.models),
@@ -4772,14 +4772,12 @@ class Executor:
             )
         return cached
 
-    def _device(self) -> Device:
-        """This executor's device as `author.device()` names it: its rank's GPU (`cuda:0`
-        alone; the worker sealed this process to its lane, cr-066), MPS, or the CPU where none
-        is present. No torch in this process means no device to name (cl-013)."""
-        if self.torch is None:
-            return Device()
-        placed = self._rank_device(self.torch)
-        return Device(cast("DeviceType", placed.type), placed.index)  # torch names cuda/cpu/mps
+    def _place(self) -> None:
+        """Name this executor's device for `author.device()`: its rank's GPU (`cuda:0` alone;
+        the worker sealed this process to its lane, cr-066), MPS, or the CPU where none is
+        present. No torch in this process means no device to name (cl-013)."""
+        if self.torch is not None:
+            place(self._rank_device(self.torch))
 
     @contextlib.contextmanager
     def _request(self, request_id: str) -> Iterator[list[GpuMemory]]:
@@ -5109,6 +5107,7 @@ def main(argv: list[str] | None = None) -> int:
             return int(Exit.structural)
 
     _capture_seal()
+    console.install()
     _remember_distributions()
     declared_recipes.install(run_recipe)
     kernel_cache.configure(kernel_cache.from_sealed(_SEALED))

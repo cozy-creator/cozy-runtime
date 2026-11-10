@@ -1,4 +1,5 @@
-"""Typed refusals. Every author-surface failure is one of these — never a bare ValueError.
+"""Typed refusals: what the author API raises. A package raises `InvalidRequest`,
+`UnsupportedInput` or `OutputError`; any other exception fails the run with its first line.
 
 Two clocks (§1.0): `ConformanceError` refuses at BUILD (describe), everything else refuses
 at REQUEST time. The clock is the class, so a caller never has to read prose to know

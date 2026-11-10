@@ -38,7 +38,8 @@ from cozy_runtime.author._activity import asides
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._calls import _Broker, _current
-from cozy_runtime.author._context import CURRENT, Context, Device
+from cozy_runtime.author._console import attempt_log
+from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._decode import (
     AudioProbe,
     VideoProbe,
@@ -99,7 +100,6 @@ class Invocation:
     request_id: str
     spool: Path
     deadline: float
-    device: Device = field(default_factory=Device)
     cancel: Callable[[], bool] = field(default=lambda: False)
     models: Mapping[str, Model[object]] = field(default_factory=dict)
     #: The package's declared recipes, which its `quantize` runs.
@@ -300,9 +300,10 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
 
     attempt = record
     attempt.outputs = surface.outputs
-    ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel)
+    ctx = Context(inv.request_id, inv.deadline, inv.cancel)
     ctx._recipes = inv.recipes
     ctx._progress, ctx._called = Telemetry(record, ctx).loop_progress()
+    ctx._log = attempt_log(record)
     handles = ExitStack()
     _bind_tensorfs(ctx, record, inv, surface, handles)
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)

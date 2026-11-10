@@ -19,12 +19,14 @@ import time
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, final
+from typing import TYPE_CHECKING, final
 
 from cozy_runtime.author._errors import Cancelled, CapabilityError, DeadlineExceeded
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
+
+    import torch
 
     from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._loader import Scheduler
@@ -34,33 +36,23 @@ if TYPE_CHECKING:
     from cozy_runtime.graphs import Finite
     from cozy_runtime.weights_store import Checkpoint, Derivation, Output
 
-DeviceType = Literal["cuda", "cpu", "mps"]
+_PLACED: list[torch.device] = []
 
 
-@dataclass(frozen=True, slots=True)
-class Device:
-    """A read-only device identity. `str(device)` is the torch spelling (`cuda:0`)."""
-
-    type: DeviceType = "cpu"
-    index: int | None = None
-
-    def __str__(self) -> str:
-        return self.type if self.index is None else f"{self.type}:{self.index}"
-
-
-_PLACED: list[Device] = [Device()]
-
-
-def device() -> Device:
+def device() -> torch.device:
     """This process's device, the one every model, call and placement here uses: its GPU (a
-    group rank's own), MPS, or the CPU where none is present. A package never picks one; reading
-    it is not a door. The CPU until an executor names it."""
+    group rank's own), MPS, or the CPU where none is present. A package never picks one. The CPU
+    until an executor names it."""
+    if not _PLACED:
+        import torch
+
+        _PLACED.append(torch.device("cpu"))
     return _PLACED[0]
 
 
-def place(placed: Device) -> None:
+def place(placed: torch.device) -> None:
     """The executor names its device once its accelerator is up (`device()`)."""
-    _PLACED[0] = placed
+    _PLACED[:] = [placed]
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +136,6 @@ class Context:
     request_id: str
     deadline: float
     """Monotonic-clock instant the attempt must not outlive."""
-    device: Device = field(default_factory=Device)
     _cancel: Callable[[], bool] = field(default=lambda: False, repr=False)
     _tensorfs_source: Callable[[Weights[Model[object]]], Checkpoint] | None = field(
         default=None, repr=False
@@ -165,6 +156,8 @@ class Context:
     _called: Callable[[str], None] | None = field(default=None, repr=False)
     #: the package contract's state for this request: its own random streams and numerics flags
     _contract: object = field(default=None, repr=False, compare=False)
+    #: one of the run's log lines and its level: what `print`, `logging` and `warnings` write
+    _log: Callable[[str, str], None] | None = field(default=None, repr=False)
 
     def tensorfs_source(self, weights: Weights[Model[object]]) -> Checkpoint:
         """An admitted `Weights` argument's checkpoint: its pipeline, components and stored
@@ -211,6 +204,11 @@ class Context:
         """
         if self._release_gpus is not None:
             self._release_gpus()
+
+    @property
+    def device(self) -> torch.device:
+        """Where this attempt's tensors live (`author.device()`)."""
+        return device()
 
     @property
     def cancelled(self) -> bool:

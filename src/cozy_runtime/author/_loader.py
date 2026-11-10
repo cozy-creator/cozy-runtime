@@ -50,10 +50,12 @@ from typing import (
 
 import msgspec
 
-from cozy_runtime.author._context import AdapterRef, Device, device
+from cozy_runtime.author._context import AdapterRef, device
 from cozy_runtime.author._errors import CapabilityError, ConformanceError, InvalidRequest
 
 if TYPE_CHECKING:
+    import torch
+
     from cozy_runtime.internal.fill import FitVerdict
 
 T = TypeVar("T")
@@ -845,9 +847,8 @@ class Loader:
         self._pretrained: dict[str, object] = {}
 
     @property
-    def device(self) -> Device:
-        """This process's device (`author.device()`). Placement is the runtime's; naming it is
-        not a door."""
+    def device(self) -> torch.device:
+        """This process's device (`author.device()`). Placement is the runtime's."""
         self._require_open("loader.device")
         return device()
 
