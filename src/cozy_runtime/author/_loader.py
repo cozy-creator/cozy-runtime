@@ -440,7 +440,7 @@ class ModelFitRefused(ConformanceError):
 
     default_code = "model_fit_refused"
 
-    def __init__(self, fit: Fit, unnormalized: str = "") -> None:
+    def __init__(self, fit: Mapping[str, object], unnormalized: str = "") -> None:
         verdict = f"{fit.get('code')} — {fit.get('detail')}"
         super().__init__(
             f"{unnormalized}; {verdict}" if unnormalized else verdict,
