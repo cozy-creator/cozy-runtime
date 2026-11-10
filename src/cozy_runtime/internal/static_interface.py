@@ -1487,6 +1487,13 @@ def _single_target(stmt: ast.stmt) -> str | None:
 def read_application(project: Path) -> str:
     """pyproject's one `cozy.application` entry point (the one the wheel carries), or the
     zero/ambiguous refusal."""
+    if project.is_file():
+        raise StaticRefusal(
+            f"{project} is a file, not a package directory: pass the directory holding its "
+            f"pyproject.toml (`--dir {project.parent}`), or describe a script with "
+            f"`cozy run {project} --describe`",
+            code="project_is_file",
+        )
     path = project / "pyproject.toml"
     try:
         data = tomllib.loads(path.read_text())
