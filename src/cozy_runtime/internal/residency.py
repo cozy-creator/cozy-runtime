@@ -21,7 +21,7 @@ from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict
+from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict, Unpack, cast
 
 import tensorfs
 import tensorfs.varena.torch as vt
@@ -47,7 +47,15 @@ from cozy_runtime.internal.accel import (
 )
 
 if TYPE_CHECKING:
-    from tensorfs.varena._facts import DeviceStats, EscapeRecord, Verdict
+    from tensorfs.varena._facts import (
+        DeviceStats,
+        EscapeRecord,
+        PagesStats,
+        PlanFacts,
+        Verdict,
+        WorkingStats,
+    )
+    from torch._ops import OpOverload
 
 __all__ = [
     "Binding",
@@ -207,8 +215,12 @@ class Declared:
 class Placeholder(Tensor):  # type: ignore[misc]  # Torch is optional in the checking environment.
     """Metadata between binds; a real read obtains ordinary owning Torch storage."""
 
+    _varena_read: Callable[[], Tensor]
+
     @staticmethod
-    def __new__(cls: Any, shape: Sequence[int], dtype: Any, device: Any) -> Any:
+    def __new__(
+        cls: type[Placeholder], shape: Sequence[int], dtype: torch.dtype, device: torch.device
+    ) -> Placeholder:
         return Tensor._make_wrapper_subclass(
             cls, tuple(shape), dtype=dtype, device=device, storage_size=0
         )
@@ -216,12 +228,16 @@ class Placeholder(Tensor):  # type: ignore[misc]  # Torch is optional in the che
     def __repr__(self) -> str:
         return f"UnboundWeight({tuple(self.shape)}, {self.dtype}, {self.device})"
 
-    def _varena_read(self) -> Tensor:
+    def _varena_read(self) -> Tensor:  # type: ignore[no-redef]  # the default; a made copy's own reads its source
         raise ResidencyError("this weight has no declared source")
 
     @classmethod
-    def __torch_dispatch__(
-        cls: Any, func: Any, types: Any, args: Any = (), kwargs: Any = None
+    def __torch_dispatch__(  # type: ignore[explicit-any]  # torch hands over any ATen op's operands and result
+        cls,
+        func: OpOverload[..., Any],
+        types: Sequence[type],
+        args: Sequence[Any] = (),
+        kwargs: dict[str, Any] | None = None,
     ) -> Any:
         aten, kwargs = torch.ops.aten, kwargs or {}
         if func in (aten.detach.default, aten.alias.default):
@@ -237,7 +253,7 @@ class Placeholder(Tensor):  # type: ignore[misc]  # Torch is optional in the che
         return func(*tree_map(_readable, args), **tree_map(_readable, kwargs))
 
 
-def _readable(value: Any) -> Any:
+def _readable(value: object) -> object:
     return value._varena_read() if isinstance(value, Placeholder) else value
 
 
@@ -374,7 +390,8 @@ def unpaged(module: nn.Module, rule: str, groups: Mapping[str, int]) -> str | No
 
 @dataclass(frozen=True, slots=True)
 class _Site:
-    table: dict[str, Any]
+    #: the module's `_parameters` or `_buffers`: a bind puts plain tensors in either
+    table: dict[str, Tensor | None]
     name: str
     parameter: bool
 
@@ -396,7 +413,7 @@ class _Block:
     parts: dict[str, dict[str, _Part]] = field(default_factory=dict)
     data: dict[str, dict[str, Tensor]] | None = None
     assigned: list[tuple[_Site, Tensor]] | None = None
-    saved: list[tuple[_Site, Any]] = field(default_factory=list)
+    saved: list[tuple[_Site, Tensor | None]] = field(default_factory=list)
     count: int = 0
     retained: int = 0
     loading: bool = False
@@ -418,7 +435,9 @@ class _Block:
     #: the fill overlay (`Filling.overlay`) its page was written with
     overlay: Hashable = None
     #: native pages of other overlays, parked for reuse (`_switch_overlay`): (raw, final) regions
-    parked: dict[Hashable, tuple[varena.Region | None, varena.Region | None]] = field(default_factory=dict)
+    parked: dict[Hashable, tuple[varena.Region | None, varena.Region | None]] = field(
+        default_factory=dict
+    )
     #: an `nn.Embedding`'s table: one that does not fit the room gathers its rows on the host
     table: bool = False
     #: its host copy while it gathers, by overlay: (overlay, raw views, final views)
@@ -1002,7 +1021,10 @@ class Memory:
     """One executor's weight residency, beside Torch's activation allocator."""
 
     def __init__(
-        self, device: torch.device | str | int, budget_bytes: int | None = None, shared: bool = False
+        self,
+        device: torch.device | str | int,
+        budget_bytes: int | None = None,
+        shared: bool = False,
     ) -> None:
         self.device = torch.device(device)
         self.cuda: bool = self.device.type == "cuda"
@@ -1012,13 +1034,15 @@ class Memory:
         self._working_phase_owners: dict[str, set[Model | Request]] = {}
         self.regions: weakref.WeakSet[Region] = weakref.WeakSet()
         self.requests: set[Request] = set()
-        self.last: dict[str, Any] | None = None
+        self.last: RequestStats | None = None
         self.native: varena.Device | None = None
         #: This GPU's host tier: TensorFS keeps weight pages in pinned host RAM.
         self.pages: varena.Pages | None = None
         self.granularity = 512
         self._phase_plan: varena.Plan | None = None
-        self._phase_plan_signature: tuple[tuple[list[str] | _PhaseSignature, ...], ...] | None = None
+        self._phase_plan_signature: tuple[tuple[list[str] | _PhaseSignature, ...], ...] | None = (
+            None
+        )
         self._phase_plan_keys: dict[frozenset[str], str] = {}
         self._phase_plan_models: set[Model] = set()
         self._phase_plan_status: tuple[object, ...] | None = None
@@ -1043,7 +1067,11 @@ class Memory:
 
     @classmethod
     def open(
-        cls, gpu: torch.device | str | int = 0, *, budget_bytes: int | None = None, shared: bool = False
+        cls,
+        gpu: torch.device | str | int = 0,
+        *,
+        budget_bytes: int | None = None,
+        shared: bool = False,
     ) -> Memory:
         device = torch.device("cuda", gpu) if isinstance(gpu, int) else torch.device(gpu)
         if device.type == "cuda":
@@ -1477,8 +1505,12 @@ class Memory:
         if stats["pin_failed"]:
             rows.append(("a host page did not pin: its refills stay on the store", {}))
         if stats["refused"] is not None:
-            reason = {"reason": stats["refused"][:300]}
-            rows.append(("weights stream from the store: pinning host memory failed", reason))
+            rows.append(
+                (
+                    "weights stream from the store: pinning host memory failed",
+                    {"reason": stats["refused"][:300]},
+                )
+            )
         for row in rows:
             if row not in WARNINGS:
                 WARNINGS.append(row)
@@ -1715,7 +1747,11 @@ class Memory:
         owner = weakref.ref(block)  # a Region owns its Source: never the block back
         if final:
             return varena.Source(
-                self._tier(), model.name, block.index, block.final_bytes, page=page,
+                self._tier(),
+                model.name,
+                block.index,
+                block.final_bytes,
+                page=page,
                 derive=functools.partial(_derive, owner, "final_region", _write_final),
             )
         offset, parts = 0, []
@@ -1728,8 +1764,14 @@ class Memory:
         if model.fill is not None:
             derive = functools.partial(_derive, owner, "region", _bake)
         return varena.Source(
-            self._tier(), model.name, block.index, block.storage_bytes,
-            checkpoint=model.source.ck, parts=parts, page=page, derive=derive,
+            self._tier(),
+            model.name,
+            block.index,
+            block.storage_bytes,
+            checkpoint=model.source.ck,
+            parts=parts,
+            page=page,
+            derive=derive,
         )
 
     def _use(self, block: _Block, *, final: bool = False) -> varena.Use:
@@ -1743,7 +1785,7 @@ class Memory:
             return use
         return self._native_region(block, final=final).use(self._cuda_stream().cuda_stream)
 
-    def _note_phase_plan(self, status: str, reason: str = "", **facts: Any) -> None:
+    def _note_phase_plan(self, status: str, reason: str = "", **facts: Unpack[_PlanNote]) -> None:
         request = _REQUEST.get()
         stamp = (self._phase_request, self._phase_names, status, reason)
         if request is not None and stamp != self._phase_plan_status:
@@ -1822,13 +1864,19 @@ class Memory:
             self._retire_phase_plan("no_regions")  # A model with no weights plans nothing.
             return
         represented: tuple[tuple[list[str] | _PhaseSignature, ...], ...] = tuple(
-            (sorted(step), *signature) for step, _, signature, why in phases if not why and signature
+            (sorted(step), *signature)
+            for step, _, signature, why in phases
+            if not why and signature
         )
         if self._phase_plan is None or represented != self._phase_plan_signature:
             self._retire_phase_plan("phase_inventory_changed")
             digest = hashlib.sha256(repr(represented).encode()).hexdigest()
-            keys = {step: f"runtime.phase.regions/1:{digest}/{i}" for i, (step, _) in enumerate(planned)}
-            self._phase_plan = varena.Plan(self._device_native(), [(keys[step], regions) for step, regions in planned])
+            keys = {
+                step: f"runtime.phase.regions/1:{digest}/{i}" for i, (step, _) in enumerate(planned)
+            }
+            self._phase_plan = varena.Plan(
+                self._device_native(), [(keys[step], regions) for step, regions in planned]
+            )
             self._phase_plan_signature, self._phase_plan_keys = represented, keys
             self._phase_plan_models = {
                 model for model in self.models.values()
@@ -1977,7 +2025,9 @@ class Memory:
         if (request := _REQUEST.get()) is not None:
             request.gathered += 1
 
-    def _read_into(self, tensors: tensorfs.Tensors, key: str, raw: Tensor, role: str | None) -> None:
+    def _read_into(
+        self, tensors: tensorfs.Tensors, key: str, raw: Tensor, role: str | None
+    ) -> None:
         if self.device.type != "mps":
             tensors.read_into(key, raw, role=role)
             return
@@ -2123,7 +2173,7 @@ class Memory:
                         "construction computed one (from config or a constant), not from a "
                         "weightless parameter"
                     )
-                return value
+                return cast(Tensor, value)  # a site is a slot that held a tensor
             finally:
                 self._exit(block)
         finally:
@@ -2296,7 +2346,7 @@ class Memory:
                     if self.cuda and not idle:
                         varena.request_boundary(self.device.index or 0, begin=False)
 
-    def stats(self) -> dict[str, Any] | None:
+    def stats(self) -> RequestStats | None:
         return self.last
 
     def torch_stats(self) -> TorchStats:
@@ -2310,6 +2360,99 @@ class Memory:
             "allocator_scope": "process",
             "weights": self.native.stats() if self.native is not None else None,
         }
+
+
+class _PlanNote(TypedDict, total=False):
+    native: PlanFacts
+
+
+class RegionPlan(_PlanNote):
+    status: str
+    reason: str
+
+
+class PhaseChange(TypedDict):
+    """A change of the request's phase models (`Memory.phase`), and its native region plan's."""
+
+    models: list[str]
+    retention: str
+    region_plan: NotRequired[RegionPlan]
+
+
+class FillEntry(TypedDict):
+    """One block fill (`Request.fill`): a demand fill also has its read's times, a baked one its bake's."""
+
+    sequence: int
+    set: str
+    block: int
+    bytes: int
+    origin: str
+    speculative: bool
+    ns: NotRequired[int]
+    at_unix_ms: NotRequired[float]
+    bake_ns: NotRequired[int]
+    bake_device_ns: NotRequired[int | None]
+
+
+class _BakeTimes(TypedDict, total=False):
+    """A bake's times, on its fill's trace entry or, when the fill is not traced, alone."""
+
+    bake_ns: int
+    bake_device_ns: int | None
+
+
+class Moved(TypedDict):
+    bytes: int
+    fills: int
+    ns: int
+
+
+class BakeTotals(TypedDict):
+    blocks: int
+    host_ns: int
+    device_ns: int
+
+
+class FinalBindings(TypedDict):
+    fills: int
+    hits: int
+    resident_scope: str
+    raw_resident_bytes: int
+    final_resident_bytes: int
+    fallback_blocks: int
+
+
+class RequestStats(TypedDict):
+    """`Request.stats`: the request's memory record. CUDA adds its allocator and residency
+    figures, MPS its observed allocation."""
+
+    request: str
+    allocator_scope: str
+    overlapping: bool
+    sets: dict[str, int]
+    #: by origin (`Request.moved`), and "bake": the bakes' totals
+    moved: dict[str, Moved | BakeTotals]
+    baked_pages: PagesStats | None
+    trace: list[FillEntry]
+    trace_scope: str
+    phases: list[PhaseChange]
+    working_phases: list[dict[str, Any]]  # type: ignore[explicit-any]  # phase.observing's rows (typing-runtime types them)
+    working_splits: list[SplitRecord]
+    escaped: list[EscapeRecord]
+    finer_splits: int
+    swallowed_ooms: int
+    retained_bytes: int
+    gathered: int
+    host: None
+    allocated: NotRequired[int]
+    reserved: NotRequired[int]
+    working_allocator: NotRequired[WorkingStats]
+    weight_residency: NotRequired[DeviceStats | None]
+    final_bindings: NotRequired[FinalBindings]
+    allocator: NotRequired[dict[str, int]]
+    #: "completed", the core's ahead-of-demand counters (`_ahead`) and "scope"
+    prefetch: NotRequired[dict[str, int | str]]
+    measurement: NotRequired[str]
 
 
 class SplitChoice(TypedDict):
@@ -2416,7 +2559,9 @@ type _PhaseSignature = tuple[str, str, str, str, tuple[tuple[str, str, int, int]
 
 class _Kept:
     def __init__(
-        self, memory: Memory, region: varena.Retained | None,
+        self,
+        memory: Memory,
+        region: varena.Retained | None,
         views: list[tuple[int, int, torch.dtype, torch.Size]],
     ) -> None:
         self.memory, self.region, self.views = memory, region, views
@@ -2429,7 +2574,7 @@ class _Kept:
         if self.region is None:
             raise RuntimeError("retained state read after its loop ended")
         raw = self.region.use(self.memory._cuda_stream().cuda_stream).tensor
-        return tuple(raw[at:at + n].view(dtype).view(shape) for at, n, dtype, shape in self.views)
+        return tuple(raw[at : at + n].view(dtype).view(shape) for at, n, dtype, shape in self.views)
 
 
 class _Retaining:
@@ -2484,8 +2629,8 @@ class Request:
         self.current: set[str] = set()
         self.steps: list[set[str]] = []
         self.declared_steps: list[set[str]] = []
-        self.phase_changes: list[dict[str, Any]] = []
-        self.working_phases: list[dict[str, Any]] = []
+        self.phase_changes: list[PhaseChange] = []
+        self.working_phases: list[dict[str, Any]] = []  # type: ignore[explicit-any]  # phase.observing's rows (typing-runtime types them)
         self.working_phase_keys: set[str] = set()
         self.working_splits: dict[str, SplitRecord] = {}
         #: each loop's record of what its passes left live outside any owner (`vt.escapes_take`);
@@ -2510,15 +2655,15 @@ class Request:
         #: bytes on this GPU (`resident`) or in its kept page (`host`)
         self.moved = {origin: [0, 0, 0] for origin in ("store", "baked", "resident", "host")}
         #: each baked fill's trace entry and its bake (`Bake`), resolved when the request ends
-        self.bakes: list[tuple[dict[str, object], Bake]] = []
+        self.bakes: list[tuple[FillEntry | _BakeTimes, Bake]] = []
         self.final_fills = self.final_hits = 0
         #: table lookups served on the host (`Memory._gather`)
         self.gathered = 0
         self.prefetch_completed = 0
         self.ahead = _ahead(memory)
         self.allocator = _allocator(memory)
-        self._trace: list[dict[str, object]] = []
-        self.ended: dict[str, Any] | None = None
+        self._trace: list[FillEntry] = []
+        self.ended: RequestStats | None = None
         if memory.cuda and torch.cuda.is_initialized() and not memory.requests:
             # The working peak is process-wide since its reset: alone, a request starts its own,
             # or its floor is the largest decode the process ever ran (sieg: SDXL gave nothing)
@@ -2584,7 +2729,7 @@ class Request:
             }
         )
         if not ahead:
-            self._trace[-1].update(ns=ns, at_unix_ms=round(at_ms, 1))
+            self._trace[-1].update({"ns": ns, "at_unix_ms": round(at_ms, 1)})
 
     def record_fills(self) -> None:
         """The fills TensorFS logged since the last look."""
@@ -2593,13 +2738,13 @@ class Request:
         self.sample()
 
     @property
-    def trace(self) -> list[dict[str, object]]:
+    def trace(self) -> list[FillEntry]:
         # An idle request opens inside a running one and fills nothing: the fills are that one's.
         if self.memory.pages is not None and not self.idle:
             self.record_fills()
         return self._trace
 
-    def _bakes(self) -> dict[str, int]:
+    def _bakes(self) -> BakeTotals:
         """The bakes this request ran after a store read: each one's host and device time onto
         its trace entry, and their sums."""
         host = device = 0
@@ -2610,13 +2755,13 @@ class Request:
             device += on_device or 0
         return {"blocks": len(self.bakes), "host_ns": host, "device_ns": device}
 
-    def stats(self) -> dict[str, Any]:
+    def stats(self) -> RequestStats:
         if self.ended is not None:
             return self.ended
         trace = self.trace
         self.sample()
         allocated, reserved = self.memory._figures()
-        out: dict[str, Any] = {
+        out: RequestStats = {
             "request": self.id,
             "allocator_scope": "process",
             "overlapping": self.overlap,
@@ -2646,41 +2791,44 @@ class Request:
         if self.memory.cuda and torch.cuda.is_initialized():
             groups = [b for model in self.memory.models.values() for b in model.groups()]
             out.update(
-                allocated=allocated,
-                reserved=reserved,
-                working_allocator=vt.stats(self.memory.device.index or 0),
-                weight_residency=(
-                    self.memory.native.stats() if self.memory.native is not None else None
-                ),
-                final_bindings={
-                    "fills": self.final_fills,
-                    "hits": self.final_hits,
-                    "resident_scope": "process",
-                    "raw_resident_bytes": sum(
-                        int(b.region.allocated_bytes)
-                        for b in groups
-                        if b.region is not None and b.region.resident
+                {
+                    "allocated": allocated,
+                    "reserved": reserved,
+                    "working_allocator": vt.stats(self.memory.device.index or 0),
+                    "weight_residency": (
+                        self.memory.native.stats() if self.memory.native is not None else None
                     ),
-                    "final_resident_bytes": sum(
-                        int(b.final_region.allocated_bytes)
-                        for b in groups
-                        if b.final_region is not None and b.final_region.resident
-                    ),
-                    "fallback_blocks": sum(b.aliases is None for b in groups),
-                },
-                # Cumulative native working counters sampled over this request.
-                allocator={
-                    k: v - self.allocator.get(k, 0)
-                    for k, v in _allocator(self.memory).items()
-                },
-                prefetch={
-                    "completed": self.prefetch_completed,
-                    **{k: v - self.ahead.get(k, 0) for k, v in _ahead(self.memory).items()},
-                    "scope": "the core's fills ahead of demand",
-                },
+                    "final_bindings": {
+                        "fills": self.final_fills,
+                        "hits": self.final_hits,
+                        "resident_scope": "process",
+                        "raw_resident_bytes": sum(
+                            int(b.region.allocated_bytes)
+                            for b in groups
+                            if b.region is not None and b.region.resident
+                        ),
+                        "final_resident_bytes": sum(
+                            int(b.final_region.allocated_bytes)
+                            for b in groups
+                            if b.final_region is not None and b.final_region.resident
+                        ),
+                        "fallback_blocks": sum(b.aliases is None for b in groups),
+                    },
+                    # Cumulative native working counters sampled over this request.
+                    "allocator": {
+                        k: v - self.allocator.get(k, 0) for k, v in _allocator(self.memory).items()
+                    },
+                    "prefetch": {
+                        "completed": self.prefetch_completed,
+                        **{k: v - self.ahead.get(k, 0) for k, v in _ahead(self.memory).items()},
+                        "scope": "the core's fills ahead of demand",
+                    },
+                }
             )
         elif self.memory.device.type == "mps":
-            out.update(allocated=allocated, reserved=reserved, measurement="observed_current")
+            out.update(
+                {"allocated": allocated, "reserved": reserved, "measurement": "observed_current"}
+            )
         return out
 
 
@@ -2718,7 +2866,9 @@ def _sites(module: nn.Module) -> dict[str, list[_Site]]:
     groups: dict[int, list[_Site]] = {}
     names: dict[str, int] = {}
     for path, sub in module.named_modules(remove_duplicate=False):
-        for table, parameter in ((sub._parameters, True), (sub._buffers, False)):
+        # torch types `_parameters` with Parameter; the Runtime binds plain tensors there too
+        slots = cast(dict[str, Tensor | None], sub._parameters), sub._buffers
+        for table, parameter in ((slots[0], True), (slots[1], False)):
             for attr, tensor in table.items():
                 if tensor is None:
                     continue
@@ -2850,6 +3000,7 @@ def _layout(
             if set(parts) != {"value"} or not sites:
                 return
             target = sites[0].table[sites[0].name]
+            assert target is not None  # a site is a slot that held a tensor
             code = codes.get(str(target.dtype).removeprefix("torch."))
             if code is None:
                 return
@@ -2864,6 +3015,7 @@ def _layout(
             shape = layout.shape
             strides = layout.strides or _strides(shape)
             target = model.sites[name][0].table[model.sites[name][0].name]
+            assert target is not None  # a site is a slot that held a tensor
             if (
                 tuple(target.shape) != shape
                 or (target_dtypes or {}).get(
@@ -2910,9 +3062,12 @@ def _placeholder(
     raw_views: Mapping[tuple[int, str], tuple[int, _Part]],
 ) -> Tensor:
     meta = sites[0].table[sites[0].name]
+    assert meta is not None  # a site is a slot that held a tensor
     held = Placeholder(meta.shape, dtype, model.memory.device)
     if sites[0].parameter:
-        held = nn.Parameter(held, requires_grad=False)
+        held = cast(
+            Placeholder, nn.Parameter(held, requires_grad=False)
+        )  # a subclass's Parameter is one
 
     def read(
         b: _Block = block,
@@ -2929,6 +3084,7 @@ def _placeholders(model: Model) -> None:
     done: set[int] = set()
     for name, sites in model.sites.items():
         meta = sites[0].table[sites[0].name]
+        assert meta is not None  # a site is a slot that held a tensor
         if id(meta) in done or meta.device.type != "meta":
             continue
         done.add(id(meta))
@@ -3155,7 +3311,10 @@ def _gathering(module: nn.Module, memory: Memory) -> list[RemovableHandle]:
 
 
 def _paired(
-    module: nn.Module, enter: Callable[..., None], leave: Callable[[], None], owner: Model,
+    module: nn.Module,
+    enter: Callable[..., None],
+    leave: Callable[[], None],
+    owner: Model,
 ) -> list[RemovableHandle]:
     owed = threading.local()
 
