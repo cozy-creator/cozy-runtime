@@ -44,7 +44,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from importlib import metadata, util
 from pathlib import Path
-from typing import Any
+from typing import NotRequired, TypedDict
 from urllib.parse import urlparse
 
 from packaging.tags import sys_tags
@@ -87,6 +87,35 @@ class Source:
     #: Runtime-pinned sources are acquired only when their builder opens them.
     acquire: bool = False
     preseed: str = ""
+
+
+class SourceRow(TypedDict):
+    """A `Source` as a builder's spec carries it (`asdict`)."""
+
+    name: str
+    version: str
+    file: str
+    sha256: str
+    origin: str
+    package: str
+    acquire: bool
+    preseed: str
+
+
+class BuildSpec(TypedDict):
+    """A `setup` or `python` job's spec, which its builder reads."""
+
+    recipe: str
+    sm: NotRequired[int]
+    sources: dict[str, SourceRow]
+    build_deps: NotRequired[dict[str, SourceRow]]
+
+
+class _Index(TypedDict):
+    """`fetch`'s index of the pinned sources beside them."""
+
+    schema: int
+    sources: dict[str, dict[str, str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -613,7 +642,7 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
     """The exact artifact `name` is on a card of capability `sm` in this environment."""
     recipe = RECIPES[name]
     sources, why = registry(root) if root is not None else (_pinned_sources(), "")
-    inputs: dict[str, Any]
+    inputs: dict[str, object]
     wheel = sources.get(KITCHEN_WHEEL) if name == "comfy-kitchen" else None
     if _compatible_kitchen_wheel(wheel):
         assert wheel is not None
@@ -714,7 +743,7 @@ def _python() -> str:
 # ------------------------------------------------------------------------------ builders
 
 
-def _verified(source: Mapping[str, Any]) -> Path:
+def _verified(source: SourceRow) -> Path:
     path = Path(source["file"])
     if source.get("acquire"):
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -734,7 +763,7 @@ def _verified(source: Mapping[str, Any]) -> Path:
     return path
 
 
-def _fetched(sources: Iterable[Mapping[str, Any]]) -> None:
+def _fetched(sources: Iterable[SourceRow]) -> None:
     """A build's sources, downloaded side by side (the image may carry them already)."""
     with ThreadPoolExecutor() as pool:
         list(pool.map(_verified, [row for row in sources if not _tree(row).is_dir()]))
@@ -748,7 +777,7 @@ def _digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _tree(source: Mapping[str, Any]) -> Path:
+def _tree(source: SourceRow) -> Path:
     """The part of a source a worker image carries, unpacked (`fetch`)."""
     named = str(source.get("file") or "")
     if named.endswith(".tree") or Path(named).is_dir():
@@ -756,7 +785,7 @@ def _tree(source: Mapping[str, Any]) -> Path:
     return Path(f"{source.get('preseed') or '-'}.tree")
 
 
-def _extract(source: Mapping[str, Any], into: Path) -> Path:
+def _extract(source: SourceRow, into: Path) -> Path:
     """A verified source tree, its one top directory stripped; the image's copy when it has."""
     if _tree(source).is_dir():
         shutil.copytree(_tree(source), into)
@@ -768,7 +797,7 @@ def _extract(source: Mapping[str, Any], into: Path) -> Path:
     return tops[0] if len(tops) == 1 and tops[0].is_dir() else into
 
 
-def _unpack(source: Mapping[str, Any], site: Path) -> None:
+def _unpack(source: SourceRow, site: Path) -> None:
     """A wheel into an importable tree: its purelib/platlib data folded into the root."""
     with zipfile.ZipFile(_verified(source)) as wheel:
         for member in wheel.infolist():
@@ -789,7 +818,7 @@ def _unpack(source: Mapping[str, Any], site: Path) -> None:
 
 @request_path.forbid("kernel build: python")
 def build_python(
-    spec: Mapping[str, Any], staging: Path, report: Callable[[float], None]
+    spec: BuildSpec, staging: Path, report: Callable[[float], None]
 ) -> dict[str, object]:
     site = staging / kernel_cache.SITE
     site.mkdir()
@@ -832,7 +861,7 @@ compiler_job(*{job!r})
 
 @request_path.forbid("kernel build: setup")
 def build_setup(
-    spec: Mapping[str, Any], staging: Path, report: Callable[[float], None]
+    spec: BuildSpec, staging: Path, report: Callable[[float], None]
 ) -> dict[str, object]:
     """Upstream's `setup.py build` into the staging `site/`, against this interpreter's torch
     and the card this process sees."""
@@ -943,7 +972,7 @@ def _dist_info(site: Path, name: str, version: str, installed: list[Path]) -> No
     (info / "RECORD").write_text("\n".join(rows) + "\n")
 
 
-def fetch(root: Path) -> dict[str, Any]:
+def fetch(root: Path) -> _Index:
     """Download every pinned source into `root` side by side through the Runtime's one egress
     boundary, each held to its pinned sha256, and write the index beside them. A worker image
     carries them, so a pod's boot compile downloads none; of a source with `keep`, only those
@@ -982,7 +1011,7 @@ def fetch(root: Path) -> dict[str, Any]:
         }
         for pin in PINS
     }
-    index = {"schema": 1, "sources": sources}
+    index: _Index = {"schema": 1, "sources": sources}
     (root / INDEX).write_text(json.dumps(index, indent=1, sort_keys=True) + "\n")
     return index
 
