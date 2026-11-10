@@ -262,7 +262,6 @@ else:
 if TYPE_CHECKING:
     import torch.distributed
     from torch import device as TorchDevice
-    from torch import nn
     from torch._C._distributed_c10d import Store
 
     from cozy_runtime.author._context import DeviceType
@@ -337,12 +336,6 @@ def _sealed_entries() -> tuple[str, ...]:
         for entry in _SEALED.get("CUDA_VISIBLE_DEVICES", "").split(",")
         if entry.strip()
     )
-
-
-def _seal_fits(degree: int) -> bool:
-    """A GPU group is sealed to one device per rank; with none sealed, its ranks run on the CPU over gloo."""
-    entries = _sealed_entries()
-    return degree <= 1 or not entries or degree == len(entries)
 
 
 def _gpu_numbers(degree: int) -> list[int]:
@@ -623,14 +616,6 @@ def _safeguard_rows(found: dict[str, list[str]]) -> list[dict[str, str]]:
         )
         for code, whys in found.items()
     ]
-
-
-def _prepared_inputs(command: PrepareRequest) -> dict[str, InputMetadata]:
-    """The request's input files as its handler's prepare reads them."""
-    return {
-        path: InputMetadata(file.input_id, file.media_type, file.digest, file.length, file.order)
-        for path, file in command.input_metadata.items()
-    }
 
 
 def _granted_inputs(command: Invoke) -> dict[str, GrantedInput]:
@@ -1368,6 +1353,11 @@ class Executor:
         print(f"[memory] GPU {index} drives a display: at most {budget >> 20} MiB", file=sys.stderr)
         return budget
 
+    def _seal_fits(self, degree: int) -> bool:
+        """A group of `degree` drives one sealed GPU per process; a CPU group (gloo, the free
+        end-to-end test's) any number of processes."""
+        return degree <= 1 or self.device_kind != "cuda" or degree == len(_sealed_entries())
+
     def _rank_device(self, torch: ModuleType) -> TorchDevice:
         device: TorchDevice
         if self.device_kind == "cuda" and accel.present(torch, self.device_kind):
@@ -1532,20 +1522,14 @@ class Executor:
         """The attempt on this follower: prepared and run as GPU 0 runs it, in a private spool,
         with no progress, publish or child calls, its saves recording only what they would
         save. Its reply is how its handler ended and its part of the record."""
-        pg = self.host.pg
-        if (
-            not self.ready
-            or self.poisoned
-            or self.torch is None
-            or self.discovered is None
-            or pg is None
-        ):
+        if not self.ready or self.poisoned or self.torch is None or self.discovered is None:
             code = "poisoned_generation" if self.poisoned else "executor_not_ready"
             return {"ok": False, "code": code, "detail": self.poisoned or "no generation is Ready"}
         ranks = spmd.Ranks(
             rank=self.rank,
             world=self.world,
-            pg=pg,
+            # A follower runs an attempt only in its formed group.
+            pg=cast("torch.distributed.ProcessGroup", self.host.pg),
             device=self._rank_device(self.torch),
             tag=tag,
             gpu=_gpu,
@@ -1581,7 +1565,8 @@ class Executor:
                     prepared = prepare(
                         registration,
                         asked.payload,  # type: ignore[arg-type]  # an invoke's payload is a JSON object
-                        input_metadata=_prepared_inputs(asked),
+                        # TensorFS's own InputMetadata: it has every field prepare reads.
+                        input_metadata=asked.input_metadata,  # type: ignore[arg-type]
                     )
                     envelope, outcome, record = run_prepared(
                         prepared,
@@ -1680,19 +1665,19 @@ class Executor:
     def _ranks(self, command: Invoke, prepared: PreparedRequest) -> Iterator[_Ranks | None]:
         """GPU 0's side of a group attempt: every follower is sent the same request (`run`)
         before GPU 0's handler starts, and answers once its own ends (`_Ranks.settle`)."""
-        group, asked, pg, torch = self.group, prepared.asked, self.host.pg, self.torch
+        group, asked = self.group, prepared.asked
         if group is None:
             yield None
             return
-        # A formed group has its process group, and an attempt runs after the device is up.
-        assert isinstance(asked, PrepareRequest) and pg is not None and torch is not None
+        assert isinstance(asked, PrepareRequest)
         entropy = secrets.randbits(63)
         tag = f"{entropy:016x}"
         ranks = spmd.Ranks(
             rank=0,
             world=self.world,
-            pg=pg,
-            device=self._rank_device(torch),
+            # A formed group has its process group, and an attempt runs after the device is up.
+            pg=cast("torch.distributed.ProcessGroup", self.host.pg),
+            device=self._rank_device(cast("ModuleType", self.torch)),
             tag=tag,
             gpu=_gpu,
         )
@@ -1880,7 +1865,7 @@ class Executor:
         cuda_start = (
             self.device_kind == "cuda" and bool(command.devices) and not command.import_only
         )
-        if degree != expected or not _seal_fits(degree):
+        if degree != expected or not self._seal_fits(degree):
             self.poisoned = "sequence-parallel degree mismatch"
             return {
                 "ok": False,
@@ -1911,13 +1896,14 @@ class Executor:
                 "detail": f"the start names no readable PackageInterface: {exc}"[:900],
             }
         # Run 6132: an environment without torch runs on the devices it was given, untouched.
-        torch_present = importlib.util.find_spec("torch") is not None
-        device = bool(command.devices) and torch_present
-        builds = torch_present and any(
+        cpu_group = degree > 1 and self.device_kind != "cuda"
+        device = (bool(command.devices) or cpu_group) and importlib.util.find_spec(
+            "torch"
+        ) is not None
+        constructs = device and any(
             not slot.weights for entry in interface.entrypoints for slot in entry.models
         )
-        constructs = device and builds
-        if degree > 1 and not builds:
+        if degree > 1 and not constructs:
             self.poisoned = "sequence-parallel construction unsupported"
             return {
                 "ok": False,
@@ -2028,11 +2014,8 @@ class Executor:
                             f"{reply.get('detail', '')}"[:800],
                             code="group_unformed",
                         )
-                if not command.import_only and self.group.backend != "nccl":
-                    import torch
-
-                    self.torch = torch
-                    self.pg = self.group.form(torch, _SEALED)
+                if not command.import_only and cpu_group:
+                    self.pg = self.group.form(self.torch, _SEALED)
                     stage("group_form")
                 elif not command.import_only:
                     measured = links.measured(
@@ -2469,7 +2452,7 @@ class Executor:
         # mismatch refuses before any weight moves. Degree 1 (or absent) is a plain
         # executor, whatever the seal's width.
         degree = command.sequence_parallel_degree or 1
-        if degree != max(self.world, 1) or not _seal_fits(degree):
+        if degree != max(self.world, 1) or not self._seal_fits(degree):
             self.poisoned = "sequence-parallel degree mismatch"
             return {
                 "ok": False,
@@ -3479,7 +3462,12 @@ class Executor:
             prepared = prepare(
                 registration,
                 command.payload,  # type: ignore[arg-type]  # an invoke's payload is a JSON object
-                input_metadata=_prepared_inputs(command),
+                input_metadata={
+                    path: InputMetadata(
+                        file.input_id, file.media_type, file.digest, file.length, file.order
+                    )
+                    for path, file in command.input_metadata.items()
+                },
             )
         except Exception as exc:
             outcome = classify(exc)

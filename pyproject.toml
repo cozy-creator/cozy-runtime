@@ -69,11 +69,6 @@ pythonPlatform = "Linux"
 typeCheckingMode = "standard"
 reportMissingModuleSource = false  # the native kernel modules ship as stubs
 
-# 0.23.1's TensorFS by git rev until it publishes (cozy-creator rc/0.23.1's integration head): the release
-# relocks to PyPI. To move it: new rev, then `uv lock`.
-[tool.uv.sources]
-tensorfs = { git = "https://github.com/cozy-creator/cozy-creator", rev = "56fa475889897709c2f198e37295e352223cd8d0", subdirectory = "crates/tensorfs-py" }
-
 # The required type check (scripts/typecheck.sh), against the real dependencies in
 # scripts/typecheck-requirements.txt. `Any` is an error; one a third-party boundary needs carries
 # `# type: ignore[explicit-any]  # <why>`. Known errors live in .mypy-baseline.txt, which only shrinks.
