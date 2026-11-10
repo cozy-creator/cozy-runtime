@@ -12,7 +12,6 @@ import sys
 from collections import deque
 from collections.abc import Mapping
 from pathlib import PurePath
-from typing import Any
 
 from cozy_runtime.internal import proctree
 from cozy_runtime.internal.config import inherited_environment
@@ -72,7 +71,7 @@ def activity_lines(trace: object) -> tuple[str, ...]:
     return tuple(_printable(line) for line in bounded.splitlines()[:MAX_TRACE_LINES])
 
 
-def memory_summary(reply: Mapping[str, Any]) -> str:
+def memory_summary(reply: Mapping[str, object]) -> str:
     """Absent or sentinel readings are unknown; an explicitly measured zero is valid."""
     parts = []
     for key, label in (
@@ -86,12 +85,12 @@ def memory_summary(reply: Mapping[str, Any]) -> str:
     return "memory at failure: " + ", ".join(parts)
 
 
-def startup_facts(*, rank: int, world: int, device_kind: str) -> dict[str, Any]:
+def startup_facts(*, rank: int, world: int, device_kind: str) -> dict[str, object]:
     """Observe only approved startup facts; never import Torch or initialize CUDA."""
     # Config owns environment reads. Narrow its process snapshot immediately;
     # neither the whole mapping nor unrelated values enter the diagnostic.
     environment = inherited_environment()
-    facts: dict[str, Any] = {
+    facts: dict[str, object] = {
         "pid": os.getpid(),
         "rank": rank,
         "world": world,
