@@ -44,10 +44,10 @@ from cozy_runtime.author._recipes import (
 
 # The code that decides a lane's bytes: its replay key changes with any of it.
 @invocable
-async def quantize(
+async def quantize(  # type: ignore[explicit-any,misc]  # static describe's any-layout spelling
     ctx: Context,
     *,
-    source: Weights[Any],  # type: ignore[explicit-any]  # static describe's any-layout spelling
+    source: Weights[Any],
     lane: str,
     package: str,
     release: str,
@@ -60,11 +60,11 @@ async def quantize(
 
 
 @invocable
-async def quantize_calibrated(
+async def quantize_calibrated(  # type: ignore[explicit-any,misc]  # static describe's any-layout spelling
     ctx: Context,
     *,
-    source: Weights[Any],  # type: ignore[explicit-any]  # static describe's any-layout spelling
-    model: Model[Any],  # type: ignore[explicit-any]  # static describe's any-layout spelling
+    source: Weights[Any],
+    model: Model[Any],
     lane: str,
     package: str,
     release: str,

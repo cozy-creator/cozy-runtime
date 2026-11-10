@@ -183,10 +183,10 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
 
 
 @invocable
-async def quantize(
+async def quantize(  # type: ignore[explicit-any,misc]  # static describe's any-layout spelling
     ctx: Context,
     *,
-    source: Weights[Any],  # type: ignore[explicit-any]  # static describe's any-layout spelling
+    source: Weights[Any],
     plan: QuantizationPlan,
     tel: Telemetry,
     max_relative_frobenius: float | None = None,
