@@ -33,7 +33,7 @@ from cozy_runtime.author._errors import DoesNotFit, Fault, fault
 from cozy_runtime.internal import attention_ulysses
 from cozy_runtime.internal.execution import catch, sizing
 from cozy_runtime.internal.parallel import copy_engine
-from cozy_runtime.internal.parallel.group import abort_process_group
+from cozy_runtime.internal.parallel.group import abort_process_group, gather
 
 type Compute = Callable[[Tensor, Tensor, Tensor], Tensor]
 type Wait = Callable[[], None]
@@ -75,13 +75,22 @@ class _Rendezvous:
         self.floors: dict[tuple[int, ...], int] = {}
 
     def gather(self, value: dict[str, Any]) -> list[dict[str, Any]]:
-        """Every rank's `value` for this sequence: three store calls a rank. Each rank has read
-        the last sequence's values before it proposes this one, so its own of them goes."""
+        """Every rank's `value` for this sequence: four store calls a rank. Each rank has read
+        the last sequence's values before it proposes this one, so its own of them goes. A rank
+        that never proposes ends the wait (`group.gather`); ranks whose values name different
+        sites made different calls, and each of them says so."""
         keys = [f"{self.sequence}/{rank}" for rank in range(self.world)]
         self.store.set(keys[self.rank], json.dumps(value))
-        rows = [json.loads(data) for data in self.store.multi_get(keys)]
+        what = f"Ulysses call {self.sequence} at {value['site']}"
+        rows = [json.loads(data) for data in gather(self.store, keys, what)]
         if self.sequence > 1:
             self.store.delete_key(f"{self.sequence - 1}/{self.rank}")
+        sites = [row["site"] for row in rows]
+        if len(set(sites)) > 1:
+            raise RuntimeError(
+                f"Ulysses call {self.sequence} is not one call: "
+                + ", ".join(f"GPU {rank} at {site}" for rank, site in enumerate(sites))
+            )
         return rows
 
 
@@ -302,16 +311,22 @@ def taken() -> dict[str, float]:
 
 
 def exchange(
-    query: Tensor, key: Tensor, value: Tensor, handle: ProcessGroup, compute: Compute
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    handle: ProcessGroup,
+    compute: Compute,
+    site: str = "",
 ) -> Tensor:
-    """`compute` over whole sequences per head subset, back to this GPU's rows of every head."""
+    """`compute` over whole sequences per head subset, back to this GPU's rows of every head.
+    `site` names the caller's attention module where it knows it: every GPU must be there."""
     meet = _rendezvous(handle)
     held = catch.LEAF.acquire(blocking=False)
     try:
         # One model pass owns its group's collective order.
         with meet.lock:
             meet.sequence += 1
-            return _exchange(meet, query, key, value, handle, compute, held)
+            return _exchange(meet, query, key, value, handle, compute, held, site)
     finally:
         if held:
             catch.LEAF.release()
@@ -325,6 +340,7 @@ def _exchange(
     handle: ProcessGroup,
     compute: Compute,
     held: bool,
+    called: str,
 ) -> Tensor:
     rank, world = meet.rank, meet.world
     batch, mine, heads, dim = (int(n) for n in query.shape)
@@ -352,7 +368,11 @@ def _exchange(
         assert request is not None
         stream = int(torch.cuda.current_stream(device).cuda_stream)
         request.memory.remember_working_phase(site, catch.owners(request))
-    proposal: dict[str, Any] = {"rows": mine, "at": max(catch.LEVELS.get(site, floor), floor)}
+    proposal: dict[str, Any] = {
+        "rows": mine,
+        "at": max(catch.LEVELS.get(site, floor), floor),
+        "site": f"{called or 'attention'} [{batch} x {padded} heads x {dim}, {b} B]",
+    }
     selection: dict[str, Any] = {}
     try:
         if native:

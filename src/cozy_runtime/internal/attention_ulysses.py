@@ -237,12 +237,13 @@ def exchange(
     value: Tensor,
     handle: ProcessGroup,
     compute: Callable[[Tensor, Tensor, Tensor], Tensor],
+    site: str = "",
 ) -> Tensor:
     """Sequence shards -> full sequence per head subset -> `compute` -> back
     (`internal.parallel.ulysses.exchange`)."""
     if _EXCHANGE is None:
         raise ValueError(_UNSERVED)
-    return _EXCHANGE(query, key, value, handle, compute)
+    return _EXCHANGE(query, key, value, handle, compute, site)
 
 
 _UNSERVED = "Ulysses runs where torch does: nothing imported internal.parallel.ulysses"

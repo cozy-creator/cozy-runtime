@@ -34,6 +34,7 @@ from typing import Any
 
 from cozy_runtime.graphs import streams
 from cozy_runtime.internal.config import short_socket_directory
+from cozy_runtime.internal.parallel.group import gather
 
 #: The exchange the group formed with, by process group; absent: NCCL.
 _BY_GROUP: dict[int, Exchange] = {}
@@ -267,10 +268,8 @@ class HostStagedExchange(Exchange):
         from tensorfs.varena import _runtime as varena
 
         store.set(f"cozy.staged/{self.rank}", self.own.name)
-        names = [
-            bytes(name).decode()
-            for name in store.multi_get([f"cozy.staged/{r}" for r in range(self.world)])
-        ]
+        keys = [f"cozy.staged/{r}" for r in range(self.world)]
+        names = [bytes(name).decode() for name in gather(store, keys, "the exchange's inboxes")]
         ok = True
         try:
             for rank, name in enumerate(names):
