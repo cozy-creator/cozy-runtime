@@ -274,12 +274,6 @@ src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowe
 src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/stepcache.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/accel/stepcache.py: [unreachable] Statement is unreachable
-src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "and" is always true
 src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "and" is always true
 src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
@@ -289,7 +283,6 @@ src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is 
 src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_call_results.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_call_results.py: [redundant-expr] Left operand of "and" is always true
 src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
@@ -298,10 +291,6 @@ src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_calls.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_calls.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
@@ -322,16 +311,6 @@ src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_color.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_color.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_context.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_context.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_context.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_context.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_data.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_data.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_data.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_data.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
@@ -356,74 +335,19 @@ src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_decode.py: [misc] Type of decorated function contains type "Any" ("Callable[[File, Any, str], _GeneratorContextManager[None, None, None]]")
-src/cozy_runtime/author/_defaults.py: [assignment] Incompatible types in assignment (expression has type "tuple[type[CollectionType], type[TupleType]]", variable has type "tuple[type[StructType], type[DataclassType], type[TypedDictType], type[DictType]]")
-src/cozy_runtime/author/_defaults.py: [assignment] Incompatible types in assignment (expression has type "tuple[type[IntType], type[FloatType], type[LiteralType]]", variable has type "tuple[type[StructType], type[DataclassType], type[TypedDictType], type[DictType]]")
-src/cozy_runtime/author/_defaults.py: [assignment] Incompatible types in assignment (expression has type "tuple[type[StrType], type[EnumType]]", variable has type "tuple[type[StructType], type[DataclassType], type[TypedDictType], type[DictType]]")
 src/cozy_runtime/author/_defaults.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_defaults.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_defaults.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_defaults.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_defaults.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_defaults.py: [no-any-return] Returning Any from function declared to return "str"
-src/cozy_runtime/author/_defaults.py: [operator] Unsupported operand types for - ("None" and "float")
-src/cozy_runtime/author/_defaults.py: [operator] Unsupported operand types for - ("None" and "int")
-src/cozy_runtime/author/_defaults.py: [operator] Unsupported operand types for - ("str" and "float")
-src/cozy_runtime/author/_defaults.py: [operator] Unsupported operand types for - ("str" and "int")
-src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_files.py: [redundant-expr] Left operand of "and" is always true
 src/cozy_runtime/author/_image.py: [redundant-expr] If condition is always true
-src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_loader.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_markers.py: [call-overload] No overload variant of "Meta" matches argument types "dict[str, object]", "dict[str, dict[str, object]]"
-src/cozy_runtime/author/_markers.py: [no-any-return] Returning Any from function declared to return "Meta"
 src/cozy_runtime/author/_markers.py: [redundant-expr] If condition is always true
 src/cozy_runtime/author/_markers.py: [redundant-expr] Left operand of "and" is always true
 src/cozy_runtime/author/_markers.py: [redundant-expr] Left operand of "and" is always true
 src/cozy_runtime/author/_markers.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_markers.py: [unused-ignore] Unused "type: ignore" comment
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
@@ -447,31 +371,8 @@ src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is alwa
 src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_recipes.py: [redundant-expr] Left operand of "and" is always true
 src/cozy_runtime/author/_recipes.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_services.py: [misc] Tuple index out of range
 src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "and" is always true
 src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "and" is always true
 src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "and" is always true
@@ -479,46 +380,8 @@ src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "or" is a
 src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_split.py: [possibly-undefined] Name "part" may be undefined
-src/cozy_runtime/author/_stage_memo.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_stage_memo.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_stage_memo.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_stage_memo.py: [misc] Type of decorated function contains type "Any" ("_Wrapped[[VarArg(Any), KwArg(Any)], Any, [Any, VarArg(object), KwArg(object)], object]")
-src/cozy_runtime/author/_walker.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_weights.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_weights.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/canonical_json.py: [explicit-any] Explicit "Any" is not allowed
