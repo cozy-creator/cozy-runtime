@@ -57,7 +57,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 
 import tensorfs.varena.torch as vt
 from tensorfs.varena import Exhausted
@@ -83,6 +83,18 @@ from cozy_runtime.graphs.domain import Pool
 from cozy_runtime.internal import cache_owners, contract
 from cozy_runtime.lm import _kernels
 
+if TYPE_CHECKING:
+    from types import ModuleType
+
+    from torch.utils.hooks import RemovableHandle
+    from transformers import PreTrainedConfig, PreTrainedModel
+    from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
+
+    from cozy_runtime.author._model import Residency, WarningRow
+    from cozy_runtime.graphs import DecodeReceipt
+    from cozy_runtime.graphs.domain import Domain
+    from cozy_runtime.internal.residency import Binding, Region
+
 try:
     import torch
     from torch.overrides import TorchFunctionMode
@@ -97,8 +109,9 @@ try:
 except ImportError as _absent:  # pragma: no cover - the base package has neither
     if TYPE_CHECKING:
         raise
-    ABSENT = f"torch and transformers do not import ({_absent})"
-    StaticLayer = LinearAttentionLayer = Cache = TorchFunctionMode = StoppingCriteria = object
+    else:
+        ABSENT = f"torch and transformers do not import ({_absent})"
+        StaticLayer = LinearAttentionLayer = Cache = TorchFunctionMode = StoppingCriteria = object
 else:
     ABSENT = ""
 
@@ -109,15 +122,17 @@ LAG = 2
 #: Tokens a draft head proposes a step. Qwen3.5-9B's head on FLUX.3's prompt upsampler keeps
 #: ~0.7 of first drafts and few third ones: 2 is fastest on a 4090 (1 and 3 lose 5%, 4 more).
 DEPTH = 2
-_DRAFT: contextvars.ContextVar[Any] = contextvars.ContextVar("cozy_lm_draft", default=None)
+_DRAFT: contextvars.ContextVar[torch.nn.Module | None] = contextvars.ContextVar(
+    "cozy_lm_draft", default=None
+)
 
 
 #: Each model's own multi-token-prediction head, where its checkpoint keeps one (`vlm.construct`).
-HEADS: weakref.WeakKeyDictionary[Any, Draft] = weakref.WeakKeyDictionary()
+HEADS: weakref.WeakKeyDictionary[torch.nn.Module, Draft] = weakref.WeakKeyDictionary()
 
 
 @contextmanager
-def drafting(draft: Any) -> Iterator[None]:
+def drafting(draft: torch.nn.Module | None) -> Iterator[None]:
     """`generate` calls in the body draft with `draft` (`Draft`), so a package's model can name
     the head another model holds without passing it through its own (memoized) calls."""
     token = _DRAFT.set(draft)
@@ -128,7 +143,7 @@ def drafting(draft: Any) -> Iterator[None]:
 
 
 #: Each model's continuous batch (buffers and graphs), kept until the plane wants the memory.
-_ENGINES: weakref.WeakKeyDictionary[Any, _Engine] = weakref.WeakKeyDictionary()
+_ENGINES: weakref.WeakKeyDictionary[torch.nn.Module, _Engine] = weakref.WeakKeyDictionary()
 _ENGINES_LOCK = threading.Lock()
 #: The weight plane's paging hooks and holds are not thread-safe: in a process one decode at a
 #: time runs through them, an engine's driver for its loop or a call through Transformers' loop.
@@ -174,9 +189,59 @@ class Constraint(Protocol):
         ...
 
 
+class _Decoder(Protocol):
+    """A causal LM's decoder (`get_decoder`): its rotary embedding, which a draft head shares."""
+
+    rotary_emb: torch.nn.Module
+
+    def register_forward_hook(
+        self,
+        hook: Callable[[torch.nn.Module, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]], None],
+        /,
+    ) -> RemovableHandle: ...
+
+
+class _Head(Protocol):
+    """A causal LM's output head (`get_output_embeddings`): an int8 one has no `.weight`."""
+
+    out_features: int
+
+    def __call__(self, hidden: torch.Tensor, /) -> torch.Tensor: ...
+
+
+class _Generating(Protocol):
+    """What this module calls of a causal LM that Transformers leaves untyped, or types with a
+    `self` (`GenerativePreTrainedModel`) no model class meets."""
+
+    def generate(self, **kwargs: object) -> torch.Tensor: ...
+
+    def prepare_inputs_for_generation(
+        self, input_ids: torch.Tensor, **kwargs: object
+    ) -> dict[str, object]: ...
+
+    def _prepare_position_ids_for_generation(
+        self, inputs_tensor: torch.Tensor, model_kwargs: Mapping[str, object]
+    ) -> torch.Tensor: ...
+
+    def get_decoder(self) -> _Decoder: ...
+
+    def get_output_embeddings(self) -> _Head: ...
+
+
+def _lm(model: PreTrainedModel) -> _Generating:
+    """`model`'s generation methods, typed."""
+    return cast("_Generating", model)  # cast: `generate` serves causal LMs (GenerationMixin's)
+
+
+def _set[T](value: T | None) -> T:
+    """`value`, which the engine's state has set where it is read (its slots' cache and
+    device, its head, its graphs' domain and pool, a row's tokens once it ended)."""
+    return cast("T", value)  # cast: each caller reads it only in the state that sets it
+
+
 def generate(
-    model: Any,
-    inputs: Mapping[str, Any],
+    model: PreTrainedModel,
+    inputs: Mapping[str, torch.Tensor],
     *,
     max_new_tokens: int,
     stop: Sequence[int],
@@ -186,10 +251,10 @@ def generate(
     top_p: float = 1.0,
     top_k: int = 0,
     seed: int = 0,
-    draft: Any = None,
+    draft: torch.nn.Module | None = None,
     allowed: Constraint | None = None,
     progress: Callable[[int], None] | None = None,
-) -> Any:
+) -> torch.Tensor:
     """Tokens after the prompt, `[batch, n]` (`model.generate(...)`'s tail): `inputs` as the
     processor returned them, generation ends at a `stop` token or after `max_new_tokens`, and a
     row that stopped early continues as `pad` (default: the first stop). `presence_penalty`
@@ -231,7 +296,7 @@ def generate(
         say(
             type(model).__name__, f"[lm] {type(model).__name__} decodes through Transformers: {why}"
         )
-        row = ("decode ran through Transformers' loop", {"why": why})
+        row: WarningRow = ("decode ran through Transformers' loop", {"why": why})
         if row not in WARNINGS:
             WARNINGS.append(row)
         with contract.owned():  # the Runtime's own use of Transformers' loop and caches
@@ -257,7 +322,7 @@ def _share(stage: Callable[[float], None], most: int, tokens: int) -> None:
     stage(min(tokens / max(most, 1), 1.0))
 
 
-def release(model: Any) -> None:
+def release(model: torch.nn.Module) -> None:
     """Retire an idle model's decode buffers, graphs and virtual address ownership."""
     with _PLANE, _ENGINES_LOCK:
         engine = _ENGINES.pop(model, None)
@@ -276,12 +341,14 @@ def release(model: Any) -> None:
         engine.where = ()
 
 
-def _graph_snapshot(model: Any) -> tuple[dict[str, Any], list[Any], Any]:
+def _graph_snapshot(
+    model: torch.nn.Module,
+) -> tuple[DecodeReceipt | None, list[Pool], Domain | None]:
     """Final-reply facts and live pool owners; no device work or per-token aggregation."""
     with _ENGINES_LOCK:
         engine = _ENGINES.get(model)
     if engine is None:
-        return {}, [], None
+        return None, [], None
     return (
         {
             "active_graphs": len(engine.graphs),
@@ -297,14 +364,31 @@ def _graph_snapshot(model: Any) -> tuple[dict[str, Any], list[Any], Any]:
     )
 
 
-class Draft(torch.nn.Module if not ABSENT else object):  # type: ignore[misc]
+if TYPE_CHECKING:
+    _Module = torch.nn.Module
+
+    class _Mtp(torch.nn.Module):
+        """`Draft.mtp`'s submodules, as `Draft.__init__` sets them."""
+
+        fc: torch.nn.Linear
+        pre_fc_norm_embedding: torch.nn.Module
+        pre_fc_norm_hidden: torch.nn.Module
+        layers: torch.nn.ModuleList
+        norm: torch.nn.Module
+else:
+    _Module = torch.nn.Module if not ABSENT else object
+
+
+class Draft(_Module):
     """The multi-token-prediction head of a Qwen3.5 or Qwen3-Next checkpoint, its weights where
     the checkpoint keeps them (`mtp.*`): the `draft` `generate` takes. From a token's embedding
     and the hidden state the model's head read before it: the state the head reads for the token
     after, which the next draft takes as its hidden state (as vLLM's and SGLang's do). `space` is
     the model's modeling module."""
 
-    def __init__(self, config: Any, space: Any) -> None:
+    mtp: _Mtp
+
+    def __init__(self, config: PreTrainedConfig, space: ModuleType) -> None:
         super().__init__()
         text = config.get_text_config(decoder=True)
         prefix = next(n[: -len("DecoderLayer")] for n in vars(space) if n.endswith("DecoderLayer"))
@@ -314,7 +398,7 @@ class Draft(torch.nn.Module if not ABSENT else object):  # type: ignore[misc]
         )
         layer.self_attn.layer_idx = 0  # the draft's own cache has the one layer
         size, eps = text.hidden_size, text.rms_norm_eps
-        self.mtp = torch.nn.Module()
+        self.mtp = cast("_Mtp", torch.nn.Module())  # cast: its submodules are set just below
         self.mtp.fc = torch.nn.Linear(2 * size, size, bias=False)
         self.mtp.pre_fc_norm_embedding = norm(size, eps=eps)
         self.mtp.pre_fc_norm_hidden = norm(size, eps=eps)
@@ -322,13 +406,19 @@ class Draft(torch.nn.Module if not ABSENT else object):  # type: ignore[misc]
         self.mtp.norm = norm(size, eps=eps)
 
     def forward(
-        self, embeds: Any, hidden: Any, positions: Any, cache: Any, mask: Any, rotary: Any
-    ) -> Any:
+        self,
+        embeds: torch.Tensor,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cache: Cache,
+        mask: torch.Tensor,
+        rotary: torch.nn.Module,
+    ) -> torch.Tensor:
         """`rotary` is the model's: its tables are where the model is, at the model's precision
         (a copy of its own would be wherever a package left it, as the head's dtype)."""
         mtp = self.mtp
         joined = torch.cat([mtp.pre_fc_norm_embedding(embeds), mtp.pre_fc_norm_hidden(hidden)], -1)
-        x = mtp.fc(joined)
+        x: torch.Tensor = mtp.fc(joined)
         # Qwen3.5 carries the text position first and the rotary (mrope) ones after it.
         text, rope = (positions[0], positions[1:]) if positions.shape[0] == 4 else (None, positions)
         x = mtp.layers[0](
@@ -338,10 +428,11 @@ class Draft(torch.nn.Module if not ABSENT else object):  # type: ignore[misc]
             position_ids=text,
             past_key_values=cache,
         )
-        return mtp.norm(x)
+        normed: torch.Tensor = mtp.norm(x)
+        return normed
 
 
-def install(plan: Plan, model: Any) -> str:
+def install(plan: Plan, model: torch.nn.Module) -> str:
     """Runtime's one-launch kernels in the Transformers kernel slots `model`'s layers call
     (`causal_conv1d_update`, `torch_recurrent_gated_delta_rule`): a gated-delta-net layer's
     token then costs two launches where the reference path runs a few dozen ops. Call it from
@@ -398,16 +489,62 @@ def _report(plan: Plan, reason: str = "") -> str:
     return ""
 
 
-def _conv_slot(original: Any, launch: Launch) -> Any:
+class _ConvUpdate(Protocol):
+    """Transformers' `causal_conv1d_update` slot: one token's causal conv."""
+
+    def __call__(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        activation: str | None = None,
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor: ...
+
+
+class _ConvFn(Protocol):
+    """Transformers' `causal_conv1d_fn` slot: a sequence's causal conv."""
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor: ...
+
+
+class _DeltaRule(Protocol):
+    """Transformers' gated-delta-rule slots (`torch_recurrent_gated_delta_rule`,
+    `torch_chunk_gated_delta_rule`): the output and, asked for, the final state."""
+
+    def __call__(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
+
+
+def _conv_slot(original: _ConvUpdate, launch: Launch) -> _ConvUpdate:
     def slot(
-        hidden_states: Any,
-        conv_state: Any,
-        weight: Any,
-        bias: Any = None,
-        activation: Any = None,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        activation: str | None = None,
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
         batch, channels, length = hidden_states.shape
         bf16 = torch.bfloat16
         if (
@@ -439,22 +576,22 @@ def _conv_slot(original: Any, launch: Launch) -> Any:
             return out
         return original(hidden_states, conv_state, weight, bias, activation, *args, **kwargs)
 
-    slot._cozy_slot = True  # type: ignore[attr-defined]
+    slot._cozy_slot = True  # type: ignore[attr-defined]  # a marker on the function object
     return slot
 
 
-def _recurrent_slot(original: Any, launch: Launch) -> Any:
+def _recurrent_slot(original: _DeltaRule, launch: Launch) -> _DeltaRule:
     def slot(
-        query: Any,
-        key: Any,
-        value: Any,
-        g: Any,
-        beta: Any,
-        initial_state: Any = None,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor | None = None,
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
-        **kwargs: Any,
-    ) -> Any:
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch, length, heads, width = query.shape
         bf16 = torch.bfloat16
         if (
@@ -514,18 +651,21 @@ def _recurrent_slot(original: Any, launch: Launch) -> Any:
             **kwargs,
         )
 
-    slot._cozy_slot = True  # type: ignore[attr-defined]
+    slot._cozy_slot = True  # type: ignore[attr-defined]  # a marker on the function object
     return slot
 
 
-_SLOTS = {"causal_conv1d_update": _conv_slot, "torch_recurrent_gated_delta_rule": _recurrent_slot}
+_SLOTS: dict[
+    str,
+    Callable[[_ConvUpdate, Launch], _ConvUpdate] | Callable[[_DeltaRule, Launch], _DeltaRule],
+] = {"causal_conv1d_update": _conv_slot, "torch_recurrent_gated_delta_rule": _recurrent_slot}
 #: Launches the slots made in this process (Python runs once per capture, not per replay).
 _LAUNCHED = [0]
 #: The kernels' launcher once they serve: a verify pass's tokens then take one launch per layer.
 _STEPS: list[Launch | None] = [None]
 
 
-def _unsupported(model: Any) -> str:
+def _unsupported(model: PreTrainedModel) -> str:
     config = model.config
     if getattr(config, "is_encoder_decoder", False):
         return "an encoder-decoder"
@@ -562,34 +702,34 @@ _DELTA_NET = (
 )
 
 
-def _shapes(text: Any) -> tuple[list[tuple[Any, ...]], str]:
+def _shapes(text: PreTrainedConfig) -> tuple[list[_Shape], str]:
     """Each cache layer's state for one row, from the config alone, before any forward: a
     full-attention layer's `("keys", heads, key width, value width)`, a gated delta net's
     `("state", (conv channels, kernel), (heads, key width, value width))`. "" or why not."""
     types, kwargs = get_layer_types_and_kwargs(text)
-    if isinstance(kwargs, dict):  # Transformers before 5.19: one set for every layer
-        kwargs = [kwargs] * len(types)
+    if isinstance(kwargs, dict):  # type: ignore[unreachable]  # before 5.19, a dict
+        kwargs = [kwargs] * len(types)  # type: ignore[unreachable]  # before 5.19, a dict
     heads = getattr(text, "num_key_value_heads", None) or text.num_attention_heads
     width = getattr(text, "head_dim", None) or text.hidden_size // text.num_attention_heads
     linear = [getattr(text, f"linear_{name}", None) for name in _DELTA_NET]
-    layers: list[tuple[Any, ...]] = []
+    layers: list[_Shape] = []
     for kind, extra in zip(types, kwargs, strict=True):
         if kind == "full_attention":
             layers.append(("keys", int(heads), int(width), int(width)))
         elif None in linear or extra.get("number_of_states", 1) != 1:
             return [], "its linear-attention state is not a gated delta net's (Qwen3-Next, Qwen3.5)"
         else:
-            kernel, k_heads, k_width, v_heads, v_width = (int(x) for x in linear)
+            kernel, k_heads, k_width, v_heads, v_width = (int(_set(x)) for x in linear)
             conv = (2 * k_heads * k_width + v_heads * v_width, kernel)
             layers.append(("state", conv, (v_heads, k_width, v_width)))
     return layers, ""
 
 
 #: Models whose experts were found fused (Transformers' host loop) or split (`moe.split`).
-_FUSED: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
+_FUSED: weakref.WeakKeyDictionary[torch.nn.Module, bool] = weakref.WeakKeyDictionary()
 
 
-def _fused_experts(model: Any, text: Any) -> bool:
+def _fused_experts(model: torch.nn.Module, text: PreTrainedConfig) -> bool:
     """A mixture of experts whose experts are not all `accel.moe.Experts`: Transformers'
     routes each in a host loop. Split ones decode in two launches a layer (`moe`)."""
     found = _FUSED.get(model)
@@ -608,7 +748,7 @@ def _fused_experts(model: Any, text: Any) -> bool:
     return found
 
 
-def _capture_contract(model: Any, draft: Any = None) -> str:
+def _capture_contract(model: torch.nn.Module, draft: torch.nn.Module | None = None) -> str:
     """Shipped decode contracts, dense and with experts split (`moe`), and a drafted step's
     head (`Draft` around Transformers' decoder layer); persistent KV, positions and counters
     are device buffers.
@@ -629,7 +769,8 @@ def _capture_contract(model: Any, draft: Any = None) -> str:
     # A component root's class is Runtime's graphed subclass (`graphs.install`): forward is Draft's.
     if draft is not None and (
         type(draft).forward is not Draft.forward
-        or not type(draft.mtp.layers[0]).__module__.startswith("transformers.models.")
+        # cast: its forward is Draft's, so its `mtp` is Draft's
+        or not type(cast(Draft, draft).mtp.layers[0]).__module__.startswith("transformers.models.")
     ):
         return "no shipped draft head capture contract"
     for module in (model,) if draft is None else (model, draft):
@@ -653,7 +794,14 @@ def _capture_contract(model: Any, draft: Any = None) -> str:
 
 
 #: A buffer as `_Engine._layout` gives it: shape, dtype, fill.
-_Spec = tuple[tuple[int, ...], Any, Any]
+type _Spec = tuple[tuple[int, ...], torch.dtype, bool | float]
+#: A cache layer's state for one row (`_shapes`): a full-attention layer's
+#: `("keys", heads, key width, value width)`, a gated delta net's
+#: `("state", (conv channels, kernel), (heads, key width, value width))`.
+type _Shape = (
+    tuple[Literal["keys"], int, int, int]
+    | tuple[Literal["state"], tuple[int, int], tuple[int, int, int]]
+)
 
 
 class _Sampling(NamedTuple):
@@ -670,13 +818,13 @@ class _Sampling(NamedTuple):
 _Key = tuple[int, int, bool, bool, int, bool, int]
 
 
-def _top_k(scores: Any, k: int) -> Any:
+def _top_k(scores: torch.Tensor, k: int) -> torch.Tensor:
     """`scores` (`[..., vocab]`) with all but each row's `k` largest at -inf (ties kept)."""
     kth = scores.topk(min(k, scores.shape[-1]), dim=-1).values[..., -1:]
     return scores.masked_fill(scores < kth, float("-inf"))
 
 
-def _ids(constraint: Constraint, tokens: Sequence[int], vocab: int) -> Any:
+def _ids(constraint: Constraint, tokens: Sequence[int], vocab: int) -> torch.Tensor:
     """`constraint.allowed(tokens)` as a host index tensor: some, each in the vocabulary."""
     ids = torch.as_tensor(constraint.allowed(tokens)).to("cpu", torch.long).reshape(-1)
     if not ids.numel() or int(ids.min()) < 0 or int(ids.max()) >= vocab:
@@ -687,7 +835,7 @@ def _ids(constraint: Constraint, tokens: Sequence[int], vocab: int) -> Any:
     return ids
 
 
-def _pack(ids: Any, out: Any) -> None:
+def _pack(ids: torch.Tensor, out: torch.Tensor) -> None:
     """`ids` as bits of `out` (`[ceil(vocab / 8)]` uint8, on the host): token 8i + j is bit j of
     byte i."""
     bits = torch.zeros(out.numel() * 8, dtype=torch.uint8)
@@ -698,12 +846,12 @@ def _pack(ids: Any, out: Any) -> None:
 _LOW32 = 0xFFFFFFFF
 
 
-def _times(x: Any, constant: int) -> Any:
+def _times(x: torch.Tensor, constant: int) -> torch.Tensor:
     """`x * constant` mod 2**32 for 32-bit values held in int64, with no int64 overflow."""
     return (x * (constant & 0xFFFF) + (((x * (constant >> 16)) & 0xFFFF) << 16)) & _LOW32
 
 
-def _mix(x: Any) -> Any:
+def _mix(x: torch.Tensor) -> torch.Tensor:
     """A 32-bit integer hash (Wellons' lowbias32): the same bits on every device."""
     x = x ^ (x >> 16)
     x = _times(x, 0x7FEB352D)
@@ -712,7 +860,13 @@ def _mix(x: Any) -> Any:
     return x ^ (x >> 16)
 
 
-def _draw(scores: Any, temperature: Any, top_p: Any, seed: Any, index: Any) -> Any:
+def _draw(
+    scores: torch.Tensor,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+    seed: torch.Tensor,
+    index: torch.Tensor,
+) -> torch.Tensor:
     """Each row's sampled token from `scores` (`[rows, ..., vocab]`, float32): the argmax over the
     `top_p` nucleus of scores / `temperature` plus Gumbel noise hashed from (`seed`, `index`, the
     vocabulary entry). `temperature`, `top_p` and `seed` are per row; `index` is the token's
@@ -741,7 +895,7 @@ class _Draw:
     def __init__(self, prompt: int, sampling: _Sampling) -> None:
         self.prompt, self.sampling = prompt, sampling
 
-    def __call__(self, input_ids: Any, scores: Any) -> Any:
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         rows, device = int(scores.shape[0]), scores.device
         at = int(input_ids.shape[1]) - self.prompt
         index = torch.full((rows,), at, dtype=torch.long, device=device)
@@ -749,7 +903,9 @@ class _Draw:
         return torch.full_like(scores, float("-inf")).scatter_(1, token[:, None], 0.0)
 
 
-def _per_row(sampling: _Sampling, rows: int, device: Any) -> tuple[Any, Any, Any]:
+def _per_row(
+    sampling: _Sampling, rows: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """`sampling` as `_draw`'s per-row temperature, top-p and seed."""
     return (
         torch.full((rows,), sampling.temperature, dtype=torch.float32, device=device),
@@ -765,7 +921,7 @@ class _Allowed:
     def __init__(self, prompt: int, constraint: Constraint, stops: list[int]) -> None:
         self.prompt, self.constraint, self.stops = prompt, constraint, set(stops)
 
-    def __call__(self, input_ids: Any, scores: Any) -> Any:
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         keep = torch.ones(scores.shape, dtype=torch.bool)
         for row, tokens in enumerate(input_ids[:, self.prompt :].tolist()):
             if not self.stops.intersection(tokens):  # a finished row continues as padding
@@ -780,7 +936,7 @@ class _TopK:
     def __init__(self, k: int) -> None:
         self.k = k
 
-    def __call__(self, input_ids: Any, scores: Any) -> Any:
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         return _top_k(scores, self.k)
 
 
@@ -790,7 +946,7 @@ class _Presence:
     def __init__(self, prompt: int, penalty: float) -> None:
         self.prompt, self.penalty = prompt, penalty
 
-    def __call__(self, input_ids: Any, scores: Any) -> Any:
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         generated = input_ids[:, self.prompt :]
         if not generated.shape[1]:
             return scores
@@ -799,8 +955,8 @@ class _Presence:
 
 
 def _transformers(
-    model: Any,
-    inputs: Mapping[str, Any],
+    model: PreTrainedModel,
+    inputs: Mapping[str, torch.Tensor],
     max_new_tokens: int,
     stops: list[int],
     pad: int,
@@ -808,9 +964,11 @@ def _transformers(
     sampling: _Sampling,
     tell: _Tell,
     allowed: Constraint | None = None,
-) -> Any:
+) -> torch.Tensor:
     prompt = int(inputs["input_ids"].shape[1])
-    processors: list[Any] = [] if allowed is None else [_Allowed(prompt, allowed, stops)]
+    processors: list[_Allowed | _TopK | _Presence | _Draw] = (
+        [] if allowed is None else [_Allowed(prompt, allowed, stops)]
+    )
     if sampling.temperature > 0 and sampling.top_k:
         processors.append(_TopK(sampling.top_k))
     if penalty:
@@ -819,7 +977,7 @@ def _transformers(
         processors.append(_Draw(prompt, sampling))
     context = CURRENT.get()
     with _PLANE, torch.inference_mode():
-        out = model.generate(
+        out = _lm(model).generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
@@ -831,19 +989,22 @@ def _transformers(
     return out[:, prompt:]
 
 
-class _Cancel(StoppingCriteria):  # type: ignore[misc]
+class _Cancel(StoppingCriteria):
     """Transformers' loop raises the attempt's cancellation between tokens and tells its
     progress."""
 
     def __init__(self, context: Context | None, tell: _Tell) -> None:
         self.context, self.tell, self.steps = context, tell, 0
 
-    def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
+    def __call__(
+        self, input_ids: torch.Tensor, scores: tuple[torch.Tensor] | None, **kwargs: object
+    ) -> torch.BoolTensor:
         if self.context is not None:
             self.context.raise_if_cancelled()
         self.steps += 1  # one token a step: this loop drafts none
         self.tell(lambda: self.steps)
-        return torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        flags = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        return cast("torch.BoolTensor", flags)  # cast: Transformers types its flags as BoolTensor
 
 
 #: The least time between two progress reports of one call.
@@ -898,11 +1059,15 @@ def window(length: int, capacity: int) -> int:
     return min(size, capacity)
 
 
-class _Keys(StaticLayer):  # type: ignore[misc]
+class _Keys(StaticLayer):  # type: ignore[no-untyped-call]  # Transformers' __init_subclass__
     """A full-attention layer's keys and values in fixed buffers of the cache's capacity, of which
     attention reads the first `window` positions (the rest are masked)."""
 
-    cumulative_length: Any
+    # Set by `lazy_initialization` or `_Engine._buffers` before this module reads them (a head
+    # that writes none leaves `keys` None: read only where checked).
+    keys: torch.Tensor
+    values: torch.Tensor
+    cumulative_length: torch.Tensor  # type: ignore[assignment]  # a static layer's is a tensor
 
     def __init__(self, size: list[int], capacity: int, rows: bool = False) -> None:
         super().__init__(max_cache_len=capacity)
@@ -912,7 +1077,7 @@ class _Keys(StaticLayer):  # type: ignore[misc]
         #: each row writes at its own length (`cumulative_length` has a row per slot)
         self.rows = rows
 
-    def lazy_initialization(self, key_states: Any, value_states: Any) -> None:
+    def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
         # Transformers' own, less `mark_static_address`: nothing here goes through dynamo.
         self.dtype, self.device = key_states.dtype, key_states.device
         self.batch_size, self.num_heads = key_states.shape[:2]
@@ -923,7 +1088,9 @@ class _Keys(StaticLayer):  # type: ignore[misc]
         self.cumulative_length = self.cumulative_length.to(self.device)
         self.is_initialized = True
 
-    def update(self, key_states: Any, value_states: Any, *args: Any, **kwargs: Any) -> Any:
+    def update(
+        self, key_states: torch.Tensor, value_states: torch.Tensor, *args: object, **kwargs: object
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.rows:
             keys, values = super().update(key_states, value_states, *args, **kwargs)
         else:
@@ -937,19 +1104,21 @@ class _Keys(StaticLayer):  # type: ignore[misc]
         size = self.size[0]
         return keys[:, :, :size], values[:, :, :size]
 
-    def get_mask_sizes(self, query_length: int, *args: Any, **kwargs: Any) -> tuple[int, int]:
+    def get_mask_sizes(self, query_length: int, *args: object, **kwargs: object) -> tuple[int, int]:
         return self.size[0], 0
 
 
-class _State(LinearAttentionLayer):  # type: ignore[misc]
+class _State(LinearAttentionLayer):
     """A linear-attention layer's conv and recurrent state, updated in place."""
 
-    device: Any
+    # Transformers declares them by their `None` defaults.
+    device: torch.device | None  # type: ignore[assignment]  # set at its first state
+    dtype: torch.dtype | None  # type: ignore[assignment]  # set at its first state
 
     def lazy_initialization(
         self,
-        conv_states: Any = None,
-        recurrent_states: Any = None,
+        conv_states: torch.Tensor | None = None,
+        recurrent_states: torch.Tensor | None = None,
         state_idx: int = 0,
         conv_kernel_size: int | None = None,
     ) -> None:
@@ -969,17 +1138,17 @@ class _State(LinearAttentionLayer):  # type: ignore[misc]
 
     def update_conv_state(
         self,
-        conv_states: Any,
+        conv_states: torch.Tensor,
         state_idx: int = 0,
         conv_kernel_size: int | None = None,
-        **kwargs: Any,
-    ) -> Any:
+        **kwargs: object,
+    ) -> torch.Tensor:
         verify = _VERIFY.get()
         if verify is None or not self.has_previous_state[state_idx]:
             return super().update_conv_state(
                 conv_states, state_idx, conv_kernel_size=conv_kernel_size, **kwargs
             )
-        state = self.conv_states[state_idx]
+        state = _set(self.conv_states[state_idx])
         full = torch.cat([state, conv_states], dim=-1)
         verify.conv.append((state, full))  # its state after each token is a slice of `full`
         state.copy_(full[..., -state.shape[-1] :])
@@ -987,26 +1156,30 @@ class _State(LinearAttentionLayer):  # type: ignore[misc]
 
 
 @contextmanager
-def _taking(model: Any) -> Iterator[list[Any]]:
+def _taking(model: PreTrainedModel) -> Iterator[list[torch.Tensor]]:
     """The decoder's final states in the body, one per call: what the output head reads, at
     every position of the call."""
-    taken: list[Any] = []
-    handle = model.get_decoder().register_forward_hook(
-        lambda _module, _args, out: taken.append(out[0])
-    )
+    taken: list[torch.Tensor] = []
+    decoder = _lm(model).get_decoder()
+    handle = decoder.register_forward_hook(lambda _module, _args, out: taken.append(out[0]))
     try:
         yield taken
     finally:
         handle.remove()
 
 
-class _RowByRow(TorchFunctionMode):  # type: ignore[misc]
+class _RowByRow(TorchFunctionMode):
     """A verify pass's plain linears one row at a time, as decoding runs them: cuBLAS takes
     another kernel for a few rows, whose sums differ in the last bit (Qwen3.5's `in_proj_a` and
     `in_proj_b`), and a drafted token must keep decode's bits. It is faster for those, too."""
 
-    def __torch_function__(
-        self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
+    # torch's mode hook sees every torch function, its arguments and its result.
+    def __torch_function__(  # type: ignore[explicit-any]  # every torch function
+        self,
+        func: Callable[..., Any],
+        types: tuple[type, ...],
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
     ) -> Any:
         kwargs = kwargs or {}
         x = args[0] if args else None
@@ -1026,8 +1199,8 @@ class _Verify:
     (its state, then the new tokens) and its recurrent state after each token."""
 
     def __init__(self) -> None:
-        self.conv: list[tuple[Any, Any]] = []
-        self.recurrent: list[tuple[Any, Any]] = []
+        self.conv: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self.recurrent: list[tuple[torch.Tensor, torch.Tensor]] = []
 
 
 #: Set while the model verifies drafted tokens: its linear-attention layers then take each token
@@ -1041,23 +1214,33 @@ _MANY = ("causal_conv1d_fn", "torch_chunk_gated_delta_rule")
 _ONE = ("causal_conv1d_update", "torch_recurrent_gated_delta_rule")
 
 
-def _speculable(model: Any) -> bool:
+def _speculable(model: torch.nn.Module) -> bool:
     """Whether `model`'s linear-attention layers can verify drafted tokens: their modules carry
     every slot it steps through; it wraps the multi-token ones once."""
-    spaces = {sys.modules.get(type(m).__module__) for m in model.modules()}
-    spaces = {space for space in spaces if space is not None and hasattr(space, _MANY[1])}
+    found = {sys.modules.get(type(m).__module__) for m in model.modules()}
+    spaces = {space for space in found if space is not None and hasattr(space, _MANY[1])}
     if not all(callable(getattr(space, name, None)) for space in spaces for name in _MANY + _ONE):
         return False
+    wraps: tuple[
+        Callable[[ModuleType, _ConvFn], _ConvFn] | Callable[[ModuleType, _DeltaRule], _DeltaRule],
+        ...,
+    ] = (_stepped_conv, _stepped_recurrence)
     for space in spaces:
-        for name, wrap in zip(_MANY, (_stepped_conv, _stepped_recurrence), strict=True):
+        for name, wrap in zip(_MANY, wraps, strict=True):
             current = getattr(space, name)
             if not getattr(current, "_cozy_verify", False):
                 setattr(space, name, wrap(space, current))
     return True
 
 
-def _stepped_conv(space: Any, original: Any) -> Any:
-    def conv(x: Any, weight: Any, bias: Any = None, *args: Any, **kwargs: Any) -> Any:
+def _stepped_conv(space: ModuleType, original: _ConvFn) -> _ConvFn:
+    def conv(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
         if _VERIFY.get() is None:
             return original(x, weight, bias, *args, **kwargs)
         activation = kwargs.get("activation", args[0] if args else None)
@@ -1102,22 +1285,22 @@ def _stepped_conv(space: Any, original: Any) -> Any:
             )[..., 0]
         return out
 
-    conv._cozy_verify = True  # type: ignore[attr-defined]
+    conv._cozy_verify = True  # type: ignore[attr-defined]  # a marker on the function object
     return conv
 
 
-def _stepped_recurrence(space: Any, original: Any) -> Any:
+def _stepped_recurrence(space: ModuleType, original: _DeltaRule) -> _DeltaRule:
     def recurrence(
-        query: Any,
-        key: Any,
-        value: Any,
-        g: Any,
-        beta: Any,
-        initial_state: Any = None,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor | None = None,
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
-        **kwargs: Any,
-    ) -> Any:
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         verify = _VERIFY.get()
         if verify is None or initial_state is None:
             return original(
@@ -1175,7 +1358,8 @@ def _stepped_recurrence(space: Any, original: Any) -> Any:
             )
             verify.recurrent.append((initial_state, states))
             return out, states[-1]
-        state, outs = initial_state.clone(), []
+        state: torch.Tensor = initial_state.clone()
+        outs: list[torch.Tensor] = []
         for t in range(tokens):
             out, state = space.torch_recurrent_gated_delta_rule(
                 query[:, t : t + 1],
@@ -1192,17 +1376,22 @@ def _stepped_recurrence(space: Any, original: Any) -> Any:
         verify.recurrent.append((initial_state, states))
         return torch.cat(outs, dim=1), state
 
-    recurrence._cozy_verify = True  # type: ignore[attr-defined]
+    recurrence._cozy_verify = True  # type: ignore[attr-defined]  # a marker on the function object
     return recurrence
 
 
-class _StaticCache(Cache):  # type: ignore[misc]
-    def __init__(self, text_config: Any, capacity: int, size: int, rows: bool = False) -> None:
+class _StaticCache(Cache):
+    #: a view's head cache (`_Engine._view`)
+    draft: Cache
+
+    def __init__(
+        self, text_config: PreTrainedConfig, capacity: int, size: int, rows: bool = False
+    ) -> None:
         self.size = [size]
         types, kwargs = get_layer_types_and_kwargs(text_config)
-        if isinstance(kwargs, dict):  # Transformers before 5.19: one set for every layer
-            kwargs = [kwargs] * len(types)
-        layers = [
+        if isinstance(kwargs, dict):  # type: ignore[unreachable]  # before 5.19, one set for all
+            kwargs = [kwargs] * len(types)  # type: ignore[unreachable]  # before 5.19, a dict
+        layers: list[CacheLayerMixin | LinearAttentionCacheLayerMixin] = [
             _Keys(self.size, capacity, rows) if kind == "full_attention" else _State(**extra)
             for kind, extra in zip(types, kwargs, strict=True)
         ]
@@ -1218,11 +1407,38 @@ class _StaticCache(Cache):  # type: ignore[misc]
         self.size[0] = size
 
 
+def _layers(cache: Cache) -> list[_Keys | _State]:
+    """The layers of a cache this module built (`_StaticCache`, a head's)."""
+    return cast("list[_Keys | _State]", cache.layers)  # cast: it builds only these
+
+
+def _head_keys(cache: Cache) -> _Keys:
+    """A head's cache's one layer (`Draft` attends with one full-attention layer)."""
+    return cast(_Keys, cache.layers[0])  # cast: a head's cache is built of its one `_Keys`
+
+
+def _pairs(mine: Cache, theirs: Cache) -> Iterator[tuple[_Keys | _State, _Keys | _State]]:
+    """Two caches' layers side by side. Built from one config, each pair is of one type."""
+    return zip(_layers(mine), _layers(theirs), strict=True)
+
+
+def _like[L: (_Keys, _State)](mine: L, theirs: _Keys | _State) -> L:
+    """`theirs`, `mine`'s pair from `_pairs`: of `mine`'s type."""
+    return cast(L, theirs)  # cast: both caches were built from one config
+
+
 class _Prefill:
     """A call's prompt through the model: its own cache, mask and positions, each row's first
     token and, drafting, the head's keys for the prompt and its state after it."""
 
-    def __init__(self, cache: Any, mask: Any, position: Any, token: Any, drafted: Any) -> None:
+    def __init__(
+        self,
+        cache: _StaticCache,
+        mask: torch.Tensor,
+        position: torch.Tensor | None,
+        token: torch.Tensor,
+        drafted: tuple[_Keys, torch.Tensor] | None,
+    ) -> None:
         self.cache, self.mask, self.position, self.token, self.drafted = (
             cache,
             mask,
@@ -1232,7 +1448,7 @@ class _Prefill:
         )
 
 
-def _derived(models: Iterable[Any]) -> list[Any]:
+def _derived(models: Iterable[torch.nn.Module]) -> list[torch.Tensor]:
     """The non-persistent buffers of `models` on a device: built from config (a rotary table),
     never a checkpoint's, so the plane neither places nor pins them."""
     return [
@@ -1241,6 +1457,7 @@ def _derived(models: Iterable[Any]) -> list[Any]:
         for module in model.modules()
         for name, tensor in module._buffers.items()
         if name in module._non_persistent_buffers_set
+        and tensor is not None  # as `type(None)` is not "Tensor"
         and type(tensor).__name__ == "Tensor"
         and tensor.device.type != "meta"
         and tensor.device.type != "cpu"
@@ -1252,7 +1469,7 @@ class _Request:
 
     def __init__(
         self,
-        inputs: Mapping[str, Any],
+        inputs: Mapping[str, torch.Tensor],
         max_new: int,
         stops: list[int],
         pad: int,
@@ -1273,18 +1490,18 @@ class _Request:
         self.tell = tell
         rows = int(inputs["input_ids"].shape[0])
         self.prompt = int(inputs["input_ids"].shape[1])
-        self.tokens: list[Any] = [None] * rows
+        self.tokens: list[torch.Tensor | None] = [None] * rows
         self.left = rows
         self.error: BaseException | None = None
         #: why it decodes through Transformers' loop instead (its caller runs it)
         self.fallback = ""
         #: the head it drafts with (None: any, drafting keeps a model's tokens)
-        self.draft: Any = None
+        self.draft: torch.nn.Module | None = None
         self.prefill_s = self.began = self.ended = 0.0
         #: the engine's (captures, capture seconds, eager steps) at admission, then over its life
         self.at: tuple[float, ...] = (0, 0.0, 0)
         self.steps = self.live = 0
-        self.warnings: list[tuple[str, dict[str, Any]]] = []
+        self.warnings: list[WarningRow] = []
         #: the attempt it serves (cancellation), and whether its rows left for it
         self.context: Context | None = CURRENT.get()
         self.cut = False
@@ -1300,11 +1517,11 @@ class _Request:
     def cancelled(self) -> bool:
         return self.context is not None and self.context.cancelled
 
-    def result(self) -> Any:
-        width = max(int(t.shape[0]) for t in self.tokens)
+    def result(self) -> torch.Tensor:
+        width = max(int(_set(t).shape[0]) for t in self.tokens)
         out = torch.full((len(self.tokens), width), self.pad, dtype=torch.long)
         for row, tokens in enumerate(self.tokens):
-            out[row, : int(tokens.shape[0])] = tokens.cpu()
+            out[row, : int(_set(tokens).shape[0])] = _set(tokens).cpu()
         return out.to(self.inputs["input_ids"].device)
 
 
@@ -1360,7 +1577,7 @@ class _Engine:
     dhidden: torch.Tensor
     allow: torch.Tensor
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: PreTrainedModel) -> None:
         self.model = model
         self.text = model.config.get_text_config(decoder=True)
         parameters = set(inspect.signature(model.forward).parameters)
@@ -1384,13 +1601,13 @@ class _Engine:
         #: and when the graphs were last started over
         self.building, self.landed = -1, LANDED[0]
         self.driver: int | None = None
-        self.draft: Any = None
+        self.draft: torch.nn.Module | None = None
         self.slots: list[_Row | None] = []
         self.capacity = 0
         self.width = 0
-        self.cache: Any = None
-        self.views: dict[int, Any] = {}
-        self.graphs: dict[_Key, Any] = {}
+        self.cache: _StaticCache | None = None
+        self.views: dict[int, _StaticCache] = {}
+        self.graphs: dict[_Key, torch.cuda.CUDAGraph] = {}
         #: Full shape variants whose real accepted step preseeded their capture pool, and the
         #: working peak varena measured it at: the pool its capture prepares first.
         self.warmed: set[_Key] = set()
@@ -1398,12 +1615,12 @@ class _Engine:
         self.layout: tuple[object, ...] | None = None
         #: its decode graphs' capture pool (`domain.Pool`): the model's graph region, or a
         #: torch pool of its own with no varena memory
-        self.pool: Any = None
-        self.addresses: dict[int, Any] = {}
+        self.pool: Pool | None = None
+        self.addresses: dict[int, Binding] = {}
         self.unprepared: BaseException | None = None
-        self.completions: dict[Any, Any] = {}
-        self.unfenced: set[Any] = set()
-        self.domain: Any = None
+        self.completions: dict[torch.cuda.Stream, torch.cuda.Event] = {}
+        self.unfenced: set[torch.cuda.Stream] = set()
+        self.domain: Domain | None = None
         #: a step's graph key (`_Key`) -> why that step runs eagerly
         self.unrecorded: dict[_Key, str] = {}
         #: the graphs recorded a path that changed since (a kernel landed in `install`)
@@ -1411,11 +1628,12 @@ class _Engine:
         #: seconds the last admission took: decoding gets as long before the next one
         self.debt = 0.0
         #: KV storage stays pinned across driver handoffs while any live row remains.
-        self.region: Any = None
-        self.region_use: ExitStack | None = None
+        self.region: Region | None = None
+        self.region_use: ExitStack[bool | None] | None = None
         self.retire = False
-        self.cache_device: Any = None
-        self.vocab = int(model.get_output_embeddings().out_features)  # an int8 head: no .weight
+        self.cache_device: torch.device | None = None
+        # an int8 head: no .weight
+        self.vocab = int(_lm(model).get_output_embeddings().out_features)
         #: the device bytes of the slot buffers (`_need`), and whether the graphs' pool is held
         #: mapped for the rows decoding (`_pool`)
         self.held = 0
@@ -1436,7 +1654,7 @@ class _Engine:
 
     # ------------------------------------------------------------------ calls
 
-    def generate(self, request: _Request, draft: Any) -> Any:
+    def generate(self, request: _Request, draft: torch.nn.Module | None) -> torch.Tensor:
         request.draft = draft if draft is not None and self._speculable() else None
         rows = len(request.tokens)
         if rows > BUCKETS[-1]:
@@ -1483,13 +1701,13 @@ class _Engine:
         return _speculable(self.model)
 
     def _report(self, request: _Request) -> None:
-        tokens = sum(int(t.shape[0]) for t in request.tokens)
+        tokens = sum(int(_set(t).shape[0]) for t in request.tokens)
         rows = len(request.tokens)
         looped = (tokens - rows) / rows  # a row's tokens after its first, the prefill's
         captures, capture_s, eager = request.at
         loop_s = max(request.ended - request.began - capture_s, 0.0)
         per = 1000 * loop_s / max(looped, 1)
-        mode = "eager" if self.cache_device.type != "cuda" else "graphs"
+        mode = "eager" if _set(self.cache_device).type != "cuda" else "graphs"
         if eager:
             mode = "partly eager" if mode == "graphs" else mode
         if self.draft is not None:
@@ -1518,8 +1736,11 @@ class _Engine:
                 # bindings below may be replaced while this driver owns live rows.
                 if self.region is None and (placed := PLACED.get(self.model)) is not None:
                     self.region = placed[0].region(
-                        f"lm:{type(self.model).__name__}", "kv", self.model,
-                        release=self._drop, shrink=self._try_drop,
+                        f"lm:{type(self.model).__name__}",
+                        "kv",
+                        self.model,
+                        release=self._drop,
+                        shrink=self._try_drop,
                     )
                 if (
                     not held_region
@@ -1592,7 +1813,7 @@ class _Engine:
             self._drop()
             self.cond.notify_all()
 
-    def _targets(self) -> list[tuple[Any, Any]]:
+    def _targets(self) -> list[tuple[torch.nn.Module, tuple[Residency, str]]]:
         return [(m, PLACED[m]) for m in (self.model, self.draft) if m is not None and m in PLACED]
 
     def _hold(self, stack: ExitStack) -> bool:
@@ -1652,9 +1873,10 @@ class _Engine:
         rows = [row for row in self.slots if row is not None]
         drafting, constrained = self._drafting(size), self._constrained()
         per = DEPTH + 1 if drafting else 1
-        self.cache.window = window(max(row.reach for row in rows) + per, self.capacity)
-        stream, event = None, None
-        if self.cache_device.type == "cuda":
+        _set(self.cache).window = window(max(row.reach for row in rows) + per, self.capacity)
+        stream: torch.cuda.Stream | None = None
+        event: torch.cuda.Event | None = None
+        if _set(self.cache_device).type == "cuda":
             if self.domain is None:
                 placed = PLACED.get(self.model)
                 self.domain = (
@@ -1665,7 +1887,8 @@ class _Engine:
             stream = torch.cuda.current_stream()
             event = self.completions.get(stream)
             if event is None:
-                event = self.completions[stream] = torch.cuda.Event()
+                event = torch.cuda.Event()  # type: ignore[no-untyped-call]  # unannotated in Torch
+                self.completions[stream] = event
                 event.record(stream)  # instantiate before any accepted step can run
             self.unfenced.add(stream)
         try:
@@ -1673,7 +1896,7 @@ class _Engine:
                 self.part = part
                 if constrained:
                     self._fill(size, max(part, 0))
-                with self.domain.using() if stream is not None else nullcontext():
+                with _set(self.domain).using() if stream is not None else nullcontext():
                     self._replay(size, cuda)
                 if part < 0 or part == DEPTH or not self._drafting(size):
                     break  # the whole step, its verify, or a plain step for a part not recorded
@@ -1696,7 +1919,7 @@ class _Engine:
         above fill their slots, and new calls prefill into the slots that are free."""
         if self.cache is not None:
             with _disable_current_modes():
-                if self.cache_device.type == "cuda":
+                if _set(self.cache_device).type == "cuda":
                     torch.cuda.current_stream().synchronize()
                 self._retire()
                 self.flag.zero_()
@@ -1766,9 +1989,9 @@ class _Engine:
         with self.cond:
             self.cond.notify_all()
 
-    def _rows(self) -> Iterator[Any]:
+    def _rows(self) -> Iterator[torch.Tensor]:
         """Every buffer with a row per slot."""
-        for layer in self.cache.layers:
+        for layer in _layers(_set(self.cache)):
             if isinstance(layer, _Keys):
                 yield from (layer.keys, layer.values, layer.cumulative_length)
             else:
@@ -1826,7 +2049,7 @@ class _Engine:
         self._splice(request, fresh, [slot for slot, row in enumerate(self.slots) if row is None])
         return True
 
-    def _enter(self, request: _Request, position: Any) -> bool:
+    def _enter(self, request: _Request, position: torch.Tensor | None) -> bool:
         """Whether `request`'s rows have their decode memory, decided before its prefill, the one
         place it is: the slots held now where they can take it (the decode graphs' pool mapped
         back for them), else slots for every row's prompt and `max_new_tokens` allocated now
@@ -1887,7 +2110,7 @@ class _Engine:
             ) from exc
         return True
 
-    def _card(self, device: Any) -> int:
+    def _card(self, device: torch.device) -> int:
         """The most this process could ever have for slots: the whole card, less its own live
         working memory and weights in use. What other processes hold is not counted against it:
         they give memory back when an allocation asks."""
@@ -1896,7 +2119,11 @@ class _Engine:
         return max(total - int(room["working_live"]) - int(room["pinned"]), 0)
 
     def _refused(
-        self, request: _Request, alone: tuple[int, int, int], position: Any, room: int
+        self,
+        request: _Request,
+        alone: tuple[int, int, int],
+        position: torch.Tensor | None,
+        room: int,
     ) -> str:
         """`DoesNotFit`'s line for slots the card cannot hold, with the longest that it could."""
         rows, prompt = len(request.tokens), request.prompt
@@ -1917,17 +2144,21 @@ class _Engine:
             f"run it smaller ({smaller}), or rent a larger card: `cozy run … --on new`"
         )
 
-    def _inputs(self, request: _Request) -> tuple[dict[str, Any], Any, Any]:
+    def _inputs(
+        self, request: _Request
+    ) -> tuple[dict[str, torch.Tensor | int | None], torch.Tensor, torch.Tensor | None]:
         """The prefill's arguments, its attention mask and positions: no forward."""
         model, inputs = self.model, request.inputs
         ids = inputs["input_ids"]
-        kwargs = {key: value for key, value in inputs.items() if key != "input_ids"}
-        mask = kwargs.get("attention_mask")
+        kwargs: dict[str, torch.Tensor | int | None] = {
+            key: value for key, value in inputs.items() if key != "input_ids"
+        }
+        mask = inputs.get("attention_mask")  # kwargs' own: it holds every input but the ids
         mask = torch.ones_like(ids) if mask is None else mask
         kwargs["attention_mask"] = mask
-        position = None
+        position: torch.Tensor | None = None
         if self.positional:
-            position = kwargs["position_ids"] = model._prepare_position_ids_for_generation(
+            position = kwargs["position_ids"] = _lm(model)._prepare_position_ids_for_generation(
                 ids, kwargs
             )
         if bool(mask.all()):  # as `generate`: no padding, no 2D mask
@@ -1937,19 +2168,24 @@ class _Engine:
         return kwargs, mask, position
 
     def _prefill(
-        self, request: _Request, kwargs: dict[str, Any], mask: Any, position: Any, first: Any
-    ) -> Any:
+        self,
+        request: _Request,
+        kwargs: dict[str, torch.Tensor | int | None],
+        mask: torch.Tensor,
+        position: torch.Tensor | None,
+        first: torch.Tensor | None,
+    ) -> _Prefill:
         """The prompt through the model's own forward into a cache of its own, and each row's
         first token, from what `first` (the constraint's ids for no tokens) allows."""
         started = time.perf_counter()
         model, ids = self.model, request.inputs["input_ids"]
         fresh = _StaticCache(self.text, request.prompt, request.prompt)
-        prepared = model.prepare_inputs_for_generation(
+        prepared = _lm(model).prepare_inputs_for_generation(
             ids, past_key_values=fresh, use_cache=True, is_first_iteration=True, **kwargs
         )
         # Native allocation recovery runs underneath this single prefill invocation.
         with _taking(model) as taken:
-            logits = model(**prepared, return_dict=True).logits[:, -1]
+            logits: torch.Tensor = model(**prepared, return_dict=True).logits[:, -1]
         hidden = taken[-1]
         with _disable_current_modes():
             scores = logits.float()
@@ -1964,13 +2200,19 @@ class _Engine:
                 rows = int(ids.shape[0])
                 first = torch.zeros((rows,), dtype=torch.long, device=ids.device)
                 token = _draw(scores, *_per_row(request.sampling, rows, ids.device), first)
-            drafted = None
+            drafted: tuple[_Keys, torch.Tensor] | None = None
             if self.draft is not None:
                 drafted = self._drafted_prompt(ids, token, hidden, position)
         request.prefill_s += time.perf_counter() - started
         return _Prefill(fresh, mask, position, token, drafted)
 
-    def _drafted_prompt(self, ids: Any, token: Any, hidden: Any, position: Any) -> Any:
+    def _drafted_prompt(
+        self,
+        ids: torch.Tensor,
+        token: torch.Tensor,
+        hidden: torch.Tensor,
+        position: torch.Tensor | None,
+    ) -> tuple[_Keys, torch.Tensor]:
         """The head's keys for the prompt and the first token, as it attends to them while
         drafting: slot j from token j and the model's state for the token before it, so drafts
         read the whole context the head was trained on; and its state for the token after."""
@@ -1989,12 +2231,14 @@ class _Engine:
             at = torch.cat([position[..., 1:], following], dim=-1)
         else:
             at = slots[None, 1:]
-        cache = Cache(layers=[_Keys([prompt + 1], prompt + 1)])
-        cache.layers[0].cumulative_length = torch.ones((), dtype=torch.long, device=ids.device)
+        keys = _Keys([prompt + 1], prompt + 1)
+        cache = Cache(layers=[keys])
+        keys.cumulative_length = torch.ones((), dtype=torch.long, device=ids.device)
         embed = self.model.get_input_embeddings()
-        rotary = self.model.get_decoder().rotary_emb
-        last = self.draft(embed(tokens), hidden, at, cache, mask, rotary)[:, -1:]
-        return cache.layers[0], last
+        rotary = _lm(self.model).get_decoder().rotary_emb
+        drafted: torch.Tensor = _set(self.draft)(embed(tokens), hidden, at, cache, mask, rotary)
+        last = drafted[:, -1:]
+        return keys, last
 
     def _splice(self, request: _Request, fresh: _Prefill, free: list[int]) -> None:
         """`fresh`'s rows into slots `free`, each with its prompt's keys, state, mask and
@@ -2006,18 +2250,19 @@ class _Engine:
         with _disable_current_modes():
             for row in range(int(fresh.token.shape[0])):
                 slot = free[row]
-                for mine, theirs in zip(self.cache.layers, fresh.cache.layers, strict=True):
+                for mine, theirs in _pairs(_set(self.cache), fresh.cache):
                     if isinstance(mine, _Keys):
-                        mine.keys[slot, :, :prompt].copy_(theirs.keys[row])
-                        mine.values[slot, :, :prompt].copy_(theirs.values[row])
+                        mine.keys[slot, :, :prompt].copy_(_like(mine, theirs).keys[row])
+                        mine.values[slot, :, :prompt].copy_(_like(mine, theirs).values[row])
                         mine.cumulative_length[slot] = prompt
                     else:
+                        given = _like(mine, theirs)
                         for i, state in mine.conv_states.items():
                             if state is not None:
-                                state[slot].copy_(theirs.conv_states[i][row])
+                                state[slot].copy_(_set(given.conv_states[i])[row])
                         for i, state in mine.recurrent_states.items():
                             if state is not None:
-                                state[slot].copy_(theirs.recurrent_states[i][row])
+                                state[slot].copy_(_set(given.recurrent_states[i])[row])
                 self.length[slot] = prompt
                 self.mask[slot].fill_(self.closed)
                 self.mask[slot, 0, 0, :prompt].masked_fill_(fresh.mask[row].bool(), self.open)
@@ -2039,36 +2284,43 @@ class _Engine:
                 self.seen[slot, token] = 1.0
                 self.done[slot] = bool((self.stops[slot] == token).any()) or request.max_new <= 1
                 if self.draft is not None:
-                    keys, last = fresh.drafted
+                    keys, last = _set(fresh.drafted)
                     if keys.keys is not None:
                         self.dkeys.keys[slot, :, : prompt + 1].copy_(keys.keys[row])
                         self.dkeys.values[slot, :, : prompt + 1].copy_(keys.values[row])
                     self.dmask[slot].fill_(self.closed)
                     self.dmask[slot, ..., 1 : prompt + 1] = self.open
                     self.hidden[slot].copy_(last[row])
-                self.slots[slot] = _Row(request, row, prompt)
+                held = self.slots[slot] = _Row(request, row, prompt)
                 if firsts:
-                    self.slots[slot].generated = [firsts[row]]
+                    held.generated = [firsts[row]]
         request.began = time.perf_counter()
         request.at = (self.captured[0], self.captured[1], self.eager)
         self.retire = self.retire or bool(self.done[free[: int(fresh.token.shape[0])]].any())
 
-    def _grow(self, size: int, capacity: int, stops: int, position: Any, device: Any) -> None:
+    def _grow(
+        self,
+        size: int,
+        capacity: int,
+        stops: int,
+        position: torch.Tensor | None,
+        device: torch.device,
+    ) -> None:
         """Allocate the slots before the call's prefill, in the KV region."""
         with self.region.pin() if self.region is not None else nullcontext():
             self._buffers(size, capacity, stops, position, device)
 
     def _layout(
-        self, size: int, capacity: int, stops: int, position: Any
+        self, size: int, capacity: int, stops: int, position: torch.Tensor | None
     ) -> tuple[list[list[_Spec]], list[_Spec], dict[str, _Spec]]:
         """What `size` slots of `capacity` positions hold, from the config alone (`_shapes`),
         each tensor as (shape, dtype, fill): every cache layer's, the head's keys, the rest."""
         dtype, long, f32 = self.model.dtype, torch.long, torch.float32
         shapes = _shapes(self.text)[0]
         layers: list[list[_Spec]] = []
-        for kind, *dims in shapes:
-            if kind == "keys":
-                heads, k_width, v_width = dims
+        for shape in shapes:
+            if shape[0] == "keys":
+                _, heads, k_width, v_width = shape
                 layers.append(
                     [
                         ((size, heads, capacity, k_width), dtype, 0),
@@ -2077,7 +2329,7 @@ class _Engine:
                     ]
                 )
             else:
-                conv, recurrent = dims
+                _, conv, recurrent = shape
                 layers.append([((size, *conv), dtype, 0), ((size, *recurrent), f32, 0)])
         kind = torch.bool if self.closed is False else dtype
         mask: _Spec = ((size, 1, 1, capacity), kind, self.closed)
@@ -2105,7 +2357,7 @@ class _Engine:
         draft: list[_Spec] = []
         if self.draft is not None:
             # `Draft`'s one layer is the model's own full attention: its keys are as the model's.
-            heads, width = next((dims[1], dims[2]) for dims in shapes if dims[0] == "keys")
+            heads, width = next((s[1], s[2]) for s in shapes if s[0] == "keys")
             keys: _Spec = ((size, heads, capacity, width), dtype, 0)
             draft = [keys, keys, ((size,), long, 0)]
             fields["dmask"] = mask
@@ -2114,7 +2366,7 @@ class _Engine:
             fields["dhidden"] = fields["hidden"]
         return layers, draft, fields
 
-    def _need(self, size: int, capacity: int, stops: int, position: Any) -> int:
+    def _need(self, size: int, capacity: int, stops: int, position: torch.Tensor | None) -> int:
         """The device bytes `_buffers` allocates for these slots."""
         layers, draft, fields = self._layout(size, capacity, stops, position)
         specs = [*(spec for layer in layers for spec in layer), *draft, *fields.values()]
@@ -2124,23 +2376,25 @@ class _Engine:
     def _misfit(self, fresh: _Prefill) -> str:
         """How a row of the prefill's state differs from the slots sized from the config, ""
         when it does not: a copy into a slot of another dtype would cast it silently."""
-        pairs: list[tuple[object, Any, Any, int]] = []
-        for j, (mine, theirs) in enumerate(zip(self.cache.layers, fresh.cache.layers, strict=True)):
-            if isinstance(mine, _Keys):
-                pairs += [(j, mine.keys, theirs.keys, 2), (j, mine.values, theirs.values, 2)]
+        pairs: list[tuple[object, torch.Tensor, torch.Tensor | None, int]] = []
+        for j, (layer, other) in enumerate(_pairs(_set(self.cache), fresh.cache)):
+            if isinstance(layer, _Keys):
+                keys_ = _like(layer, other)
+                pairs += [(j, layer.keys, keys_.keys, 2), (j, layer.values, keys_.values, 2)]
             else:
+                state = _like(layer, other)
                 pairs += [
-                    (j, mine.conv_states[0], theirs.conv_states.get(0), -1),
-                    (j, mine.recurrent_states[0], theirs.recurrent_states.get(0), -1),
+                    (j, _set(layer.conv_states[0]), state.conv_states.get(0), -1),
+                    (j, _set(layer.recurrent_states[0]), state.recurrent_states.get(0), -1),
                 ]
         if self.draft is not None:
-            keys, last = fresh.drafted
+            keys, last = _set(fresh.drafted)
             if keys.keys is not None:  # `Draft` writes keys; a head of none reads none
                 pairs += [("head", self.dkeys.keys, keys.keys, 2)]
                 pairs += [("head", self.dkeys.values, keys.values, 2)]
             pairs.append(("head", self.hidden, last, -1))
 
-        def row(t: Any, positions: int) -> tuple[object, ...]:
+        def row(t: torch.Tensor, positions: int) -> tuple[object, ...]:
             return (*(n for d, n in enumerate(t.shape) if d not in (0, positions)), t.dtype)
 
         for where, mine, theirs, positions in pairs:
@@ -2149,18 +2403,25 @@ class _Engine:
                 return f"layer {where}: {found} a row, sized {row(mine, positions)}"
         return ""
 
-    def _buffers(self, size: int, capacity: int, stops: int, position: Any, device: Any) -> None:
+    def _buffers(
+        self,
+        size: int,
+        capacity: int,
+        stops: int,
+        position: torch.Tensor | None,
+        device: torch.device,
+    ) -> None:
         """Every slot buffer for `size` rows of `capacity` positions (`_layout`), all allocated
         before any replaces the engine's, then the rows held now moved over."""
 
-        def full(spec: _Spec) -> Any:
+        def full(spec: _Spec) -> torch.Tensor:
             shape, dtype, fill = spec
             return torch.full(shape, fill, dtype=dtype, device=device)
 
         layers, draft_specs, specs = self._layout(size, capacity, stops, position)
         old, held = self.cache, [row for row in self.slots if row is not None]
         cache = _StaticCache(self.text, capacity, MIN_WINDOW, rows=True)
-        for mine, layer in zip(cache.layers, layers, strict=True):
+        for mine, layer in zip(_layers(cache), layers, strict=True):
             tensors = [full(spec) for spec in layer]
             mine.dtype, mine.device = tensors[0].dtype, device
             if isinstance(mine, _Keys):
@@ -2173,6 +2434,7 @@ class _Engine:
                 mine.has_previous_state[0] = True
                 mine.is_recurrent_states_initialized[0] = True
         fields = {name: full(spec) for name, spec in specs.items()}
+        draft: _Keys | None = None
         if self.draft is not None:
             draft = _Keys([MIN_WINDOW], capacity, rows=True)
             draft.keys, draft.values, draft.cumulative_length = (full(s) for s in draft_specs)
@@ -2185,8 +2447,8 @@ class _Engine:
         for name, tensor in fields.items():
             setattr(self, name, tensor)
         if self.draft is not None:
-            self.dkeys = draft
-            self.dcache = Cache(layers=[draft])
+            self.dkeys = _set(draft)
+            self.dcache = Cache(layers=[self.dkeys])
         # The rows held now keep their slots.
         if moving:
             with _disable_current_modes():
@@ -2214,33 +2476,36 @@ class _Engine:
 
     # ------------------------------------------------------------------ steps
 
-    def _view(self, size: int) -> Any:
+    def _view(self, size: int) -> _StaticCache:
         """The cache over the first `size` slots: views of the buffers, which graphs read."""
         view = self.views.get(size)
         if view is None:
-            view = _StaticCache(self.text, self.capacity, self.cache.window, rows=True)
-            view.size = self.cache.size
-            for mine, full in zip(view.layers, self.cache.layers, strict=True):
+            cache = _set(self.cache)
+            view = _StaticCache(self.text, self.capacity, cache.window, rows=True)
+            view.size = cache.size
+            for mine, theirs in _pairs(view, cache):
                 if isinstance(mine, _Keys):
-                    mine.size = self.cache.size
+                    full = _like(mine, theirs)
+                    mine.size = cache.size
                     mine.dtype, mine.device = full.dtype, full.device
                     mine.keys, mine.values = full.keys[:size], full.values[:size]
                     mine.cumulative_length = full.cumulative_length[:size]
                     mine.is_initialized = True
                 else:
-                    mine.dtype, mine.device = full.dtype, full.device
-                    for i, state in full.conv_states.items():
-                        if state is not None:
-                            mine.conv_states[i] = state[:size]
-                            mine.conv_kernel_size[i] = full.conv_kernel_size[i]
+                    state = _like(mine, theirs)
+                    mine.dtype, mine.device = state.dtype, state.device
+                    for i, state_ in state.conv_states.items():
+                        if state_ is not None:
+                            mine.conv_states[i] = state_[:size]
+                            mine.conv_kernel_size[i] = state.conv_kernel_size[i]
                             mine.is_conv_states_initialized[i] = True
                             mine.has_previous_state[i] = True
-                    for i, state in full.recurrent_states.items():
-                        if state is not None:
-                            mine.recurrent_states[i] = state[:size]
+                    for i, state_ in state.recurrent_states.items():
+                        if state_ is not None:
+                            mine.recurrent_states[i] = state_[:size]
                             mine.is_recurrent_states_initialized[i] = True
             if self.draft is not None:
-                keys = _Keys(self.cache.size, self.capacity, rows=True)
+                keys = _Keys(cache.size, self.capacity, rows=True)
                 keys.dtype, keys.device = self.dkeys.dtype, self.dkeys.device
                 keys.keys, keys.values = self.dkeys.keys[:size], self.dkeys.values[:size]
                 keys.cumulative_length = self.dkeys.cumulative_length[:size]
@@ -2252,12 +2517,12 @@ class _Engine:
     def _steps(self) -> None:
         """Steps until a row is done or a call waits to join, queued `LAG` ahead of the host; a
         constrained batch's each caught up with before the next, whose mask its tokens decide."""
-        cuda = self.cache_device.type == "cuda"
+        cuda = _set(self.cache_device).type == "cuda"
         if cuda and (self.where != self.layout or self.landed != LANDED[0] or self.stale):
             # The weights moved, or a kernel landed (the graphs recorded its stand-in).
             self._forget()
             self.layout, self.landed, self.stale = self.where, LANDED[0], False
-        queued: deque[Any] = deque()
+        queued: deque[torch.cuda.Event] = deque()
         size = self._bucket()
         held = [slot for slot, row in enumerate(self.slots[:size]) if row is not None]
         constrained = self._constrained()
@@ -2286,7 +2551,7 @@ class _Engine:
                         break
                     self._tell()
                     continue
-                event = torch.cuda.Event()
+                event = torch.cuda.Event()  # type: ignore[no-untyped-call]  # unannotated in Torch
                 event.record()
                 queued.append(event)
                 if len(queued) > lag:
@@ -2313,8 +2578,9 @@ class _Engine:
                     row.drafts = []
                 tokens, stops = [*row.generated, *row.drafts[:at]], row.request.stops
                 if not row.ended() and not any(t in stops for t in row.drafts[:at]):
-                    try:
-                        _pack(_ids(row.request.allowed, tokens, self.vocab), host[slot])
+                    try:  # a row with `generated` has its call's constraint
+                        allowed = _set(row.request.allowed)
+                        _pack(_ids(allowed, tokens, self.vocab), host[slot])
                         free = False
                     except Exception as exc:  # the call's own constraint: only it fails
                         row.request.error = row.request.error or exc
@@ -2355,9 +2621,9 @@ class _Engine:
         for request in {id(row.request): row.request for row in self.slots if row}.values():
             request.tell(partial(tokens, request))
 
-    def _read(self, drafted: bool) -> tuple[Any, ...]:
+    def _read(self, drafted: bool) -> tuple[torch.nn.Module, ...]:
         """The modules a step reads: the model, and its head when the step drafts."""
-        return (self.model, self.draft) if drafted else (self.model,)
+        return (self.model, _set(self.draft)) if drafted else (self.model,)
 
     @contextmanager
     def _graph_memory(self, drafted: bool) -> Iterator[None]:
@@ -2365,15 +2631,16 @@ class _Engine:
         before a lease can end."""
         current = torch.cuda.current_stream()
         side = None
+        domain = _set(self.domain)
         try:
             with ExitStack() as stack:
                 for module in self._read(drafted):
                     if (binding := self.addresses.get(id(module))) is not None:
                         stack.enter_context(binding.prepare(current))
-                self.domain.initialize()
-                side = self.domain.stream
+                domain.initialize()
+                side = cast("torch.cuda.Stream", domain.stream)  # initialize() sets it
                 side.wait_stream(current)
-                self.domain.prime_blas()
+                domain.prime_blas()
                 stack.enter_context(torch.cuda.stream(side))
                 try:
                     yield
@@ -2387,7 +2654,8 @@ class _Engine:
         drafted = self._drafting(size)
         constrained = self._constrained()
         part = self.part if drafted else -1
-        key = (size, self.cache.window, drafted, self._sampled(), self._kept(), constrained, part)
+        window_ = _set(self.cache).window
+        key = (size, window_, drafted, self._sampled(), self._kept(), constrained, part)
         placed = PLACED.get(self.model)
         unaccounted = (
             cuda
@@ -2419,10 +2687,11 @@ class _Engine:
             return
         graph = self.graphs.get(key)
         if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
+            domain = _set(self.domain)  # a CUDA step's (`_one`)
             if key not in self.warmed:
                 # This is the caller's actual next token, never an extra speculative warmup; its
                 # working peak, as varena measured it, is what its capture's pool takes.
-                with self._graph_memory(drafted), _measured(self.domain.device) as peak:
+                with self._graph_memory(drafted), _measured(domain.device) as peak:
                     self._advance(size)
                 self.warmed.add(key)
                 if peak:
@@ -2449,15 +2718,15 @@ class _Engine:
                         )
                     try:
                         graph, why = capture(
-                            torch, lambda: self._advance(size), self.pool, self.domain, reserve
+                            torch, lambda: self._advance(size), _set(self.pool), domain, reserve
                         )
                     except Exhausted as exc:  # its pool's room, before anything was captured
-                        why = no_room(self.domain.device, "its pool", reserve, exc)
+                        why = no_room(domain.device, "its pool", reserve, exc)
             except Building:  # eager until a kernel lands
                 graph, why, self.building = None, "", LANDED[0]
             finally:
                 if graph is None and not self.graphs and self.pool is not None:
-                    close_pool(self.pool, self.domain.device)
+                    close_pool(self.pool, domain.device)
                     self.pool = None
             if graph is not None:
                 self.graphs[key] = graph
@@ -2470,7 +2739,7 @@ class _Engine:
             if graph is not None:
                 self.recorded += 1
                 try:
-                    vt.pool_scratch(self.pool.handle, (), self.domain.device)
+                    vt.pool_scratch(_set(self.pool).handle, (), domain.device)
                 except (RuntimeError, ValueError) as exc:  # A live allocation: it stays mapped.
                     safeguard("scratch_declined", str(exc))
                 self._verify(key, graph, size)
@@ -2478,13 +2747,13 @@ class _Engine:
             elif why:
                 self._unrecorded(key, why)
         if graph is not None:  # its pool is held (`_pool`): the replay maps nothing
-            vt.replay(graph, stream=torch.cuda.current_stream(self.domain.device))
+            vt.replay(graph, stream=torch.cuda.current_stream(_set(self.domain).device))
             self.replayed += 1
         else:
             self._advance(size)
             self.eager += 1
 
-    def _token_state(self, drafted: bool) -> list[Any]:
+    def _token_state(self, drafted: bool) -> list[torch.Tensor]:
         """What a step writes but its keys, each slot of which it writes before reading; a drafted
         step's head state, mask and key count too."""
         state = [self.ids, self.mask, self.out, self.n, self.done, self.seen, self.length]
@@ -2492,7 +2761,7 @@ class _Engine:
         if drafted:
             state += [self.hidden, self.dmask, self.dkeys.cumulative_length]
             state += [self.drafts, self.dhidden]
-        for layer in self.cache.layers:
+        for layer in _layers(_set(self.cache)):
             if isinstance(layer, _Keys):
                 state.append(layer.cumulative_length)
             else:
@@ -2500,16 +2769,17 @@ class _Engine:
                 state += [value for value in held if value is not None]
         return state
 
-    def _written(self, size: int, at: Any) -> list[Any]:
+    def _written(self, size: int, at: torch.Tensor) -> list[torch.Tensor]:
         """Each row's keys and values at its slot `at`."""
         rows = torch.arange(size, device=at.device)
-        layers = [layer for layer in self.cache.layers if isinstance(layer, _Keys)]
+        layers = [layer for layer in _layers(_set(self.cache)) if isinstance(layer, _Keys)]
         return [buffer[rows, :, at] for layer in layers for buffer in (layer.keys, layer.values)]
 
-    def _verify(self, key: _Key, graph: Any, size: int) -> None:
+    def _verify(self, key: _Key, graph: torch.cuda.CUDAGraph, size: int) -> None:
         """A new graph's one check: its replay, then this token's eager step from the same
         state, last so that what serves the call is eager's. A difference discards the graph."""
-        state, stream = self._token_state(key[2]), torch.cuda.current_stream(self.domain.device)
+        domain = _set(self.domain)
+        state, stream = self._token_state(key[2]), torch.cuda.current_stream(domain.device)
         start, at = [value.clone() for value in state], self.length[:size].clone()
         vt.replay(graph, stream=stream)  # its pool is held since its capture
         replayed = [*(value.clone() for value in state), *self._written(size, at)]
@@ -2525,7 +2795,7 @@ class _Engine:
             del self.graphs[key]
             graph.reset()
             if not self.graphs:
-                close_pool(self.pool, self.domain.device)
+                close_pool(_set(self.pool), domain.device)
                 self.pool = None
             self._unrecorded(key, why, "replay_mismatch")
 
@@ -2544,7 +2814,7 @@ class _Engine:
             for graph in self.graphs.values():
                 graph.reset()
             if self.pool is not None:
-                close_pool(self.pool, self.domain.device)
+                close_pool(self.pool, _set(self.domain).device)
             self.graphs, self.warmed, self.unrecorded, self.peaks = {}, set(), {}, {}
             self.undrafted = False
             self.pool = None
@@ -2559,7 +2829,7 @@ class _Engine:
         if not self.graphs:  # nothing recorded owns it: no use to take or end
             self.pooled = False
             return
-        device = self.domain.device
+        device = _set(self.domain).device
         if hold:
             vt.prepare_pool(self.pool.handle, 0, device)
         else:
@@ -2573,7 +2843,10 @@ class _Engine:
         if code is None:
             return
         safeguard(code, f"{type(self.model).__name__}: {why}")
-        warning = ("a CUDA graph was not used", {"module": type(self.model).__name__, "why": why})
+        warning: WarningRow = (
+            "a CUDA graph was not used",
+            {"module": type(self.model).__name__, "why": why},
+        )
         for request in {id(r.request): r.request for r in self.slots if r is not None}.values():
             if warning not in request.warnings:
                 request.warnings.append(warning)
@@ -2588,7 +2861,7 @@ class _Engine:
             self.draft is not None
             and size <= DRAFT_ROWS
             and not self.undrafted
-            and self.cache_device.type == "cuda"
+            and _set(self.cache_device).type == "cuda"
         )
 
     def _sampled(self) -> bool:
@@ -2599,7 +2872,7 @@ class _Engine:
         """Whether a held row has a constraint: its step reads `allow` and reports its tokens."""
         return any(row is not None and row.request.allowed is not None for row in self.slots)
 
-    def _allowed(self, scores: Any, size: int, at: int | slice) -> Any:
+    def _allowed(self, scores: torch.Tensor, size: int, at: int | slice) -> torch.Tensor:
         """`scores` (`[size, ..., vocab]`) with what a constrained row may not take at -inf: the
         host's bits (`allow`) for position `at` of the step (a slice: `[size, positions, vocab]`);
         as they are where no held row is constrained."""
@@ -2617,7 +2890,7 @@ class _Engine:
         rows = [row.request.sampling for row in self.slots if row is not None]
         return min(max((s.top_k for s in rows if s.temperature > 0), default=0), self.vocab)
 
-    def _keep(self, scores: Any, size: int) -> Any:
+    def _keep(self, scores: torch.Tensor, size: int) -> torch.Tensor:
         """`scores` (`[size, ..., vocab]`, before the presence penalty) with each sampling row's
         logits below its `top_k`th largest at -inf; a greedy row's (`top_k` 0) as they are."""
         if not (most := self._kept()):
@@ -2628,7 +2901,9 @@ class _Engine:
         kth = scores.topk(most, dim=-1).values.gather(-1, at)
         return scores.masked_fill((rows > 0).view(lead) & (scores < kth), float("-inf"))
 
-    def _pick(self, scores: Any, size: int, index: Any, sampled: bool) -> Any:
+    def _pick(
+        self, scores: torch.Tensor, size: int, index: torch.Tensor, sampled: bool
+    ) -> torch.Tensor:
         """Each row's token from `scores` (`[size, ..., vocab]`): its argmax, or a sampling row's
         draw (`_draw`) for the token at `index`."""
         best = scores.argmax(-1)
@@ -2644,7 +2919,7 @@ class _Engine:
         else:
             self._step(size)
 
-    def _select(self, logits: Any, size: int) -> Any:
+    def _select(self, logits: torch.Tensor, size: int) -> torch.Tensor:
         """Each live row's next token, on the device, in `ids` and `out`; a row that stops (a
         stop token, or its limit) is done. Returns the rows live before it."""
         scores = self._keep(self._allowed(logits.float(), size, 0), size)
@@ -2667,10 +2942,10 @@ class _Engine:
 
     def _step(self, size: int) -> None:
         """One token a row: attend to the window, write the row's keys at its length, select."""
-        view, window_ = self._view(size), self.cache.window
+        view, window_ = self._view(size), _set(self.cache).window
         length = self.length[:size]
         self.mask[:size].scatter_(3, length.view(size, 1, 1, 1), self.open)
-        kwargs: dict[str, Any] = {
+        kwargs: dict[str, torch.Tensor | _StaticCache | bool | int] = {
             "input_ids": self.ids[:size],
             "attention_mask": self.mask[:size, ..., :window_],
             "past_key_values": view,
@@ -2683,7 +2958,7 @@ class _Engine:
             kwargs["logits_to_keep"] = 1
         live = self._select(self.model(**kwargs).logits[:, -1], size)
         length.add_(live.long())
-        for layer in view.layers:
+        for layer in _layers(view):
             if isinstance(layer, _Keys):
                 layer.cumulative_length.copy_(length)
         self.position[:size].add_(live.long().view(size, *[1] * (self.position.dim() - 1)))
@@ -2703,10 +2978,10 @@ class _Engine:
     def _draft(self, size: int, i: int) -> None:
         """Each row's `i`th draft, into `drafts`: the head's token from its state for it (the
         first's, `hidden`, the step before left; a later one's from the draft before it)."""
-        model, w = self.model, self.cache.window
+        model, w = self.model, _set(self.cache).window
         view, length = self._view(size), self.length[:size]
         if not i:
-            view.draft.layers[0].cumulative_length.copy_(length + 1)
+            _head_keys(view.draft).cumulative_length.copy_(length + 1)
             hidden = self.hidden[:size]
         else:
             L, keys = length[:, None], self.rows_index[:w]
@@ -2714,16 +2989,16 @@ class _Engine:
             mask = torch.where(open_[:, None, None], self.open, self.dmask[:size, ..., :w])
             position = self.position[:size]
             at = (position + i).movedim(0, -2) if self.positional else (length + i)[:, None]
-            embed, rotary = model.get_input_embeddings(), model.get_decoder().rotary_emb
+            embed, rotary = model.get_input_embeddings(), _lm(model).get_decoder().rotary_emb
             before = self.hidden[:size] if i == 1 else self.dhidden[:size]
             token = self.drafts[:size, i - 1 : i]
-            hidden = self.draft(embed(token), before, at, view.draft, mask, rotary)
+            hidden = _set(self.draft)(embed(token), before, at, view.draft, mask, rotary)
             if i + 1 < DEPTH:
                 self.dhidden[:size].copy_(hidden)
         seen = self.seen[:size]
         if i:  # and the drafts before it
             seen = seen.scatter(1, self.drafts[:size, :i], 1.0)
-        logits = model.get_output_embeddings()(hidden)[:, -1].float()
+        logits = _lm(model).get_output_embeddings()(hidden)[:, -1].float()
         scores = self._keep(self._allowed(logits, size, i), size)
         scores = scores - self.penalty[:size, None] * seen
         token = self._pick(scores, size, self.n[:size] + i, self._sampled())
@@ -2734,16 +3009,16 @@ class _Engine:
     def _commit(self, size: int) -> None:
         """The drafts verified with the row's token before them in one pass, what it keeps
         written, and the head's keys and state and the model's states put at its end."""
-        model, depth, w = self.model, DEPTH, self.cache.window
+        model, depth, w = self.model, DEPTH, _set(self.cache).window
         view = self._view(size)
         span = depth + 1
-        embed, rotary = model.get_input_embeddings(), model.get_decoder().rotary_emb
+        embed, rotary = model.get_input_embeddings(), _lm(model).get_decoder().rotary_emb
         keys, steps = self.rows_index[:w], self.rows_index[:span]
         length = self.length[:size]
         L = length[:, None]
         done = self.done[:size]
         live = ~done
-        dkeys = view.draft.layers[0]
+        dkeys = _head_keys(view.draft)
         dmask = self.dmask[:size, ..., :w]
         position = self.position[:size]
         sampled, n = self._sampled(), self.n[:size]
@@ -2753,7 +3028,7 @@ class _Engine:
             keys[None, None] <= (L + steps[None])[..., None]
         )
         mask = torch.where(open_[:, None], self.open, self.mask[:size, ..., :w])
-        kwargs: dict[str, Any] = {
+        kwargs: dict[str, torch.Tensor | _StaticCache | bool | int] = {
             "input_ids": torch.cat([self.ids[:size], drafted], dim=1),
             "attention_mask": mask,
             "past_key_values": view,
@@ -2768,7 +3043,7 @@ class _Engine:
         reset = _VERIFY.set(verify)
         try:
             with _taking(model) as taken, _RowByRow():
-                scores = model(**kwargs).logits[:, -span:].float()
+                scores: torch.Tensor = model(**kwargs).logits[:, -span:].float()
             scores = self._keep(self._allowed(scores, size, slice(0, span)), size)
         finally:
             _VERIFY.reset(reset)
@@ -2804,13 +3079,16 @@ class _Engine:
         )
         mask = torch.where(open_[:, None], self.open, dmask)
         at = (position + 1 + steps).movedim(0, -2) if self.positional else (L + 1 + steps[None])
-        states = self.draft(embed(tokens), taken[-1][:, -span:], at, view.draft, mask, rotary)
+        head = _set(self.draft)
+        states: torch.Tensor = head(
+            embed(tokens), taken[-1][:, -span:], at, view.draft, mask, rotary
+        )
         self.hidden[:size].copy_(
             states.gather(1, last[:, None, None].expand(-1, 1, states.shape[-1]))
         )
         # Back to the kept tokens' end: keys past it are masked and overwritten later.
         ended = length + made
-        for layer in view.layers:
+        for layer in _layers(view):
             if isinstance(layer, _Keys):
                 layer.cumulative_length.copy_(ended)
         rows = torch.arange(size, device=length.device)
@@ -2850,11 +3128,16 @@ class _Engine:
             with cache_owners.try_locks(locks) as claimed:
                 if not claimed:
                     return False
-                if self.unfenced or any(not event.query() for event in self.completions.values()):
+                if self.unfenced or any(
+                    not event.query()  # type: ignore[no-untyped-call]  # unannotated in Torch
+                    for event in self.completions.values()
+                ):
                     return False
-                if any(binding.completion_lost or (
-                    binding.last is not None and not binding.last.query()
-                ) for binding in bindings):
+                if any(
+                    binding.completion_lost
+                    or (binding.last is not None and not binding.last.query())
+                    for binding in bindings
+                ):
                     return False
                 self._drop()
                 for binding in bindings:  # Retired graphs no longer read their Regions.

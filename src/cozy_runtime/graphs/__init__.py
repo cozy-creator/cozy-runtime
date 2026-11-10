@@ -25,10 +25,11 @@ import threading
 import time
 import weakref
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager, nullcontext
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Any, NamedTuple, cast
+from types import ModuleType
+from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, TypedDict, cast, overload
 
 import tensorfs.varena.torch as vt
 from tensorfs import varena
@@ -49,6 +50,20 @@ from cozy_runtime.graphs import domain
 from cozy_runtime.internal import attention_ulysses, kernel_ready
 from cozy_runtime.internal.accel import StaleBinding
 
+if TYPE_CHECKING:
+    import torch
+    import torch.utils._python_dispatch
+    import torch.utils._pytree
+    from torch.utils._pytree import TreeSpec
+
+    from cozy_runtime.author._model import Residency, WarningRow
+    from cozy_runtime.internal.residency import Binding, Memory
+else:
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - the base package is torch-free
+        torch = None
+
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
 #: Set while a region warms up its capture: the regions under it run as written.
 _WARMING = contextvars.ContextVar("cozy_graphs_warming", default=False)
@@ -59,12 +74,99 @@ _SETTLING: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "cozy_graphs_settling", default=False
 )
 _PLAIN = (type(None), bool, int, float, str)
+
+
+class DecodeReceipt(TypedDict):
+    """A component's LM decode graphs (`DECODERS`), in its region's receipt."""
+
+    active_graphs: int
+    capture_attempts: int
+    captures: int
+    retired_graphs: int
+    replays: int
+    eager_steps: int
+    refused: list[str]
+
+
+class TimingReceipt(TypedDict):
+    calls: int
+    first_ms: float
+    host_ms: float
+    device_ms: float
+    device_timed: int
+
+
+class MeasuredReceipt(TypedDict):
+    submit_ms: float
+    busy_ms: float | None
+    replay_ms: float | None
+
+
+class GraphReceipt(TypedDict):
+    capture_each_ms: list[float]
+    measured: list[MeasuredReceipt]
+    saving_ms: float | None
+    payback_calls: int | None
+    eager: list[str]
+
+
+class IdleReceipt(TypedDict):
+    queued: int
+    periods: int
+    yields: int
+    failures: int
+    longest_block_ms: float
+
+
+class Receipt(TypedDict, total=False):
+    """`describe`: one component root's region, this attempt."""
+
+    active_graphs: int
+    region_calls: int
+    replays: int
+    capture_attempts: int
+    captures: int
+    retired_graphs: int
+    replay_copy_bytes: int
+    capture_ms: float
+    call_ms: float
+    prepare_ms: float
+    key_changes: dict[str, int]
+    graph: GraphReceipt
+    eager: TimingReceipt
+    replay: TimingReceipt
+    eager_gap: str
+    decode: DecodeReceipt
+    idle: IdleReceipt
+    graph_pools: int
+    graph_pool_bytes: None
+    domains: int
+
+
+#: a component root's decode graphs: its receipt (None without any), live pools and domain
+type DecodeSnapshot = Callable[
+    [torch.nn.Module], tuple[DecodeReceipt | None, list[domain.Pool], domain.Domain | None]
+]
 #: graph owners beside the regions (the LM engine's decode steps), each its (snapshot, release)
 #: of a component root, registered by its module when a package imports it: a Runtime serving no
 #: LM never imports Transformers for them (v7: 2.8 s of executor imports)
-DECODERS: list[
-    tuple[Callable[[Any], tuple[dict[str, Any], list[Any], Any]], Callable[[Any], None]]
-] = []
+DECODERS: list[tuple[DecodeSnapshot, Callable[[torch.nn.Module], None]]] = []
+
+
+class _Call(Protocol):
+    """A component root's own `__call__`, unbound."""
+
+    def __call__(self, module: torch.nn.Module, /, *args: object, **kwargs: object) -> object: ...
+
+
+class _Op(Protocol):
+    """A torch op as a function mode sees it."""
+
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
+
+
+#: what a graph's place holds: its residency and component name (`PLACED`)
+type _Placed = tuple[Residency, str]
 _SAID: set[str] = set()
 #: the isolated request used for idle warm-up and capture observations
 IDLE_REQUEST = "graphs-idle"
@@ -102,13 +204,36 @@ def no_room(device: int, what: str, need: int, error: BaseException) -> str:
     )
 
 
-def safeguards(warnings: list[Any]) -> dict[str, list[str]]:
+def safeguards(warnings: Iterable[WarningRow]) -> dict[str, list[str]]:
     """An attempt's reasons, by `SAFEGUARDS` code."""
     found: dict[str, list[str]] = {}
     for _, fields in warnings:
-        if fields.get("code") in SAFEGUARDS:
-            found.setdefault(fields["code"], []).append(str(fields["why"]))
+        if isinstance(code := fields.get("code"), str) and code in SAFEGUARDS:
+            found.setdefault(code, []).append(str(fields["why"]))
     return found
+
+
+type _Sums = tuple[torch.Tensor, torch.cuda.Event | None]
+
+
+# Torch leaves these unannotated.
+def _event(timing: bool = False) -> torch.cuda.Event:
+    made: torch.cuda.Event = torch.cuda.Event(enable_timing=timing)  # type: ignore[no-untyped-call]  # unannotated in torch
+    return made
+
+
+def _passed(event: torch.cuda.Event) -> bool:
+    done: bool = event.query()  # type: ignore[no-untyped-call]  # unannotated in torch
+    return done
+
+
+def _cuda_initialized() -> bool:
+    ready: bool = torch.cuda.is_initialized()  # type: ignore[no-untyped-call]  # unannotated in torch
+    return ready
+
+
+def _sleep(cycles: int) -> None:
+    torch.cuda._sleep(cycles)  # type: ignore[no-untyped-call]  # unannotated in torch
 
 
 class Finite:
@@ -120,36 +245,36 @@ class Finite:
     which only write finite values over finite ones. A tensor not finite on entry is not latents
     yet (SDXL's `image`, which `after` fills): its entry sum is read with the first step's."""
 
-    def __init__(self, torch: Any, tensors: tuple[Any, ...] = ()) -> None:
-        self.torch = torch
+    def __init__(self, tensors: tuple[torch.Tensor, ...] = ()) -> None:
         self.tensors = tuple(t for t in tensors if t.is_floating_point())
-        self.entry, self.sums = self._queue(self.tensors), None
+        self.entry = self._queue(self.tensors)
+        self.sums: _Sums | None = None
         self.kept: tuple[bool, ...] | None = None
 
-    def _queue(self, tensors: tuple[Any, ...]) -> tuple[Any, Any] | None:
+    def _queue(self, tensors: tuple[torch.Tensor, ...]) -> _Sums | None:
         """Their sums, on the host once the event says so (None off CUDA: read at once)."""
         if not tensors:
             return None
-        torch = self.torch
         sums = torch.stack([tensor.sum(dtype=torch.float32) for tensor in tensors])
         if not sums.is_cuda:
             return sums, None
         host = torch.empty(sums.shape, dtype=torch.float32, pin_memory=True)
         host.copy_(sums, non_blocking=True)
-        event = torch.cuda.Event()
+        event = _event()
         event.record()
         return host, event
 
     @staticmethod
-    def _read(queued: tuple[Any, Any] | None) -> list[float]:
+    def _read(queued: _Sums | None) -> list[float]:
         if queued is None:
             return []
         values, event = queued
         if event is not None:
             event.synchronize()
-        return values.tolist()
+        read: list[float] = values.tolist()
+        return read
 
-    def _sound(self, queued: tuple[Any, Any] | None, latents: bool = True) -> bool:
+    def _sound(self, queued: _Sums | None, latents: bool = True) -> bool:
         found = self._read(queued)
         if latents:
             if self.kept is None:
@@ -157,7 +282,7 @@ class Finite:
             found = [value for value, kept in zip(found, self.kept, strict=False) if kept]
         return all(math.isfinite(value) for value in found)
 
-    def step(self, tensors: tuple[Any, ...] | None = None) -> bool:
+    def step(self, tensors: tuple[torch.Tensor, ...] | None = None) -> bool:
         """Queues the sums of what this step wrote; whether the step before's were finite."""
         queued, self.sums = self.sums, self._queue(self.tensors if tensors is None else tensors)
         return self._sound(queued, latents=tensors is None)
@@ -167,13 +292,17 @@ class Finite:
         return self._sound(self.sums) and self._sound(self._queue(self.tensors))
 
 
-def _same_shaped(torch: Any, args: Any, kwargs: Any, result: Any) -> tuple[Any, ...]:
+def _same_shaped(
+    args: tuple[object, ...], kwargs: dict[str, object], result: object
+) -> tuple[torch.Tensor, ...]:
     """A root's float inputs and outputs of one shape: a denoiser's latents and what it returns of
     them. Both: a quantized forward turns NaN into integers, so NaN latents can return finite."""
 
-    def floats(value: Any) -> list[Any]:
+    def floats(value: object) -> list[torch.Tensor]:
         leaves = torch.utils._pytree.tree_leaves(value)
-        return [v for v in leaves if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dim()]
+        return [
+            v for v in leaves if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dim()
+        ]
 
     inputs, outputs = floats((args, kwargs)), floats(result)
     shared = {tuple(t.shape) for t in inputs} & {tuple(t.shape) for t in outputs}
@@ -208,8 +337,12 @@ def close_pool(pool: domain.Pool, device: int) -> None:
 
 @request_path.forbid("cuda graph capture")
 def capture(
-    torch: Any, step: Callable[[], object], pool: domain.Pool, owner: domain.Domain, reserve: int
-) -> tuple[Any, str]:
+    _torch: ModuleType,
+    step: Callable[[], object],
+    pool: domain.Pool,
+    owner: domain.Domain,
+    reserve: int,
+) -> tuple[torch.cuda.CUDAGraph | None, str]:
     """Record a pure computation into Varena's capture pool, `reserve` bytes of it prepared first:
     refused there (`varena.Exhausted`), nothing is captured. An allocation the capture still finds
     no room for fails it, as a device fault does: no capacity is learned from it.
@@ -223,7 +356,7 @@ def capture(
         raise
     graph = torch.cuda.CUDAGraph()
     current = torch.cuda.current_stream()
-    stream, work = owner.control, owner.stream
+    stream, work, fork, join = owner.capturing()
     stream.wait_stream(current)
     stream.wait_stream(work)
     failure: BaseException | None = None
@@ -233,14 +366,14 @@ def capture(
             torch.utils._python_dispatch._disable_current_modes(),
             vt.graph(graph, pool=pool.handle, stream=stream, reserve_bytes=reserve, primed=(work,)),
         ):
-            owner.fork.record(stream)
-            work.wait_event(owner.fork)
+            fork.record(stream)
+            work.wait_event(fork)
             with torch.cuda.stream(work):
                 try:
                     step()
                 finally:
-                    owner.join.record(work)
-                    stream.wait_event(owner.join)
+                    join.record(work)
+                    stream.wait_event(join)
     except Exception as exc:
         failure = exc
     current.wait_stream(stream)
@@ -256,7 +389,7 @@ def capture(
             error = torch.AcceleratorError(
                 f"failed capture could not be discarded safely: {cleanup}"
             )
-            error.error_code = 999
+            error.error_code = 999  # type: ignore[attr-defined]  # read back by `fault`
             raise error from failure
     if isinstance(failure, Building | Yielded) or (failure is not None and is_capacity(failure)):
         raise failure
@@ -276,23 +409,24 @@ class _Recording:
 
     def __init__(
         self,
-        torch: Any,
-        graph: Any,
-        pool: Any,
-        inputs: list[Any],
-        outputs: Any,
+        graph: torch.cuda.CUDAGraph,
+        pool: domain.Pool,
+        inputs: list[torch.Tensor | None],
+        outputs: object,
         layout: object,
-        served: Any,
+        served: attention_ulysses.Seen,
         owner: domain.Domain,
     ) -> None:
-        self.torch, self.graph, self.pool, self.owner = torch, graph, pool, owner
+        self.graph: torch.cuda.CUDAGraph | None = graph
+        self.pool: domain.Pool | None = pool
+        self.owner = owner
         self.inputs, self.outputs, self.layout = inputs, outputs, layout
         self.served = [(b, i) for b, impls in served.items() for i in impls]
         self.refused = dict(served.refused)
         #: bytes the last replay copied in and out
         self.copied = 0
-        self.done: Any = None
-        self.stream: Any = None
+        self.done: torch.cuda.Event | None = None
+        self.stream: torch.cuda.Stream | None = None
         self.fenced = True
         # Nothing reads a pool between replays, so the core may take its pages back when idle.
         held = [t for t in inputs if t is not None]
@@ -306,34 +440,37 @@ class _Recording:
         except (RuntimeError, ValueError) as exc:  # An escaped alias: its pool just stays mapped.
             safeguard("scratch_declined", str(exc))
 
-    def output(self) -> Any:
+    def output(self) -> object:
         """Caller-owned outputs, allocated before residency admission or graph launch."""
-        torch = self.torch
-        return torch.utils._pytree.tree_map(
+        out: object = torch.utils._pytree.tree_map(
             lambda v: torch.empty_like(v) if isinstance(v, torch.Tensor) else v, self.outputs
         )
+        return out
 
-    def __call__(self, leaves: list[Any], out: Any) -> Any:
+    def __call__(self, leaves: Sequence[object], out: object) -> object:
         """Replays, copying its outputs into `out`."""
-        torch, stream = self.torch, self.torch.cuda.current_stream()
-        if self.done is None:
-            self.done = torch.cuda.Event()
-            self.done.record(stream)  # instantiate before any replay can be enqueued
+        stream = torch.cuda.current_stream()
+        done = self.done
+        if done is None:
+            done = self.done = _event()
+            done.record(stream)  # instantiate before any replay can be enqueued
         else:
-            stream.wait_event(self.done)
+            stream.wait_event(done)
         if self.stream is not None and self.stream != stream:
             stream.wait_stream(self.stream)
         self.stream, self.fenced = stream, False
         copied = 0
+        # A closed recording replays no more: its region dropped it before anything could call it.
+        pool, graph = cast("domain.Pool", self.pool), cast("torch.cuda.CUDAGraph", self.graph)
         try:
-            vt.prepare_pool(self.pool.handle, 0, self.owner.device)
+            vt.prepare_pool(pool.handle, 0, self.owner.device)
             for static, value in zip(self.inputs, leaves, strict=True):
                 # Always: a pool's contents need not survive between replays.
                 if static is not None:
-                    static.copy_(value)
+                    static.copy_(cast("torch.Tensor", value))  # a tensor leaf's static is a tensor
                     copied += static.nbytes
             with self.owner.recovery_blocked(replay=True):
-                vt.replay(self.graph, stream=stream)
+                vt.replay(graph, stream=stream)
             for backend, implementation in self.served:
                 attention_ulysses.record(backend, implementation)
             for why, calls in self.refused.items():
@@ -346,18 +483,18 @@ class _Recording:
             return out
         finally:
             self.copied = copied
-            self.done.record(stream)
-            vt.record_pool_stream(self.pool.handle, stream)
+            done.record(stream)
+            vt.record_pool_stream(pool.handle, stream)
             self.fenced = True
 
     def close(self) -> None:
         """After last use: release static tensors and executable before their pool."""
         self.inputs, self.outputs = [], None
-        self.graph.reset()
+        cast("torch.cuda.CUDAGraph", self.graph).reset()  # closed once, by its region
         self.graph = self.pool = None
 
     def idle(self) -> bool:
-        return self.fenced and (self.done is None or self.done.query())
+        return self.fenced and (self.done is None or _passed(self.done))
 
     def finish(self) -> None:
         """Wait for its last replay and output copies."""
@@ -379,17 +516,17 @@ class _Timing:
         #: autotune, library initialization, page-in)
         self.first_ms: float | None = None
         self.first_device_ms = 0.0
-        self.pending: deque[tuple[Any, Any]] = deque()
-        self.free: list[tuple[Any, Any]] = []
+        self.pending: deque[tuple[torch.cuda.Event, torch.cuda.Event]] = deque()
+        self.free: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
 
-    def run[T](self, torch: Any, call: Callable[[], T]) -> T:
+    def run[T](self, call: Callable[[], T]) -> T:
         stream = torch.cuda.current_stream()
         start, end = (
             self.free.pop()
             if self.free
             else (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
+                _event(timing=True),
+                _event(timing=True),
             )
         )
         start.record(stream)
@@ -406,7 +543,7 @@ class _Timing:
             self.settle()
 
     def settle(self) -> None:
-        while self.pending and self.pending[0][1].query():
+        while self.pending and _passed(self.pending[0][1]):
             start, end = self.pending.popleft()
             took = start.elapsed_time(end)
             self.first_device_ms = took if not self.timed else self.first_device_ms
@@ -432,10 +569,10 @@ class _Timing:
         self.settle()
         return self.calls, self.timed, self.host_ms, self.device_ms
 
-    def document(self, base: tuple[int, int, float, float] = (0, 0, 0.0, 0.0)) -> dict[str, Any]:
-        calls, timed, host, device = (
-            now - then for now, then in zip(self.counts(), base, strict=True)
-        )
+    def document(self, base: tuple[int, int, float, float] = (0, 0, 0.0, 0.0)) -> TimingReceipt:
+        now = self.counts()
+        calls, timed = now[0] - base[0], now[1] - base[1]
+        host, device = now[2] - base[2], now[3] - base[3]
         return {
             "calls": calls,
             "first_ms": round(self.first_ms or 0.0, 3),
@@ -446,7 +583,12 @@ class _Timing:
 
 
 #: a recorder's counters a receipt reports per attempt
-_COUNTERS = (
+type _Count = Literal[
+    "attempts", "replays", "capture_attempts", "captures", "retired", "copy_bytes"
+]
+type _Ms = Literal["capture_ms", "call_ms", "prepare_ms"]
+type _Counter = _Count | _Ms
+_COUNTERS: tuple[_Counter, ...] = (
     "attempts",
     "replays",
     "capture_attempts",
@@ -457,6 +599,23 @@ _COUNTERS = (
     "call_ms",
     "prepare_ms",
 )
+
+
+class _Snapshot(TypedDict, total=False):
+    """A region's counters when its attempt opened (`_Recorder.mark`)."""
+
+    attempts: int
+    replays: int
+    capture_attempts: int
+    captures: int
+    retired: int
+    copy_bytes: int
+    capture_ms: float
+    call_ms: float
+    prepare_ms: float
+    changes: dict[str, int]
+    eager: tuple[int, int, float, float]
+    replayed: tuple[int, int, float, float]
 
 
 class _Recorder:
@@ -478,7 +637,7 @@ class _Recorder:
         #: per signature its idle measure: host submission, device-busy and (recorded) replay
         #: ms a call
         self.bound: dict[tuple[object, ...], tuple[float, float | None, float | None]] = {}
-        self.binding: Any = None
+        self.binding: Binding | None = None
         #: its graphs' capture pool (`domain.Pool`), made at its first capture
         self.pool: domain.Pool | None = None
         self.replays = 0
@@ -505,19 +664,33 @@ class _Recorder:
         self.eager: _Timing = _Timing()
         self.replayed: _Timing = _Timing()
         #: the counters when the current attempt opened (`mark`): receipts are per request
-        self.base: dict[str, Any] = {}
+        self.base: _Snapshot = {}
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self) -> _Snapshot:
         return {
-            **{name: getattr(self, name) for name in _COUNTERS},
+            "attempts": self.attempts,
+            "replays": self.replays,
+            "capture_attempts": self.capture_attempts,
+            "captures": self.captures,
+            "retired": self.retired,
+            "copy_bytes": self.copy_bytes,
+            "capture_ms": self.capture_ms,
+            "call_ms": self.call_ms,
+            "prepare_ms": self.prepare_ms,
             "changes": dict(self.changes),
             "eager": self.eager.counts(),
             "replayed": self.replayed.counts(),
         }
 
-    def since(self, name: str) -> Any:
+    @overload
+    def since(self, name: _Count) -> int: ...
+    @overload
+    def since(self, name: _Ms) -> float: ...
+    def since(self, name: _Counter) -> float:
         """Counter `name` since the attempt opened."""
-        return getattr(self, name) - self.base.get(name, 0)
+        now: float = getattr(self, name)
+        then = cast("float", self.base.get(name, 0))  # a counter's value: mypy reads object
+        return now - then
 
     def forget(self) -> bool:
         if any(not entry.idle() for entry in self.recordings.values()):
@@ -546,13 +719,15 @@ class _Recorder:
 
 
 #: each installed component root's region
-_RECORDERS: weakref.WeakKeyDictionary[Any, _Recorder] = weakref.WeakKeyDictionary()
+_RECORDERS: weakref.WeakKeyDictionary[torch.nn.Module, _Recorder] = weakref.WeakKeyDictionary()
 #: each component root's plain attributes at its first call, until its second compares them
-_FIRST: weakref.WeakKeyDictionary[Any, dict[str, object] | None] = weakref.WeakKeyDictionary()
+_FIRST: weakref.WeakKeyDictionary[torch.nn.Module, dict[str, object] | None] = (
+    weakref.WeakKeyDictionary()
+)
 #: per component, the undeclared plain attributes of its root that changed between its first two
 #: calls: each would key its graphs or steer its forward unseen (`task conform` fails on it)
 UNDECLARED: dict[str, set[str]] = {}
-_CLASSES: dict[type, type] = {}
+_CLASSES: dict[type[torch.nn.Module], type[torch.nn.Module]] = {}
 
 
 class _Lagging(Yielded):
@@ -590,8 +765,8 @@ class _Idle:
         self.periods = self.yields = self.failures = 0
         self.longest_ms = 0.0
         #: the running job's ops still queued on the device: each one's event and host time
-        self.queued: deque[tuple[Any, float]] = deque()
-        self.spare: list[Any] = []
+        self.queued: deque[tuple[torch.cuda.Event, float]] = deque()
+        self.spare: list[torch.cuda.Event] = []
         #: host ms the jobs' ops waited for the device (`meter`)
         self.metered_ms = 0.0
         #: in a busy measure, how far (ms) its device may fall behind its host (`_busy`)
@@ -615,17 +790,17 @@ class _Idle:
             self._settle()
         self.metered_ms += (time.perf_counter() - began) * 1e3
 
-    def mark(self, torch: Any) -> None:
+    def mark(self) -> None:
         """A job's op was queued on the current stream."""
         now = time.perf_counter()
         if self.lag_ms is not None and self.queued and now - self.queued[-1][1] < _LAG_MARK_S:
             return
-        event = self.spare.pop() if self.spare else torch.cuda.Event()
+        event = self.spare.pop() if self.spare else _event()
         event.record()
         self.queued.append((event, now))
 
     def _settle(self) -> None:
-        while self.queued and self.queued[0][0].query():
+        while self.queued and _passed(self.queued[0][0]):
             self.spare.append(self.queued.popleft()[0])
 
     def add(self, job: Callable[[], bool]) -> None:
@@ -644,7 +819,7 @@ class _Idle:
         it interrupted goes first next period)."""
         self.stop, self.last, later = stop, time.perf_counter(), []
         self.periods += 1
-        torch = sys.modules.get("torch")  # a job's ops yield only where torch runs them
+        loaded = sys.modules.get("torch")  # a job's ops yield only where torch runs them
         token = _IDLE.set(self)
         try:
             while True:
@@ -656,8 +831,8 @@ class _Idle:
                     self.check()
                     # A job that yields only at its own boundaries runs without the per-op
                     # check: every torch call under a Python mode pays its dispatch.
-                    ops = torch is not None and getattr(job, "yields_per_op", True)
-                    with _yielding(torch)() if ops else nullcontext():
+                    ops = loaded is not None and getattr(job, "yields_per_op", True)
+                    with _yielding()() if ops else nullcontext():
                         done = job()
                     if not done:
                         later.append(job)
@@ -681,7 +856,7 @@ class _Idle:
             with self.lock:
                 self.jobs.extend(later)
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> IdleReceipt:
         return {
             "queued": len(self.jobs),
             "periods": self.periods,
@@ -695,25 +870,29 @@ IDLE = _Idle()
 
 
 @functools.cache
-def _yielding(torch: Any) -> Any:
+def _yielding() -> type[torch.overrides.TorchFunctionMode]:
     """The torch function mode an idle job runs under: before each op, a command that arrived
     ends the job (`_Idle.check`), so a whole component's capture yields within one op, and the
     device is at most `_QUEUED` ops behind (`_Idle.meter`; nothing runs while a stream
     captures). Its cleanup (`_SETTLING`) never yields."""
 
-    class Yielding(torch.overrides.TorchFunctionMode):  # type: ignore[misc]
+    class Yielding(torch.overrides.TorchFunctionMode):
         def __torch_function__(
-            self, func: Any, types: Any, args: Any = (), kwargs: Any = None
-        ) -> Any:
+            self,
+            func: _Op,
+            types: Collection[type],
+            args: tuple[object, ...] = (),
+            kwargs: dict[str, object] | None = None,
+        ) -> object:
             if _SETTLING.get() or (idle := _IDLE.get(None)) is None:
                 return func(*args, **(kwargs or {}))
             idle.check()
-            metered = torch.cuda.is_initialized() and not torch.cuda.is_current_stream_capturing()
+            metered = _cuda_initialized() and not torch.cuda.is_current_stream_capturing()
             if metered:
                 idle.meter()
             out = func(*args, **(kwargs or {}))
             if metered and isinstance(out, torch.Tensor) and out.is_cuda:
-                idle.mark(torch)
+                idle.mark()
             return out
 
     return Yielding
@@ -731,19 +910,18 @@ class _Leaf(NamedTuple):
 
     shape: tuple[int, ...]
     stride: tuple[int, ...]
-    dtype: Any
-    device: Any
+    dtype: torch.dtype
+    device: torch.device
 
 
 @dataclass(eq=False)
 class _Pending:
     """A signature whose first call ran as written, queued to record at idle."""
 
-    torch: Any
-    module: weakref.ref[Any]
-    call: Callable[..., Any]
+    module: weakref.ref[torch.nn.Module]
+    call: _Call
     key: tuple[object, ...]
-    spec: Any
+    spec: TreeSpec
     #: each argument leaf: a tensor's layout, or the plain value
     leaves: list[object]
 
@@ -751,7 +929,7 @@ class _Pending:
         return _capture_pending(self)
 
 
-def install(torch: Any, model: object, roots: Mapping[str, Any]) -> list[str]:
+def install(_torch: ModuleType, model: object, roots: Mapping[str, object]) -> list[str]:
     """Each component root is a region, keyed by the attributes the model declares steer it
     (`__graph_keys__`: component -> attribute paths). Nothing inside a root is a region: a
     streamed component runs as written."""
@@ -766,34 +944,38 @@ def install(torch: Any, model: object, roots: Mapping[str, Any]) -> list[str]:
         elif not _RECORDERS[root].recordings and _RECORDERS[root].pool is None:
             _RECORDERS[root].keys = tuple(declared.get(name, ()))
         if not getattr(type(root), "_cozy_graphed", False):
-            root.__class__ = _graphed(torch, type(root))
+            root.__class__ = _graphed(type(root))
         installed.append(name)
     return installed
 
 
-def _graphed(torch: Any, cls: type) -> type:
+def _graphed(cls: type[torch.nn.Module]) -> type[torch.nn.Module]:
     made = _CLASSES.get(cls)
     if made is None:
-        call = cls.__call__
+        call: _Call = cls.__call__
 
-        def __call__(self: Any, *args: Any, **kwargs: Any) -> Any:
-            return _dispatch(torch, self, call, args, kwargs)
+        def __call__(self: torch.nn.Module, *args: object, **kwargs: object) -> object:
+            return _dispatch(self, call, args, kwargs)
 
-        made = _CLASSES[cls] = type(
-            cls.__name__,
-            (cls,),
-            {
-                "__call__": __call__,
-                "_cozy_graphed": True,
-                "_cozy_original_call": call,
-                "__module__": cls.__module__,
-                "__qualname__": cls.__qualname__,
-            },
+        # `type` makes a subclass of `cls`
+        made = _CLASSES[cls] = cast(
+            "type[torch.nn.Module]",
+            type(
+                cls.__name__,
+                (cls,),
+                {
+                    "__call__": __call__,
+                    "_cozy_graphed": True,
+                    "_cozy_original_call": call,
+                    "__module__": cls.__module__,
+                    "__qualname__": cls.__qualname__,
+                },
+            ),
         )
     return made
 
 
-def retire(torch: Any, root: Any) -> None:
+def retire(_torch: ModuleType, root: torch.nn.Module) -> None:
     """Drain `root`'s graphs and drop them, keeping its region: its calls run as written until
     an idle period records them again (an idle offload, a changed fill)."""
     recorder = _RECORDERS.get(root)
@@ -805,23 +987,23 @@ def retire(torch: Any, root: Any) -> None:
         recorder.drop()
 
 
-def retire_stale(torch: Any, *roots: Any) -> None:
+def retire_stale(_torch: ModuleType, *roots: torch.nn.Module) -> None:
     """Before a scope binds `roots`' weights: graphs recorded against another fill (a LoRA mode
     or bake recipe this attempt changed) go first, so nothing replays over a refill."""
     for root in roots:
         recorder = _RECORDERS.get(root)
         if recorder is not None and recorder.binding is not None and not recorder.binding.valid():
-            retire(torch, root)
+            retire(_torch, root)
 
 
-def release(torch: Any, root: Any) -> None:
+def release(_torch: ModuleType, root: torch.nn.Module) -> None:
     """A generation's explicit teardown: finish its output copies before releasing addresses."""
-    retire(torch, root)
+    retire(_torch, root)
     _RECORDERS.pop(root, None)
     domain.release(root)
 
 
-def mark(root: Any) -> None:
+def mark(root: torch.nn.Module) -> None:
     """A new attempt of `root`'s component opens: its receipts count from here."""
     recorder = _RECORDERS.get(root)
     if recorder is not None:
@@ -829,53 +1011,63 @@ def mark(root: Any) -> None:
             recorder.base = recorder.snapshot()
 
 
-def capture_domain(torch: Any, root: Any, memory: Any = None) -> domain.Domain:
+def capture_domain(
+    _torch: ModuleType, root: torch.nn.Module, memory: Memory | None = None
+) -> domain.Domain:
     """The component owns hidden library scratch independently of its disposable graphs."""
-    return domain.acquire(torch, root, memory)
+    return domain.acquire(root, memory)
 
 
-def capture_device(torch: Any, memory: Any) -> domain.Domain:
+def capture_device(_torch: ModuleType, memory: Memory) -> domain.Domain:
     """A placed component's graphs share the device's domain with its other components'."""
-    return domain.device(torch, memory)
+    return domain.device(memory)
 
 
-def describe(root: Any) -> dict[str, Any]:
+def describe(root: torch.nn.Module) -> Receipt:
     """One final-reply snapshot of `root`'s region, never an aggregate scan on the replay hot
     path. Counts are this attempt's, since the Placement opened it (`mark`); an unplaced
     component's are its generation's. Pool bytes count each live pool once (a device's shared
     pool under the first component it served); driver/context and pending native frees remain
     ledger facts."""
-    pools: dict[tuple[int, int], Any] = {}
+    pools: dict[tuple[int, int], domain.Pool] = {}
     domains: dict[int, domain.Domain] = {}
-    answer: dict[str, Any] = dict.fromkeys(
-        ("active_graphs", "region_calls", "replays", "capture_attempts", "captures"), 0
-    )
-    answer.update(retired_graphs=0, replay_copy_bytes=0, capture_ms=0.0)
+    answer: Receipt = {
+        "active_graphs": 0,
+        "region_calls": 0,
+        "replays": 0,
+        "capture_attempts": 0,
+        "captures": 0,
+        "retired_graphs": 0,
+        "replay_copy_bytes": 0,
+        "capture_ms": 0.0,
+    }
     recorder = _RECORDERS.get(root)
     if recorder is not None:
         with recorder.lock:
             since, base = recorder.since, recorder.base
             before = base.get("changes", {})
             answer.update(
-                active_graphs=len(recorder.recordings),
-                region_calls=since("attempts"),
-                replays=since("replays"),
-                capture_attempts=since("capture_attempts"),
-                captures=since("captures"),
-                retired_graphs=since("retired"),
-                replay_copy_bytes=since("copy_bytes"),
-                capture_ms=round(since("capture_ms"), 3),
-                call_ms=round(since("call_ms"), 3),
-                prepare_ms=round(since("prepare_ms"), 3),
-                key_changes={
-                    what: n - before.get(what, 0)
-                    for what, n in recorder.changes.items()
-                    if n > before.get(what, 0)
-                },
-                graph=_receipt(recorder),
-                eager=recorder.eager.document(base.get("eager", (0, 0, 0.0, 0.0))),
-                replay=recorder.replayed.document(base.get("replayed", (0, 0, 0.0, 0.0))),
-                eager_gap=recorder.gap,
+                {
+                    "active_graphs": len(recorder.recordings),
+                    "region_calls": since("attempts"),
+                    "replays": since("replays"),
+                    "capture_attempts": since("capture_attempts"),
+                    "captures": since("captures"),
+                    "retired_graphs": since("retired"),
+                    "replay_copy_bytes": since("copy_bytes"),
+                    "capture_ms": round(since("capture_ms"), 3),
+                    "call_ms": round(since("call_ms"), 3),
+                    "prepare_ms": round(since("prepare_ms"), 3),
+                    "key_changes": {
+                        what: n - before.get(what, 0)
+                        for what, n in recorder.changes.items()
+                        if n > before.get(what, 0)
+                    },
+                    "graph": _receipt(recorder),
+                    "eager": recorder.eager.document(base.get("eager", (0, 0, 0.0, 0.0))),
+                    "replay": recorder.replayed.document(base.get("replayed", (0, 0, 0.0, 0.0))),
+                    "eager_gap": recorder.gap,
+                }
             )
             # A device's shared pool and domain count once.
             if recorder.pool is not None and recorder.recordings:
@@ -892,24 +1084,30 @@ def describe(root: Any) -> dict[str, Any]:
             domains[id(decode_domain)] = decode_domain
         if decode:
             answer["decode"] = decode
-            for key in (
+            summed: tuple[_Summed, ...] = (
                 "active_graphs",
                 "capture_attempts",
                 "captures",
                 "retired_graphs",
                 "replays",
-            ):
-                answer[key] += decode[key]
+            )
+            for key in summed:
+                answer[key] = answer.get(key, 0) + decode[key]
     answer.update(
-        idle=IDLE.document(),
-        graph_pools=len(pools),
-        graph_pool_bytes=None,  # stock Torch does not expose a public per-pool byte counter
-        domains=len(domains),
+        {
+            "idle": IDLE.document(),
+            "graph_pools": len(pools),
+            "graph_pool_bytes": None,  # stock Torch does not expose a public per-pool byte counter
+            "domains": len(domains),
+        }
     )
     return answer
 
 
-def _receipt(recorder: _Recorder) -> dict[str, Any]:
+type _Summed = Literal["active_graphs", "capture_attempts", "captures", "retired_graphs", "replays"]
+
+
+def _receipt(recorder: _Recorder) -> GraphReceipt:
     """A region's graph economics so far: each idle capture's cost (warm-up, busy measure,
     capture and instantiation), what each signature measured, a replay's saving over an eager
     call (device time between their events, beyond each way's first call) and the calls that
@@ -933,11 +1131,13 @@ def _receipt(recorder: _Recorder) -> dict[str, Any]:
     }
 
 
-def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
+def _dispatch(
+    module: torch.nn.Module, call: _Call, args: tuple[object, ...], kwargs: dict[str, object]
+) -> object:
     context = CURRENT.get()
     if (
         context is not None
-        and not (torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing())
+        and not (_cuda_initialized() and torch.cuda.is_current_stream_capturing())
         and not (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1)
     ):
         context.raise_if_cancelled()
@@ -957,14 +1157,14 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
         return call(module, *args, **kwargs)
     began = time.perf_counter()
     try:
-        result = _region_call(torch, module, recorder, call, args, kwargs)
+        result = _region_call(module, recorder, call, args, kwargs)
     finally:
         recorder.call_ms += (time.perf_counter() - began) * 1e3
     if context is not None:
         # A loop of the package's own: each root call is a step, and any next one reads it.
         if context._finite is None:
-            context._finite = Finite(torch)
-        if not context._finite.step(_same_shaped(torch, args, kwargs, result)):
+            context._finite = Finite()
+        if not context._finite.step(_same_shaped(args, kwargs, result)):
             raise OutputError(
                 f"the latents went non-finite before this call of {_name(module)}",
                 code="non_finite_latents",
@@ -972,7 +1172,7 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
     return result
 
 
-def _watch(root: Any, recorder: _Recorder) -> None:
+def _watch(root: torch.nn.Module, recorder: _Recorder) -> None:
     """At a component root's second call: the undeclared plain attributes that changed since
     its first (`UNDECLARED`), said once. A step counter set on the root each call keys every
     call apart once declared, or steers a graph unseen when not: the package decides."""
@@ -1001,14 +1201,18 @@ def _watch(root: Any, recorder: _Recorder) -> None:
         )
 
 
-def _name(root: Any) -> str:
+def _name(root: torch.nn.Module) -> str:
     placed = PLACED.get(root)
     return placed[1] if placed is not None else type(root).__name__
 
 
 def _region_call(
-    torch: Any, module: Any, recorder: _Recorder, call: Callable[..., Any], args: Any, kwargs: Any
-) -> Any:
+    module: torch.nn.Module,
+    recorder: _Recorder,
+    call: _Call,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> object:
     """The call replayed when its signature has a graph; otherwise as written, with nothing
     around it but its key and two timing events: no lock, pass or preparation until a graph
     exists (an idle period records it)."""
@@ -1028,7 +1232,7 @@ def _region_call(
         if layout is not None and layout.sparse
         else "under an attention layout its producer keeps state for"
         if layout is not None and _stateful(module, layout)
-        else _unplain(torch, leaves)
+        else _unplain(leaves)
     )
     if why:
         recorder.gap = why
@@ -1045,20 +1249,20 @@ def _region_call(
     )
     autocast = torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
     declared = tuple(functools.reduce(getattr, p.split("."), module) for p in recorder.keys)
-    key = (*_signature(torch, leaves, spec), declared, addresses, autocast, _dense(layout))
+    key = (*_signature(leaves, spec), declared, addresses, autocast, _dense(layout))
     if layout is not None:  # an idle recording runs outside the caller's scope: under its own
         call = functools.partial(_under, layout, call)
     if recorder.last is not None and recorder.last != key:
-        _changed(torch, module, recorder, key, (args, kwargs), len(leaves))
+        _changed(module, recorder, key, (args, kwargs), len(leaves))
     recorder.last = key
     recorder.attempts += 1
     if key in recorder.recordings:
-        result = _replay_call(torch, module, recorder, key, leaves, placed)
+        result = _replay_call(module, recorder, key, leaves, placed)
         if result is not _EAGER:
             return result
     elif key not in recorder.queued and key not in recorder.failed and key not in recorder.judged:
-        _queue(torch, module, recorder, call, key, spec, leaves, placed)
-    return recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
+        _queue(module, recorder, call, key, spec, leaves, placed)
+    return recorder.eager.run(lambda: call(module, *args, **kwargs))
 
 
 def _dense(layout: AttentionLayout | None) -> tuple[object, ...] | None:
@@ -1075,12 +1279,18 @@ def _dense(layout: AttentionLayout | None) -> tuple[object, ...] | None:
     )
 
 
-def _under(layout: AttentionLayout, call: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+def _under(
+    layout: AttentionLayout,
+    call: _Call,
+    module: torch.nn.Module,
+    *args: object,
+    **kwargs: object,
+) -> object:
     with attention_scope(layout):
-        return call(*args, **kwargs)
+        return call(module, *args, **kwargs)
 
 
-def _stateful(module: Any, layout: AttentionLayout) -> bool:
+def _stateful(module: torch.nn.Module, layout: AttentionLayout) -> bool:
     """Whether a package's attention producer serving a site under `module` now does not state
     this call stateless (`AttentionProducer.stateless`): its `produce` must run."""
     producers = {site.producer.name: site.producer for site in producer_sites(module)}
@@ -1088,17 +1298,16 @@ def _stateful(module: Any, layout: AttentionLayout) -> bool:
 
 
 def _queue(
-    torch: Any,
-    module: Any,
+    module: torch.nn.Module,
     recorder: _Recorder,
-    call: Callable[..., Any],
+    call: _Call,
     key: tuple[object, ...],
-    spec: Any,
-    leaves: list[Any],
-    placed: Any,
+    spec: TreeSpec,
+    leaves: list[object],
+    placed: _Placed | None,
 ) -> None:
     """A new signature waits for an idle period to record it (`capture_idle`)."""
-    layout = [
+    layout: list[object] = [
         _Leaf(tuple(v.shape), v.stride(), v.dtype, v.device) if isinstance(v, torch.Tensor) else v
         for v in leaves
     ]
@@ -1111,9 +1320,7 @@ def _queue(
             )
         if key in recorder.queued or key in recorder.failed or key in recorder.judged:
             return
-        pending = recorder.queued[key] = _Pending(
-            torch, weakref.ref(module), call, key, spec, layout
-        )
+        pending = recorder.queued[key] = _Pending(weakref.ref(module), call, key, spec, layout)
     IDLE.add(pending)
 
 
@@ -1122,13 +1329,12 @@ _EAGER = object()
 
 
 def _replay_call(
-    torch: Any,
-    module: Any,
+    module: torch.nn.Module,
     recorder: _Recorder,
     key: tuple[object, ...],
-    leaves: list[Any],
-    placed: Any,
-) -> Any:
+    leaves: list[object],
+    placed: _Placed | None,
+) -> object:
     """The call replayed in its component's pass, serialized on the device, or `_EAGER`: its
     graphs retired (a kernel landed, a changed fill), or no room to prepare its weights."""
     owner = recorder.domain
@@ -1147,18 +1353,17 @@ def _replay_call(
             return _EAGER
         if placed is not None and recorder.binding is None:
             recorder.binding = placed[0].retain(placed[1], ("",))
-        return _replay(torch, leaves, placed, recorder, key, entry, attempt)
+        return _replay(leaves, placed, recorder, key, entry, attempt)
 
 
 def _replay(
-    torch: Any,
-    leaves: list[Any],
-    placed: Any,
+    leaves: list[object],
+    placed: _Placed | None,
     recorder: _Recorder,
     key: tuple[object, ...],
     entry: _Recording,
     attempt: int,
-) -> Any:
+) -> object:
     """The call replayed, or `_EAGER`. Its results leave the component (a package's loop may
     keep them past its next call): they are copied out, allocated before the physical lease so
     admission sees their segments. varena refusing its weights room, this call runs as written
@@ -1166,7 +1371,7 @@ def _replay(
     out = entry.output()
     try:
         began = time.perf_counter()
-        lease = _lease(torch, placed, recorder.binding)
+        lease = _lease(placed, recorder.binding)
         lease.__enter__()
         recorder.prepare_ms += (time.perf_counter() - began) * 1e3
     except StaleBinding:
@@ -1177,7 +1382,7 @@ def _replay(
         safeguard("no_room", why)
         return _EAGER
     try:
-        result = recorder.replayed.run(torch, lambda: entry(leaves, out))
+        result = recorder.replayed.run(lambda: entry(leaves, out))
     finally:
         lease.__exit__(None, None, None)
     recorder.gap = ""
@@ -1190,9 +1395,9 @@ def _capture_pending(pending: _Pending) -> bool:
     """An idle period's job: `pending`'s signature recorded, or ruled out (`_record`). False
     waits for a later period: only its first call measured, or a placed region's pages not
     resident. Anything else that fails it ends it, and the run says why: never retried."""
-    torch, module = pending.torch, pending.module()
-    recorder = _RECORDERS.get(module) if module is not None else None
-    if recorder is None or recorder.queued.get(pending.key) is not pending:
+    module = pending.module()
+    recorder = None if module is None else _RECORDERS.get(module)
+    if module is None or recorder is None or recorder.queued.get(pending.key) is not pending:
         return True  # released, or its graphs dropped since it queued: its next call queues
     submit = recorder.eager.submit_ms()
     if submit is None:
@@ -1218,7 +1423,7 @@ def _capture_pending(pending: _Pending) -> bool:
             owner.initialize()
             owner.prime_blas()  # before the idle request: Torch owns the shared workspaces
             with idle:
-                done = _record(torch, module, pending, recorder, placed, submit)
+                done = _record(module, pending, recorder, placed, submit)
         except Building:
             return False  # a cold probe postpones capture without consuming the signature
         except Exception as exc:  # the signature runs as written; the period goes on
@@ -1232,11 +1437,10 @@ def _capture_pending(pending: _Pending) -> bool:
 
 
 def _record(
-    torch: Any,
-    module: Any,
+    module: torch.nn.Module,
     pending: _Pending,
     recorder: _Recorder,
-    placed: Any,
+    placed: _Placed | None,
     submit: float,
 ) -> bool:
     """Records `pending`'s signature at idle on seeded inputs of its layout, in the device's
@@ -1251,7 +1455,7 @@ def _record(
     key, call, owner = pending.key, pending.call, recorder.domain
     assert owner is not None
     current = torch.cuda.current_stream()
-    graph = None
+    graph: torch.cuda.CUDAGraph | None = None
     recorder.capture_attempts += 1
     began = time.perf_counter()
     try:
@@ -1261,8 +1465,12 @@ def _record(
         if placed is not None and not placed[0].graph_accounted():
             _failed(module, recorder, key, "driver/context memory is unmeasured")
             return True
-        scope = placed[0].graph_pass(placed[1], "") if placed is not None else nullcontext()
-        lease = recorder.binding.prepare(current) if recorder.binding is not None else nullcontext()
+        scope: AbstractContextManager[object] = (
+            placed[0].graph_pass(placed[1], "") if placed is not None else nullcontext()
+        )
+        lease: AbstractContextManager[object] = (
+            recorder.binding.prepare(current) if recorder.binding is not None else nullcontext()
+        )
         with ExitStack() as entered:
             try:
                 entered.enter_context(scope)
@@ -1270,8 +1478,8 @@ def _record(
             except varena.Exhausted as exc:  # its admission: nothing ran
                 _failed(module, recorder, key, no_room(owner.device, "its weights", 0, exc))
                 return True
-            state = entered.enter_context(_capture_state(torch, module, owner.stream))
-            stream = owner.stream
+            stream = owner.capturing()[1]
+            state = entered.enter_context(_capture_state(module, stream))
             stream.wait_stream(current)
             with torch.cuda.stream(stream):
                 # Warm-up runs with ordinary Torch allocations, before graph-private storage.
@@ -1281,14 +1489,14 @@ def _record(
                     with attention_ulysses.observing() as served:
                         with _measured(owner.device) as peak:  # what its capture allocates
                             inputs = [
-                                _input(torch, v, seeded) if isinstance(v, _Leaf) else None
+                                _input(v, seeded) if isinstance(v, _Leaf) else None
                                 for v in pending.leaves
                             ]
-                            cargs, ckwargs = _arguments(torch, pending, inputs)
+                            cargs, ckwargs = _arguments(pending, inputs)
                             took, metered = time.perf_counter(), IDLE.metered_ms
                             eager = call(module, *cargs, **ckwargs)
                             took = (time.perf_counter() - took) * 1e3
-                        if not _clonable(torch, eager):
+                        if not _clonable(eager):
                             _failed(module, recorder, key, "output is not a tensor tree", None)
                             return True
                         # A device that kept the warm-up's host waiting half its time is the
@@ -1296,7 +1504,7 @@ def _record(
                         busy = (
                             None
                             if 2 * (IDLE.metered_ms - metered) >= took
-                            else _busy(torch, lambda: call(module, *cargs, **ckwargs), took)
+                            else _busy(lambda: call(module, *cargs, **ckwargs), took)
                         )
                 finally:
                     _WARMING.reset(warming)
@@ -1310,23 +1518,23 @@ def _record(
                 reserve = vt.pool_bytes(peak[0]) + sum(
                     entry.held_bytes for entry in recorder.recordings.values()
                 )
-                if recorder.pool is None:
-                    recorder.pool = (
+                pool = recorder.pool
+                if pool is None:
+                    pool = recorder.pool = (
                         placed[0].graph_pool(placed[1])
                         if placed is not None
                         else domain.Pool(torch.cuda.graph_pool_handle())
                     )
-                pool = recorder.pool
                 # Its static inputs are the pool's, made in the capture (an allocation launches
                 # nothing), so their storage stays owned with the graph.
-                statics: list[Any] = []
-                outputs: list[Any] = []
+                statics: list[torch.Tensor | None] = []
+                outputs: list[object] = []
 
                 def step() -> None:
                     statics.extend(
-                        _static(torch, v) if isinstance(v, _Leaf) else None for v in pending.leaves
+                        _static(v) if isinstance(v, _Leaf) else None for v in pending.leaves
                     )
-                    sargs, skwargs = _arguments(torch, pending, statics)
+                    sargs, skwargs = _arguments(pending, statics)
                     outputs.append(call(module, *sargs, **skwargs))
 
                 took = time.perf_counter_ns()
@@ -1344,11 +1552,11 @@ def _record(
                     graph.reset()
                     graph = None
                     return True
-                if not _clonable(torch, outputs[0]):
+                if not _clonable(outputs[0]):
                     _failed(module, recorder, key, "captured output is not a tensor tree", None)
                     return True
                 for target, value in zip(statics, inputs, strict=True):
-                    if target is not None:
+                    if target is not None and value is not None:  # both from one leaf
                         target.copy_(value)
                 IDLE.check()
                 with owner.recovery_blocked(replay=True):
@@ -1357,14 +1565,14 @@ def _record(
                 if differs := vt.replay_differs(eager, outputs[0]):
                     _failed(module, recorder, key, differs, "replay_mismatch")
                     return True
-                entry = _Recording(torch, graph, pool, statics, outputs[0], key, served, owner)
+                entry = _Recording(graph, pool, statics, outputs[0], key, served, owner)
                 try:
                     IDLE.check()
                 except Yielded:
                     entry.close()
                     graph = None
                     raise
-                why, replayed = _no_gain(torch, entry, recorder.eager)
+                why, replayed = _no_gain(entry, recorder.eager)
                 recorder.bound[key] = (submit, busy, replayed)
                 if why:
                     recorder.judged[key] = why
@@ -1398,11 +1606,11 @@ def _record(
 
 
 @contextmanager
-def _capture_state(torch: Any, module: Any, stream: Any) -> Iterator[_State]:
+def _capture_state(module: torch.nn.Module, stream: torch.cuda.Stream) -> Iterator[_State]:
     """Restore warm-up state and join its stream before the prepared weight lease ends."""
     current, state = torch.cuda.current_stream(), None
     try:
-        state = _State(torch, module)
+        state = _State(module)
         yield state
     finally:
         current.wait_stream(stream)
@@ -1414,7 +1622,7 @@ def _capture_state(torch: Any, module: Any, stream: Any) -> Iterator[_State]:
             _SETTLING.reset(settling)
 
 
-def _hooked(module: Any) -> str:
+def _hooked(module: torch.nn.Module) -> str:
     """Why a component's forward is no graph: a package hook on one of its modules runs Python
     at every call, which a replay would skip (Runtime's binding and scope hooks are served). A
     LoRA overlay hook (`lora.Hook`) asks the package at every call which overlay is armed, and
@@ -1429,6 +1637,11 @@ def _hooked(module: Any) -> str:
     return ""
 
 
+type _Geometry = tuple[
+    tuple[int, ...], tuple[int, ...], torch.dtype, torch.device, int | torch.SymInt, int
+]
+
+
 class _State:
     """What an idle recording must leave as it found it: the component's modules' plain
     attributes, its buffers (contents and version counters) and the RNG. Package
@@ -1437,9 +1650,8 @@ class _State:
     measuring must never change a later request)."""
 
     def __init__(
-        self, torch: Any, module: Any, *, immutable_buffers: frozenset[int] = frozenset()
+        self, module: torch.nn.Module, *, immutable_buffers: frozenset[int] = frozenset()
     ) -> None:
-        self.torch = torch
         self.modules = list(module.modules())
         self.plain = [{n: v for n, v in vars(m).items() if type(v) in _PLAIN} for m in self.modules]
         self.buffers = [
@@ -1448,7 +1660,9 @@ class _State:
             for name, tensor in m._buffers.items()
             if tensor is not None and id(tensor) not in immutable_buffers
         ]
-        self.immutable = []
+        self.immutable: list[
+            tuple[dict[str, torch.Tensor | None], str, torch.Tensor, int, torch.Tensor, _Geometry]
+        ] = []
         for m in self.modules:
             for name, tensor in m._buffers.items():
                 if tensor is None or id(tensor) not in immutable_buffers:
@@ -1456,10 +1670,10 @@ class _State:
                 read = getattr(tensor, "_varena_read", None)
                 if read is not None:  # residency's unbound weight: keep its reader, not data
                     saved = type(tensor)(tensor.shape, tensor.dtype, tensor.device)
-                    saved._varena_read = read
+                    saved._varena_read = read  # type: ignore[attr-defined]  # residency's Placeholder
                 else:
                     saved = tensor.detach()
-                geometry = (
+                geometry: _Geometry = (
                     tuple(tensor.shape),
                     tuple(tensor.stride()),
                     tensor.dtype,
@@ -1474,14 +1688,14 @@ class _State:
     def restore(self) -> str:
         """Everything put back; the names that had changed ("" when none)."""
         if self.changed is None:
-            changed = set()
+            changed: set[str] = set()
             for module, plain in zip(self.modules, self.plain, strict=True):
                 for name, value in plain.items():
                     if vars(module).get(name, _EAGER) != value:
                         changed.add(name)
                         vars(module)[name] = value
             for table, name, tensor, version, saved, geometry in self.immutable:
-                current = (
+                current: _Geometry = (
                     tuple(tensor.shape),
                     tuple(tensor.stride()),
                     tensor.dtype,
@@ -1502,13 +1716,13 @@ class _State:
                 if tensor._version != version:
                     changed.add(name)
                     tensor.copy_(saved)
-            self.torch.random.set_rng_state(self.rng[0])
-            self.torch.cuda.set_rng_state(self.rng[1])
+            torch.random.set_rng_state(self.rng[0])
+            torch.cuda.set_rng_state(self.rng[1])
             self.changed = ", ".join(sorted(changed))
         return self.changed
 
 
-def _no_gain(torch: Any, entry: _Recording, eager: _Timing) -> tuple[str, float | None]:
+def _no_gain(entry: _Recording, eager: _Timing) -> tuple[str, float | None]:
     """Why a verified graph is dropped, and a replay's measured ms: a replay as a request makes
     it (its inputs copied in, its outputs copied out), timed twice at idle, costs no less than
     an eager call by more than the two differ by (v14/v15: CLIP's tiny regions recorded, then
@@ -1523,7 +1737,7 @@ def _no_gain(torch: Any, entry: _Recording, eager: _Timing) -> tuple[str, float 
     costs = []
     for _ in range(2):
         out = entry.output()
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start, end = _event(timing=True), _event(timing=True)
         start.record()
         began = time.perf_counter()
         entry(leaves, out)
@@ -1552,21 +1766,25 @@ def _device_bound(submit: float, busy: float | None) -> str:
 _SEED = 0
 
 
-def _arguments(torch: Any, pending: Any, tensors: list[Any]) -> tuple[Any, Any]:
+def _arguments(
+    pending: _Pending, tensors: list[torch.Tensor | None]
+) -> tuple[tuple[object, ...], dict[str, object]]:
     """The call's arguments with `tensors` at its leaves' places (None keeps the leaf)."""
     leaves = [t if t is not None else v for t, v in zip(tensors, pending.leaves, strict=True)]
-    args, kwargs = torch.utils._pytree.tree_unflatten(leaves, pending.spec)
-    return args, kwargs
+    arguments: tuple[tuple[object, ...], dict[str, object]] = torch.utils._pytree.tree_unflatten(
+        leaves, pending.spec
+    )
+    return arguments
 
 
-def _static(torch: Any, leaf: _Leaf) -> Any:
+def _static(leaf: _Leaf) -> torch.Tensor:
     """A static input of `leaf`'s layout, uninitialized: made inside a capture, from its pool."""
     span = 1 + sum((n - 1) * s for n, s in zip(leaf.shape, leaf.stride, strict=True))
     flat = torch.empty(span if all(leaf.shape) else 0, dtype=leaf.dtype, device=leaf.device)
     return flat.as_strided(leaf.shape, leaf.stride)
 
 
-def _input(torch: Any, leaf: _Leaf, generator: Any) -> Any:
+def _input(leaf: _Leaf, generator: torch.Generator) -> torch.Tensor:
     """A static input of `leaf`'s layout, seeded: floats standard normal (zeros would hide a
     replay that drops work), bools fair coins, integers zero (a valid index into any table)."""
     span = 1 + sum((n - 1) * s for n, s in zip(leaf.shape, leaf.stride, strict=True))
@@ -1589,7 +1807,7 @@ _CALIBRATE = 1 << 22
 _GATE_MS = 20.0
 
 
-def _busy(torch: Any, run: Callable[[], object], gate_ms: float) -> float | None:
+def _busy(run: Callable[[], object], gate_ms: float) -> float | None:
     """Device-busy ms of one `run` on the current stream: its launches queue behind a sleep as
     long as its last host submission (`gate_ms`, at most `_GATE_MS`), so the device runs them
     back to back. A host slower than the gate leaves the device waiting inside: the time is then
@@ -1597,17 +1815,17 @@ def _busy(torch: Any, run: Callable[[], object], gate_ms: float) -> float | None
     past the gate behind its host (`_Idle.meter`): device-bound, with no more than that queued
     for an arriving command to wait on. Its waits yield to one (`_Idle.check`)."""
     device, stream = torch.cuda.current_device(), torch.cuda.current_stream()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start, end = _event(timing=True), _event(timing=True)
     start.record(stream)
     _settled(start)  # the warm-up's last ops ran: the lag is this run's alone
     if device not in _CYCLES:
         start.record(stream)
-        torch.cuda._sleep(_CALIBRATE)
+        _sleep(_CALIBRATE)
         end.record(stream)
         _settled(end)
         _CYCLES[device] = _CALIBRATE / start.elapsed_time(end)
     gate = min(gate_ms, _GATE_MS)
-    torch.cuda._sleep(int(gate * _CYCLES[device]))
+    _sleep(int(gate * _CYCLES[device]))
     start.record(stream)
     IDLE.lag_ms = gate + _LAG_MS
     try:
@@ -1621,16 +1839,16 @@ def _busy(torch: Any, run: Callable[[], object], gate_ms: float) -> float | None
     return float(start.elapsed_time(end))
 
 
-def _settled(event: Any) -> None:
+def _settled(event: torch.cuda.Event) -> None:
     """Wait for `event`, yielding to a command that arrives meanwhile (`_Idle.check`)."""
-    while not event.query():
+    while not _passed(event):
         if (idle := _IDLE.get(None)) is not None:
             idle.check()
         time.sleep(_POLL_S)
 
 
 @contextmanager
-def replaying(stream: Any, bindings: Iterable[Any]) -> Iterator[None]:
+def replaying(stream: torch.cuda.Stream, bindings: Iterable[Binding]) -> Iterator[None]:
     """A graph's weights for one replay, back at their addresses if they left, and no longer. All
     of what is still here is pinned before any fill, which can then evict nothing the replay
     needs; what left comes back in the core's reclaim order. It never reassigns a module slot."""
@@ -1643,7 +1861,7 @@ def replaying(stream: Any, bindings: Iterable[Any]) -> Iterator[None]:
         yield
 
 
-def _lease(torch: Any, placed: Any, binding: Any) -> Any:
+def _lease(placed: _Placed | None, binding: Binding | None) -> AbstractContextManager[None]:
     if placed is None or binding is None:
         return nullcontext()
     stream, held = torch.cuda.current_stream(), placed[0].graph_held(placed[1])
@@ -1652,7 +1870,7 @@ def _lease(torch: Any, placed: Any, binding: Any) -> Any:
     return replaying(stream, (binding,))
 
 
-def _refused(recorder: _Recorder, placed: Any, why: str) -> None:
+def _refused(recorder: _Recorder, placed: _Placed | None, why: str) -> None:
     """A root whose preparation the memory refused runs as written; the run says so once."""
     why = why.splitlines()[0][:300]
     recorder.gap = why
@@ -1662,7 +1880,7 @@ def _refused(recorder: _Recorder, placed: Any, why: str) -> None:
 
 
 def _failed(
-    module: Any,
+    module: torch.nn.Module,
     recorder: _Recorder,
     key: tuple[object, ...],
     why: str,
@@ -1677,11 +1895,10 @@ def _failed(
 
 
 def _changed(
-    torch: Any,
-    module: Any,
+    module: torch.nn.Module,
     recorder: _Recorder,
     key: tuple[object, ...],
-    arguments: Any,
+    arguments: tuple[tuple[object, ...], dict[str, object]],
     count: int,
 ) -> None:
     """Count what in the region's key changed since its previous call. A plain argument whose
@@ -1712,7 +1929,7 @@ def _changed(
     recorder.changes[what] = recorder.changes.get(what, 0) + 1
 
 
-def _unplain(torch: Any, leaves: list[Any]) -> str:
+def _unplain(leaves: list[object]) -> str:
     tensors = [leaf for leaf in leaves if isinstance(leaf, torch.Tensor)]
     if any(type(t) not in (torch.Tensor, torch.nn.Parameter) for t in tensors):
         return "with custom tensor dispatch"
@@ -1726,14 +1943,14 @@ def _unplain(torch: Any, leaves: list[Any]) -> str:
     return ""
 
 
-def _clonable(torch: Any, out: Any) -> bool:
+def _clonable(out: object) -> bool:
     leaves = torch.utils._pytree.tree_leaves(out)
     return any(isinstance(v, torch.Tensor) for v in leaves) and all(
         type(v) in (torch.Tensor, torch.nn.Parameter) or type(v) in _PLAIN for v in leaves
     )
 
 
-def _signature(torch: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
+def _signature(leaves: list[object], spec: TreeSpec) -> tuple[object, ...]:
     return (
         str(spec),
         *(

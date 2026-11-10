@@ -9,7 +9,7 @@ only in reduction order.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol
 
 from cozy_runtime.accel.kernels import TritonEntry
 
@@ -19,7 +19,7 @@ try:
 except ImportError as _absent:  # pragma: no cover - a CPU-only or non-Linux environment
     if TYPE_CHECKING:
         raise
-    TRITON_ABSENT = f"triton does not import ({_absent})"
+    TRITON_ABSENT = f"triton does not import ({_absent})"  # type: ignore[unreachable]  # absent Triton
 else:
     TRITON_ABSENT = ""
 
@@ -30,7 +30,7 @@ KEY_DIM, VALUE_DIM, VALUE_BLOCK = 128, 128, 32
 
 if not TRITON_ABSENT:
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
     def conv_step_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         state_ptr,
@@ -60,7 +60,7 @@ if not TRITON_ABSENT:
         y = acc.to(tl.bfloat16).to(tl.float32)
         tl.store(out_ptr + b * channels + c, (y * tl.sigmoid(y)).to(tl.bfloat16), mask=ok)
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
     def conv_steps_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         weight_ptr,
@@ -91,7 +91,7 @@ if not TRITON_ABSENT:
             at = out_ptr + b * out_stride_b + t * out_stride_t + c
             tl.store(at, (y * tl.sigmoid(y)).to(tl.bfloat16), mask=ok)
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
     def recurrent_steps_kernel(  # type: ignore[no-untyped-def]
         q_ptr,
         k_ptr,
@@ -150,7 +150,13 @@ if not TRITON_ABSENT:
             tl.store(out_ptr + at * DV + rv, tl.sum(state * q[:, None], axis=0).to(tl.bfloat16))
 
 
-def _signature(kernel: Any, **types: str) -> dict[str, str]:
+class _Kernel(Protocol):
+    """A `triton.jit` kernel, as `_signature` reads it."""
+
+    arg_names: list[str]
+
+
+def _signature(kernel: _Kernel, **types: str) -> dict[str, str]:
     return {
         name: types.get(name)
         or ("constexpr" if name.isupper() else "*bf16" if name.endswith("_ptr") else "i32")
