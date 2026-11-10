@@ -16,7 +16,7 @@ import threading
 from collections import deque
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Sequence
 from concurrent.futures import Future
-from typing import IO, TYPE_CHECKING, Any, NamedTuple
+from typing import IO, TYPE_CHECKING, NamedTuple
 
 import msgspec
 import numpy as np
@@ -39,7 +39,14 @@ from .microscale import (
     encode_nvfp4,
     encode_w4a8,
 )
-from .native_quantization import PARAMS, PER_ROW, QuantizationStats, _pool, _run_native
+from .native_quantization import (
+    PARAMS,
+    PER_ROW,
+    QuantizationStats,
+    QuantizedTensors,
+    _pool,
+    _run_native,
+)
 
 if TYPE_CHECKING:
     from tensorfs.api import NormalizeBf16Tensor
@@ -266,7 +273,7 @@ class _Bf16Result(msgspec.Struct):
     new_bytes_written: int
     required_buffer_bytes: int
     worst_relative_frobenius: float | None
-    tensors: list[dict[str, Any]] = msgspec.field(default_factory=list)
+    tensors: QuantizedTensors = msgspec.field(default_factory=list)
 
 
 def bf16_source_dtypes(sources: Sequence[str]) -> tuple[str, ...]:

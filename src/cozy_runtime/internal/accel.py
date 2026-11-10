@@ -26,7 +26,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 import tensorfs.varena.torch as vt
 from tensorfs.varena import _runtime as varena
@@ -241,7 +241,7 @@ def _device_memory_of(free: int, total: int) -> DeviceMemory:
     return DeviceMemory("measured", free, total)
 
 
-def synchronize(torch: Any, kind: str) -> None:
+def synchronize(torch: ModuleType, kind: str) -> None:
     """A device-order fence for `kind`. `cpu` is a no-op (host code is already ordered)."""
     if kind == "mps":
         torch.mps.synchronize()
@@ -259,7 +259,7 @@ def healthy(torch: ModuleType, kind: str) -> bool:
     return True
 
 
-def drain(torch: Any, kind: str) -> None:
+def drain(torch: ModuleType, kind: str) -> None:
     """Wait for the CURRENT stream only: the caller's own queued work, not other streams'.
     MPS has one command queue per process: its drain is a synchronize."""
     if kind == "mps":
@@ -268,7 +268,7 @@ def drain(torch: Any, kind: str) -> None:
         completion_event(torch, kind).synchronize()
 
 
-def bind_allocator(torch: Any, kind: str) -> None:
+def bind_allocator(torch: ModuleType, kind: str) -> None:
     """Select Runtime's allocator without device activation or standalone defaults."""
     if kind != "cuda":
         return
@@ -280,7 +280,7 @@ def bind_allocator(torch: Any, kind: str) -> None:
         raise ResidencyError(str(exc)) from exc
 
 
-def initialize(torch: Any, kind: str) -> None:
+def initialize(torch: ModuleType, kind: str) -> None:
     """Initialize after allocator binding and the caller's explicit native custody."""
     if kind == "cpu":
         return
@@ -293,7 +293,7 @@ def initialize(torch: Any, kind: str) -> None:
         torch.cuda.init()
 
 
-def owned_stream(torch: Any, device: int) -> Stream:
+def owned_stream(torch: ModuleType, device: int) -> Stream:
     """A unique Runtime-owned blocking stream. It orders with the legacy default stream, where a
     CUDA extension launches when it passes no stream, and a capture on it refuses that launch
     instead of leaving it out of the graph. CUDA's runtime makes it, so a thread that has not yet
@@ -317,7 +317,7 @@ def owned_stream(torch: Any, device: int) -> Stream:
             raise
 
 
-def destroy_stream(torch: Any, stream: Stream) -> None:
+def destroy_stream(torch: ModuleType, stream: Stream) -> None:
     """Destroy an owned stream only after its owner retires and joins every consumer."""
     with torch.cuda.device(stream.device):
         code = int(torch.cuda.cudart().cudaStreamDestroy(stream.cuda_stream))
@@ -346,7 +346,7 @@ def first_launches(torch: ModuleType, kind: str) -> None:
         completion_event(torch, kind).synchronize()
 
 
-def initialized(torch: Any, kind: str) -> bool:
+def initialized(torch: ModuleType, kind: str) -> bool:
     """Whether device initialization already escaped Runtime's explicit init boundary. MPS
     has no context to pick a device with: there is one GPU."""
     if kind == "cuda":
@@ -355,7 +355,7 @@ def initialized(torch: Any, kind: str) -> bool:
 
 
 def allocation(
-    torch: Any, kind: str, memory: Memory | None = None, device: vt.DeviceLike = None
+    torch: ModuleType, kind: str, memory: Memory | None = None, device: vt.DeviceLike = None
 ) -> dict[str, int]:
     """The allocator's live numbers, and the card as varena's `room()` reports it: capacity (the
     card or its cap, less what other processes hold) and what maps free. A report, never sizing.
@@ -395,13 +395,15 @@ def _weight_bytes(memory: Memory | None) -> int:
     return int(native.stats()["resident_bytes"]) if native is not None else 0
 
 
-def allocated(torch: Any, kind: str, memory: Memory | None = None) -> int:
+def allocated(torch: ModuleType, kind: str, memory: Memory | None = None) -> int:
     """Process-local live allocations, without querying the driver."""
     if kind == "mps":
         return int(torch.mps.current_allocated_memory())
     if kind == "cpu":
         return 0
-    return int(vt.stats(memory.device if memory is not None else None)["allocated_bytes"]) + _weight_bytes(memory)
+    return int(
+        vt.stats(memory.device if memory is not None else None)["allocated_bytes"]
+    ) + _weight_bytes(memory)
 
 
 def reserved(torch: ModuleType, kind: str, memory: Memory | None = None) -> int:
@@ -410,7 +412,9 @@ def reserved(torch: ModuleType, kind: str, memory: Memory | None = None) -> int:
         return int(torch.mps.driver_allocated_memory())
     if kind == "cpu":
         return 0
-    return int(vt.stats(memory.device if memory is not None else None)["mapped_bytes"]) + _weight_bytes(memory)
+    return int(
+        vt.stats(memory.device if memory is not None else None)["mapped_bytes"]
+    ) + _weight_bytes(memory)
 
 
 def allocator_peak(memory: Memory | None, request: str | None = None) -> int:
@@ -425,13 +429,13 @@ def allocator_peak(memory: Memory | None, request: str | None = None) -> int:
     return max(int(figures["peak"]), int(carried))
 
 
-def release_cached(torch: Any, kind: str) -> None:
+def release_cached(torch: ModuleType, kind: str) -> None:
     """MPS's unused allocator blocks back to its driver. On CUDA the native core alone does this."""
     if kind == "mps":
         torch.mps.empty_cache()
 
 
-def completion_event(torch: Any, kind: str) -> Event | MPSEvent:
+def completion_event(torch: ModuleType, kind: str) -> Event | MPSEvent:
     """An event recorded on the CURRENT stream — "everything queued so far has run".
     The residency plane's eviction fence: bytes a kernel may still read are not evictable
     until this queries true."""
@@ -444,7 +448,7 @@ def completion_event(torch: Any, kind: str) -> Event | MPSEvent:
     return event
 
 
-def streams_idle(torch: Any, kind: str, *, stream: Stream) -> bool:
+def streams_idle(torch: ModuleType, kind: str, *, stream: Stream) -> bool:
     """Whether the execution stream and its explicitly joined producers are complete.
 
     The caller supplies its owned stream; another thread's current/default stream cannot
@@ -460,7 +464,7 @@ def streams_idle(torch: Any, kind: str, *, stream: Stream) -> bool:
     return bool(stream.query())
 
 
-def present(torch: Any, kind: str) -> bool:
+def present(torch: ModuleType, kind: str) -> bool:
     """Whether THIS backend is actually usable in this process. `False` is a fact, not a
     refusal: a torch-bearing process with no card is a legitimate weightless executor, and a
     CPU executor has no accelerator to be present."""
@@ -471,7 +475,16 @@ def present(torch: Any, kind: str) -> bool:
     return not sees_no_gpu() and bool(torch.cuda.is_available())
 
 
-def device_identity(torch: Any, kind: str, index: int = 0) -> dict[str, Any]:
+class DeviceIdentity(TypedDict):
+    """`device_identity`: the device's name, SM (0 off CUDA), the wheel's CUDA runtime and the driver API."""
+
+    name: str
+    sm: int
+    cuda_runtime: str
+    driver_api: str
+
+
+def device_identity(torch: ModuleType, kind: str, index: int = 0) -> DeviceIdentity:
     """One device's STABLE identity, from TORCH. Everything here holds for the life of the
     machine, which is what lets a probe result be keyed by it.
 

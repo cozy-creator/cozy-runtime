@@ -53,6 +53,7 @@ from cozy_runtime.internal.encoding.selection import (
 )
 from cozy_runtime.internal.fill import (
     Checkpoint,
+    FitVerdict,
     PlanRow,
     TensorRequirement,
     _refuse,
@@ -81,7 +82,7 @@ from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution
 if TYPE_CHECKING:
     import torch
     from torch import Tensor
-    from torch.nn import Module
+    from torch.nn import Linear, Module
 
 
 # ---------------------------------------------------------------------------- the backend
@@ -214,7 +215,7 @@ class Backend:
         """Completeness sets: a destination the census never reaches refuses the commit."""
         self.expected = {name: frozenset(keys) for name, keys in sets.items()}
 
-    def fit(self, walked: Census, *, encoded_leaves: str) -> Mapping[str, object] | None:
+    def fit(self, walked: Census, *, encoded_leaves: str) -> FitVerdict | None:
         """`fill.fit` over the serving census, per checkpoint the census reads."""
         by_checkpoint: dict[str, tuple[Checkpoint, list[str]]] = {}
         for component in walked.components:
@@ -227,7 +228,7 @@ class Backend:
                     [component],
                 )
             by_checkpoint.setdefault(checkpoint.id, (checkpoint, []))[1].append(component)
-        verdict: dict[str, object] | None = None
+        verdict: FitVerdict | None = None
         ignored: list[str] = []
         unstored: list[str] = []
         warnings: list[str] = []
@@ -257,12 +258,12 @@ class Backend:
             if not fit.get("ok"):
                 return fit
             verdict = fit
-            extras = [str(k) for k in fit.get("ignored", ())]  # type: ignore[attr-defined]
+            extras = [str(k) for k in fit.get("ignored", ())]
             ignored.extend(extras)
             if extras:
                 warnings.append(str(fit.get("warning") or self._skipped_line(extras)))
-            unstored.extend(str(k) for k in fit.get("unstored", ()))  # type: ignore[attr-defined]
-            counted: Mapping[str, int] = fit.get("routes", {})  # type: ignore[assignment]
+            unstored.extend(str(k) for k in fit.get("unstored", ()))
+            counted: Mapping[str, int] = fit.get("routes", {})
             for route in routes:
                 routes[route] += int(counted.get(route, 0))
         if verdict is None:
@@ -759,12 +760,18 @@ def _float32(torch: ModuleType, root: Module) -> None:
         future.set_swap_module_params_on_conversion(swapping)
     narrow = (torch.float16, torch.bfloat16)
 
-    def widen(_: Module, args: Any, kwargs: Any) -> Any:
-        def up(value: Any) -> Any:
-            narrowed = isinstance(value, torch.Tensor) and value.dtype in narrow
-            return value.float() if narrowed else value
+    def widen(
+        _: Module, args: tuple[object, ...], kwargs: dict[str, object]
+    ) -> tuple[tuple[object, ...], dict[str, object]]:
+        def up(value: object) -> object:
+            if isinstance(value, torch.Tensor) and value.dtype in narrow:
+                return value.float()
+            return value
 
-        return torch.utils._pytree.tree_map(up, (args, kwargs))
+        widened: tuple[tuple[object, ...], dict[str, object]] = torch.utils._pytree.tree_map(
+            up, (args, kwargs)
+        )
+        return widened
 
     for sub in root.modules():
         owned = (*sub._parameters.values(), *sub._buffers.values())
@@ -810,6 +817,8 @@ class LoRASource(Protocol):
 class LoRALayer(Protocol):
     active_adapters: Sequence[str]
     scaling: Mapping[str, float]
+    lora_A: Mapping[str, Linear]
+    lora_B: Mapping[str, Linear]
     _cozy_baked: bool
 
 
@@ -1103,10 +1112,11 @@ def _deltas(bake: _Bake) -> list[tuple[object, Tensor, Tensor, float]]:
     """An svdq leaf's LoRAs as it runs: each `(identity, down, up, scale)`, the bound factors of
     its PEFT layer's active adapters, then its model's hooks'."""
     out: list[tuple[object, Tensor, Tensor, float]] = []
-    layer = cast(Any, bake.layer)
-    for adapter in getattr(layer, "active_adapters", ()):
-        down, up = layer.lora_A[adapter], layer.lora_B[adapter]
-        out.append((down, down.weight, up.weight, float(layer.scaling[adapter])))
+    layer = bake.layer
+    if layer is not None:
+        for adapter in layer.active_adapters:
+            down, up = layer.lora_A[adapter], layer.lora_B[adapter]
+            out.append((down, down.weight, up.weight, float(layer.scaling[adapter])))
     for hook in bake.hooks:
         got = hook.lora_factors()
         if got is not None:
