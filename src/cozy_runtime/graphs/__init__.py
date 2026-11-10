@@ -570,6 +570,14 @@ _LAG_MS = 10.0
 _LAG_MARK_S = 0.002
 #: the host's poll while idle work waits on the device (`_Idle.meter`, `_settled`)
 _POLL_S = 0.0002
+#: The least free room the card must report for an idle job's next op (`_Idle.room`).
+_IDLE_ROOM = 256 << 20
+#: How often (s) an idle job reads the room: a read costs a native call, an op far less.
+_ROOM_S = 0.002
+
+
+class _NoRoom(Yielded):
+    """An idle job's next op found the card short of free room: the job ends for this period."""
 
 
 class _Idle:
@@ -587,7 +595,8 @@ class _Idle:
         self.jobs: deque[Callable[[], bool]] = deque()
         self.stop: Callable[[], bool] = lambda: False
         self.last = 0.0
-        self.periods = self.yields = self.failures = 0
+        self.periods = self.yields = self.failures = self.starved = 0
+        self.read = 0.0
         self.longest_ms = 0.0
         #: the running job's ops still queued on the device: each one's event and host time
         self.queued: deque[tuple[Any, float]] = deque()
@@ -639,6 +648,22 @@ class _Idle:
         if self.stop():
             raise Yielded
 
+    def room(self, device: int, need: int) -> None:
+        """Before a job's next op on the device: idle work takes free room only. Where the card's
+        free bytes and this process's own free working pages are less than the op's tensors hold
+        twice over (`_IDLE_ROOM` at least), the job
+        ends for this period (`_NoRoom`): its allocation would evict for a guess, and with nothing
+        of this process's left to give it would wait for memory outside it, minutes a command
+        that arrives meanwhile would wait too (run 43986: 300 s)."""
+        now = time.perf_counter()
+        if now - self.read < _ROOM_S and need <= _IDLE_ROOM:
+            return
+        self.read = now
+        working = vt.stats(device)
+        own = int(working["mapped_bytes"]) - int(working["allocated_bytes"])
+        if short(int(vt.room(device)["free"]) + max(own, 0), need):
+            raise _NoRoom
+
     def run(self, stop: Callable[[], bool]) -> bool:
         """Each queued job once, while `stop()` stays false; False when it turned true (the job
         it interrupted goes first next period)."""
@@ -661,6 +686,9 @@ class _Idle:
                         done = job()
                     if not done:
                         later.append(job)
+                except _NoRoom:
+                    self.starved += 1
+                    later.append(job)  # a later period, when the card has room again
                 except Yielded:
                     self.yields += 1
                     with self.lock:
@@ -687,8 +715,14 @@ class _Idle:
             "periods": self.periods,
             "yields": self.yields,
             "failures": self.failures,
+            "no_room": self.starved,
             "longest_block_ms": round(self.longest_ms, 3),
         }
+
+
+def short(free: int, need: int) -> bool:
+    """Whether `free` reported bytes are too few for an idle op whose tensors hold `need`."""
+    return free < max(_IDLE_ROOM, 2 * need)
 
 
 IDLE = _Idle()
@@ -699,7 +733,8 @@ def _yielding(torch: Any) -> Any:
     """The torch function mode an idle job runs under: before each op, a command that arrived
     ends the job (`_Idle.check`), so a whole component's capture yields within one op, and the
     device is at most `_QUEUED` ops behind (`_Idle.meter`; nothing runs while a stream
-    captures). Its cleanup (`_SETTLING`) never yields."""
+    captures). An op the card reports no free room for ends the job too (`_Idle.room`). Its
+    cleanup (`_SETTLING`) never yields."""
 
     class Yielding(torch.overrides.TorchFunctionMode):  # type: ignore[misc]
         def __torch_function__(
@@ -710,6 +745,12 @@ def _yielding(torch: Any) -> Any:
             idle.check()
             metered = torch.cuda.is_initialized() and not torch.cuda.is_current_stream_capturing()
             if metered:
+                held = sum(
+                    value.numel() * value.element_size()
+                    for value in (*args, *(kwargs or {}).values())
+                    if isinstance(value, torch.Tensor) and value.is_cuda
+                )
+                idle.room(torch.cuda.current_device(), held)
                 idle.meter()
             out = func(*args, **(kwargs or {}))
             if metered and isinstance(out, torch.Tensor) and out.is_cuda:
