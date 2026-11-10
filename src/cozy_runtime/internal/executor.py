@@ -1247,8 +1247,7 @@ class Executor:
                 row = self.group.rank_records.get(follower.rank) or execution_evidence.record(
                     {"pid": follower.pid, "gpu": gpu}, 0, 0
                 )
-                timing = self.group.rank_timing.get(follower.rank, {})
-                gpus.append({**row, "attention": {**row["attention"], "requested": pin}, **timing})
+                gpus.append({**row, "attention": {**row["attention"], "requested": pin}})
         facts = self.facts
         transport = self.host.transport
         crossing: dict[str, Any] = {}
@@ -1256,6 +1255,11 @@ class Executor:
             from cozy_runtime.internal.parallel import ulysses
 
             crossing = {"transport": {**transport.document(), "exchange": ulysses.taken()}}
+        if self.group is not None:
+            # each follower's exchanges, step points and stalls, by its GPU (`wire.RunReply`)
+            crossing["followers"] = {
+                self.group.gpu(rank): timing for rank, timing in self.group.rank_timing.items()
+            }
         return {
             "degree": self.world,
             "gpus": gpus,
