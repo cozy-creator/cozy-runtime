@@ -69,6 +69,14 @@ class JitKernel(Protocol):
     def cache_key(self) -> str: ...
 
 
+def jit[**P](fn: Callable[P, object]) -> JitKernel:
+    """`triton.jit` for a kernel a set declares, typed (Triton ships no types)."""
+    import triton
+
+    kernel: JitKernel = triton.jit(fn)
+    return kernel
+
+
 @dataclass(frozen=True, slots=True)
 class TritonEntry:
     """One compiled specialization of a module-level `@triton.jit` kernel: Triton's signature

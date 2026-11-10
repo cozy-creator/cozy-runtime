@@ -32,6 +32,7 @@ from array import array
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from functools import partial
+from typing import Protocol, cast
 
 import torch
 from torch import nn
@@ -61,9 +62,13 @@ COMPILING = "compiling: it serves from the next request"
 _LAUNCH: list[Launch | str] = ["the model's execution plan installs no grouped kernels"]
 
 
-class RoutedExpert(nn.Module):  # type: ignore[misc]
+class RoutedExpert(nn.Module):
     """One routed SwiGLU expert. `gate_first`: `act(gate) * up` with the gate the first half of
     `gate_and_up_proj`'s rows (Qwen's), else `first * act(second)` (Hunyuan's)."""
+
+    #: Linears, or the encoded leaves a lane puts in their place.
+    gate_and_up_proj: nn.Linear
+    down_proj: nn.Linear
 
     def __init__(
         self,
@@ -84,10 +89,24 @@ class RoutedExpert(nn.Module):  # type: ignore[misc]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         a, b = self.gate_and_up_proj(x).chunk(2, dim=-1)
-        return self.down_proj(self.act(a) * b if self.gate_first else a * self.act(b))
+        out: torch.Tensor = self.down_proj(self.act(a) * b if self.gate_first else a * self.act(b))
+        return out
 
 
-class Experts(nn.ModuleList):  # type: ignore[misc]
+class _Int8Leaf(Protocol):
+    """An int8.convrot leaf's stored operands (`_kind` "int8")."""
+
+    data: torch.Tensor
+    scale: torch.Tensor
+
+
+class _NoSplit(Protocol):
+    """A Transformers model's `_no_split_modules` (torch types a Module's attributes as modules)."""
+
+    _no_split_modules: list[str]
+
+
+class Experts(nn.ModuleList):
     """A layer's routed experts. `forward(hidden [T, H], index [T, k], weights [T, k])`: each
     (token, k) pair's expert output, summed by `weights` in the outputs' dtype.
 
@@ -142,7 +161,8 @@ class Experts(nn.ModuleList):  # type: ignore[misc]
         if self.trace is not None:
             self.trace(self.layer, counts)
         selected = hidden[order // k]
-        outputs, start = [], 0
+        outputs: list[torch.Tensor] = []
+        start = 0
         for expert, count in zip(self, counts, strict=True):
             if count:
                 outputs.append(expert(selected[start : start + count]))
@@ -177,7 +197,7 @@ class Experts(nn.ModuleList):  # type: ignore[misc]
     ) -> torch.Tensor:
         """Two grouped launches with the gate between them as `RoutedExpert.forward` computes it:
         GEMVs for up to `GROUPED` pairs, else GEMMs over the pairs sorted by expert."""
-        first = self[0]
+        first = cast("RoutedExpert", self[0])  # an Experts holds RoutedExperts
         size, inner = first.down_proj.out_features, first.down_proj.in_features
         if index.numel() <= GROUPED:
             project = partial(self._gemv, launch, kind, table, index.reshape(-1).to(torch.int64))
@@ -278,17 +298,18 @@ class Experts(nn.ModuleList):  # type: ignore[misc]
         expert's operands are bound, contiguous and of that kind on `device`; else why not.
         Outside a capture a changed address set is written to the table; inside one it is a
         refusal."""
-        head = self[0].gate_and_up_proj
+        head = cast("RoutedExpert", self[0]).gate_and_up_proj  # an Experts holds RoutedExperts
         kind = _kind(head)
         if kind is None:
             name = getattr(head, "provider", None) or type(head).__name__
             return f"its experts are {name}: the grouped kernels take bf16 and int8.convrot"
         rows: list[list[int]] = [[] for _ in range(2 if kind == "bf16" else 4)]
-        for expert in self:
+        for expert in cast("Iterable[RoutedExpert]", self):  # an Experts holds RoutedExperts
             for which, linear in enumerate((expert.gate_and_up_proj, expert.down_proj)):
                 if _kind(linear) != kind:
                     return "its experts are not all of one kind"
-                operands = (linear.weight,) if kind == "bf16" else (linear.data, linear.scale)
+                leaf = cast("_Int8Leaf", linear)  # read only when `_kind` found an int8 leaf
+                operands = (linear.weight,) if kind == "bf16" else (leaf.data, leaf.scale)
                 for role, tensor in enumerate(operands):
                     address = _address(tensor, device)
                     if not address:
@@ -300,7 +321,8 @@ class Experts(nn.ModuleList):  # type: ignore[misc]
                 return "an expert's operands moved inside a capture"
             self._table = torch.tensor(rows, dtype=torch.int64, device=device)
             self._addresses = addresses
-            widths = (self[0].down_proj.in_features, self[0].down_proj.out_features)
+            down = cast("RoutedExpert", self[0]).down_proj  # an Experts holds RoutedExperts
+            widths = (down.in_features, down.out_features)
             self._aligned = all(a % 16 == 0 for a in (*addresses, *widths))
         assert self._table is not None
         return kind, self._table
@@ -347,7 +369,8 @@ def _report(plan: Plan, reason: str = "") -> str:
 def _kind(linear: nn.Module) -> str | None:
     """ "bf16" for a plain bias-free bf16 Linear, "int8" for an int8.convrot leaf, else None."""
     if type(linear) is nn.Linear:
-        return "bf16" if linear.bias is None and linear.weight.dtype == torch.bfloat16 else None
+        bias = cast("torch.Tensor | None", linear.bias)  # torch types it Tensor; bias=False: None
+        return "bf16" if bias is None and linear.weight.dtype == torch.bfloat16 else None
     if getattr(linear, "provider", None) == INT8_CONVROT and getattr(linear, "bias", 0) is None:
         return "int8"
     return None
@@ -391,7 +414,7 @@ def split(model: nn.Module) -> int:
         parent, _, attr = name.rpartition(".")
         setattr(model.get_submodule(parent), attr, experts)
     if fused:
-        model._no_split_modules = [
+        cast("_NoSplit", model)._no_split_modules = [
             *(getattr(model, "_no_split_modules", None) or ()),
             RoutedExpert.__name__,
         ]
