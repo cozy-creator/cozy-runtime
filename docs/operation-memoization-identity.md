@@ -3,36 +3,21 @@
 Package installation uses ordinary uv environments. Source archives, SDK inventories,
 installation IDs and caller scripts are not computation cache keys.
 
-For a custom deterministic operation, declare the implementation contract:
+A deterministic function asks for the result cache:
 
 ```python
-@invocable(
-    memoize=True,
-    memo_version="convert/1",
-    memo_dependencies=(convert_tensor, "my_tools.tensor_layout"),
-)
-async def convert(ctx, *, source): ...
+@app.entrypoint(memoize=True)
+async def convert(ctx: Context, *, source: Weights, seed: Seed | None = None) -> Converted: ...
 ```
 
-The worker discovers the operation's own function and the declared helpers in the
-installed environment. Its memo key includes their normalized Python source and the
-operation version, together with the invocation's inputs and numerical conditions.
-Changing a caller script or installing the same operation again does not change it.
-Changing a function or declared helper does. Module dependencies include only the
-named Python modules, never an entire distribution or an ambient client SDK.
+Its memo key is its code (its package release, or for local code the modules it imports), its
+environment, the request (files by content) and the models it runs with. Changing a caller
+script or installing the same release again does not change it. A memoized function must stay
+deterministic for its inputs.
 
-The author must list all helpers whose implementation affects the result, and bump
-`memo_version` when external behavior changes outside those sources, including native
-algorithms, configuration tables or behavior-affecting global state. Arguments should
-carry varying values; a memoized function must remain deterministic for its inputs.
-The system does not infer arbitrary dynamic Python dependencies.
-
-`memoize=Memoize(requires=("seed",))` (a list also works) memoizes only requests that
-explicitly provide each named optional parameter; a request that omits one, or sends
-null, runs normally without lookup or storage. The interface keeps `"memoize": true`
-and adds `"memo_requires": ["seed"]`. Describe refuses a named parameter without a None
-default (`seed: int | None = None`): clients fill an omitted plain `int` seed, which would
-memoize every request. Installed releases keep the rules they were published under.
+A request that leaves an optional `Seed` field unset (omitted or null) asks for a new draw, so
+it runs without lookup or storage. The interface keeps `"memoize": true` and lists those fields
+in `"memo_requires"`.
 
 An operation without a declared version, or whose source is unavailable, executes
 normally without a completed-result shortcut. Runtime reports that reason. This is

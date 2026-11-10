@@ -1,21 +1,20 @@
-"""Typed package calls; only the admitted attempt supplies their hidden broker."""
+"""Managed calls (`call`, `prefetch`); only the admitted attempt supplies their broker."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import hashlib
-import inspect
 import logging
 import math
 import re
 import socket
 import threading
 import time
-from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Generator, Mapping
 from contextvars import ContextVar
-from dataclasses import dataclass, field
-from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar, cast, overload
+from dataclasses import dataclass
+from typing import Any, Protocol, TypeVar, cast, overload
 
 import msgspec
 from tensorfs.executor import (
@@ -39,9 +38,7 @@ from cozy_runtime.author._decode import MediaReads
 from cozy_runtime.author._defaults import fit
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._files import _UNBOUND, File, Files, References, Tree, asset_dec_hook
-from cozy_runtime.author._memo import Memoize, memo_policy
 from cozy_runtime.author._model import WARNINGS, Model
-from cozy_runtime.author._model_defaults import model_components, model_defaults
 from cozy_runtime.author._observations import Scalar
 from cozy_runtime.author._services import (
     Attempt,
@@ -54,7 +51,6 @@ from cozy_runtime.author._weights import Weights
 
 _LOG = logging.getLogger(__name__)
 
-P = ParamSpec("P")
 R = TypeVar("R")
 MAX_ACTIVE_CALLS = 32
 MAX_CALL_BYTES = 48 * 1024
@@ -90,114 +86,30 @@ class ChildCallError(CapabilityError):
         self.child_traceback = child_traceback
 
 
-@dataclass(frozen=True, slots=True)
-class _Export:
-    implementation: Callable[..., object]
-    module: str
-    name: str
-    memoize: Memoize | None = None
-    defaults: Mapping[str, str] = field(default_factory=dict)
-    components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+@overload
+def call[R](
+    fn: Callable[..., Coroutine[Any, Any, R]], /, **arguments: object
+) -> PendingCall[R]: ...
 
 
 @overload
-def invocable[**P, R](
-    fn: Callable[Concatenate[Context, P], Awaitable[R]],
-    /,
-    *,
-    memoize: bool | Memoize = False,
-    defaults: Mapping[str, str] | None = None,
-    components: Mapping[str, Sequence[str]] | None = None,
-) -> Callable[P, PendingCall[R]]: ...
+def call[R](fn: Callable[..., R], /, **arguments: object) -> PendingCall[R]: ...
 
 
-@overload
-def invocable[**P, R](
-    *,
-    memoize: bool | Memoize = False,
-    defaults: Mapping[str, str] | None = None,
-    components: Mapping[str, Sequence[str]] | None = None,
-) -> Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]: ...
+def call(fn: Callable[..., object], /, **arguments: object) -> PendingCall[Any]:
+    """Run `fn` as a managed call: its own job on the machine, with its own models, memo and
+    progress. Awaiting it returns `fn`'s result.
 
-
-def invocable[**P, R](
-    fn: Callable[Concatenate[Context, P], Awaitable[R]] | None = None,
-    /,
-    *,
-    memoize: bool | Memoize = False,
-    defaults: Mapping[str, str] | None = None,
-    components: Mapping[str, Sequence[str]] | None = None,
-) -> (
-    Callable[P, PendingCall[R]]
-    | Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]
-):
-    """Mark an asynchronous implementation; explicitly register it on the package App.
-
-    Calling this exported name always reserves a managed call. App registration keeps
-    the implementation privately for ordinary admitted dispatch; importing a module
-    never registers it or resolves a package/environment.
-
-    At the call site, a Model parameter takes a ModelChoice: another model (`ref`, a name or
-    a retained ModelArtifact) or LoRAs over the parent's; None keeps the parent's. The
-    injected Model object itself belongs to its current attempt and cannot be forwarded.
-
-    A memoized operation's key is its package release, its models and its request.
-    ``memoize=Memoize(requires=("seed",))`` memoizes only requests that explicitly provide
-    each named optional parameter; any other request runs without lookup or storage.
+    `arguments` are `fn`'s own parameters as a direct call names them, less what is injected
+    (Context, services): its request struct or fields, its `Files`, and a `ModelChoice` (or
+    None, its default) per model argument. `fn` is a registered function of this package or a
+    public one of a package this one depends on. A plain `fn(...)` is an ordinary Python call.
     """
-    policy = memo_policy(memoize)
-    if fn is None:
-        return lambda target: invocable(
-            target,
-            memoize=memoize,
-            defaults=defaults,
-            components=components,
-        )
-    if not inspect.iscoroutinefunction(fn) or "<locals>" in fn.__qualname__:
-        raise ConformanceError(
-            "an invocable must be a module-level async function", code="invocable_signature"
-        )
-    export = _Export(
-        fn,
-        fn.__module__,
-        fn.__name__,
-        policy,
-        model_defaults(defaults),
-        model_components(components),
-    )
-
-    def proxy(*args: P.args, **kwargs: P.kwargs) -> PendingCall[R]:
-        if args:
-            raise ConformanceError(
-                "an invocable takes only named operation arguments",
-                code="invocable_signature",
-            )
-        broker = _current.get()
-        if broker is None:
-            raise CapabilityError(
-                "package call has no admitted attempt", code="child_broker_absent"
-            )
-        return cast(PendingCall[R], broker.reserve(export.module, export.name, dict(kwargs)))
-
-    proxy.__name__ = fn.__name__
-    proxy.__qualname__ = fn.__qualname__
-    proxy.__module__ = fn.__module__
-    proxy.__doc__ = fn.__doc__
-    proxy.__annotations__ = dict(fn.__annotations__)
-    # No __wrapped__ / raw / local bypass is exposed by the public callable.
-    metadata = cast(Any, proxy)
-    signature = inspect.signature(fn)
-    parameters = list(signature.parameters.values())
-    metadata.__signature__ = signature.replace(parameters=parameters[1:])
-    if parameters:
-        proxy.__annotations__.pop(parameters[0].name, None)
-    metadata._cozy_export = export
-    return proxy
-
-
-def _export(fn: Callable[..., object]) -> _Export | None:
-    value = getattr(fn, "_cozy_export", None)
-    return value if isinstance(value, _Export) else None
+    broker = _current.get()
+    if broker is None:
+        raise CapabilityError("a managed call has no admitted attempt", code="child_broker_absent")
+    module, name = getattr(fn, "__module__", ""), getattr(fn, "__name__", "")
+    return broker.reserve(module, name, arguments)
 
 
 def prefetch(
@@ -248,9 +160,11 @@ class _CallType:
     python_result: type[msgspec.Struct] | None = None
     #: Why the machine cannot serve this operation; "" when it can.
     unavailable: str = ""
-    #: A callable bound from its own code: its model slots, which a direct caller passes
-    #: beside its request fields and the call carries as `{payload, models}`.
+    #: A callable bound from its own code: its model slots, which a caller passes beside its
+    #: request and the call carries as `{payload, models}`.
     models: frozenset[str] | None = None
+    #: The parameter whose struct is the request; empty: the request is its other arguments.
+    request_parameter: str = ""
 
 
 class PendingCall[R](Awaitable[R]):
@@ -309,7 +223,7 @@ class _Broker:
         exchange: Exchange,
         watch: Callable[[], Nudges],
     ) -> None:
-        self.request_id, self.bindings, self.exchange = request_id, dict(bindings), exchange
+        self.request_id, self.bindings, self.exchange = request_id, bindings, exchange
         #: Opens the worker's nudges, at the first wait on a call; None once opened.
         self.watch: Callable[[], Nudges] | None = watch
         self.nudges: Nudges | None = None
@@ -389,7 +303,9 @@ class _Broker:
         binding = self.bindings.get((module, export))
         if binding is None:
             raise CapabilityError(
-                "export is not an exact locked dependency", code="child_undeclared"
+                f"{module}:{export} is not a registered function of this package or of a "
+                "package it depends on",
+                code="child_undeclared",
             )
         if binding.unavailable:
             raise CapabilityError(binding.unavailable, code="child_capability_unavailable")
@@ -401,6 +317,7 @@ class _Broker:
                 "payload": {k: v for k, v in arguments.items() if k not in slots},
                 "models": {k: v for k, v in arguments.items() if k in slots},
             }
+        struct = binding.request_parameter
         if self.next_index > MAX_CALL_INDEX:
             raise CapabilityError("package call index is exhausted", code="child_index_exhausted")
         saved: dict[str, SavedFile] = {}
@@ -427,9 +344,18 @@ class _Broker:
                     return file.digest
                 return _input_ref(value, ctx.request_id)
 
-            plain, ignored, moved = fit(
-                binding.request, msgspec.to_builtins(dict(arguments), enc_hook=asset_value)
-            )
+            wire = msgspec.to_builtins(dict(arguments), enc_hook=asset_value)
+            if struct:
+                # The request struct's fields are the request; its Files argument joins them.
+                given = dict(wire["payload"])
+                fields = given.pop(struct, None)
+                if not isinstance(fields, dict):
+                    raise ConformanceError(
+                        f"{module}:{export} takes its request as {struct}=",
+                        code="child_arguments",
+                    )
+                wire["payload"] = {**fields, **given}
+            plain, ignored, moved = fit(binding.request, wire)
             row: tuple[str, dict[str, Scalar]]
             for change in moved:
                 row = (
@@ -596,7 +522,7 @@ class _Broker:
             call.progress_sequence = progress.sequence
             scope = call.progress_scope
             if scope is None and call.broker.telemetry is not None:
-                scope = _ProgressScope(call.broker.telemetry, call.binding.export, None)
+                scope = _ProgressScope(call.broker.telemetry, call.binding.export)
             if scope is not None:
                 scope.telemetry._child_progress(progress.payload, scope)
 
@@ -639,14 +565,3 @@ class _Broker:
 
 
 _current: ContextVar[_Broker | None] = ContextVar("cozy_package_call_attempt", default=None)
-
-
-def _invoke_proxy(
-    module: str,
-    export: str,
-    arguments: Mapping[str, object],
-) -> PendingCall[Any]:
-    broker = _current.get()
-    if broker is None:
-        raise CapabilityError("package call has no admitted attempt", code="child_broker_absent")
-    return broker.reserve(module, export, arguments)

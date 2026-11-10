@@ -29,7 +29,6 @@ from cozy_runtime.author import (
     Recipe,
     Telemetry,
     Weights,
-    invocable,
 )
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._recipes import (
@@ -43,7 +42,6 @@ from cozy_runtime.author._recipes import (
 
 
 # The code that decides a lane's bytes: its replay key changes with any of it.
-@invocable
 async def quantize(
     ctx: Context,
     *,
@@ -59,7 +57,6 @@ async def quantize(
     return _run(ctx, tel, source, None, lane=lane, package=package, release=release, recipe=recipe)
 
 
-@invocable
 async def quantize_calibrated(
     ctx: Context,
     *,

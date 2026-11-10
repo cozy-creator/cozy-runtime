@@ -395,7 +395,7 @@ class Attribution:
     """Where an attempt's time went, in O(1) per span and O(names) in memory.
 
     `stages` are `tel.stage(name)` brackets — the COMMITTED `stage_ms` fact. `steps` are the
-    per-step intervals of `tel.step_callback`, which is what makes inference step time
+    per-step intervals of `ctx.progress`, which is what makes inference step time
     attributable without keeping one row per step. Both are observation only: nothing here
     reaches placement, availability or the ComponentUseContract.
     """
