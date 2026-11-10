@@ -444,6 +444,7 @@ class _Clock:
             "exposed_ms": round(exchange - attention, 1),
             "arriving_ms": round(totals["arriving"], 1),
             "landing_ms": round(totals["landing"], 1),
+            **turn.drain(),
         }
 
 
@@ -570,7 +571,10 @@ def _exchange(
         out = query.new_empty((batch, mine, padded, dim))
         sources = (query, key, value)
         crossed = True
+        marked = _Clock.mark(query)
         shift = _mean(key, total, handle) if narrow else None
+        if marked is not None:
+            turn._TIMED.append(("mean_ms", marked, _Clock.mark(query)))
 
         def send(start: int) -> tuple[Wait, list[Tensor]]:
             args = (sources, start, total, local, sent, rank, narrow, shift)

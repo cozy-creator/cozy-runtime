@@ -15,7 +15,7 @@ from __future__ import annotations
 import itertools
 from contextlib import AbstractContextManager, nullcontext
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import Tensor
@@ -40,6 +40,28 @@ _ORDERS = (64, 128)
 _TYPES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 #: The rows' dtype, by the kernels' `T` constexpr: it keys their entries
 _CODES = {torch.bfloat16: 0, torch.float16: 1}
+#: session variant: device ms of each kernel's launches, read and reset by `drain`
+STATS: dict[str, float] = {}
+_TIMED: list[tuple[str, Any, Any]] = []
+
+
+def _mark() -> Any:
+    event = torch.cuda.Event(enable_timing=True)
+    event.record()
+    return event
+
+
+def drain() -> dict[str, float]:
+    for kind, a, b in _TIMED:
+        b.synchronize()
+        STATS[kind] = STATS.get(kind, 0.0) + a.elapsed_time(b)
+        STATS[kind + "_n"] = STATS.get(kind + "_n", 0.0) + 1
+    _TIMED.clear()
+    found = {k: round(v, 1) for k, v in STATS.items()}
+    STATS.clear()
+    return found
+
+
 #: ±1 Sylvester matrices by device and order
 _SIGNS: dict[tuple[torch.device, int], Tensor] = {}
 
@@ -96,6 +118,7 @@ def narrow(
     held = (x, out, scale.expand(*lead, 1)) + (() if shift is None else (shift.expand_as(x),))
     sizes, strides = _lead(lead), [_strides(t) for t in held]
     grid = (triton.cdiv(x[..., 0].numel(), _ROWS),)
+    began = _mark()
     with _on(x):
         launch(
             _narrow_kernel, grid, x, out, scale, shift if shift is not None else scale,
@@ -103,6 +126,7 @@ def narrow(
             *(strides[3] if shift is not None else (0, 0, 0, 0)), torch.finfo(x.dtype).tiny,
             x.shape[-1] ** -0.5, x.shape[-1], int(shift is not None), _CODES[x.dtype], _ROWS,
         )  # fmt: skip
+    _TIMED.append(("narrow_ms", began, _mark()))
 
 
 def widen(launch: Launch | None, values: Tensor, scale: Tensor, out: Tensor) -> None:
@@ -113,12 +137,14 @@ def widen(launch: Launch | None, values: Tensor, scale: Tensor, out: Tensor) -> 
     lead = values.shape[:-1]
     strides = [_strides(t) for t in (values, scale.expand(*lead, 1), out)]
     grid = (triton.cdiv(values[..., 0].numel(), _ROWS),)
+    began = _mark()
     with _on(values):
         launch(
             _widen_kernel, grid, values, scale, out, signs(values.shape[-1], values.device),
             *_lead(lead), *strides[0], *strides[1], *strides[2], values.shape[-1] ** -0.5,
             values.shape[-1], _CODES[out.dtype], _ROWS,
         )  # fmt: skip
+    _TIMED.append(("widen_ms", began, _mark()))
 
 
 def _on(t: Tensor) -> AbstractContextManager[object]:
