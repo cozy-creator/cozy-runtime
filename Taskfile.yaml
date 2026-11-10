@@ -3,7 +3,7 @@ silent: true
 
 tasks:
   typecheck:
-    desc: basedpyright against the real dependencies; only errors missing from .basedpyright/baseline.json fail
+    desc: mypy --strict against the real dependencies; only errors missing from .mypy-baseline.txt fail (prune drops fixed ones)
     cmds:
       - scripts/typecheck.sh {{.CLI_ARGS}}
 

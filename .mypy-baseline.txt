@@ -1,0 +1,1729 @@
+checks/kernel_modules.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/_application_json.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/_application_json.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/_kernels/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/_kernels/__init__.py: [possibly-undefined] Name "_gemm" may be undefined
+src/cozy_runtime/_kernels/_norm.pyi: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/_concurrent.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/_concurrent.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/_concurrent.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/_concurrent.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/_concurrent.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/_concurrent.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/attention.py: [misc] Type of decorated function contains type "Any" ("Callable[[dict[str, Any] | None], _GeneratorContextManager[dict[str, Any], None, None]]")
+src/cozy_runtime/accel/fusion/__init__.py: [arg-type] Argument 1 to "report" has incompatible type "**dict[str, int]"; expected "str"
+src/cozy_runtime/accel/fusion/__init__.py: [attr-defined] "object" has no attribute "_cozy_lone"
+src/cozy_runtime/accel/fusion/__init__.py: [attr-defined] "object" has no attribute "_cozy_norm"
+src/cozy_runtime/accel/fusion/__init__.py: [attr-defined] "type" has no attribute "forward"
+src/cozy_runtime/accel/fusion/__init__.py: [call-arg] Too many arguments for "_attend"
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/__init__.py: [misc] Cannot assign to a type
+src/cozy_runtime/accel/fusion/__init__.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any], _GeneratorContextManager[None, None, None]]")
+src/cozy_runtime/accel/fusion/__init__.py: [redundant-expr] If condition is always true
+src/cozy_runtime/accel/fusion/__init__.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/accel/fusion/__init__.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/accel/fusion/__init__.py: [unreachable] Right operand of "and" is never evaluated
+src/cozy_runtime/accel/fusion/__init__.py: [unreachable] Statement is unreachable
+src/cozy_runtime/accel/fusion/__init__.py: [unreachable] Statement is unreachable
+src/cozy_runtime/accel/fusion/__init__.py: [unreachable] Statement is unreachable
+src/cozy_runtime/accel/fusion/_kernels.py: [attr-defined] "int" has no attribute "to"
+src/cozy_runtime/accel/fusion/_kernels.py: [attr-defined] "int" has no attribute "to"
+src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 10 to "channel_norm_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 11 to "channel_norm_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 11 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 12 to "channel_norm_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 12 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 13 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 14 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 15 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 15 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 16 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 16 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 17 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 17 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 18 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 18 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 19 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 19 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 2 to "_round" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 20 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 20 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 21 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 22 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 23 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 24 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 4 to "_normed" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 5 to "_normed" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 6 to "_normed" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 8 to "swiglu_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 9 to "channel_norm_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 9 to "swiglu_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/fusion/_kernels.py: [unreachable] Statement is unreachable
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/kernels.py: [misc] Type of decorated function contains type "Any" ("def (*tensors: Any) -> _GeneratorContextManager[None, None, None]")
+src/cozy_runtime/accel/kernels.py: [union-attr] Item "None" of "Any | None" has no attribute "_version"
+src/cozy_runtime/accel/lora.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/moe/__init__.py: [arg-type] Argument 1 to "_address" has incompatible type "Any | Tensor | Module"; expected "Tensor"
+src/cozy_runtime/accel/moe/__init__.py: [arg-type] Argument 1 to "_kind" has incompatible type "Tensor | Module"; expected Module
+src/cozy_runtime/accel/moe/__init__.py: [arg-type] Argument 1 to "_kind" has incompatible type "Tensor | Module"; expected Module
+src/cozy_runtime/accel/moe/__init__.py: [arg-type] Argument 2 to "reshape" of "TensorBase" has incompatible type "Any | Tensor | Module"; expected "int | SymInt"
+src/cozy_runtime/accel/moe/__init__.py: [arg-type] Argument 3 to "_gemv" of "Experts" has incompatible type "Any | Tensor | Module"; expected "int"
+src/cozy_runtime/accel/moe/__init__.py: [arg-type] Argument 3 to "_gemv" of "Experts" has incompatible type "Any | Tensor | int"; expected "int"
+src/cozy_runtime/accel/moe/__init__.py: [assignment] Incompatible types in assignment (expression has type "list[Any]", variable has type "Tensor | Module")
+src/cozy_runtime/accel/moe/__init__.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/accel/moe/__init__.py: [operator] "Tensor" not callable
+src/cozy_runtime/accel/moe/__init__.py: [operator] Unsupported operand types for % (Module and "int")
+src/cozy_runtime/accel/moe/__init__.py: [operator] Unsupported operand types for * ("int" and Module)
+src/cozy_runtime/accel/moe/__init__.py: [redundant-expr] If condition is always false
+src/cozy_runtime/accel/moe/__init__.py: [union-attr] Item "Tensor" of "Tensor | Module" has no attribute "in_features"
+src/cozy_runtime/accel/moe/__init__.py: [union-attr] Item "Tensor" of "Tensor | Module" has no attribute "in_features"
+src/cozy_runtime/accel/moe/__init__.py: [union-attr] Item "Tensor" of "Tensor | Module" has no attribute "out_features"
+src/cozy_runtime/accel/moe/__init__.py: [union-attr] Item "Tensor" of "Tensor | Module" has no attribute "out_features"
+src/cozy_runtime/accel/moe/__init__.py: [union-attr] Item "Tensor" of "Tensor | Module" has no attribute "scale"
+src/cozy_runtime/accel/moe/__init__.py: [union-attr] Item "Tensor" of "Tensor | Module" has no attribute "weight"
+src/cozy_runtime/accel/moe/__init__.py: [unreachable] Right operand of "and" is never evaluated
+src/cozy_runtime/accel/moe/__init__.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/accel/moe/__init__.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/accel/moe/_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/moe/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/accel/moe/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/accel/moe/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/accel/moe/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/accel/moe/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 10 to "experts_int8_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 10 to "grouped_bf16_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 11 to "experts_int8_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 11 to "grouped_bf16_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 12 to "grouped_bf16_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 12 to "grouped_int8_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 13 to "grouped_bf16_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 13 to "grouped_int8_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 14 to "grouped_bf16_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 14 to "grouped_int8_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 15 to "grouped_int8_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 16 to "grouped_int8_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 6 to "_tile" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 7 to "_tile" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 8 to "_tile" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 8 to "experts_bf16_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 9 to "_tile" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 9 to "experts_bf16_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/accel/moe/_kernels.py: [unreachable] Statement is unreachable
+src/cozy_runtime/accel/rows.py: [arg-type] Argument 1 to "get" of "dict" has incompatible type "Any | None"; expected "str"
+src/cozy_runtime/accel/rows.py: [arg-type] Argument 1 to "rows" has incompatible type "Tensor | Module"; expected Module
+src/cozy_runtime/accel/rows.py: [attr-defined] "Callable[..., Any]" has no attribute "_cozy_baked"
+src/cozy_runtime/accel/rows.py: [attr-defined] "Callable[..., Any]" has no attribute "lora_factors"
+src/cozy_runtime/accel/rows.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/rows.py: [index] Invalid index type "Tensor | Module" for "dict[str, tuple[frozenset[str], int]]"; expected type "str"
+src/cozy_runtime/accel/rows.py: [index] Value of type "Tensor | Module" is not indexable
+src/cozy_runtime/accel/rows.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/accel/rows.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/accel/rows.py: [operator] "Tensor" not callable
+src/cozy_runtime/accel/rows.py: [operator] "Tensor" not callable
+src/cozy_runtime/accel/rows.py: [operator] "Tensor" not callable
+src/cozy_runtime/accel/rows.py: [operator] "Tensor" not callable
+src/cozy_runtime/accel/rows.py: [operator] Unsupported operand types for - (Module and "int")
+src/cozy_runtime/accel/rows.py: [redundant-expr] If condition is always false
+src/cozy_runtime/accel/rows.py: [redundant-expr] If condition is always false
+src/cozy_runtime/accel/rows.py: [type-var] Value of type variable "SupportsRichComparisonT" of "min" cannot be "int | Tensor | Module"
+src/cozy_runtime/accel/rows.py: [union-attr] Item "Tensor" of "Tensor | Module" has no attribute "get"
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/accel/stepcache.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/accel/stepcache.py: [unreachable] Statement is unreachable
+src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_call_results.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_call_results.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_calls.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_calls.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_color.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_color.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_context.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_context.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_context.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_context.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_data.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_data.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_data.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_data.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_decode.py: [misc] Type of decorated function contains type "Any" ("Callable[[File, Any, str], _GeneratorContextManager[None, None, None]]")
+src/cozy_runtime/author/_defaults.py: [assignment] Incompatible types in assignment (expression has type "tuple[type[CollectionType], type[TupleType]]", variable has type "tuple[type[StructType], type[DataclassType], type[TypedDictType], type[DictType]]")
+src/cozy_runtime/author/_defaults.py: [assignment] Incompatible types in assignment (expression has type "tuple[type[IntType], type[FloatType], type[LiteralType]]", variable has type "tuple[type[StructType], type[DataclassType], type[TypedDictType], type[DictType]]")
+src/cozy_runtime/author/_defaults.py: [assignment] Incompatible types in assignment (expression has type "tuple[type[StrType], type[EnumType]]", variable has type "tuple[type[StructType], type[DataclassType], type[TypedDictType], type[DictType]]")
+src/cozy_runtime/author/_defaults.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_defaults.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_defaults.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_defaults.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_defaults.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_defaults.py: [no-any-return] Returning Any from function declared to return "str"
+src/cozy_runtime/author/_defaults.py: [operator] Unsupported operand types for - ("None" and "float")
+src/cozy_runtime/author/_defaults.py: [operator] Unsupported operand types for - ("None" and "int")
+src/cozy_runtime/author/_defaults.py: [operator] Unsupported operand types for - ("str" and "float")
+src/cozy_runtime/author/_defaults.py: [operator] Unsupported operand types for - ("str" and "int")
+src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_files.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_image.py: [redundant-expr] If condition is always true
+src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_loader.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_markers.py: [call-overload] No overload variant of "Meta" matches argument types "dict[str, object]", "dict[str, dict[str, object]]"
+src/cozy_runtime/author/_markers.py: [no-any-return] Returning Any from function declared to return "Meta"
+src/cozy_runtime/author/_markers.py: [redundant-expr] If condition is always true
+src/cozy_runtime/author/_markers.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_markers.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_markers.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_markers.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_recipes.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_recipes.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_services.py: [misc] Tuple index out of range
+src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_split.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_split.py: [possibly-undefined] Name "part" may be undefined
+src/cozy_runtime/author/_stage_memo.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_stage_memo.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_stage_memo.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_stage_memo.py: [misc] Type of decorated function contains type "Any" ("_Wrapped[[VarArg(Any), KwArg(Any)], Any, [Any, VarArg(object), KwArg(object)], object]")
+src/cozy_runtime/author/_walker.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/author/_weights.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/author/_weights.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/canonical_json.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/canonical_json.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/canonical_json.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/cli/image_prepare.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/derive/facade.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/facade.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/facade.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/facade.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/native_quantization.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/native_quantization.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/native_quantization.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/operations.py: [misc] Type of decorated function contains type "Any" ("def (*, source: Weights[Any], plan: QuantizationPlan, tel: Telemetry, max_relative_frobenius: float | None = ...) -> PendingCall[ModelArtifact]")
+src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/recipes.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/recipes.py: [misc] Type of decorated function contains type "Any" ("def (*, source: Weights[Any], lane: str, package: str, release: str, recipe: str = ..., tel: Telemetry) -> PendingCall[ModelArtifact]")
+src/cozy_runtime/derive/recipes.py: [misc] Type of decorated function contains type "Any" ("def (*, source: Weights[Any], model: Model[Any], lane: str, package: str, release: str, recipe: str = ..., tel: Telemetry) -> PendingCall[ModelArtifact]")
+src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [assignment] Incompatible types in assignment (expression has type "tuple[Any, Any] | None", variable has type "None")
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/__init__.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any, Any, Any], _GeneratorContextManager[_State, None, None]]")
+src/cozy_runtime/graphs/__init__.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any, Callable[[], object], Pool, Domain, int], tuple[Any, str]]")
+src/cozy_runtime/graphs/__init__.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any, Iterable[Any]], _GeneratorContextManager[None, None, None]]")
+src/cozy_runtime/graphs/__init__.py: [misc] Type of decorated function contains type "Any" ("_lru_cache_wrapper[Any]")
+src/cozy_runtime/graphs/__init__.py: [no-any-return] Returning Any from function declared to return "list[float]"
+src/cozy_runtime/graphs/__init__.py: [no-any-unimported] Base type TorchFunctionMode becomes "Any" due to an unfollowed import
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_fp8.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/attention_fp8.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 5 to "_amax" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 6 to "_amax" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 6 to "_cast" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 7 to "_amax" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 7 to "_cast" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 8 to "_cast" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_fp8.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/attention_kitchen_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_kitchen_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_kitchen_sol.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/attention_registry.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [no-any-unimported] Argument 5 to "finish_mean" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [no-any-unimported] Argument 6 to "finish_mean" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [no-any-unimported] Argument 7 to "finish_mean" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [no-any-unimported] Argument 7 to "partial_mean" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [no-any-unimported] Argument 8 to "partial_mean" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [no-any-unimported] Argument 9 to "partial_mean" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_sage3_fixed.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/attention_sage3_fixed.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/attention_sage3_fixed.py: [no-any-unimported] Argument 18 to "center_and_correct" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_sage3_fixed.py: [no-any-unimported] Argument 19 to "center_and_correct" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_sage3_fixed.py: [no-any-unimported] Argument 20 to "center_and_correct" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_site.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_site.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [assignment] Incompatible types in assignment (expression has type "Any | None", variable has type "Callable[..., Any]")
+src/cozy_runtime/internal/attention_sol.py: [assignment] Incompatible types in assignment (expression has type "_InstalledSite", variable has type "Tensor | Module")
+src/cozy_runtime/internal/attention_sol.py: [attr-defined] "Callable[..., Any]" has no attribute "__func__"
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_sol.py: [misc] Type of decorated function contains type "Any" ("Callable[[dict[str, Any], Path, Callable[..., None]], dict[str, object]]")
+src/cozy_runtime/internal/attention_sol.py: [misc] Type of decorated function contains type "Any" ("_Wrapped[[VarArg(Any), KwArg(Any)], Any, [Any, VarArg(Any), KwArg(Any)], Any]")
+src/cozy_runtime/internal/attention_sol.py: [misc] Type of decorated function contains type "Any" ("_lru_cache_wrapper[dict[str, Any]]")
+src/cozy_runtime/internal/attention_sol.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/attention_sol.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/attention_sol.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/internal/attention_sol.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/internal/attention_sol_fa4.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/attention_sol_fa4.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/attention_sol_fa4.py: [no-any-unimported] Argument 14 to "_approximate_and_merge" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_sol_fa4.py: [no-any-unimported] Argument 15 to "_approximate_and_merge" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_sol_fa4.py: [no-any-unimported] Argument 16 to "_approximate_and_merge" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_upstream.py: [arg-type] Argument 1 to "_first" has incompatible type "object"; expected "Tensor | tuple[Tensor, ...] | list[Tensor]"
+src/cozy_runtime/internal/attention_upstream.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_upstream.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/attention_upstream.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/attention_upstream.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/attention_upstream.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/internal/base_observation.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/cache_owners.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/cache_owners.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/cache_owners.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/cache_owners.py: [misc] Type of decorated function contains type "Any" ("Callable[[list[Any]], _GeneratorContextManager[bool, None, None]]")
+src/cozy_runtime/internal/call_types.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/canonical.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/contract.py: [misc] Type of decorated function contains type "Any" ("_Wrapped[[VarArg(Any), KwArg(Any)], Any, [VarArg(Any), KwArg(Any)], Any]")
+src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 10 to "_blocks_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 10 to "_code" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 10 to "_grid" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 11 to "_code" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 12 to "_code" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 13 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 13 to "_code" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 14 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 14 to "_code" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 15 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 15 to "_code" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 16 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 16 to "_code" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 16 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 17 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 17 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 18 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 18 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 19 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 19 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 20 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 20 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 21 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 21 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 22 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 22 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 23 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 24 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 24 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 25 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 25 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 26 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 27 to "_affine_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 27 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 28 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 29 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 30 to "_table_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 4 to "_word" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 5 to "_blocks_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 5 to "_by_post" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 5 to "_store" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 6 to "_blocks_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 7 to "_blocks_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 8 to "_blocks_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 8 to "_grid" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 9 to "_blocks_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 9 to "_grid" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Type of variable becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Type of variable becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_cores.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/decode_schemes.py: [no-any-unimported] Argument 4 to "_k_quant" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_schemes.py: [no-any-unimported] Argument 5 to "_k_quant" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/decode_schemes.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/delivery.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/derive.py: [redundant-cast] Redundant cast to Module
+src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore[assignment, method-assign]" comment
+src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore[assignment]" comment
+src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore[assignment]" comment
+src/cozy_runtime/internal/encoding/formats.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/formats.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/leaves.py: [call-arg] Too many arguments for "linear" of "EncodedLinear"
+src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/leaves.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/internal/encoding/selection.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/encoding/selection.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/__init__.py: [no-untyped-call] Call to untyped function "Event" in typed context
+src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/catch.py: [misc] Type of decorated function contains type "Any" ("_Wrapped[[VarArg(Any), KwArg(Any)], Any, [VarArg(object), KwArg(object)], object]")
+src/cozy_runtime/internal/execution/catch.py: [no-untyped-call] Call to untyped function "is_initialized" in typed context
+src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 1 to "len" has incompatible type "Tensor | Module"; expected "Sized"
+src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 1 to "peak" has incompatible type "Tensor | int"; expected "int"
+src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 2 to "peak" has incompatible type "tuple[int, Tensor | int]"; expected "Sequence[int]"
+src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 2 to "zip" has incompatible type "tuple[int, ...] | Tensor | Module"; expected "Iterable[Any]"
+src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 3 to "zip" has incompatible type "Tensor | Module"; expected "Iterable[Any]"
+src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 4 to "zip" has incompatible type "Tensor | Module"; expected "Iterable[Any]"
+src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 5 to "zip" has incompatible type "Tensor | Module"; expected "Iterable[Any]"
+src/cozy_runtime/internal/execution/cuts.py: [assignment] Incompatible types in assignment (expression has type "Callable[[Tensor, Tensor, Tensor | None], Tensor]", variable has type "def _conv_forward(self, input: Tensor, weight: Tensor, bias: Tensor | None) -> Any")
+src/cozy_runtime/internal/execution/cuts.py: [attr-defined] "type[Module]" has no attribute "_conv_forward"
+src/cozy_runtime/internal/execution/cuts.py: [attr-defined] "type[Module]" has no attribute "_conv_forward"
+src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/cuts.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/cuts.py: [method-assign] Cannot assign to a method
+src/cozy_runtime/internal/execution/cuts.py: [operator] Unsupported operand types for * ("int" and Module)
+src/cozy_runtime/internal/execution/phase.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/phase.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/phase.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/phase.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution/phase.py: [misc] Type of decorated function contains type "Any" ("Callable[[int | None, Literal['eager', 'capture', 'replay', 'preparation'], list[dict[str, Any]] | None, str | None], _GeneratorContextManager[Observation | None, None, None]]")
+src/cozy_runtime/internal/execution_evidence.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution_evidence.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/execution_evidence.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [arg-type] Argument 1 to "append" of "_Warnings" has incompatible type "tuple[str, dict[str, str]]"; expected "tuple[str, dict[str, str | bool | int | float | None]]"
+src/cozy_runtime/internal/executor.py: [arg-type] Argument 1 to "boundary" has incompatible type "object"; expected "Iterable[str] | None"
+src/cozy_runtime/internal/executor.py: [assignment] Incompatible types in assignment (expression has type "dict[str, Any] | None", variable has type "Request | None")
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/executor.py: [possibly-undefined] Name "torch" may be undefined
+src/cozy_runtime/internal/executor.py: [redundant-expr] If condition is always true
+src/cozy_runtime/internal/executor.py: [redundant-expr] If condition is always true
+src/cozy_runtime/internal/executor.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/internal/executor.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/internal/executor.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/internal/executor.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/executor.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/fp8_linear.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/internal/int8_linear.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/interface_wheel.py: [assignment] Incompatible types in assignment (expression has type "object", variable has type "str")
+src/cozy_runtime/internal/interface_wheel.py: [redundant-expr] If condition is always false
+src/cozy_runtime/internal/interface_wheel.py: [unreachable] Subclass of "str" and "dict[Any, Any]" cannot exist: have distinct disjoint bases
+src/cozy_runtime/internal/interface_wheel.py: [unreachable] Subclass of "str" and "list[Any]" cannot exist: have distinct disjoint bases
+src/cozy_runtime/internal/invocable_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/invocable_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/invocable_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/invocable_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/invocable_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_compile.py: [misc] Type of decorated function contains type "Any" ("Callable[[Path], _GeneratorContextManager[dict[str, Any], None, None]]")
+src/cozy_runtime/internal/kernel_ready.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/kernel_sources.py: [misc] Type of decorated function contains type "Any" ("Callable[[Mapping[str, Any], Path, Callable[[float], None]], dict[str, object]]")
+src/cozy_runtime/internal/kernel_sources.py: [misc] Type of decorated function contains type "Any" ("Callable[[Mapping[str, Any], Path, Callable[[float], None]], dict[str, object]]")
+src/cozy_runtime/internal/lora_bake.py: [arg-type] Argument 5 to "_account" has incompatible type "int"; expected "Tensor"
+src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/lora_bake.py: [no-any-unimported] Argument 10 to "_bake_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/lora_bake.py: [no-any-unimported] Argument 10 to "_bake_nvfp4_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/lora_bake.py: [no-any-unimported] Argument 11 to "_bake_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/lora_bake.py: [no-any-unimported] Argument 11 to "_bake_nvfp4_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/lora_bake.py: [no-any-unimported] Argument 9 to "_bake_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/lora_bake.py: [possibly-undefined] Name "data" may be undefined
+src/cozy_runtime/internal/lora_bake.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/lora_bake.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/lora_composition.py: [arg-type] Argument "lora_alpha" to "_Linear" has incompatible type "float"; expected "int"
+src/cozy_runtime/internal/lora_composition.py: [arg-type] Argument "lora_alpha" to "update_layer" of "LoraLayer" has incompatible type "float"; expected "int"
+src/cozy_runtime/internal/lora_composition.py: [arg-type] Argument "lora_alpha" to "update_layer" of "_ConvNd" has incompatible type "float"; expected "int"
+src/cozy_runtime/internal/lora_composition.py: [arg-type] Argument 1 to "_Magnitude" has incompatible type "int | Tensor | Module"; expected "int"
+src/cozy_runtime/internal/lora_composition.py: [arg-type] Argument 1 to "to" of "TensorBase" has incompatible type "dtype | Tensor | Module"; expected "dtype"
+src/cozy_runtime/internal/lora_composition.py: [arg-type] Argument 3 to "accumulate" has incompatible type "Tensor | Module"; expected "Tensor"
+src/cozy_runtime/internal/lora_composition.py: [arg-type] Argument 4 to "accumulate" has incompatible type "Tensor | Module"; expected "Tensor"
+src/cozy_runtime/internal/lora_composition.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/lora_composition.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/lora_composition.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/lora_composition.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/internal/lora_composition.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/internal/memo_implementation.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/memo_implementation.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/model_values.py: [redundant-cast] Redundant cast to Module
+src/cozy_runtime/internal/numerical_environment.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/numerical_environment.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/numerical_environment.py: [misc] Type of decorated function contains type "Any" ("Callable[[_Determinism, Any], _GeneratorContextManager[None, None, None]]")
+src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 1 to "signature" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 11 to "_gemv" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 12 to "_gemv" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 13 to "_gemv" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 2 to "_nibble" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 2 to "_weights" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 5 to "_gather" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 6 to "_gather" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 6 to "_packed" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 7 to "_scales" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 8 to "_decode" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 8 to "_dequant" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 9 to "_decode" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 9 to "_dequant" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/nvfp4_linear.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/pacing.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/package_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/package_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [arg-type] Argument "mesh" to "setup" of "ParallelConfig" has incompatible type "_GroupMesh"; expected "DeviceMesh | None"
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/cp.py: [no-untyped-call] Call to untyped function "get_active_backend" of "_AttentionBackendRegistry" in typed context
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/links.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/links.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/links.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/links.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/links.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/links.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/links.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/links.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/links.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/links.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/links.py: [possibly-undefined] Name "started" may be undefined
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/mirror.py: [misc] Type of decorated function contains type "Any" ("_Wrapped[[VarArg(Any), KwArg(Any)], Any, [VarArg(Any), KwArg(Any)], Any]")
+src/cozy_runtime/internal/parallel/mirror.py: [possibly-undefined] Name "result" may be undefined
+src/cozy_runtime/internal/parallel/ulysses.py: [attr-defined] Module "torch.distributed" does not explicitly export attribute "PrefixStore"
+src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/ulysses.py: [no-untyped-call] Call to untyped function "Event" in typed context
+src/cozy_runtime/internal/parallel/ulysses.py: [union-attr] Item "None" of "Work | None" has no attribute "wait"
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/philox.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/philox.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/philox.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/philox.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/philox.py: [no-any-unimported] Argument 5 to "_words_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/philox.py: [no-any-unimported] Argument 6 to "_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/philox.py: [no-any-unimported] Argument 7 to "_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/philox.py: [no-any-unimported] Argument 8 to "_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/philox.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/philox.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/prebuilt.py: [possibly-undefined] Name "want" may be undefined
+src/cozy_runtime/internal/prebuilt.py: [possibly-undefined] Name "want" may be undefined
+src/cozy_runtime/internal/prebuilt.py: [possibly-undefined] Name "x" may be undefined
+src/cozy_runtime/internal/prebuilt.py: [possibly-undefined] Name "x" may be undefined
+src/cozy_runtime/internal/prebuilt.py: [union-attr] Item "None" of "Any | None" has no attribute "data_ptr"
+src/cozy_runtime/internal/prebuilt.py: [union-attr] Item "None" of "Any | None" has no attribute "stride"
+src/cozy_runtime/internal/prepare_diagnostics.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/prepare_diagnostics.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/prepare_diagnostics.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/producers.py: [arg-type] Argument 1 to "Processor" has incompatible type "_Processor | Tensor | Module"; expected "_Processor"
+src/cozy_runtime/internal/producers.py: [operator] "Tensor" not callable
+src/cozy_runtime/internal/residency.py: [assignment] Incompatible types in assignment (expression has type "str", variable has type "_Part | None")
+src/cozy_runtime/internal/residency.py: [attr-defined] "AcceleratorError" has no attribute "error_code"
+src/cozy_runtime/internal/residency.py: [comparison-overlap] Non-overlapping equality check (left operand type: "_Part | None", right operand type: "str")
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/residency.py: [misc] Type of decorated function contains type "Any" ("def (self: Binding, stream: Any = ..., *, replay: bool = ...) -> _GeneratorContextManager[dict[Any, Any], None, None]")
+src/cozy_runtime/internal/residency.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/residency.py: [no-any-return] Returning Any from function declared to return "Tensor"
+src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "Event" in typed context
+src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "Event" in typed context
+src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "Event" in typed context
+src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "Event" in typed context
+src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "Event" in typed context
+src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "is_initialized" in typed context
+src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "is_initialized" in typed context
+src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "is_initialized" in typed context
+src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "is_initialized" in typed context
+src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "is_initialized" in typed context
+src/cozy_runtime/internal/residency.py: [override] Signature of "__repr__" incompatible with supertype "torch._tensor.Tensor"
+src/cozy_runtime/internal/residency.py: [override] Signature of "__torch_dispatch__" incompatible with supertype "torch._tensor.Tensor"
+src/cozy_runtime/internal/residency.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/internal/residency.py: [union-attr] Item "None" of "Any | None" has no attribute "use_cache"
+src/cozy_runtime/internal/residency.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/residency.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/residency.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/internal/residency.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/internal/residency.py: [var-annotated] Need type annotation for "rows" (hint: "rows: list[<type>] = ...")
+src/cozy_runtime/internal/sage3.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/sage3.py: [no-any-unimported] Argument 16 to "group_mean_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/sage3.py: [no-any-unimported] Argument 17 to "group_mean_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/sage3.py: [no-any-unimported] Argument 7 to "group_mean_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/seam.py: [redundant-expr] Left operand of "or" is always false
+src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/static_invocable.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/svdq_linear.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/svdq_linear.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/svdq_linear.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 10 to "_quantize" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 11 to "_quantize" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 12 to "_quantize" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 13 to "_quantize" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 17 to "_gemm" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 18 to "_gemm" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 19 to "_gemm" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 20 to "_gemm" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 21 to "_gemm" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 22 to "_gemm" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/svdq_linear.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/tolerant.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/tolerant.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/triton_kernels.py: [call-overload] No overload variant of "device" matches argument type "object"
+src/cozy_runtime/internal/triton_kernels.py: [call-overload] No overload variant of "device" matches argument type "object"
+src/cozy_runtime/internal/triton_kernels.py: [call-overload] No overload variant of "device" matches argument type "object"
+src/cozy_runtime/internal/triton_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/triton_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/triton_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/triton_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/triton_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/triton_kernels.py: [misc] Type of decorated function contains type "Any" ("Callable[[dict[str, Any], Path, Callable[[float], None]], dict[str, object]]")
+src/cozy_runtime/internal/triton_kernels.py: [misc] Type of decorated function contains type "Any" ("Callable[[dict[str, Any], Path, Callable[[float], None]], dict[str, object]]")
+src/cozy_runtime/internal/triton_kernels.py: [misc] Type of decorated function contains type "Any" ("_lru_cache_wrapper[dict[str, Any]]")
+src/cozy_runtime/internal/triton_kernels.py: [no-any-unimported] Argument 1 to "_compiled" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/triton_kernels.py: [no-any-unimported] Argument 1 to "_tuned" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/triton_kernels.py: [no-any-unimported] Argument 2 to "__call__" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/triton_kernels.py: [no-any-unimported] Argument 2 to "_compiled" becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/triton_kernels.py: [no-any-unimported] Argument 3 to "__init__" becomes "dict[str, Any]" due to an unfollowed import
+src/cozy_runtime/internal/triton_kernels.py: [no-any-unimported] Return type becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/triton_kernels.py: [no-any-unimported] Return type becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/triton_kernels.py: [no-any-unimported] Return type becomes "Any" due to an unfollowed import
+src/cozy_runtime/internal/triton_kernels.py: [no-any-unimported] Type of variable becomes "dict[int, Any]" due to an unfollowed import
+src/cozy_runtime/internal/triton_kernels.py: [no-any-unimported] Type of variable becomes "dict[str, Any]" due to an unfollowed import
+src/cozy_runtime/internal/triton_kernels.py: [unreachable] Statement is unreachable
+src/cozy_runtime/internal/verify.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/weights.py: [misc] List comprehension has incompatible type List[Callable[..., Any]]; expected List[LoRASource]
+src/cozy_runtime/internal/weights.py: [possibly-undefined] Name "down" may be undefined
+src/cozy_runtime/internal/weights.py: [possibly-undefined] Name "up" may be undefined
+src/cozy_runtime/internal/weights.py: [redundant-expr] If condition in comprehension is always false
+src/cozy_runtime/internal/zygote.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/zygote.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/internal/zygote.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any, int], _GeneratorContextManager[None, None, None]]")
+src/cozy_runtime/lm/__init__.py: [arg-type] Argument "layers" to "__init__" of "Cache" has incompatible type "list[_Keys | _State]"; expected "list[CacheLayerMixin | LinearAttentionCacheLayerMixin] | None"
+src/cozy_runtime/lm/__init__.py: [arg-type] Argument 1 to "_ids" has incompatible type "Constraint | None"; expected "Constraint"
+src/cozy_runtime/lm/__init__.py: [arg-type] Argument 1 to "append" of "_Warnings" has incompatible type "tuple[str, dict[str, str]]"; expected "tuple[str, dict[str, str | bool | int | float | None]]"
+src/cozy_runtime/lm/__init__.py: [arg-type] Argument 1 to "int" has incompatible type "Any | None"; expected "str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc"
+src/cozy_runtime/lm/__init__.py: [assignment] Incompatible types in assignment (expression has type "Tensor | None", variable has type "Tensor")
+src/cozy_runtime/lm/__init__.py: [attr-defined] "_StaticCache" has no attribute "draft"
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/__init__.py: [index] Value of type "Tensor | Module" is not indexable
+src/cozy_runtime/lm/__init__.py: [index] Value of type "Tensor | None" is not indexable
+src/cozy_runtime/lm/__init__.py: [index] Value of type "Tensor | None" is not indexable
+src/cozy_runtime/lm/__init__.py: [index] Value of type "Tensor | None" is not indexable
+src/cozy_runtime/lm/__init__.py: [index] Value of type "Tensor | None" is not indexable
+src/cozy_runtime/lm/__init__.py: [index] Value of type "Tensor | None" is not indexable
+src/cozy_runtime/lm/__init__.py: [index] Value of type "Tensor | None" is not indexable
+src/cozy_runtime/lm/__init__.py: [list-item] List item 0 has incompatible type "Tensor | None"; expected "Tensor"
+src/cozy_runtime/lm/__init__.py: [misc] Cannot assign to a type
+src/cozy_runtime/lm/__init__.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any], _GeneratorContextManager[None, None, None]]")
+src/cozy_runtime/lm/__init__.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any], _GeneratorContextManager[list[Any], None, None]]")
+src/cozy_runtime/lm/__init__.py: [no-any-return] Returning Any from function declared to return "int"
+src/cozy_runtime/lm/__init__.py: [no-untyped-call] Call to untyped function "Event" in typed context
+src/cozy_runtime/lm/__init__.py: [no-untyped-call] Call to untyped function "Event" in typed context
+src/cozy_runtime/lm/__init__.py: [no-untyped-call] Call to untyped function "__init_subclass__" in typed context
+src/cozy_runtime/lm/__init__.py: [operator] "Tensor" not callable
+src/cozy_runtime/lm/__init__.py: [operator] "Tensor" not callable
+src/cozy_runtime/lm/__init__.py: [operator] "Tensor" not callable
+src/cozy_runtime/lm/__init__.py: [operator] "Tensor" not callable
+src/cozy_runtime/lm/__init__.py: [possibly-undefined] Name "draft" may be undefined
+src/cozy_runtime/lm/__init__.py: [redundant-expr] Left operand of "and" is always true
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "conv_kernel_size"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "conv_kernel_size"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "conv_states"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "conv_states"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "device"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "device"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "dtype"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "dtype"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "has_previous_state"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "has_previous_state"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "is_conv_states_initialized"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "is_conv_states_initialized"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "is_recurrent_states_initialized"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "is_recurrent_states_initialized"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "recurrent_states"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "recurrent_states"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "LinearAttentionCacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "cumulative_length"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "None" of "Tensor | None" has no attribute "copy_"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "None" of "Tensor | None" has no attribute "shape"
+src/cozy_runtime/lm/__init__.py: [union-attr] Item "None" of "_Row | None" has no attribute "generated"
+src/cozy_runtime/lm/__init__.py: [unreachable] Statement is unreachable
+src/cozy_runtime/lm/__init__.py: [unreachable] Statement is unreachable
+src/cozy_runtime/lm/__init__.py: [unreachable] Statement is unreachable
+src/cozy_runtime/lm/__init__.py: [unreachable] Subclass of "list[dict[Any, Any]]" and "dict[Any, Any]" cannot exist: have distinct disjoint bases
+src/cozy_runtime/lm/__init__.py: [unreachable] Subclass of "list[dict[Any, Any]]" and "dict[Any, Any]" cannot exist: have distinct disjoint bases
+src/cozy_runtime/lm/__init__.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/lm/__init__.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/lm/__init__.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/lm/__init__.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/lm/__init__.py: [unused-ignore] Unused "type: ignore" comment
+src/cozy_runtime/lm/_kernels.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/lm/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/lm/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/lm/_kernels.py: [misc] Function is untyped after decorator transformation
+src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 10 to "conv_steps_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 11 to "conv_steps_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 21 to "recurrent_steps_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 22 to "recurrent_steps_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 23 to "recurrent_steps_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 7 to "conv_step_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 8 to "conv_step_kernel" becomes "Any" due to an unfollowed import
+src/cozy_runtime/lm/_kernels.py: [unreachable] Statement is unreachable
+src/cozy_runtime/vlm.py: [assignment] Incompatible types in assignment (expression has type "GenerationConfig", variable has type "Tensor | Module")
+src/cozy_runtime/vlm.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/vlm.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/vlm.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/vlm.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/vlm.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/vlm.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/vlm.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/vlm.py: [explicit-any] Explicit "Any" is not allowed
+src/cozy_runtime/vlm.py: [no-any-return] Returning Any from function declared to return Module
+src/cozy_runtime/vlm.py: [no-untyped-call] Call to untyped function "GenerationConfig" in typed context
+src/cozy_runtime/vlm.py: [no-untyped-call] Call to untyped function "from_config" of "_BaseAutoModelClass" in typed context
+src/cozy_runtime/vlm.py: [union-attr] Item "Tensor" of "Tensor | Module" has no attribute "eos_token_id"

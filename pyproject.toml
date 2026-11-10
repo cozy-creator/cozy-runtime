@@ -66,7 +66,7 @@ package = true
 tensorfs = { git = "https://github.com/cozy-creator/cozy-creator", rev = "a4f2f9545458efbb22cb3e0b36a110d21eb9a91d", subdirectory = "crates/tensorfs-py" }
 
 [tool.basedpyright]
-# scripts/typecheck.sh runs this against real torch, Diffusers, Transformers and TensorFS.
+# The editor's language server only; the required check is mypy (scripts/typecheck.sh).
 include = ["src", "checks", "examples"]
 extraPaths = ["src", "kernels/src", "examples/marco-polo"]
 pythonVersion = "3.12"
@@ -74,6 +74,9 @@ pythonPlatform = "Linux"
 typeCheckingMode = "standard"
 reportMissingModuleSource = false  # the native kernel modules ship as stubs
 
+# The required type check (scripts/typecheck.sh), against the real dependencies in
+# scripts/typecheck-requirements.txt. `Any` is an error; one a third-party boundary needs carries
+# `# type: ignore[explicit-any]  # <why>`. Known errors live in .mypy-baseline.txt, which only shrinks.
 [tool.mypy]
 python_version = "3.12"
 files = ["src", "checks", "examples"]
@@ -82,44 +85,17 @@ mypy_path = "src:checks:examples/marco-polo:kernels/src"
 strict = true
 warn_unreachable = true
 disallow_any_generics = true
+disallow_any_explicit = true
+disallow_any_unimported = true
+disallow_any_decorated = true
 implicit_reexport = false
+enable_error_code = ["ignore-without-code", "possibly-undefined", "redundant-expr", "truthy-bool"]
 
-# torch is an OPTIONAL extra (§1.0: the base package is torch-free), so the checking venv
-# does not have it and mypy cannot see its types. The consequence is recorded rather than
-# papered over: the two modules that touch torch are checked without unused-ignore warnings
-# and with torch itself untyped.
+# Untyped libraries (no py.typed): Triton, and `kernels` (cr-114), the image's loader for baked Hub
+# kernels, which only executors have.
 [[tool.mypy.overrides]]
-module = ["torch.*", "peft.*", "triton.*", "numpy.*", "transformers.*", "tokenizers", "tokenizers.*"]
+module = ["triton", "triton.*", "kernels"]
 ignore_missing_imports = true
-
-# `av` is the `media` OPTIONAL extra, exactly like torch: the base package is media-free
-# and the checking venv does not install it. The consequence is recorded rather than
-# papered over — the two modules that touch PyAV are checked with PyAV untyped.
-[[tool.mypy.overrides]]
-module = ["av", "av.*"]
-ignore_missing_imports = true
-
-# TensorFS is a required typed dependency, including the public native record aliases.
-# Missing bindings must fail type checking rather than silently becoming Any.
-
-[[tool.mypy.overrides]]
-module = [
-    "huggingface_hub",
-    "diffusers",
-    "diffusers.*",
-    # `kernels` (cr-114): the image's loader for baked Hub kernels; in the executor's
-    # environment, never the checking venv.
-    "kernels",
-    "safetensors",
-    "safetensors.*",
-    "PIL",
-    "PIL.*",
-]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["cozy_runtime.internal.derive"]
-warn_unused_ignores = false
 
 [project.optional-dependencies]
 assessment = ["cozy-eval>=0.7"]
