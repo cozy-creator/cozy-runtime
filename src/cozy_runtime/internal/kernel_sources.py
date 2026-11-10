@@ -109,6 +109,9 @@ class BuildSpec(TypedDict):
     sm: NotRequired[int]
     sources: dict[str, SourceRow]
     build_deps: NotRequired[dict[str, SourceRow]]
+    #: the machine's compile ledger and the job's key digest, added by the compile manager
+    ledger: str
+    key: str
 
 
 class _Index(TypedDict):
