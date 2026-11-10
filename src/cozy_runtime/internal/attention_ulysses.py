@@ -55,7 +55,8 @@ class Local:
     query block a call may be cut at and compute each row as whole (memory's `attend` cut);
     0 where the kernel needs every query row at once (a scale or mean over the sequence).
     `refusal`: why its row does not serve a call, or empty; such a call runs on `instead`, a
-    (backend, kernel) whose row serves every call.
+    (backend, kernel) whose row serves every call. `narrow`: it quantizes Q and V to int8 or
+    narrower itself, so under Ulysses they cross as int8 (`internal.parallel.ulysses.exchange`).
     """
 
     forward: Callable[..., Tensor]
@@ -64,6 +65,7 @@ class Local:
     rows: int = 0
     refusal: Callable[..., str] | None = None
     instead: tuple[str, Local] | None = None
+    narrow: bool = False
 
 
 class Seen(dict[str, set[str]]):
@@ -191,9 +193,25 @@ def _dispatch(backend: str, local: Local) -> Callable[..., Tensor]:
             value,
             group(_parallel_config),
             lambda q, k, v: _call(backend, local, q, k, v, options),
+            narrow=_narrow(local, query, options),
         )
 
     return attention
+
+
+def _narrow(local: Local, query: Tensor, options: Options) -> Callable[[int], bool]:
+    """Whether a Ulysses call of `total` tokens crosses as int8: LOCAL quantizes Q and V itself
+    and serves the whole call, which `_call` would otherwise hand to its `instead`."""
+
+    def narrow(total: int) -> bool:
+        if not local.narrow:
+            return False
+        if local.refusal is None or local.instead is None or local.instead[1].narrow:
+            return True
+        whole = query.new_empty((query.shape[0], total, 1, query.shape[3]), device="meta")
+        return not local.refusal(whole, whole, options)
+
+    return narrow
 
 
 def _call(
@@ -238,12 +256,13 @@ def exchange(
     handle: ProcessGroup,
     compute: Callable[[Tensor, Tensor, Tensor], Tensor],
     site: str = "",
+    narrow: bool | Callable[[int], bool] = False,
 ) -> Tensor:
     """Sequence shards -> full sequence per head subset -> `compute` -> back
     (`internal.parallel.ulysses.exchange`)."""
     if _EXCHANGE is None:
         raise ValueError(_UNSERVED)
-    return _EXCHANGE(query, key, value, handle, compute, site)
+    return _EXCHANGE(query, key, value, handle, compute, site, narrow)
 
 
 _UNSERVED = "Ulysses runs where torch does: nothing imported internal.parallel.ulysses"
