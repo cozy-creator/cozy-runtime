@@ -2,10 +2,12 @@
 roots, read as `ast` like the rest of the static reader, executing nothing of it.
 
 A construct that harms the process a package shares is refused in one line, `file:line: <rule>:
-<construct>: <the harm>`. Only harm is judged, never the shape of the code: loops, attention
-calls, host reads and waits, threads and library decode are the author's. Names resolve through each
-file's imports, its own package's re-exports and single-assignment aliases; an attribute of an
-object (`self.vae.decode`) is not judged here: the executor's seal catches those calls."""
+<construct>: <why, and what to do instead>`. Only harm is judged, never the shape of the code:
+loops, attention calls, host reads and waits, threads, library decode, and ordinary torch that
+means nothing here (the seal makes it a no-op or scopes it to the request) are the author's.
+Names resolve through each file's imports, its own package's re-exports and single-assignment
+aliases; an attribute of an object (`self.vae.decode`) is not judged here: the executor's seal
+catches those calls."""
 
 from __future__ import annotations
 
@@ -40,7 +42,8 @@ def _names(rule: str, names: str) -> dict[str, str]:
 
 
 _EXEC = " ".join(f"os:{k}{s}" for k in ("exec", "spawn") for s in _words("l le lp lpe v ve vp vpe"))
-#: Dotted names, and every name under them, by rule.
+#: Dotted names, and every name under them, by rule. Ordinary torch that means nothing under the
+#: Runtime (compile, empty_cache, streams, events, seeds, numerics flags) is the seal's to absorb.
 _NAMED: dict[str, str] = {
     **_names("oom_catch", "torch.OutOfMemoryError cuda:OutOfMemoryError"),
     **_names(
@@ -53,48 +56,21 @@ _NAMED: dict[str, str] = {
     ),
     **_names(
         "allocator",
-        """cuda:empty_cache cuda:reset_peak_memory_stats cuda:reset_max_memory_allocated
-        cuda:reset_max_memory_cached cuda:reset_accumulated_memory_stats
-        cuda:set_per_process_memory_fraction cuda:caching_allocator_alloc
-        cuda:caching_allocator_delete cuda:change_current_allocator cuda:CUDAPluggableAllocator
-        cuda:MemPool cuda:use_mem_pool torch.cuda.memory._set_allocator_settings
-        torch.mps.empty_cache torch.mps.set_per_process_memory_fraction""",
+        """cuda:caching_allocator_alloc cuda:caching_allocator_delete cuda:change_current_allocator
+        cuda:CUDAPluggableAllocator cuda:MemPool cuda:use_mem_pool
+        torch.cuda.memory._set_allocator_settings cuda.bindings cuda.cuda cuda.cudart cuda.core
+        pycuda""",
     ),
     **_names("env_write", "os:putenv os:unsetenv"),
     **_names(
-        "global_flag",
-        """torch.set_float32_matmul_precision torch.set_default_dtype torch.set_default_device
-        torch.set_default_tensor_type torch.use_deterministic_algorithms
-        torch.set_deterministic_debug_mode torch.set_flush_denormal
-        torch.backends.cuda.enable_flash_sdp torch.backends.cuda.enable_mem_efficient_sdp
-        torch.backends.cuda.enable_math_sdp torch.backends.cuda.enable_cudnn_sdp
-        torch.backends.cuda.sdp_kernel torch.backends.cuda.preferred_linalg_library
-        torch.backends.cuda.preferred_blas_library torch.backends.cudnn.flags
-        torch.backends.mkldnn.flags torch.nn.attention.sdpa_kernel""",
+        "cuda_graph",
+        """torch.cuda.CUDAGraph torch.cuda.graph torch.cuda.graph_pool_handle
+        torch.cuda.graphs.CUDAGraph torch.cuda.graphs.graph torch.cuda.graphs.graph_pool_handle""",
     ),
-    **_names(
-        "own_stream",
-        """torch.cuda.Stream torch.cuda.Event torch.cuda.ExternalStream torch.cuda.StreamContext
-        torch.cuda.stream torch.cuda.streams torch.cuda.set_stream
-        torch.cuda.CUDAGraph torch.cuda.graph torch.cuda.graphs torch.cuda.graph_pool_handle
-        torch.cuda.make_graphed_callables torch.cuda.set_device torch.cuda.device
-        torch.cuda.device_of torch.Stream torch.Event
-        torch.accelerator.set_stream
-        torch.accelerator.set_device_index torch.accelerator.set_device_idx
-        torch.mps.Event cuda.bindings cuda.cuda cuda.cudart cuda.core pycuda""",
-    ),
-    **_names("compile", "torch.compile torch._dynamo torch._inductor triton.autotune"),
     **_names(
         "weights_io",
         """huggingface_hub safetensors.safe_open safetensors.torch.load_file
         safetensors.numpy.load_file torch.load torch.hub numpy.load""",
-    ),
-    **_names(
-        "global_rng",
-        """torch.manual_seed torch.seed torch.default_generator torch.set_rng_state torch.random
-        torch.cuda.manual_seed torch.cuda.manual_seed_all torch.cuda.seed torch.cuda.seed_all
-        torch.cuda.set_rng_state torch.cuda.set_rng_state_all torch.cuda.default_generators
-        torch.cuda.random numpy.random.seed""",
     ),
     **_names(
         "process",
@@ -109,12 +85,6 @@ _NAMED: dict[str, str] = {
 _READS = frozenset({"torch.cuda.CUDAGraph.get_currently_capturing_graph"})
 #: `cozy_runtime`'s own machinery: every other module of it is the author's to import.
 _INTERNAL = _words("internal graphs cli")
-#: Draws that are not the global stream: a generator built from a seed.
-_SEEDED = frozenset({"Random", "SystemRandom"})
-_NUMPY_SEEDED = _words(
-    """default_rng Generator RandomState SeedSequence BitGenerator PCG64 PCG64DXSM Philox MT19937
-    SFC64"""
-)
 _ENVIRON_WRITES = frozenset({"setdefault", "update", "pop", "popitem", "clear", "__setitem__"})
 _WEIGHT_FILES = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf")
 
@@ -353,10 +323,6 @@ class _File:
             private = any(p.startswith("_") and not p.startswith("__") for p in parts[1:])
             internal = private or (len(parts) > 1 and parts[1] in _INTERNAL)
             return "internal_import" if internal else None
-        if parts[0] == "random" and len(parts) > 1 and parts[1] not in _SEEDED:
-            return "global_rng"
-        if parts[:2] == ["numpy", "random"] and len(parts) > 2 and parts[2] not in _NUMPY_SEEDED:
-            return "global_rng"
         if dotted in _READS:
             return None
         for cut in range(len(parts), 0, -1):
@@ -381,16 +347,8 @@ class _File:
         if isinstance(func, ast.Attribute):
             if func.attr in ("from_pretrained", "from_single_file"):
                 self._add(node, "weights_io", f".{func.attr}(...)")
-            if func.attr in ("wait_stream", "wait_event", "record_event") and (
-                isinstance(func.value, ast.Call)
-                and self._resolve(func.value.func)
-                in ("torch.cuda.current_stream", "torch.cuda.default_stream")
-            ):
-                self._add(node, "own_stream", f"current_stream().{func.attr}()")
             if func.attr in _ENVIRON_WRITES and self._resolve(func.value) == "os.environ":
                 self._add(node, "env_write", f"os.environ.{func.attr}(...)")
-        if dotted == "torch.Generator" and self._device_generator(node):
-            self._add(node, "device_rng", "torch.Generator(device=<not cpu>)")
         name = func.id if isinstance(func, ast.Name) and func.id not in self.aliases else None
         opens = name == "open" or dotted in ("io.open", "builtins.open")
         if opens and node.args and (suffix := _literal_suffix(node.args[0])) is not None:
@@ -402,24 +360,14 @@ class _File:
 
     def _store(self, node: ast.Assign | ast.AugAssign | ast.AnnAssign | ast.Delete) -> None:
         targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
-        value = getattr(node, "value", None)
         for target in (t for each in targets for t in _unpacked(each)):
             if isinstance(target, ast.Subscript) and self._resolve(target.value) == "os.environ":
                 self._add(target, "env_write", "os.environ[...]")
             elif isinstance(target, ast.Attribute):
                 if target.attr == "PURE_WINDOWS":
                     self._add(target, "internal_import", "PURE_WINDOWS")
-                dotted = self._resolve(target)
-                if dotted is None:
-                    continue
-                if dotted == "os.environ":
+                if self._resolve(target) == "os.environ":
                     self._add(target, "env_write", "os.environ")
-                elif dotted == "torch.backends.cudnn.benchmark" and (
-                    isinstance(value, ast.Constant) and value.value is True
-                ):
-                    self._add(target, "compile", "torch.backends.cudnn.benchmark = True")
-                elif dotted.startswith("torch.backends."):
-                    self._add(target, "global_flag", f"{dotted} = ...")
             elif (
                 isinstance(target, ast.Name)
                 and target.id == "PURE_WINDOWS"
@@ -437,17 +385,6 @@ class _File:
             ):
                 self._add(node, "oom_catch", f'except ...: "{inner.value.strip()[:40]}"')
                 return
-
-    def _device_generator(self, node: ast.Call) -> bool:
-        device = node.args[0] if node.args else None
-        for keyword in node.keywords:
-            if keyword.arg == "device":
-                device = keyword.value
-        if device is None:
-            return False
-        if isinstance(device, ast.Call) and self._resolve(device.func) == "torch.device":
-            device = device.args[0] if device.args else device
-        return not (isinstance(device, ast.Constant) and device.value == "cpu")
 
     def _add(self, node: ast.AST, code: str, construct: str) -> None:
         line = getattr(node, "lineno", 0)

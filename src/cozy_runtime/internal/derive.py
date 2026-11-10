@@ -117,38 +117,31 @@ def _wrapped(tensor: object) -> tuple[object, ...]:
 
 
 @contextmanager
-def refuse_compile() -> Iterator[None]:
-    """`torch.compile(module)` and `nn.Module.compile` REFUSE during construction, naming
-    themselves.
-
-    The wrapping spelling returns an `OptimizedModule` whose every `state_dict` key gains an
-    `_orig_mod.` prefix, so the derived tensor requirements would demand `blk._orig_mod.weight`
-    from checkpoints that carry `blk.weight` — a construction no artifact satisfies. The lazy
-    `nn.Module.compile` is refused for a different reason: derive is derive-by-execution, so
-    the callable it installs would trace under fake tensors and launch real kernels on fake
-    pointers (pgw#1659, the day v1's neutered-to-eager compile killed a CUDA context
-    process-wide). Neither refusal reaches the invocation path, and neither is a ruling that
-    `torch.compile` cannot ship.
-    """
+def no_compile() -> Iterator[None]:
+    """`torch.compile(module)` is `module` and `nn.Module.compile` does nothing during
+    construction, as under the executor's seal: compiling here would rename every destination
+    with an `_orig_mod.` prefix (no checkpoint matches it), and the lazy method would trace under
+    fake tensors (pgw#1659). Under the seal (`contract`) they already are, with a run warning."""
     torch = torch_module()
+    if hasattr(torch.compile, "__contract_original__"):
+        yield
+        return
     original = torch.compile
     original_method = torch.nn.Module.compile
-    why = (
-        "compiling during construction renames every destination with an `_orig_mod.` "
-        "prefix, so the derived tensor requirements matches no checkpoint. Compilation is a "
-        "runtime plan decision, never a construction fact — delete the call from load()"
-    )
 
-    def refuse(*args: object, **kwargs: object) -> object:
-        raise ConstructionFault("torch.compile", why, site=_author_site())
+    def compiled(model: object = None, *_: object, **__: object) -> object:
+        return model if model is not None else (lambda inner: inner)
 
-    torch.compile = refuse  # type: ignore[assignment,attr-defined]
-    torch.nn.Module.compile = refuse  # type: ignore[assignment,method-assign]
+    def nothing(*_: object, **__: object) -> None:
+        return None
+
+    torch.compile = compiled
+    torch.nn.Module.compile = nothing
     try:
         yield
     finally:
-        torch.compile = original  # type: ignore[assignment,attr-defined]
-        torch.nn.Module.compile = original_method  # type: ignore[method-assign]
+        torch.compile = original
+        torch.nn.Module.compile = original_method
 
 
 @dataclass(slots=True)
@@ -529,7 +522,7 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         stack.callback(FILLED.reset, FILLED.set(seen.fill))
         stack.callback(built)  # constants a construction outside `loader.construct` made
         stack.callback(BUILT.reset, BUILT.set(built))
-        stack.enter_context(refuse_compile())
+        stack.enter_context(no_compile())
         stack.enter_context(_capability(cap))
         stack.enter_context(_guard_mode(seen))
         yield cap
