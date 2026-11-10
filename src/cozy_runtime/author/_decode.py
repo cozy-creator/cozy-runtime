@@ -24,7 +24,7 @@ from itertools import chain
 from numbers import Integral
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, cast, overload
 
 import PIL.Image
 from PIL.Image import DecompressionBombError, Resampling, Transpose
@@ -39,6 +39,16 @@ from cozy_runtime.author._errors import AuthorError, CapabilityError, InvalidReq
 from cozy_runtime.author._markers import ImagePreparation, seconds
 
 if TYPE_CHECKING:
+    from av.audio.frame import AudioFrame
+    from av.audio.layout import AudioLayout
+    from av.audio.resampler import AudioResampler
+    from av.audio.stream import AudioStream
+    from av.codec.context import CodecContext
+    from av.container import InputContainer
+    from av.video.frame import VideoFrame
+    from av.video.reformatter import VideoReformatter
+    from av.video.stream import VideoStream
+
     from cozy_runtime.author._files import AudioFile, File, ImageFile, VideoFile
 
 
@@ -369,7 +379,7 @@ class _AudioStreamDecoder:
     def __init__(
         self,
         av: ModuleType,
-        stream: Any,
+        stream: AudioStream,
         limits: DecodeLimits,
         budget: _Budget,
         note: _Note,
@@ -390,7 +400,7 @@ class _AudioStreamDecoder:
         self._skip = 0
         self._keep: int | None = None
         self._decoded = 0
-        self._resampler: Any | None = None
+        self._resampler: AudioResampler | None = None
         self._source = ""
         self._shift = Fraction(0)
         self._time_base: Fraction | None = None
@@ -414,7 +424,7 @@ class _AudioStreamDecoder:
         """Whether every sample before `end` is already read."""
         return self._keep is not None and self._decoded >= self._keep
 
-    def _lock_format(self, frame: Any) -> None:
+    def _lock_format(self, frame: AudioFrame) -> None:
         self.sample_rate = int(frame.sample_rate or 0)
         self._source = str(frame.layout.name)
         self.channel_layout, self.channel_names = _kept_layout(frame.layout)
@@ -433,7 +443,7 @@ class _AudioStreamDecoder:
             format="fltp", layout=self.channel_layout, rate=self.sample_rate
         )
 
-    def decode(self, frame: Any) -> DecodedAudioChunk | None:
+    def decode(self, frame: AudioFrame) -> DecodedAudioChunk | None:
         """One validated chunk, or None when nothing of this frame precedes `end`."""
         if frame.is_corrupt:
             self._note("a damaged audio frame was dropped")
@@ -500,7 +510,7 @@ class _AudioStreamDecoder:
 
         assert self._resampler is not None
         converted = self._resampler.resample(frame)
-        converted = list(converted) if converted is not None else []
+        converted = list(converted) if converted is not None else []  # type: ignore[redundant-expr]  # PyAV < 19
         if sum(int(out.samples) for out in converted) != samples:
             raise MediaDecodeError(
                 "native-rate audio conversion changed the sample clock", code="audio_format"
@@ -564,7 +574,7 @@ class _AudioStreamDecoder:
                 "native-rate audio conversion left unclocked samples", code="media_clock"
             )
 
-    def chunks(self, frames: Iterator[Any]) -> Iterator[DecodedAudioChunk]:
+    def chunks(self, frames: Iterator[AudioFrame]) -> Iterator[DecodedAudioChunk]:
         """Decode until EOF or `end`; the demux stops at the cut."""
         for frame in frames:
             chunk = self.decode(frame)
@@ -575,7 +585,7 @@ class _AudioStreamDecoder:
         self.finish()
 
 
-def _kept_layout(layout: Any) -> tuple[str, tuple[str, ...]]:
+def _kept_layout(layout: AudioLayout) -> tuple[str, tuple[str, ...]]:
     """The layout a read gives: the source's, or stereo for anything wider, which every reader and
     the MP4 writer take."""
     if len(layout.channels) > 2:
@@ -583,12 +593,12 @@ def _kept_layout(layout: Any) -> tuple[str, tuple[str, ...]]:
     return str(layout.name), tuple(str(channel.name) for channel in layout.channels)
 
 
-def _stream_audio_format(stream: Any, limits: DecodeLimits) -> DecodedAudioFormat:
+def _stream_audio_format(stream: AudioStream, limits: DecodeLimits) -> DecodedAudioFormat:
     context = stream.codec_context
     sample_rate = int(context.sample_rate or 0)
     time_base = _positive_fraction(stream.time_base, "audio stream time base")
     layout = context.layout
-    channel_layout, channel_names = _kept_layout(layout) if layout is not None else ("", ())
+    channel_layout, channel_names = _kept_layout(layout) if layout is not None else ("", ())  # type: ignore[redundant-expr]  # unset layout
     channels = len(channel_names)
     if sample_rate <= 0 or not channel_layout or not channels:
         raise MediaDecodeError("audio header has no valid native rate/layout", code="audio_format")
@@ -606,7 +616,7 @@ class _Picture:
     """One validated, not yet converted picture and its exact presentation interval."""
 
     clock: _VideoClock
-    frame: Any
+    frame: VideoFrame | None
     pts: int
     duration: int
     color: tuple[int, int, int, int]
@@ -637,7 +647,7 @@ class _VideoClock:
     def __init__(
         self,
         av: ModuleType,
-        stream: Any,
+        stream: VideoStream,
         limits: DecodeLimits,
         end: Fraction | None,
         note: _Note,
@@ -686,7 +696,7 @@ class _VideoClock:
         assert self.origin is not None and self.time_base is not None
         return self.origin * self.time_base
 
-    def _check(self, frame: Any) -> _Picture | None:
+    def _check(self, frame: VideoFrame) -> _Picture | None:
         """A frame on the stream's clock, at its first size and colour, with a warning for what
         it took to get there; None for one that runs backwards in time."""
         if frame.is_corrupt:
@@ -751,7 +761,7 @@ class _VideoClock:
         rate = self.nominal_frame_rate
         return max(1, _half_up(1 / (rate * self.time_base))) if rate else 1
 
-    def _ends(self, frame: Any, pending: _Picture) -> bool:
+    def _ends(self, frame: VideoFrame, pending: _Picture) -> bool:
         """Whether `frame` starts at or after `end`; then its start ends `pending`."""
         if self._end is None or frame.pts is None or frame.time_base is None:
             return False
@@ -764,14 +774,14 @@ class _VideoClock:
         pending.duration = pts - pending.pts
         return True
 
-    def _from_start(self, frames: Iterator[Any]) -> Iterator[Any]:
+    def _from_start(self, frames: Iterator[VideoFrame]) -> Iterator[VideoFrame]:
         """The frames from the one showing at `start`; those before it are only decoded."""
         assert self._start is not None and self._origin_time is not None
         target = self._origin_time + self._start
         previous = None
         for frame in frames:
             known = frame.pts is not None and frame.time_base is not None
-            if known and frame.pts * Fraction(frame.time_base) <= target:
+            if known and frame.pts * Fraction(frame.time_base) <= target:  # type: ignore[call-overload]  # AVRational is a Rational
                 previous = frame
                 continue
             if previous is not None:
@@ -782,7 +792,7 @@ class _VideoClock:
         if previous is not None:
             yield previous
 
-    def pictures(self, frames: Iterator[Any]) -> Iterator[_Picture]:
+    def pictures(self, frames: Iterator[VideoFrame]) -> Iterator[_Picture]:
         pending: _Picture | None = None
         if self._start is not None:
             frames = self._from_start(frames)
@@ -853,7 +863,9 @@ class _VideoClock:
 _Event = DecodedMediaHeader | _Picture | DecodedAudioChunk
 
 
-def _first_stream(streams: list[Any], kind: str, note: _Note | None = None) -> Any:
+def _first_stream[S: (AudioStream, VideoStream)](
+    streams: list[S], kind: str, note: _Note | None = None
+) -> S:
     """A file's first stream of a kind; it needs one."""
     if not streams:
         _required_stream(kind)
@@ -862,17 +874,31 @@ def _first_stream(streams: list[Any], kind: str, note: _Note | None = None) -> A
     return streams[0]
 
 
-def _soundtrack(container: Any, note: _Note | None = None) -> Any | None:
+def _soundtrack(container: InputContainer, note: _Note | None = None) -> AudioStream | None:
     streams = list(container.streams.audio)
     return _first_stream(streams, "audio", note) if streams else None
 
 
-def _decoded(av: ModuleType, container: Any, stream: Any, note: _Note) -> Iterator[Any]:
+@overload
+def _decoded(
+    av: ModuleType, container: InputContainer, stream: AudioStream, note: _Note
+) -> Iterator[AudioFrame]: ...
+
+
+@overload
+def _decoded(
+    av: ModuleType, container: InputContainer, stream: VideoStream, note: _Note
+) -> Iterator[VideoFrame]: ...
+
+
+def _decoded(
+    av: ModuleType, container: InputContainer, stream: AudioStream | VideoStream, note: _Note
+) -> Iterator[AudioFrame | VideoFrame]:
     """A stream's frames, as `container.decode` gives them, past any packet the decoder can't read,
     which is skipped with a warning as ffmpeg skips it."""
     for packet in container.demux(stream):
         try:
-            frames = packet.decode()
+            frames = cast("list[AudioFrame | VideoFrame]", packet.decode())  # its stream's kind
         except av.FFmpegError:
             note(f"a damaged {stream.type} packet was skipped")
             continue
@@ -881,8 +907,8 @@ def _decoded(av: ModuleType, container: Any, stream: Any, note: _Note) -> Iterat
 
 def _audio_events(
     av: ModuleType,
-    container: Any,
-    stream: Any,
+    container: InputContainer,
+    stream: AudioStream,
     limits: DecodeLimits,
     budget: _Budget,
     note: _Note,
@@ -1008,12 +1034,12 @@ def _media_events(
 
 
 def _seek(
-    av: ModuleType, container: Any, stream: Any, target: Fraction, note: _Note
-) -> Iterator[Any] | None:
+    av: ModuleType, container: InputContainer, stream: VideoStream, target: Fraction, note: _Note
+) -> Iterator[VideoFrame] | None:
     """The stream's frames from the keyframe at or before `target` seconds, or None when a
     seek does not reach one that starts by then and decodes."""
     if stream.time_base is None:
-        return None
+        return None  # type: ignore[unreachable]  # PyAV's stub omits an unset time base
     at = target
     for _ in range(2):
         container.seek(math.floor(at / stream.time_base), stream=stream, backward=True)
@@ -1024,7 +1050,7 @@ def _seek(
             return None
         if first is None or first.pts is None or first.time_base is None:
             return None
-        begins = first.pts * Fraction(first.time_base)
+        begins = first.pts * Fraction(first.time_base)  # type: ignore[call-overload]  # AVRational is a Rational
         if begins <= target:
             return chain([first], frames)
         # A container indexes keyframes by decode time, so a reordered one can start after it.
@@ -1554,7 +1580,9 @@ def _collect_video(
     )
 
 
-def _stream_duration(av: ModuleType, container: Any, stream: Any) -> Fraction:
+def _stream_duration(
+    av: ModuleType, container: InputContainer, stream: AudioStream | VideoStream
+) -> Fraction:
     """A stream's presentation length from its header, else the container's (Matroska
     records only that), else from a packet scan without decoding (live WebM)."""
     time_base = _positive_fraction(stream.time_base, f"{stream.type} stream time base")
@@ -1807,8 +1835,8 @@ def decode_image_path(
 
 
 def _tight_rgb(
-    frame: Any,
-    reformatter: Any | None = None,
+    frame: VideoFrame,
+    reformatter: VideoReformatter | None = None,
     *,
     av: ModuleType | None = None,
     color_facts: tuple[int, int, int, int] | None = None,
@@ -1872,9 +1900,9 @@ def _rotate_rgb(rgb: bytes, width: int, height: int, rotation: int) -> tuple[byt
     return image.tobytes(), image.width, image.height
 
 
-def _valid_audio_samples(frame: Any, samples: int, rate: int) -> int:
+def _valid_audio_samples(frame: AudioFrame, samples: int, rate: int) -> int:
     duration = frame.duration
-    if duration is None or int(duration) <= 0:
+    if duration is None or int(duration) <= 0:  # type: ignore[redundant-expr]  # PyAV's stub omits None
         return samples
     time_base = frame.time_base
     if not time_base:
@@ -1919,7 +1947,7 @@ def _matrix_rotation(raw: bytes) -> tuple[int, bool]:
     return turn, (a, b, c, d) != upright
 
 
-def _display_rotation(frame: Any) -> tuple[int, bool]:
+def _display_rotation(frame: VideoFrame) -> tuple[int, bool]:
     """A frame's quarter turn, and whether its display transform holds more (`_matrix_rotation`)."""
     try:
         # Both PyAV 18 and 19 support typed lookup; iteration changed from values
@@ -1934,7 +1962,7 @@ def _display_rotation(frame: Any) -> tuple[int, bool]:
     return _quarter_turn(reported), bool(reported % 90)
 
 
-def _set_decoder_option(context: Any, name: str, value: object) -> None:
+def _set_decoder_option(context: CodecContext, name: str, value: object) -> None:
     context.options = {**context.options, name: str(value)}
 
 
@@ -1950,7 +1978,7 @@ def _check_pixels(width: int, height: int, limits: DecodeLimits) -> None:
         )
 
 
-def _required_stream(kind: str) -> None:
+def _required_stream(kind: str) -> NoReturn:
     raise MediaDecodeError(
         f"this file has no {kind} in it: give a file that does", code=f"{kind}_stream_missing"
     )

@@ -42,7 +42,7 @@ from fractions import Fraction
 from itertools import pairwise
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, BinaryIO, TypedDict, cast
 
 from PIL import Image
 
@@ -52,8 +52,16 @@ from cozy_runtime.author._errors import OutputError
 
 if TYPE_CHECKING:
     import numpy as np
+    from av.audio.codeccontext import AudioCodecContext
+    from av.audio.frame import AudioFrame
+    from av.packet import Packet
+    from av.rational import AVRational
+    from av.stream import Stream
+    from av.video.frame import VideoFrame
     from numpy.typing import NDArray
     from torch import Tensor
+
+    from cozy_runtime.canonical_json import JsonValue
 
 #: What frames and waveforms save from: a torch tensor (on any device) or a numpy array.
 type Samples = Tensor | NDArray[np.generic]
@@ -131,7 +139,7 @@ def require_encoder() -> None:
     _av()
 
 
-def _image(width: int, height: int, pixels: bytes, mode: str) -> Any:
+def _image(width: int, height: int, pixels: bytes, mode: str) -> Image.Image:
     return Image.frombytes(mode, (width, height), pixels)
 
 
@@ -315,7 +323,7 @@ def _audio_frames(
     chunk: int,
     *,
     start_pts: int = 0,
-) -> Any:
+) -> Iterator[AudioFrame]:
     """Yield AudioFrames of `chunk` samples in `fmt` (packed), pts in sample units."""
     channels, samples = planar.shape
     layout = "mono" if channels == 1 else "stereo"
@@ -340,7 +348,7 @@ def _audio_frames(
         else:
             raw, unit = planar.view(), 4 * channels
 
-    def gen() -> Any:
+    def gen() -> Iterator[AudioFrame]:
         pts = start_pts
         for off in range(0, samples, chunk):
             n = min(chunk, samples - off)
@@ -433,13 +441,30 @@ FRAME_MEDIA_TYPES: dict[str, str] = {
 }
 
 
-def encode_frame(codec: str, facts: Mapping[str, Any], raw: bytes) -> bytes:
+class _FrameFacts(TypedDict, total=False):
+    """What a registered frame's codec reads from its facts (`_services` writes them)."""
+
+    width: int
+    height: int
+    mode: str
+    channels: int
+    samples: int
+    sample_rate: int
+    video_bytes: int
+    shape: list[int]
+    audio_channels: int
+    audio_samples: int
+    fps: float
+
+
+def encode_frame(codec: str, frame_facts: Mapping[str, JsonValue], raw: bytes) -> bytes:
     """Encode ONE registered host frame from its raw snapshot and the facts its codec needs.
 
     One function under both callers — the worker's post thread and a fake's settle-at-save
     — so the bytes an author's test sees are the bytes the worker writes. Every shape here
     was validated at registration; this only encodes.
     """
+    facts = cast("_FrameFacts", frame_facts)  # registration validated these shapes
     if codec in ("png", "webp"):
         encode = encode_png if codec == "png" else encode_webp
         return encode(int(facts["width"]), int(facts["height"]), raw, str(facts["mode"]))
@@ -485,7 +510,7 @@ class EncodedVideoFacts:
 class _BoundedWriter:
     """Seekable AVIO wrapper that refuses before a write crosses the output grant."""
 
-    def __init__(self, raw: Any, cap: int) -> None:
+    def __init__(self, raw: BinaryIO, cap: int) -> None:
         self.raw = raw
         self.cap = cap
 
@@ -594,7 +619,12 @@ def _refuse_copy(why: str) -> OutputError:
     )
 
 
-def _copy_facts(path: Path) -> tuple[tuple[Any, ...], int]:
+#: One H.264 track's copy parameters: extradata, width, height, frame rate, pixel aspect ratio,
+#: time base and the four colour tags.
+type _CopyFacts = tuple[bytes, int, int, Fraction, Fraction, AVRational, int, int, int, int]
+
+
+def _copy_facts(path: Path) -> tuple[_CopyFacts, int]:
     """One H.264 track's copy parameters and frame count, or `video_copy_incompatible`
     unless it begins on a keyframe on a zero-based fixed frame clock."""
     with _av().open(str(path), "r") as container:
@@ -642,7 +672,7 @@ def _copy_facts(path: Path) -> tuple[tuple[Any, ...], int]:
 def plan_video_copy(paths: tuple[Path, ...]) -> VideoCopy:
     """Refuse `video_copy_incompatible` unless every track shares one set of H.264
     parameters and one zero-based frame clock, and each begins on a keyframe."""
-    shared: tuple[Any, ...] | None = None
+    shared: _CopyFacts | None = None
     frames: list[int] = []
     for path in paths:
         facts, count = _copy_facts(path)
@@ -853,12 +883,12 @@ class StreamingMP4Encoder:
         self._submit(lambda: self._encode_video(frame))
         self.video_frames += 1
 
-    def _encode_video(self, frame: Any) -> None:
+    def _encode_video(self, frame: VideoFrame) -> None:
         for packet in self._video.encode(frame):
             packet.duration = 1
             self._mux(packet)
 
-    def copy_video(self, before: Any) -> None:
+    def copy_video(self, before: Callable[[Fraction], None]) -> None:
         """Mux the planned tracks' packets back to back; `before(t)` writes audio up to t."""
         assert self.copy is not None
         for path, frames in zip(self.copy.paths, self.copy.frames, strict=True):
@@ -912,13 +942,13 @@ class StreamingMP4Encoder:
         self._raw.close()
         return probe_mp4(self.path)
 
-    def _flush(self, audio: list[Any]) -> None:
+    def _flush(self, audio: list[Packet[Stream]]) -> None:
         for packet in self._video.encode() if self.copy is None else ():
             packet.duration = 1
             self._mux(packet)
         self._mux_all(audio)
 
-    def _mux_all(self, packets: list[Any]) -> None:
+    def _mux_all(self, packets: list[Packet[Stream]]) -> None:
         for packet in packets:
             self._mux(packet)
 
@@ -948,7 +978,7 @@ class StreamingMP4Encoder:
         if self._failure is not None:
             raise self._failure
 
-    def _mux(self, packet: Any) -> None:
+    def _mux(self, packet: Packet[Stream]) -> None:
         # Encoded payload is a lower bound on container bytes. Charge it before
         # handing it to a muxer that can buffer instead of calling the file writer.
         self._encoded_bytes += int(packet.size)
@@ -1096,10 +1126,10 @@ class FragmentedJoin:
         #: reordering; AAC priming): the joined media timeline begins there.
         self._delay: int | None = None
         self._priming: int | None = None
-        self._first: tuple[Path, tuple[Any, ...]] | None = None
+        self._first: tuple[Path, _CopyFacts] | None = None
         self._bytes = 0
         self._av = _av()
-        self._aac: Any = None
+        self._aac: AudioCodecContext | None = None
         if audio_channels:
             aac = self._av.CodecContext.create("aac", "w")
             aac.sample_rate = audio_sample_rate
@@ -1180,7 +1210,7 @@ class FragmentedJoin:
         self._finalized = True
         return [final]
 
-    def _encode(self, planar: Planar) -> list[Any]:
+    def _encode(self, planar: Planar) -> list[Packet[Stream]]:
         if self._aac is None or planar.shape[0] != self.audio_channels:
             raise OutputError(
                 "joined audio does not match the declared soundtrack", code="audio_shape"
@@ -1196,11 +1226,13 @@ class FragmentedJoin:
         self.samples += planar.shape[1]
         return [packet for frame in frames for packet in self._aac.encode(frame)]
 
-    def _flush(self) -> list[Any]:
+    def _flush(self) -> list[Packet[Stream]]:
         self.flushed = True
         return list(self._aac.encode()) if self._aac is not None else []
 
-    def _mux(self, video: Path | None, audio: list[Any], duration: Fraction) -> list[Path]:
+    def _mux(
+        self, video: Path | None, audio: list[Packet[Stream]], duration: Fraction
+    ) -> list[Path]:
         assert self._first is not None
         first = not self.parts
         temporary = self.directory / f".join-{len(self.parts)}.mp4"
@@ -1233,16 +1265,16 @@ class FragmentedJoin:
                     1: [self.frames * step + int(p.dts) + (self._delay or 0) for p in pictures]
                 }
                 if audio and self._priming is None:
-                    self._priming = max(0, -int(audio[0].pts))
+                    self._priming = max(0, -int(audio[0].pts))  # type: ignore[arg-type]  # encoded: stamped
                 if sound is not None:
-                    times[2] = [int(packet.pts) + (self._priming or 0) for packet in audio]
+                    times[2] = [int(packet.pts) + (self._priming or 0) for packet in audio]  # type: ignore[arg-type]  # encoded: stamped
                 # A later muxer starts both tracks at zero, so it shifts and pads nothing: its
                 # decode times are restamped onto the joined timeline anyway. The first keeps
                 # the source clocks, whose negative starts become the init's edit lists.
-                origin = 0 if first or not audio else int(audio[0].pts)
+                origin = 0 if first or not audio else int(audio[0].pts)  # type: ignore[arg-type]  # encoded: stamped
                 for packet in audio:
-                    packet.pts -= origin
-                    packet.dts -= origin
+                    packet.pts -= origin  # type: ignore[operator]  # encoded: stamped
+                    packet.dts -= origin  # type: ignore[operator]  # encoded: stamped
                     packet.stream = sound
                 shift = 0 if first or not pictures else -int(pictures[0].dts)
                 for packet in pictures:
