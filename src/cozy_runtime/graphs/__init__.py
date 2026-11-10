@@ -563,7 +563,7 @@ _CLASSES: dict[type, type] = {}
 #: an idle job's ops still queued on the device as its host reaches its next one (`_Idle.meter`):
 #: a command that arrives waits for at most these there
 _QUEUED = 2
-#: the host's poll while idle work waits on the device (`_Idle.meter`, `_settled`)
+#: the host's poll while idle work waits on the device to finish (`_settled`)
 _POLL_S = 0.0002
 
 
@@ -592,14 +592,17 @@ class _Idle:
 
     def meter(self) -> None:
         """Before a job's next op on the device: wait, yielding, while `_QUEUED` of its ops are
-        queued there."""
+        queued there. Its waits are the device's time, which says whether a call is
+        device-bound (`_record`), so it only yields the CPU between polls: a 0.2 ms sleep per wait
+        counted its oversleep as the device's (SDXL's UNet: 96 to 163 ms of waits a call, against
+        a 78 ms replay)."""
         self._settle()
         if len(self.queued) < _QUEUED:
             return
         began = time.perf_counter()
         while len(self.queued) >= _QUEUED:
             self.check()
-            time.sleep(_POLL_S)
+            time.sleep(0)
             self._settle()
         self.metered_ms += (time.perf_counter() - began) * 1e3
 
