@@ -21,7 +21,7 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Literal, cast
+from typing import Literal, cast
 
 import msgspec
 import msgspec.inspect as mi
@@ -61,7 +61,7 @@ class Clamp:
 class Overlay:
     """The immutable result. `payload` is the revalidated request the handler receives."""
 
-    payload: Any
+    payload: object
     values: Mapping[str, object]
     sources: Mapping[str, str]
     digest: str
@@ -147,7 +147,7 @@ def resolve(
 
     # What the caller sent decodes on its own, before any recipe joins it: a wrong type or a
     # missing field refuses here. Its numbers and lengths are already within their limits.
-    decode_request(cast("type[Any]", payload_type), wire)
+    decode_request(cast("type[object]", payload_type), wire)
 
     rows = list(fitted)
     for recipe in default_sets:
@@ -217,7 +217,7 @@ def resolve(
             )
 
     # ONE whole-request revalidation, cross-field constraints included.
-    payload = decode_request(cast("type[Any]", payload_type), merged, "the resolved request")
+    payload = decode_request(cast("type[object]", payload_type), merged, "the resolved request")
     return Overlay(
         payload,
         dict(sorted(merged.items())),
@@ -248,7 +248,7 @@ def fit(
 
 @functools.lru_cache(maxsize=256)
 def _type_info(payload_type: object) -> mi.Type:
-    return mi.type_info(cast("Any", payload_type))
+    return mi.type_info(payload_type)
 
 
 _OBJECTS = (mi.StructType, mi.DataclassType, mi.TypedDictType)

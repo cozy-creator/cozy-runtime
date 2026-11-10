@@ -407,9 +407,9 @@ class Files[T](Sequence[T]):
     def __getitem__(self, key: int | str) -> T: ...
 
     @overload
-    def __getitem__(self, key: slice) -> Files[T]: ...
+    def __getitem__(self, key: slice[int | None]) -> Files[T]: ...
 
-    def __getitem__(self, key: int | str | slice) -> T | Files[T]:
+    def __getitem__(self, key: int | str | slice[int | None]) -> T | Files[T]:
         if isinstance(key, slice):
             return self.select(*range(len(self))[key])
         return self._items[self._index(key)]  # type: ignore[return-value]

@@ -66,7 +66,7 @@ class Sliceable[W](Protocol):
 
     def dim(self) -> int: ...
 
-    def __getitem__(self, index: tuple[slice, ...], /) -> W: ...
+    def __getitem__(self, index: tuple[slice[int | None], ...], /) -> W: ...
 
 
 _RUNTIME: Pieces | None = None
@@ -412,7 +412,7 @@ def _run[W](
         held[tuple(s if i in dims else slice(None) for i, s in enumerate(place))] += weight
     whole = cast("Tensor", out)  # made at the first of at least two windows
     if blend:
-        return whole.div_(cast("Tensor", total)).to(part.dtype)
+        return whole.div_(cast("Tensor", total)).to(part.dtype)  # type: ignore[possibly-undefined]  # >= 2 windows ran
     return whole
 
 

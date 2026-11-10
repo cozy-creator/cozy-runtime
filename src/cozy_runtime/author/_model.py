@@ -618,12 +618,14 @@ class Placement(Protocol):
 #: The remote scopes open in this context, innermost last: (model, method, components).
 #: Per context rather than per model, so a remote scope on a helper thread is visible to that
 #: thread's hosted calls and to nothing else.
-_REMOTE_SCOPES: contextvars.ContextVar[tuple[tuple[Model[object], str, tuple[str, ...]], ...]] = (
-    contextvars.ContextVar("cozy_remote_scopes", default=())
+#: Open scopes, innermost last: (model, method, components).
+type _OpenScopes = tuple[tuple[Model[object], str, tuple[str, ...]], ...]
+_REMOTE_SCOPES: contextvars.ContextVar[_OpenScopes] = contextvars.ContextVar(
+    "cozy_remote_scopes", default=()
 )
 #: The local scopes open in this context, innermost last: (model, method, components).
-_LOCAL_SCOPES: contextvars.ContextVar[tuple[tuple[Model[object], str, tuple[str, ...]], ...]] = (
-    contextvars.ContextVar("cozy_local_scopes", default=())
+_LOCAL_SCOPES: contextvars.ContextVar[_OpenScopes] = contextvars.ContextVar(
+    "cozy_local_scopes", default=()
 )
 #: Whether a `deterministic=True` scope is open in this context.
 _DETERMINISTIC_SCOPE: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -635,9 +637,14 @@ _DETERMINISTIC_SCOPE: contextvars.ContextVar[bool] = contextvars.ContextVar(
 DETERMINISTIC: list[Callable[[], AbstractContextManager[None]]] = [nullcontext]
 
 
+#: What a seal's `enter` hands its `leave`: the refusal count, finer splits and shared-scope count
+#: at entry, or None when nothing reads refusals (`internal/contract._Scopes`).
+type Sealing = tuple[int, int, int] | None
+
+
 class Sealed(Protocol):
-    def enter(self) -> Any: ...
-    def leave(self, entered: Any, method: str, ok: bool) -> None: ...
+    def enter(self) -> Sealing: ...
+    def leave(self, entered: Sealing, method: str, ok: bool) -> None: ...
 
 
 #: The package contract's checks at each local scope (`internal/contract._Scopes`: the flags a
@@ -1165,13 +1172,13 @@ class _ComponentScope:
         self._model = model
         self._method = method
         self._components = components
-        self._remote: contextvars.Token[Any] | None = None
-        self._local: contextvars.Token[Any] | None = None
+        self._remote: contextvars.Token[_OpenScopes] | None = None
+        self._local: contextvars.Token[_OpenScopes] | None = None
         self._call: Context | None = None
         self._using: AbstractContextManager[None] | None = None
         self._numerics: AbstractContextManager[None] | None = None
         self._caches: list[DerivedCache] = []
-        self._contract: tuple[Sealed, object] | None = None
+        self._contract: tuple[Sealed, Sealing] | None = None
 
     def __enter__(self) -> None:
         model = self._model
