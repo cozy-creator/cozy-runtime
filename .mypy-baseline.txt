@@ -559,13 +559,6 @@ src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not all
 src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_fp8.py: [misc] Function is untyped after decorator transformation
 src/cozy_runtime/internal/attention_fp8.py: [misc] Function is untyped after decorator transformation
 src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 5 to "_amax" becomes "Any" due to an unfollowed import
@@ -576,9 +569,7 @@ src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 7 to "_
 src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 8 to "_cast" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/attention_fp8.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/attention_kitchen_sol.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_kitchen_sol.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_kitchen_sol.py: [no-any-return] Returning Any from function declared to return "Tensor"
-src/cozy_runtime/internal/attention_registry.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [misc] Function is untyped after decorator transformation
 src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [misc] Function is untyped after decorator transformation
 src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [no-any-unimported] Argument 5 to "finish_mean" becomes "Any" due to an unfollowed import
@@ -592,8 +583,6 @@ src/cozy_runtime/internal/attention_sage3_fixed.py: [no-any-return] Returning An
 src/cozy_runtime/internal/attention_sage3_fixed.py: [no-any-unimported] Argument 18 to "center_and_correct" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/attention_sage3_fixed.py: [no-any-unimported] Argument 19 to "center_and_correct" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/attention_sage3_fixed.py: [no-any-unimported] Argument 20 to "center_and_correct" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_site.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_site.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_sol.py: [assignment] Incompatible types in assignment (expression has type "Any | None", variable has type "Callable[..., Any]")
 src/cozy_runtime/internal/attention_sol.py: [assignment] Incompatible types in assignment (expression has type "_InstalledSite", variable has type "Tensor | Module")
 src/cozy_runtime/internal/attention_sol.py: [attr-defined] "Callable[..., Any]" has no attribute "__func__"
@@ -629,19 +618,7 @@ src/cozy_runtime/internal/attention_sol_fa4.py: [no-any-unimported] Argument 14 
 src/cozy_runtime/internal/attention_sol_fa4.py: [no-any-unimported] Argument 15 to "_approximate_and_merge" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/attention_sol_fa4.py: [no-any-unimported] Argument 16 to "_approximate_and_merge" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_upstream.py: [arg-type] Argument 1 to "_first" has incompatible type "object"; expected "Tensor | tuple[Tensor, ...] | list[Tensor]"
-src/cozy_runtime/internal/attention_upstream.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_upstream.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_upstream.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/attention_upstream.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/attention_upstream.py: [redundant-expr] Left operand of "or" is always false
