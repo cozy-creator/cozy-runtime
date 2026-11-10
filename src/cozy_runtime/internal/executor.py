@@ -718,6 +718,11 @@ class _Ranks:
                 attention_sol.record_rank(rank, reply.sol_calls)
             if reply.memory is not None:
                 self.memory.append(msgspec.convert(reply.memory, GpuMemory))
+            group.rank_timing[rank] = {
+                "exchange": reply.exchange,
+                "steps": reply.steps,
+                "stages": reply.stages,
+            }
         answered = list(zip(group.followers, replies, strict=True))
         ranks.clear({0: ranks.sequence, **{f.rank: r.meetings for f, r in answered}})
         rows = [(0, mine)] + [
@@ -1242,7 +1247,8 @@ class Executor:
                 row = self.group.rank_records.get(follower.rank) or execution_evidence.record(
                     {"pid": follower.pid, "gpu": gpu}, 0, 0
                 )
-                gpus.append({**row, "attention": {**row["attention"], "requested": pin}})
+                timing = self.group.rank_timing.get(follower.rank, {})
+                gpus.append({**row, "attention": {**row["attention"], "requested": pin}, **timing})
         facts = self.facts
         transport = self.host.transport
         crossing: dict[str, Any] = {}
@@ -1475,7 +1481,12 @@ class Executor:
         served = attention_ulysses.Seen()
         envelope: InvocationResult | None = None
         outcome: Outcome | None = None
+        record: AuthorAttempt | None = None
         working = 0
+        exchange: dict[str, float] = {}
+        from cozy_runtime.internal.parallel import ulysses
+
+        ulysses.taken()  # what an earlier attempt left uncounted is not this one's
         stage_memo.ENGINE.open(None, spool)
         if self.residency is not None:
             self.residency.open_attempt()
@@ -1491,7 +1502,7 @@ class Executor:
                     prepared = prepare(
                         registration, asked.payload, input_metadata=asked.input_metadata
                     )
-                    envelope, outcome, _record = run_prepared(
+                    envelope, outcome, record = run_prepared(
                         prepared,
                         Invocation(
                             request_id=command.request_id,
@@ -1519,6 +1530,7 @@ class Executor:
                         ranks.end(outcome is not None and outcome.terminal == "succeeded")
                 if self.host.memory is not None:
                     working = accel.allocator_peak(self.host.memory, command.request_id)
+                exchange = ulysses.taken()
         except Exception as exc:
             outcome = classify(exc)
             with contextlib.suppress(Exception):
@@ -1559,6 +1571,15 @@ class Executor:
                 ),
             ),
             memory=msgspec.to_builtins(rows[0]) if rows else None,
+            exchange=exchange,
+            steps={
+                name: list(track.series or ())
+                for name, track in (record.attribution.steps if record else {}).items()
+            },
+            stages={
+                name: round(track.total_ms, 1)
+                for name, track in (record.attribution.stages if record else {}).items()
+            },
         )
         return {**msgspec.to_builtins(reply), "rank": self.rank, "poisoned": bool(self.poisoned)}
 
@@ -3574,6 +3595,7 @@ class Executor:
         if self.group is not None:
             self.group.working_peaks.clear()
             self.group.rank_records.clear()
+            self.group.rank_timing.clear()
 
         # The lossy lane, carrying BOTH kinds of live record. A progress frame is not
         # retained anywhere: its `position` is the monotone unit count the worker's
@@ -3625,7 +3647,10 @@ class Executor:
             if frame.position is not None:
                 steps[frame.stage] = frame.position
             at = point[0] = {"stage": frame.stage, "step": steps.get(frame.stage, 0), **here}
-            swapped.extend((name, at) for name in kernel_ready.boundary())
+            # A group's kernels change only between attempts: its followers took this attempt's
+            # set with its `run` and meet no boundary of GPU 0's, so GPU 0 decides nothing new here.
+            agreed = kernel_ready.agreed() if self.group is not None else None
+            swapped.extend((name, at) for name in kernel_ready.boundary(agreed))
             if pin or served_attention is None or self.group is not None:
                 return  # an override, or a group's agreed selection, holds for every step
             if not segments:

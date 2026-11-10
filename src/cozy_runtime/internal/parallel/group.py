@@ -352,6 +352,8 @@ class RankGroup:
         #: per follower rank, its executor's plane facts as its latest reply stated them
         #: per follower rank, its `execution_evidence` record folded over this attempt's calls
         self.rank_records: dict[int, execution_evidence.GpuEvidence] = {}
+        #: per follower rank, its exchanges and step points this attempt (`wire.RunReply`)
+        self.rank_timing: dict[int, dict[str, object]] = {}
         #: each kernel a follower began serving at a command (`kernel_ready.boundary`), and its
         #: rank, until the attempt's record takes them
         self.began: list[tuple[int, str]] = []

@@ -172,3 +172,9 @@ class RunReply(msgspec.Struct, frozen=True):
     #: its kernels not serving yet (`kernel_ready.pending`), and those it began serving
     kernels: dict[str, str] = {}
     began: list[str] = []
+    #: its own Ulysses exchanges this attempt (`ulysses.taken`), each step track's
+    #: `(end unix ms, ms)` points on the clock GPU 0 shares, and its stages' ms, its host
+    #: stalls (`host · <code>`) among them: where it waited
+    exchange: dict[str, float] = {}
+    steps: dict[str, list[tuple[int, float]]] = {}
+    stages: dict[str, float] = {}
