@@ -236,6 +236,8 @@ class _Packer:
             self.out, self.back, self.inbound = found
         #: what an unpacking or landing on `inbound` read, kept until the calling stream waits
         self.held: list[object] = []
+        #: the attended rows `back` packs, each with the event after its packing (`read`)
+        self.reading: list[tuple[Tensor, Any]] = []
 
     def mark(self) -> Any:
         """An event on the calling stream: what it allocated so far is free for a side stream."""
@@ -253,11 +255,35 @@ class _Packer:
             stream.wait_event(after)
         return torch.cuda.stream(stream)
 
+    def mark_on(self, stream: Any) -> Any:
+        """An event on `stream` after its work so far (None without one)."""
+        if stream is None:
+            return None
+        event = torch.cuda.Event()
+        event.record(stream)
+        return event
+
     def caught_up(self) -> None:
         """The calling stream waits for every unpacking and landing so far; what they read goes."""
         if self.inbound is not None:
             torch.cuda.current_stream(self.inbound.device).wait_stream(self.inbound)
         self.held.clear()
+
+    def settle(self) -> None:
+        """The calling stream waits for every side stream, so nothing goes while one reads it."""
+        for stream in (self.out, self.back, self.inbound):
+            if stream is not None:
+                torch.cuda.current_stream(stream.device).wait_stream(stream)
+        self.held.clear()
+        self.reading.clear()
+
+    def read(self, keep: int) -> None:
+        """The attended rows `back` packed, all but the last `keep`, go once the calling stream
+        waits for their packing: long done by then, so the wait costs the calling stream nothing."""
+        while len(self.reading) > keep:
+            _, packed = self.reading.pop(0)
+            if packed is not None:
+                torch.cuda.current_stream(packed.device).wait_event(packed)
 
 
 def _pack(
@@ -411,13 +437,16 @@ def _returned(
         sends.append(attended.new_empty((total, batch, local, 1)))
         returned.append(attended.new_empty((world * mine, batch, local, 1)))
     with packer.on(packer.back, packer.mark()):
-        if packer.back is not None:
-            attended.record_stream(packer.back)
         if narrow:
             turn.narrow(packer.launch, rows, sends[0], sends[1])
         else:
             sends[0].copy_(rows)
-        return _start(handle, engines, sends, returned, back, rank), returned
+        wait = _start(handle, engines, sends, returned, back, rank)
+    # `attended` stays until the calling stream has waited for this packing (`_Packer.read`): a
+    # block another stream still reads, freed on the calling stream, would be reused under it,
+    # and `record_stream` instead holds every such block while the host runs ahead of the GPU.
+    packer.reading.append((attended, packer.mark_on(packer.back)))
+    return wait, returned
 
 
 def _waited(on: Tensor, wait: Wait, waits: list[Any]) -> None:
@@ -655,6 +684,7 @@ def _exchange(
             operands = _unpack(packer, current)
             arrived.append((before, _Clock.mark(query)))
             del current
+            packer.read(keep=1)
             first = _Clock.mark(query)
             attended = compute(*operands)
             inner.append((first, _Clock.mark(query)))
@@ -671,10 +701,12 @@ def _exchange(
         before = _Clock.mark(query)
         packer.caught_up()
         landed.append((before, _Clock.mark(query)))
+        packer.read(keep=0)
         submitted = True
     except BaseException:
         if crossed:
             abort_process_group()
+        packer.settle()
         raise
     finally:
         if token is not None:
