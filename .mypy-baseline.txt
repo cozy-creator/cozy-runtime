@@ -41,7 +41,6 @@ src/cozy_runtime/internal/invocable_interface.py: [explicit-any] Explicit "Any" 
 src/cozy_runtime/internal/invocable_interface.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/invocable_interface.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/lora_bake.py: [possibly-undefined] Name "data" may be undefined
-src/cozy_runtime/internal/parallel/cp.py: [no-untyped-call] Call to untyped function "get_active_backend" of "_AttentionBackendRegistry" in typed context
 src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed

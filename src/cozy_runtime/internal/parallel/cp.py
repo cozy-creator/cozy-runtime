@@ -8,7 +8,7 @@ accelerate wrappers on sharded components are refused.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -181,7 +181,11 @@ def _install_on_component(component: nn.Module, *, degree: int, comms: CpComms) 
             continue
         backend = processor._attention_backend
         if backend is None:
-            backend, _ = _AttentionBackendRegistry.get_active_backend()
+            # Diffusers leaves it unannotated: the active backend and its keyword arguments.
+            active: Callable[[], tuple[AttentionBackendName, object]] = (
+                _AttentionBackendRegistry.get_active_backend
+            )
+            backend, _ = active()
         else:
             backend = AttentionBackendName(backend)
         if not _AttentionBackendRegistry._is_context_parallel_available(backend):
