@@ -592,23 +592,14 @@ def uncaptured(*names: str) -> Callable[[type[ModelT]], type[ModelT]]:
 
 class Placement(Protocol):
     """Where a generation's components live across the GPUs of its group, installed by the
-    runtime on the group's first GPU when it hosts a `placeable` component elsewhere.
+    runtime on every GPU of a group that hosts a `placeable` component on one of them.
 
     A scope whose declared components ALL live on other GPUs holds nothing on this device:
-    its module calls run on their home GPUs. Such a REMOTE scope is admitted there, not
-    here, and may be open beside this GPU's one serial scope (`author.concurrently`).
+    its module calls run on their home GPUs, and their results cross here. Such a REMOTE scope
+    is admitted there, not here.
     """
 
     def remote(self, components: tuple[str, ...]) -> bool: ...
-
-    def enter(self, components: tuple[str, ...]) -> None: ...
-
-    def leave(self, components: tuple[str, ...]) -> None: ...
-
-    def carry[T](self, call: Callable[[], T], components: tuple[str, ...]) -> Callable[[], T]:
-        """`call`, to run on another thread under this thread's device and autograd modes.
-        Its components' home GPUs are reserved from now until it returns."""
-        ...
 
 
 #: The remote scopes open in this context, innermost last: (model, method, components).
@@ -1189,7 +1180,6 @@ class _ComponentScope:
                     "scope of the same instance in this context",
                     code="concurrent_scope",
                 )
-            placement.enter(self._components)
             self._remote = _REMOTE_SCOPES.set(
                 (*_REMOTE_SCOPES.get(), (model, self._method, self._components))
             )
@@ -1233,9 +1223,6 @@ class _ComponentScope:
                 numerics.__exit__(None, None, None)
             _REMOTE_SCOPES.reset(self._remote)
             self._remote = None
-            placement = model._cozy_placement
-            if placement is not None:
-                placement.leave(self._components)
             return
         # Only what this scope took, innermost first; each release runs even when one before it
         # raises, so a failed release never keeps the call's turn.

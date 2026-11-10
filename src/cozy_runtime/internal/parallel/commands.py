@@ -8,7 +8,7 @@ and `map` with what only a follower reads beside them (`Forwarded`), and these c
 from __future__ import annotations
 
 import json
-from typing import Literal, get_args
+from typing import get_args
 
 import msgspec
 from msgspec import UNSET, UnsetType
@@ -40,7 +40,7 @@ class Join(_Own, frozen=True, kw_only=True, tag="join"):
     backend: str = "nccl"
     #: A socket follows: a byte on it aborts this follower's collectives (`RankGroup.interrupt`).
     abort: bool = False
-    #: The group forms again after a call ended short of memory (`mirror.mirror_component`).
+    #: The group forms again after an attempt ended on one of its GPUs (`spmd`).
     again: bool = False
     #: The NCCL route rank 0 chose from the group's measured links; set before joining.
     nccl: dict[str, str] = {}
@@ -51,13 +51,6 @@ class Form(_Own, frozen=True, kw_only=True, tag="form"):
 
     #: Every GPU then maps this exchange and checks its bytes (`copy_engine.form`).
     exchange: str = ""
-
-
-class RequestMemory(_Own, frozen=True, kw_only=True, tag="request_memory"):
-    construction: str
-    request_id: str
-    phase: Literal["begin", "plan", "end"]
-    steps: tuple[tuple[str, ...], ...] = ()
 
 
 class Attention(_Own, frozen=True, kw_only=True, tag="attention"):
@@ -99,7 +92,7 @@ class Forwarded(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     model_key: str | None = None
 
 
-type Own = Shutdown | Join | Form | RequestMemory | Attention | Kernels
+type Own = Shutdown | Join | Form | Attention | Kernels
 type Command = wire.Command | Own
 
 _OWN = frozenset(str(kind.__struct_config__.tag) for kind in get_args(Own.__value__))
@@ -119,7 +112,8 @@ def decode(frame: dict[str, object]) -> tuple[Command, Forwarded]:
 
 
 def encode(
-    command: _Own | wire.Start | wire.Load | wire.Map, added: Forwarded | None = None
+    command: _Own | wire.Start | wire.Load | wire.Map | wire.PrepareRequest | wire.Invoke,
+    added: Forwarded | None = None,
 ) -> dict[str, object]:
     """The frame of one command to a follower, `cmd` included, with what rank 0 adds."""
     if isinstance(command, _Own):
