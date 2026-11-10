@@ -346,7 +346,7 @@ class _File:
         func = node.func
         dotted = self._resolve(func)
         if isinstance(func, ast.Attribute):
-            if func.attr in ("from_pretrained", "from_single_file"):
+            if func.attr == "from_single_file":
                 self._add(node, "weights_io", f".{func.attr}(...)")
             if self._resolve(func.value) == "os.environ":
                 if func.attr in _ENVIRON_WIPES:

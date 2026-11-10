@@ -47,9 +47,11 @@ def generate(ctx: Context, payload: Request, model: Flow, out: Outputs, tel: Tel
   `components`, `preflight`.
 - **Handler parameters** are injected by type: `Context`, a `msgspec.Struct` request, any `Model`,
   and the services `Outputs`, `Telemetry`, `Adjustments`.
-- **`Model`**: `load(loader)` builds the components. `loader.construct(factory)` takes a class or a
-  function of the `Config` and fills its tensors; `loader.assets` holds the checkpoint's other
-  files. `unload(loader)` is optional.
+- **`Model`**: `load(loader)` builds the components. `X.from_pretrained(loader.path, ...)` builds a
+  Diffusers or Transformers model, pipeline, tokenizer, processor or scheduler from the bound model's
+  folder (its configs and small files; the Runtime fills the weights). `torch_dtype=`, `.to(...)`
+  and the offload helpers work: a device is ignored, a dtype is served. `loader.construct(factory)`
+  builds a custom model from the `Config`. `unload(loader)` is optional.
 - **Errors**: raise `InvalidRequest` (the request is wrong), `UnsupportedInput` (this model can't)
   or `OutputError` (the result is bad). Any other exception fails the run with its first line.
 

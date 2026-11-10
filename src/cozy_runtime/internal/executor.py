@@ -180,6 +180,7 @@ from cozy_runtime.internal import (
     schema,
     spawn,
     stage_memo,
+    stock,
     tools,
     w4a8_linear,
     zygote,
@@ -2746,6 +2747,12 @@ class Executor:
             # tiers it (§1.1).
             custody=_CUSTODY,
             unnormalized=normalized(config_checkpoint),
+            files=functools.partial(
+                stock.folder,
+                self.root / "models",
+                config_checkpoint.ck,
+                {name: checkpoint.ck for name, checkpoint in checkpoints.items()},
+            ),
         )
         adapter_graphs = [
             (checkpoint.id, checkpoint.asset(component, model_config.ADAPTERS))
@@ -2839,6 +2846,7 @@ class Executor:
         # shared `use` of its components, and each block binds its weights while it runs.
         self.residency = Placement(host.memory, backend)
         object.__setattr__(model, "_cozy_residency", self.residency)
+        stock.place({name: m.module for name, m in backend.models.items()})
         # Its components' calls replay CUDA graphs once recorded (`graphs`), unless uncaptured.
         graphs.install(self.torch, model, {name: m.module for name, m in backend.models.items()})
         # A plain loop's component call takes its request's numerics flags, as a method's scope.

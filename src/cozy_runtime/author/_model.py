@@ -334,9 +334,15 @@ class Residency(Protocol):
         ...
 
     def represent(
-        self, component: str, dtype: Any, *, resident_only: bool = False
+        self,
+        component: str,
+        dtype: Any,
+        *,
+        resident_only: bool = False,
+        keep: tuple[str, ...] = (),
     ) -> Callable[[], None]:
-        """Validate a final representation and return its pre-capture metadata transition."""
+        """Validate a final representation and return its pre-capture metadata transition;
+        modules named in `keep` stay float32."""
         ...
 
     def graph_accounted(self) -> bool:
@@ -998,8 +1004,8 @@ class Model[PipelineT]:
     def load(self, loader: Loader) -> None:
         """Construct this model from the bound artifact. The runtime owns WHEN it runs."""
         raise ConformanceError(
-            f"{type(self).__name__} defines no load(loader): a Model constructs through "
-            "loader.construct(factory) — the one construction primitive",
+            f"{type(self).__name__} defines no load(loader): a Model builds its components "
+            "there, `X.from_pretrained(loader.path, ...)` or `loader.construct(factory)`",
             code="no_load",
         )
 
@@ -1483,13 +1489,14 @@ class ModelRegistry:
                 began = time.perf_counter()
                 with loading(loader):
                     model.load(loader)
+                    loader._finish()
                 loaded = time.perf_counter()
             exited = time.perf_counter()
             records = loader.records()
             if not records:
                 raise ConformanceError(
-                    f"{cls.__name__}.load did not construct anything: the one construction "
-                    "primitive is loader.construct(factory)",
+                    f"{cls.__name__}.load built no component: build them with "
+                    "`X.from_pretrained(loader.path, ...)` or `loader.construct(factory)`",
                     code="no_construction",
                 )
             record = records[0] if len(records) == 1 else _merge(records)
@@ -1630,7 +1637,7 @@ def _prove_components(cls: type, record: ConstructionRecord) -> None:
             code="unknown_component",
             fields=unknown,
         )
-    if undeclared_methods(cls):
+    if undeclared_methods(cls) or not contract:
         return  # an omitted declaration means ALL: conservatively safe, nothing to prove
     declared = {c for names in contract.values() for c in names}
     surplus = sorted(censused - declared)

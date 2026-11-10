@@ -3121,17 +3121,17 @@ def _widened(
 ) -> torch.dtype | None:
     """The dtype a site widens `served` bytes to on each bind, or None. A placed component
     serves its binding's dtype (stored, or `hold_dtype`'s cast copy); only a CPU executor widens,
-    to float32 (`weights._float32`). Any other mismatch is a `module.to(dtype)`, `.half()` or
-    `.float()` after placement, which would cast every weight on every forward, unaccounted."""
+    to float32 (`weights._float32`). Any other mismatch is a module inside the component cast after
+    placement (the component itself answers `.to(dtype)`: `stock.place`), which would cast every
+    weight on every forward, unaccounted."""
     if site is None or site.dtype == served:
         return None
     if model.memory.device.type == "cpu" and site.dtype == torch.float32:
         return site.dtype
     raise ResidencyError(
-        f"{model.name}: {name} serves {served} and the module was changed to {site.dtype} "
-        "after placement: serve a placed component in another dtype with "
-        "`cozy_runtime.author.hold_dtype(module, dtype)`, never `module.to(dtype)`, "
-        "`.half()` or `.float()`"
+        f"{model.name}: {name} serves {served} and a module inside the component was changed to "
+        f"{site.dtype} after placement: cast the component itself (`component.to(dtype)`), not a "
+        "module inside it"
     )
 
 

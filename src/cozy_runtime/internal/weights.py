@@ -681,7 +681,7 @@ class _PlainDtype:
 
     encoded = False
 
-    def __init__(self, base: _Routes, dtype: str) -> None:
+    def __init__(self, base: _Routes, dtype: str, keep: tuple[str, ...] = ()) -> None:
         if any(route != "verbatim" for route in base.routes.values()):
             raise StaleBinding("prepared dtype overrides require plain stored weights")
         self.base = base
@@ -698,7 +698,11 @@ class _PlainDtype:
             layouts[key] = MappingProxyType(
                 {
                     name: TensorLayout(
-                        dtype if value.dtype in {"F16", "BF16", "F32"} else value.dtype,
+                        (
+                            ("F32" if any(m in name.split(".") for m in keep) else dtype)
+                            if value.dtype in {"F16", "BF16", "F32"}
+                            else value.dtype
+                        ),
                         value.shape,
                         value.strides,
                         value.source,
@@ -708,7 +712,8 @@ class _PlainDtype:
             )
         self.layouts = MappingProxyType(layouts)
         unchanged = all(dict(row) == dict(base.layout(key) or {}) for key, row in layouts.items())
-        self.identity = base.identity if unchanged else repr((base.identity, "plain-cast/1", dtype))
+        held = (base.identity, "plain-cast/1", dtype, *((keep,) if keep else ()))
+        self.identity = base.identity if unchanged else repr(held)
 
     def layout(self, key: str) -> Mapping[str, TensorLayout]:
         return self.layouts[key]
@@ -1253,10 +1258,16 @@ class Placement:
         return self.models[component].retain(paths)
 
     def represent(
-        self, component: str, dtype: torch.dtype, *, resident_only: bool = False
+        self,
+        component: str,
+        dtype: torch.dtype,
+        *,
+        resident_only: bool = False,
+        keep: tuple[str, ...] = (),
     ) -> Callable[[], None]:
-        """Preflight every requested cast before capture applies any representation change. A CPU
-        executor serves every component in float32 (`_float32`), so a hold there changes nothing."""
+        """Preflight every requested cast before capture applies any representation change;
+        modules named in `keep` stay float32 (`_keep_in_fp32_modules`). A CPU executor serves
+        every component in float32 (`_float32`), so a hold there changes nothing."""
         if dtype not in (self.torch.float16, self.torch.bfloat16, self.torch.float32):
             raise StaleBinding("prepared weight dtype must be float16, bfloat16 or float32")
         if self.memory.device.type == "cpu":
@@ -1265,7 +1276,7 @@ class Placement:
         base = model.declared_finals
         if not isinstance(base, _Routes):
             raise StaleBinding("prepared dtype overrides require the ordinary weight routes")
-        layout = _PlainDtype(base, TENSORFS_NAMES[canonical_dtype(dtype)])
+        layout = _PlainDtype(base, TENSORFS_NAMES[canonical_dtype(dtype)], keep)
         return self.memory._configure_binding(model, layout, resident_only=resident_only)
 
     def graph_accounted(self) -> bool:
