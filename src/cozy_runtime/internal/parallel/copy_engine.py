@@ -276,20 +276,21 @@ class HostStagedExchange(Exchange):
             raise MemoryError("varena's host number has no room for this GPU's exchange inbox")
         #: its own inbox until `close`, which `map` names to the group
         self.own: Staging | None = own
-        self.inbox: Staging = own
 
     def map(self, store: Store, agree: Callable[[bool], bool]) -> bool:
         """Collective, once per formation: every GPU maps every inbox for its own; each unlinks
         its inbox's name once all agreed. False on every GPU alike when any could not."""
         from tensorfs.varena import _runtime as varena
 
-        store.set(f"cozy.staged/{self.rank}", self.inbox.name)
+        own = self.own
+        assert own is not None  # mapped once per formation, before `close`
+        store.set(f"cozy.staged/{self.rank}", own.name)
         keys = [f"cozy.staged/{r}" for r in range(self.world)]
         names = [bytes(name).decode() for name in gather(store, keys, "the exchange's inboxes")]
         ok = True
         try:
             for rank, name in enumerate(names):
-                staging = self.inbox
+                staging = own
                 if rank != self.rank:
                     staging = varena.Staging.open(self.device.index, name, self.size)
                     self.peers.append(staging)
@@ -297,7 +298,7 @@ class HostStagedExchange(Exchange):
         except Exception:
             ok = False
         agreed = agree(ok)
-        self.inbox.unlink()
+        own.unlink()
         if not agreed:
             self.close()
             return False
