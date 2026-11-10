@@ -12,9 +12,12 @@ from cozy_runtime.author._decode import (
 from cozy_runtime.author._files import (
     AudioFile,
     File,
+    FileInfo,
     Files,
     ImageFile,
     Latents,
+    References,
+    Tree,
     VideoFile,
 )
 
@@ -28,8 +31,11 @@ __all__ = [
     "DecodedVideoFormat",
     "DecodedVideoFrame",
     "File",
+    "FileInfo",
     "Files",
     "ImageFile",
     "Latents",
+    "References",
+    "Tree",
     "VideoFile",
 ]

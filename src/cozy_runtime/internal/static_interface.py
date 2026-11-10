@@ -47,7 +47,7 @@ import cozy_runtime.internal.memo_identity as memo_identity
 import cozy_runtime.internal.package_interface as package_interface
 import cozy_runtime.internal.static_contract as static_contract
 from cozy_runtime import _interpreter
-from cozy_runtime.author._markers import PREFLIGHT
+from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._model import Model, component_method, component_set
 from cozy_runtime.author._model_defaults import (
     model_components,
@@ -985,6 +985,8 @@ class Reader:
                 return typing.Union[tuple(self.translate(module, arg) for arg in args)]  # noqa: UP007
             if found.key == "author.Preflight":
                 return Annotated[self.translate(module, args[0]), PREFLIGHT]
+            if found.key == "author.ModelDefault":
+                return Annotated[self.translate(module, args[0]), MODEL_DEFAULT]
             generic = self._vocab_type(module, node.value, found)
             params = tuple(
                 Ellipsis

@@ -8,6 +8,7 @@ from cozy_runtime.author._markers import (
     FileLimits,
     ImagePreparation,
     Label,
+    ModelDefault,
     Placeholder,
     Preflight,
     Range,
@@ -16,6 +17,7 @@ from cozy_runtime.author._markers import (
     Snap,
     Spans,
     Total,
+    VideoPreparation,
 )
 from cozy_runtime.author._tool import (
     MENTION,
@@ -40,6 +42,7 @@ __all__ = [
     "Image",
     "ImagePreparation",
     "Label",
+    "ModelDefault",
     "Pickup",
     "Placeholder",
     "Preflight",
@@ -51,5 +54,6 @@ __all__ = [
     "Spans",
     "Total",
     "Video",
+    "VideoPreparation",
     "name_key",
 ]
