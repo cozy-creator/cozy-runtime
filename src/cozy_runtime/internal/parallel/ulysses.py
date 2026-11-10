@@ -40,7 +40,7 @@ type Compute = Callable[[Tensor, Tensor, Tensor], Tensor]
 type Wait = Callable[[], None]
 
 #: Head groups an exchange that pipelines runs in, at least.
-_ROUNDS = 4
+_ROUNDS = 8
 #: Each group's Q/K/V to one peer, at least, for a group's crossing to outlast its launches.
 _ROUND_BYTES = 16 << 20
 #: Hadamard matrices by device, dtype and order (`_narrow`).
