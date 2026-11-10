@@ -4,8 +4,9 @@ to whole sequences per head subset, `compute` runs, and its output crosses back.
 
 The heads cross in groups, pipelined: the next group's Q/K/V and the last group's output cross
 while this group's attention runs (an exchange's own streams, or NCCL's), so the links and the
-SMs work at once. A level of the native split is a head group; an exchange large enough to
-pipeline runs in at least `_ROUNDS` of them (`_pipelined`).
+SMs work at once. The next group is packed and sent before this one is waited for, so a link
+never idles between two groups. A level of the native split is a head group; an exchange large
+enough to pipeline runs in at least `_ROUNDS` of them (`_pipelined`).
 
 One round of metadata over the group's store comes first: every rank proposes its rows and the
 level native selection takes for it, its room made, or its refusal; every rank takes the finest
@@ -117,14 +118,15 @@ def _need(
     """A group of `step` heads: the output held throughout. Whole: its q, k and v sent and
     received; then received beside the local attention; then the attended rows and their return.
     Pipelined: beside a group's received q, k, v and its attention, the next group's sent and
-    received and the last group's return. Every rank's rows are taken as this one's: an estimate."""
+    received and the last group's return; while the next is packed, this group's sent too. Every
+    rank's rows are taken as this one's: an estimate."""
     total, local = rows * world, step // world
     each = batch * rows * step * dim * b
     attention = sizing.Attention(batch, total, local, local, total, dim, b).need(local, total)
     out = batch * rows * heads * dim * b
     if step == heads:
         return sizing.peak(out, (each,) * 6, (each, each, each, *attention), (each, each))
-    return sizing.peak(out, (*(each,) * 11, *attention))
+    return sizing.peak(out, (each,) * 14, (*(each,) * 11, *attention))
 
 
 def _pipelined(steps: Sequence[int], sizes: Sequence[int], batch: int, dim: int, b: int) -> int:
@@ -434,13 +436,13 @@ def _exchange(
         returning: list[tuple[Wait, Tensor, int]] = []
         for index, start in enumerate(starts):
             wait, receives = arriving.pop()
-            _waited(query, wait, arrived)
-            del wait  # its sends go: the current stream is past their crossing
             if index + 1 < len(starts):
                 following = starts[index + 1]
                 arriving.append(
                     _send(handle, engines, sources, following, total, local, sent, rank)
                 )
+            _waited(query, wait, arrived)
+            del wait  # its sends go: the current stream is past their crossing
             first = _Clock.mark(query)
             attended = compute(*(t.permute(1, 0, 2, 3).contiguous() for t in receives))
             inner.append((first, _Clock.mark(query)))
