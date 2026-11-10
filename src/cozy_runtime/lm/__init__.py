@@ -1828,9 +1828,10 @@ class _Engine:
         """Whether `request`'s rows have their decode memory, decided before its prefill, the one
         place it is: the slots held now where they can take it (the decode graphs' pool mapped
         back for them), else slots for every row's prompt and `max_new_tokens` allocated now
-        (`_buffers`; `_need` is what they take). False: it fits once the rows decoding now leave.
-        `DoesNotFit` where it would not fit with the engine's own slots gone too, before anything
-        of it ran."""
+        (`_buffers`; `_need` is what they take). False: it waits for the rows decoding now to
+        leave. `DoesNotFit` before anything of it ran: up front only where the slots exceed the
+        whole card (`_never`), else where their allocation, which asks idle executors for their
+        memory, evicts and waits as every allocation does, was refused after all of that."""
         rows = len(request.tokens)
         reach = request.prompt + request.max_new + DEPTH * (LAG + 2)
         free = sum(row is None for row in self.slots)
@@ -1861,23 +1862,36 @@ class _Engine:
             size, capacity = _batch(occupied + rows), max(self.capacity, capacity)
             stops = max(stops, self.width)
         device = request.inputs["input_ids"].device
-        if device.type == "cuda" and self.model in PLACED:
-            room = self._room(device)
-            if self._need(*alone, position) > room + self.held:
-                raise DoesNotFit(self._refused(request, alone, position, room + self.held))
-            if occupied and self._need(size, capacity, stops, position) > room:
-                request.waits = True  # it fits beside the weights once these rows leave
-                return False
+        placed = device.type == "cuda" and self.model in PLACED
+        if placed:
+            card = self._card(device) + self.held
+            if _never(self._need(*alone, position), card):
+                raise DoesNotFit(self._refused(request, alone, position, card))
         if not occupied:
             self._drop()  # the idle slots go before the new ones come
-        self._grow(size, capacity, stops, position, device)
+        try:
+            self._grow(size, capacity, stops, position, device)
+        except Exception as exc:
+            if not (placed and is_capacity(exc)):
+                raise
+            if occupied:
+                request.waits = True  # it is tried again once these rows leave
+                return False
+            need = self._need(size, capacity, stops, position)
+            raise DoesNotFit(
+                f"{type(self.model).__name__} decode: "
+                f"{no_room(device.index or 0, 'its decode state', need, exc)}: run it smaller, "
+                "or rent a larger card: `cozy run … --on new`"
+            ) from exc
         return True
 
-    def _room(self, device: Any) -> int:
-        """The most the device's reclaim could give this process now (`vt.room`, a report): the
-        card less live working memory and the weights in use."""
+    def _card(self, device: Any) -> int:
+        """The most this process could ever have for slots: the whole card, less its own live
+        working memory and weights in use. What other processes hold is not counted against it:
+        they give memory back when an allocation asks."""
         room = vt.room(device.index or 0)
-        return max(int(room["capacity"] - room["working_live"] - room["pinned"]), 0)
+        total = int(torch.cuda.get_device_properties(device).total_memory)
+        return max(total - int(room["working_live"]) - int(room["pinned"]), 0)
 
     def _refused(
         self, request: _Request, alone: tuple[int, int, int], position: Any, room: int
@@ -1896,7 +1910,8 @@ class _Engine:
         return (
             f"{type(self.model).__name__} decode: {rows} row{'s' * (rows > 1)} of {prompt} + "
             f"{request.max_new} tokens need {_gib(self._need(*alone, position))} of keys and "
-            f"state, and this card has {_gib(room)} beside the weights in use and live memory: "
+            f"state, and the whole card has {_gib(room)} beside the weights in use and live "
+            "memory: "
             f"run it smaller ({smaller}), or rent a larger card: `cozy run … --on new`"
         )
 
@@ -2857,6 +2872,12 @@ class _Engine:
         pinned = ("flag", "allow_host", "took", "dtook")
         for name in (*type(self).__annotations__, *pinned, "rows_index", "bit", "dkeys", "dcache"):
             vars(self).pop(name, None)
+
+
+def _never(need: int, card: int) -> bool:
+    """Whether slots of `need` bytes can never fit: more than the card with every other byte
+    gone. A need under that is allocated, and the allocation makes its room or is refused."""
+    return need > card
 
 
 __all__ = [
