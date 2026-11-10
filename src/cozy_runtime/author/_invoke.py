@@ -136,6 +136,8 @@ class Invocation:
     """`Outputs.publish`'s exchange with the machine, which journals the run's output log."""
     #: No worker settles this attempt's frames (the fakes), so each encodes at its save.
     settle_at_save: bool = False
+    #: False on a group's other GPUs: a save records its asset and writes nothing (`Attempt`).
+    writes: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +186,8 @@ class PreparedRequest:
     lora: str = "bake"
     #: what preparing it waited for (its attention kernel's compile): its attempt's first stages
     stages: Mapping[str, Track] = field(default_factory=dict)
+    #: in a group, the command it was prepared from: every other GPU prepares it again
+    asked: object = None
 
     def digests(self) -> dict[str, str]:
         """What a worker can hold, record and price against — never the payload."""
@@ -372,6 +376,7 @@ def run_prepared(
         publish=inv.publish,
         ignored=prepared.overlay.ignored,
         settle_at_save=inv.settle_at_save,
+        writes=inv.writes,
     )
     record.attribution.stages.update(prepared.stages)
 

@@ -45,6 +45,7 @@ from typing import (
 
 import msgspec
 
+from cozy_runtime.author import _group
 from cozy_runtime.author._context import AdapterRef, Device, device
 from cozy_runtime.author._errors import CapabilityError, ConformanceError, InvalidRequest
 
@@ -628,7 +629,16 @@ class DerivedCache:
                 "keyed by immutable digests, never by a live object",
                 code="cache_key",
             ) from None
-        if key in self._entries:
+        held = key in self._entries
+        group = _group.CURRENT[0]
+        # Each GPU of a group sheds its own entries: a hit is every GPU's or none's, so every
+        # GPU runs `build` (and the calls in it) or none does.
+        if group is not None and group.world > 1 and not group.all(held, f"cache {self.name}"):
+            if held:
+                _, dropped = self._entries.pop(key)
+                self._bytes -= dropped
+            held = False
+        if held:
             self._entries.move_to_end(key)
             return cast(V, self._entries[key][0])
         region = self._made()

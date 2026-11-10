@@ -29,8 +29,8 @@ Calls run side by side, as tasks on one bounded pool (`serve`): every per-call c
 reply and frame names its `request_id`, and answers to the executor's requests come back by
 `seq` (`seam.Mux`). Cancellation is call-keyed: `ctx.raise_if_cancelled` reads the mark a
 `cancel` command left for this exact request. Every telemetry step, stage and progress call
-and, in a group, every mirrored call is a safe point. TensorD supervises executor lifetime
-and records each attempt's terminal outcome.
+is a safe point. In a group every GPU runs each attempt's handler (`parallel/spmd`). TensorD
+supervises executor lifetime and records each attempt's terminal outcome.
 
 The env seal is enforced, not trusted: the sealed values are snapshotted BEFORE torch is
 imported, re-imposed before Torch import, CUDA init and every reply, and any names package
@@ -55,9 +55,12 @@ import importlib.util
 import json
 import math
 import os
+import secrets
+import shutil
 import signal
 import socket
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -114,7 +117,6 @@ from cozy_runtime.author._errors import (
     MEMORY_EXHAUSTED,
     CapabilityError,
     ConformanceError,
-    DoesNotFit,
     Fault,
     InvalidRequest,
     Outcome,
@@ -195,7 +197,7 @@ from cozy_runtime.internal.encoding.selection import (
     measure_device,
     measure_runtime,
 )
-from cozy_runtime.internal.executor_replies import GpuMemory, RankMemory
+from cozy_runtime.internal.executor_replies import GpuMemory
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.fill import (
     Checkpoint,
@@ -208,7 +210,7 @@ from cozy_runtime.internal.fill import (
 from cozy_runtime.internal.lora_composition import bind as bind_adapters
 from cozy_runtime.internal.lora_contract import read as read_adapter_graph
 from cozy_runtime.internal.model_values import read_values_into
-from cozy_runtime.internal.parallel import commands, copy_engine, cp, links, mirror, wire
+from cozy_runtime.internal.parallel import commands, copy_engine, cp, links, spmd, wire
 from cozy_runtime.internal.parallel.commands import (
     Attention,
     Choice,
@@ -217,10 +219,10 @@ from cozy_runtime.internal.parallel.commands import (
     GroupHardware,
     Join,
     Kernels,
-    RequestMemory,
     Shutdown,
 )
 from cozy_runtime.internal.parallel.group import (
+    ENDED,
     ChildProcess,
     RankGroup,
     RankSpec,
@@ -228,7 +230,6 @@ from cozy_runtime.internal.parallel.group import (
     form_rank,
     ready_rank,
 )
-from cozy_runtime.internal.parallel.mirror import mirror_component
 from cozy_runtime.internal.parallel.plan import (
     GpuDivergence,
     GroupPlan,
@@ -612,12 +613,24 @@ def _safeguard_rows(found: dict[str, list[str]]) -> list[dict[str, str]]:
     return [
         adjustment_row(
             AdjustmentRow(
-                "warn", "graphs", None, None,
-                f"{graphs.SAFEGUARDS[code]} ({len(whys)}×): {whys[0]}", "Runtime",
+                "warn",
+                "graphs",
+                None,
+                None,
+                f"{graphs.SAFEGUARDS[code]} ({len(whys)}×): {whys[0]}",
+                "Runtime",
             )
         )
         for code, whys in found.items()
     ]
+
+
+def _prepared_inputs(command: PrepareRequest) -> dict[str, InputMetadata]:
+    """The request's input files as its handler's prepare reads them."""
+    return {
+        path: InputMetadata(file.input_id, file.media_type, file.digest, file.length, file.order)
+        for path, file in command.input_metadata.items()
+    }
 
 
 def _granted_inputs(command: Invoke) -> dict[str, GrantedInput]:
@@ -673,16 +686,6 @@ def _serving(module: str, export: str, surface: Surface) -> _CallType:
 # --------------------------------------------------------------------------- state
 
 
-@dataclasses.dataclass(slots=True)
-class _RankRequest:
-    """A follower's part of rank 0's attempt: its open request and the record it lands in."""
-
-    construction: str
-    id: str
-    context: contextlib.AbstractContextManager[list[GpuMemory]]
-    rows: list[GpuMemory]
-
-
 @dataclasses.dataclass(frozen=True, slots=True)
 class _Install:
     """A plan's install waiting for its kernel set's build (`Plan.when_ready`): the set, its build
@@ -692,6 +695,92 @@ class _Install:
     ready: Callable[[], Launch | None]
     install: Callable[[Launch], None]
     reports: dict[str, Mapping[str, object]]
+
+
+class _Ranks:
+    """GPU 0's hold on one group attempt: once its own handler ends, every follower's answer, and
+    the attempt's outcome over all of them (`settle`)."""
+
+    def __init__(self, group: RankGroup, ranks: spmd.Ranks) -> None:
+        self.group, self.ranks = group, ranks
+        self.settled = False
+        #: each follower's own varena record
+        self.memory: list[GpuMemory] = []
+
+    def settle(
+        self, envelope: InvocationResult | None, outcome: Outcome
+    ) -> tuple[InvocationResult | None, Outcome]:
+        """GPU 0's handler ended with `outcome`. A failure ends every GPU's attempt (`interrupt`);
+        then every follower answers. The attempt's outcome is the first GPU's, in GPU order, that
+        did not just end because another did; all succeeded, their results' shapes agree."""
+        self.settled = True
+        group, ranks = self.group, self.ranks
+        ok = outcome.terminal == "succeeded"
+        # A follower's failure interrupted the group first: GPU 0's own failure is its consequence.
+        followed = group.interrupted
+        with contextlib.suppress(Exception):
+            ranks.end(ok)
+        if not ok:
+            group.interrupt()
+        mine = Executor._ended(outcome, group.interrupted)
+        if followed and not ok:
+            mine = Outcome("failed", "runtime", ENDED, outcome.message)
+        try:
+            frames = group.collect("run", shown=False)
+        except GroupRefusal as lost:
+            return None, classify(GroupRefusal(f"{lost.message}"[:1200], code="group_broken"))
+        replies: list[wire.RunReply] = []
+        for follower, frame in zip(group.followers, frames, strict=True):
+            try:
+                reply = msgspec.convert(frame, wire.RunReply)
+            except msgspec.ValidationError as exc:
+                group._break(f"{follower.gpu} answered its run malformed: {exc}"[:600])
+                return None, classify(GroupRefusal(group.broken, code="group_broken"))
+            replies.append(reply)
+            rank = follower.rank
+            group.working_peaks[rank] = max(
+                group.working_peaks.get(rank, 0), reply.working_peak_bytes
+            )
+            kernel_ready.report(rank, reply.kernels)
+            group.began.extend((rank, kernel) for kernel in reply.began)
+            if reply.evidence is not None:
+                execution_evidence.widen(group.rank_records, rank, reply.evidence)
+            if reply.sol_calls:
+                attention_sol.record_rank(rank, reply.sol_calls)
+            if reply.memory is not None:
+                self.memory.append(msgspec.convert(reply.memory, GpuMemory))
+            group.rank_timing[rank] = {
+                "exchange": reply.exchange,
+                "steps": reply.steps,
+                "stages": reply.stages,
+            }
+        answered = list(zip(group.followers, replies, strict=True))
+        ranks.clear({0: ranks.sequence, **{f.rank: r.meetings for f, r in answered}})
+        rows = [(0, mine)] + [
+            (f.rank, Outcome(r.terminal, r.origin, r.code, r.detail))
+            for f, r in answered
+            if not r.ok
+        ]
+        failed = [(rank, row) for rank, row in rows if row.terminal != "succeeded"]
+        if failed:
+            rank, cause = next(((r, o) for r, o in failed if o.code != ENDED), failed[0])
+            if cause.code == ENDED and rank == 0 and not ok:
+                cause = outcome  # no GPU names another cause: GPU 0's own
+            if rank == 0:
+                return None, cause
+            return None, replace(cause, message=ends(f"{group.gpu(rank)}: {cause.message}", 2048))
+        theirs = spmd.signature(envelope.result) if envelope is not None else ""
+        for follower, reply in answered:
+            if reply.signature != theirs:
+                return None, classify(
+                    GpuDivergence(
+                        follower.gpu,
+                        "result",
+                        f"{group.gpu(0)} returned {theirs[:300]}, "
+                        f"{follower.gpu} {reply.signature[:300]}",
+                    )
+                )
+        return envelope, outcome
 
 
 class _CompositeResidency:
@@ -943,11 +1032,6 @@ class Executor:
         self.follower_stages: list[list[object]] = []
         #: this generation's load reply
         self.load_reply: Reply = {}
-        #: follower only: the attempt spool and allocator bytes at its first mirrored call
-        self._run_entry: Path | None = None
-        #: follower only: every kernel its processors held across that attempt's calls
-        self._run_held = attention.Applied({}, ())
-        self._rank_request: _RankRequest | None = None
         #: HOST ONLY: this process's start, for the execution record (wall ms and its legs)
         self.boot: Reply = {}
         #: HOST ONLY: this rank's pid, host ordinal, GPU uuid and arch, read once after device init
@@ -978,10 +1062,6 @@ class Executor:
         #: Library workspaces/tensors may retain it until exit; do not destroy it at unload.
         self.execution_stream: torch.cuda.Stream | None = None
         self._startup_reported = False
-        #: the attempt spool while an attempt runs: where a mirrored call's payloads go
-        self._attempt_spool: Path | None = None
-        #: rank 0 only: the attempt whose cancel marker the mirror reads before each call
-        self._attempt_request = ""
         #: cr-038: the fill plane's capture directory, taken from the sealed environment
         #: snapshot at process entry and passed down — never read ambiently.
         self.fill_forensics_dir = fill_forensics_dir
@@ -995,15 +1075,11 @@ class Executor:
         self.residency: Placement | _CompositeResidency | None = None
         self.model_executors: list[Executor] = []
         self.models: dict[str, Model[object] | _OnDemand] = {}
-        # Accepted with this member (or its deferred container), never a per-alias cache.
-        self.group_components: dict[tuple[str, str], tuple[Model[object], nn.Module]] = {}
+        #: (model, component) of every sharded root this process holds
         self.group_sharded: set[tuple[str, str]] = set()
-        #: component -> the follower rank that keeps it resident for the whole group
-        self.group_hosted: dict[tuple[str, str], int] = {}
         #: the many-model construction this per-model generation belongs to, if any
         self._group_parent: Executor | None = None
         self._group_model_key = ""
-        self._group_attempts: dict[str, Path] = {}
         self.surface_names: dict[str, Surface] = {}
         self.discovered: Discovered | None = None
         #: HOST ONLY: what its attempts may call (`Start.call_interfaces`), and their bindings
@@ -1082,10 +1158,6 @@ class Executor:
                     return self.unsettled(target, exc, command.request_id)
             case Map():
                 return self.map(command)
-            case RequestMemory():
-                reply = msgspec.to_builtins(self.request_memory(command))
-                assert isinstance(reply, dict)
-                return reply
             case _:
                 # `cancel` is the seam's (`Mux`), and `shutdown` ends the loop.
                 raise AssertionError(f"{type(command).__name__} is not answered here")
@@ -1253,12 +1325,15 @@ class Executor:
             from cozy_runtime.internal.parallel import ulysses
 
             crossing = {"transport": {**transport.document(), "exchange": ulysses.taken()}}
+        if self.group is not None:
+            # each follower's exchanges, step points and stalls, by its GPU (`wire.RunReply`)
+            crossing["followers"] = {
+                self.group.gpu(rank): timing for rank, timing in self.group.rank_timing.items()
+            }
         return {
             "degree": self.world,
             "gpus": gpus,
             **crossing,
-            # per spread method: the calls each rank ran, and why a rank declined
-            "spread": dict(self.group.spread_log) if self.group is not None else {},
             "executor": dict(self.host.boot),
             "plan": {k: v for m in self.model_executors or [self] for k, v in m.planned.items()},
             "plan_reports": {
@@ -1415,8 +1490,8 @@ class Executor:
                 self._interrupted.set()
 
     def _group_reform(self) -> None:
-        """Rank 0's half of `mirror.mirror_component`: after a GPU ran short of memory in a
-        call, the group forms again for the next attempt (§5.5)."""
+        """After an attempt the group's interrupt ended (a GPU failed, ran short of memory or was
+        cancelled), the group forms again for the next one; weights stay (§5.5)."""
         assert self.group is not None and self.torch is not None
         exchange = self.host._group_exchange()
         self.host.pg = self.group.form(
@@ -1429,213 +1504,216 @@ class Executor:
         if self.host.comms is not None:
             self.host.comms.pg = self.host.pg
 
-    def run(self, command: Reply) -> Reply:
-        """Run a prepared sharded component, or one this rank hosts, under its leader's
-        scope and execution modes. A hosted call's result returns through the spool."""
+    def run(self, frame: Reply) -> Reply:
+        """A FOLLOWER's part of GPU 0's attempt: the same handler on the same request (`spmd`)."""
         if self.rank == 0:
             return {
                 "ok": False,
                 "code": "not_a_follower",
-                "detail": f"{_gpu(0)} leads the group's calls; it is not sent them",
+                "detail": f"{_gpu(0)} takes its attempts from the machine",
             }
-        if not self.ready or self.torch is None:
-            return {"ok": False, "code": "executor_not_ready", "detail": "no generation is Ready"}
-        if self.poisoned:
-            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        named = command.get("component")
-        if (
-            not isinstance(named, list)
-            or len(named) != 2
-            or not all(isinstance(part, str) for part in named)
-        ):
-            return {
-                "ok": False,
-                "code": "gpu_divergence",
-                "detail": "component identity is not a model/root pair",
-            }
-        name = (named[0], named[1])
-        target = self.group_components.get(name)
-        hosted = self.group_hosted.get(name) == self.rank
-        spread = "method" in command
-        if target is None or not (hosted or spread or name in self.group_sharded):
-            self.poisoned = "mirrored call names no prepared sharded component"
-            return {
-                "ok": False,
-                "code": "gpu_divergence",
-                "detail": f"{_gpu(self.rank)} holds no sharded component {name!r}",
-                "rank": self.rank,
-            }
-        _model, component = target
-        sol_counts: dict[str, int] = {}
-        result: object = None
-        models = {key[0]: model for key, (model, _root) in self.group_components.items()}
-        started_us = execution_evidence.now_us()
-        # A spread call rank 0 waits on over the group: a header always answers it.
-        answered = False
         try:
-            run = wire.RunCommand.read(command)
-            scoped = {scope.model: scope for scope in run.scopes}
-            spool = Path(cast("str", command["spool"]))  # a run command names its spool
-            held = attention.observed(
-                {f"{m}/{c}": root for (m, c), (_, root) in self.group_components.items()}
-            )
-            if self._run_entry != spool:
-                self._run_entry = spool
-                self._run_held = held
-            # A run takes rank 0's kernel at a step boundary (`_upgrade_attention`).
-            self._run_held = self._run_held.joined(held)
-            scopes = command["scopes"]
-            if not isinstance(scopes, list) or not 1 <= len(scopes) <= len(models):
-                raise GroupRefusal("mirrored scope set is not a bounded prepared model set")
-            seen: set[str] = set()
-            active: dict[str, tuple[str, ...]] = {}
-            with contextlib.ExitStack() as stack:
-                for scope in scopes:
-                    key = scope["model"]
-                    if key not in models or key in seen:
-                        raise GroupRefusal("mirrored scope names an unknown or duplicate model")
-                    seen.add(key)
-                    components = tuple(scope["components"])
-                    if not components or any(
-                        (key, root) not in self.group_components for root in components
-                    ):
-                        raise GroupRefusal("mirrored scope names no prepared component")
-                    residency = models[key]._cozy_residency
-                    if residency is not None and self._group_attempts.get(key) != spool:
-                        # A rank that hosts a component holds a set rank 0's plan never
-                        # priced, so it may always make room: demand-pull when measured.
-                        residency.open_attempt()
-                        self._group_attempts[key] = spool
-                    if residency is not None:
-                        choices = scoped[key].lora
-                        if set(choices) != set(components):
-                            raise GroupRefusal(
-                                "mirrored LoRA choices do not cover the scope's components"
-                            )
-                        stack.enter_context(residency.mirrored_lora(choices))
-                    stack.enter_context(models[key]._cozy_scope(scope["method"], components))
-                    active[key] = components
-                if name[0] not in active or name[1] not in active[name[0]]:
-                    raise GroupRefusal("sharded component has no active owning scope")
-                references = {
-                    key: root
-                    for key, (_owner, root) in self.group_components.items()
-                    if key[0] in active and key[1] in active[key[0]]
-                }
-                # Stage the same scopes before allocating the incoming activations.
-                stack.enter_context(self.torch.inference_mode(command["inference_mode"]))
-                stack.enter_context(self.torch.set_grad_enabled(command["grad_enabled"]))
-                if not (hosted or spread):
-                    stack.enter_context(cp.gated_call())
-                autocast = cast("dict[str, str]", command.get("autocast") or {})  # kind -> dtype
-                for kind, dtype in autocast.items():
-                    stack.enter_context(
-                        self.torch.autocast(device_type=kind, dtype=getattr(self.torch, dtype))
+            asked = commands.decode(cast("dict[str, object]", frame["prepare"]))[0]
+            command = commands.decode(cast("dict[str, object]", frame["invoke"]))[0]
+            entropy, tag = int(cast("int", frame["entropy"])), str(frame["tag"])
+            if not isinstance(asked, PrepareRequest) or not isinstance(command, Invoke):
+                raise ValueError("a run carries a prepare_request and an invoke")
+        except (KeyError, TypeError, ValueError, msgspec.ValidationError) as exc:
+            self.poisoned = "a malformed run"
+            return {"ok": False, "code": "gpu_divergence", "detail": f"{exc}"[:900]}
+        target = self._target(command, attempt=False)  # GPU 0 activated it
+        if isinstance(target, dict):
+            return target
+        return target._rank_attempt(asked, command, entropy, tag)
+
+    def _rank_attempt(
+        self, asked: PrepareRequest, command: Invoke, entropy: int, tag: str
+    ) -> Reply:
+        """The attempt on this follower: prepared and run as GPU 0 runs it, in a private spool,
+        with no progress, publish or child calls, its saves recording only what they would
+        save. Its reply is how its handler ended and its part of the record."""
+        pg = self.host.pg
+        if (
+            not self.ready
+            or self.poisoned
+            or self.torch is None
+            or self.discovered is None
+            or pg is None
+        ):
+            code = "poisoned_generation" if self.poisoned else "executor_not_ready"
+            return {"ok": False, "code": code, "detail": self.poisoned or "no generation is Ready"}
+        ranks = spmd.Ranks(
+            rank=self.rank,
+            world=self.world,
+            pg=pg,
+            device=self._rank_device(self.torch),
+            tag=tag,
+            gpu=_gpu,
+        )
+        held = attention.observed(self._attention_roots())
+        hold = self.host._producer_hold
+        states = hold[1] if hold is not None and hold[0] == self.construction else None
+        spool = Path(tempfile.mkdtemp(prefix=f"cozy-gpu{self.rank}-"))
+        started_us = execution_evidence.now_us()
+        rows: list[GpuMemory] = []
+        sol: dict[str, int] = {}
+        served = attention_ulysses.Seen()
+        envelope: InvocationResult | None = None
+        outcome: Outcome | None = None
+        record: AuthorAttempt | None = None
+        working = 0
+        exchange: dict[str, float] = {}
+        from cozy_runtime.internal.parallel import ulysses
+
+        ulysses.taken()  # what an earlier attempt left uncounted is not this one's
+        stage_memo.ENGINE.open(None, spool)
+        if self.residency is not None:
+            self.residency.open_attempt()
+        try:
+            with (
+                self._request(command.request_id) as rows,
+                attention_sol.observing(held=states) as sol,
+                attention_ulysses.observing() as served,
+                spmd.attempt(ranks, entropy),
+            ):
+                try:
+                    registration = self.discovered.app.get(asked.entrypoint)
+                    prepared = prepare(
+                        registration,
+                        asked.payload,  # type: ignore[arg-type]  # an invoke's payload is a JSON object
+                        input_metadata=_prepared_inputs(asked),
                     )
-                stack.enter_context(wire.attention_context(run))
-                states = None
-                if self._producer_hold is not None:
-                    construction, held_store = self._producer_hold
-                    if name[0].startswith(construction + "#"):
-                        states = held_store
-                sol_counts = stack.enter_context(attention_sol.observing(held=states))
-                served = stack.enter_context(attention_ulysses.observing())
-                args, kwargs = wire.run_call(
-                    run,
-                    wire.Broadcast(references).receive(run, self.pg, self._rank_device(self.torch))
-                    if command.get("broadcast")
-                    else wire.TensorSpool(
-                        spool / str(command.get("payloads", "ranks")), references
-                    ),
-                    device=self._rank_device(self.torch),
-                )
-                if spread:
-                    # A pure method call whose one tensor result goes straight to rank 0.
-                    output = getattr(component, str(command["method"]))(*args, **kwargs)
-                    head = wire.p2p_head(output)
-                    # From the header on, rank 0 reads this answer; before it, `send_nothing`.
-                    answered = True
-                    wire.send_tensor(output, head, 0, self.pg)
-                elif hosted:
-                    call = component.get_submodule(str(command.get("module", "")))
-                    result = wire.marshal(
-                        call(*args, **kwargs),
-                        wire.TensorSpool(spool / str(command.get("results", "hosted"))),
+                    envelope, outcome, record = run_prepared(
+                        prepared,
+                        Invocation(
+                            request_id=command.request_id,
+                            spool=spool,
+                            deadline=_deadline(command.deadline_s),
+                            device=self._device(),
+                            cancel=self.host._interrupted.is_set,
+                            # An on-demand proxy stands for its model (`_OnDemand.__getattr__`).
+                            models=cast("Mapping[str, Model[object]]", self.models),
+                            recipes=self.discovered.recipes,
+                            trees=command.trees,
+                            assets=_granted_inputs(command),
+                            max_output_bytes=command.max_output_bytes,
+                            writes=False,
+                        ),
                     )
-                else:
-                    component(*args, **kwargs)
-                accel.drain(self.torch, self.device_kind)
-            self._attempt_spool = spool
-            ranked = self.host._rank_request
-            working = accel.allocator_peak(self.host.memory, ranked.id) if ranked is not None else 0
+                except Exception as exc:
+                    outcome = classify(exc)
+                finally:
+                    with contextlib.suppress(Exception):
+                        ranks.end(outcome is not None and outcome.terminal == "succeeded")
+                if self.host.memory is not None:
+                    working = accel.allocator_peak(self.host.memory, command.request_id)
+                exchange = ulysses.taken()
         except Exception as exc:
-            ending = mirror.ending(exc)
-            # where it was raised, innermost first: a GPU's own traceback stays on that GPU
-            at = " < ".join(
-                f"{Path(f.filename).name}:{f.lineno} {f.name}"
-                for f in reversed(traceback.extract_tb(exc.__traceback__)[-3:])
-            )
-            if spread and not answered:
-                declined = self._declines(exc, ending)
-                with contextlib.suppress(Exception):
-                    wire.send_nothing(
-                        0, self.pg, self._rank_device(self.torch), failed=declined is None
-                    )
-                if declined is not None:
-                    # Nothing moved that this rank must keep: the call is pure and runs on
-                    # another rank. The generation stays Ready.
-                    return {
-                        "ok": True,
-                        "rank": self.rank,
-                        "component": list(name),
-                        "sol_calls": {},
-                        "working_peak_bytes": 0,
-                        "declined": declined,
-                    }
-            if ending is not None and not spread:
-                # Short of memory, or rank 0 ended this collective: never this process's
-                # poison. A mirrored call's GPU waits for the group to form again.
-                return {
-                    "ok": False,
-                    "code": ending,
-                    "detail": f"{type(exc).__name__}: {str(exc)[:640]} (at {at})"[:900],
-                    "rank": self.rank,
-                    **({} if hosted else {"rerun": True}),
-                }
             outcome = classify(exc)
-            self.poisoned = f"mirrored {name} failed: {outcome.code}"
-            return {
-                "ok": False,
-                "code": outcome.code,
-                "detail": f"{type(exc).__name__}: {str(exc)[:640]}"[:900],
-                "rank": self.rank,
-            }
-        return {
-            "ok": True,
-            "rank": self.rank,
-            "component": list(name),
-            "sol_calls": sol_counts,
-            "working_peak_bytes": working,
-            **({"result": result} if hosted else {}),
-            "evidence": execution_evidence.record(
+            with contextlib.suppress(Exception):
+                ranks.end(False)
+        finally:
+            stage_memo.ENGINE.close(lambda *_, **__: None)
+            shutil.rmtree(spool, ignore_errors=True)
+            # As GPU 0's last attempt out: its stream drains, then the last step's holds go.
+            with contextlib.suppress(Exception):
+                accel.drain(self.torch, self.device_kind)
+            if self.residency is not None:
+                self.residency.release()
+        assert outcome is not None
+        outcome = self._ended(outcome, self.host._interrupted.is_set())
+        failed = outcome.terminal == "failed"
+        if failed and (
+            outcome.code == DEVICE_FAULT or not accel.healthy(self.torch, self.device_kind)
+        ):
+            self._poison(f"device fault: {outcome.message}"[:300])
+        reply = wire.RunReply(
+            ok=outcome.terminal == "succeeded",
+            code=outcome.code,
+            detail=ends(outcome.message, 900),
+            terminal=outcome.terminal,
+            origin=outcome.origin,
+            signature=spmd.signature(envelope.result) if envelope is not None else "",
+            meetings=ranks.sequence,
+            sol_calls=dict(sol),
+            working_peak_bytes=working,
+            evidence=execution_evidence.record(
                 self._rank_identity(),
                 started_us,
                 execution_evidence.now_us(),
                 execution_evidence.attention(
-                    observed=execution_evidence.observed(self._run_held.hosts),
+                    observed=execution_evidence.observed(held.hosts),
                     impl=attention.implementations(served),
-                    kernels=attention.evidence(self._run_held.totals(), served.refused),
+                    kernels=attention.evidence(held.totals(), served.refused),
                 ),
             ),
-        }
+            memory=msgspec.to_builtins(rows[0]) if rows else None,
+            exchange=exchange,
+            steps={
+                name: list(track.series or ())
+                for name, track in (record.attribution.steps if record else {}).items()
+            },
+            stages={
+                name: round(track.total_ms, 1)
+                for name, track in (record.attribution.stages if record else {}).items()
+            },
+        )
+        return {**msgspec.to_builtins(reply), "rank": self.rank, "poisoned": bool(self.poisoned)}
 
-    def _declines(self, exc: Exception, ending: str | None) -> str | None:
-        """Why a spread call is declined rather than failed: this GPU's memory refused it up front
-        (`DoesNotFit`, before the pass that would run out), so another GPU takes it. An allocation
-        that failed partway fails the call: nothing runs again for it."""
-        if isinstance(exc, DoesNotFit):
-            return f"{DOES_NOT_FIT}: {exc}"[:300]
-        return None
+    def _poison(self, why: str) -> None:
+        """This process serves nothing more; its first cause stays its cause."""
+        self.poisoned = self.poisoned or why
+
+    @staticmethod
+    def _ended(outcome: Outcome, interrupted: bool) -> Outcome:
+        """An aborted collective after the group's interrupt is that GPU's call ending, not
+        its device failing (`spmd`)."""
+        if (
+            interrupted
+            and outcome.code == DEVICE_FAULT
+            and outcome.message.startswith("DistBackendError")
+        ):
+            return Outcome("failed", "runtime", ENDED, outcome.message)
+        return outcome
+
+    @contextlib.contextmanager
+    def _ranks(self, command: Invoke, prepared: PreparedRequest) -> Iterator[_Ranks | None]:
+        """GPU 0's side of a group attempt: every follower is sent the same request (`run`)
+        before GPU 0's handler starts, and answers once its own ends (`_Ranks.settle`)."""
+        group, asked, pg, torch = self.group, prepared.asked, self.host.pg, self.torch
+        if group is None:
+            yield None
+            return
+        # A formed group has its process group, and an attempt runs after the device is up.
+        assert isinstance(asked, PrepareRequest) and pg is not None and torch is not None
+        entropy = secrets.randbits(63)
+        tag = f"{entropy:016x}"
+        ranks = spmd.Ranks(
+            rank=0,
+            world=self.world,
+            pg=pg,
+            device=self._rank_device(torch),
+            tag=tag,
+            gpu=_gpu,
+        )
+        group.broadcast(
+            {
+                "cmd": "run",
+                "prepare": commands.encode(asked),
+                "invoke": commands.encode(command),
+                "entropy": entropy,
+                "tag": tag,
+                "kernels": list(kernel_ready.agreed()),
+            }
+        )
+        attempt = _Ranks(group, ranks)
+        try:
+            with spmd.attempt(ranks, entropy):
+                yield attempt
+        finally:
+            if not attempt.settled:
+                with contextlib.suppress(Exception):
+                    attempt.settle(None, Outcome("failed", "runtime", ENDED, "GPU 0 failed"))
 
     def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> Reply:
         """A group that could not form or hold is THIS process's poison: the worker
@@ -1648,14 +1726,12 @@ class Executor:
     def _install_group(
         self, torch: ModuleType, model: Model[object], homes: Mapping[str, int]
     ) -> Reply | None:
-        """Every rank shards its replica, takes its side of the mirror, and keeps the placeable
-        components TensorD homed on its GPU (`Binding.homes`)."""
+        """Every GPU shards its replica's `_cp_plan` components and keeps the placeable
+        components TensorD homed on its GPU (`Binding.homes`); every GPU runs the handler."""
         if self.world <= 1:
             return None
         owner = self.host
         roots = cast("Backend", self.backend).roots  # a member shards after its load
-        for component, root in roots.items():
-            owner.group_components[(self._group_model_key, component)] = (model, root)
         candidates = cp.sharding_candidates(model)
         # An explicitly group-compatible auxiliary model can be replicated beside a
         # sharded model. The complete multi-model prepare still requires a sharded root.
@@ -1669,6 +1745,7 @@ class Executor:
                 return self._group_refusal(exc)
         record = model._cozy_record
         skipped = set(record.skipped) if record is not None else set()
+        sharded: set[str] = set()
         for label, component in candidates:
             component_name = next((name for name, root in roots.items() if root is component), None)
             if component_name is None and label.rpartition(".")[2] in skipped:
@@ -1677,21 +1754,8 @@ class Executor:
                 return self._group_refusal(
                     GroupRefusal("a sharded component is not a prepared root")
                 )
-            name = (self._group_model_key, component_name)
-            owner.group_sharded.add(name)
-            if self.rank == 0:
-                assert self.group is not None
-                mirror_component(
-                    component,
-                    name=name,
-                    prepared=owner.group_components,
-                    group=self.group,
-                    spool=lambda: owner._attempt_spool,
-                    cancelled=owner._attempt_cancelled,
-                    reform=owner._group_reform,
-                    device=self._rank_device(torch),
-                )
-        sharded = {name[1] for name in owner.group_sharded if name[0] == self._group_model_key}
+            owner.group_sharded.add((self._group_model_key, component_name))
+            sharded.add(component_name)
         hosted = {component: gpu for component, gpu in homes.items() if gpu}
         for component, gpu in hosted.items():
             if component not in roots or component in sharded or not 0 < gpu < self.world:
@@ -1699,57 +1763,19 @@ class Executor:
                     GroupRefusal(f"{component} cannot be homed on GPU {gpu}", code="group_unformed")
                 )
         for component_name, home in hosted.items():
-            name = (self._group_model_key, component_name)
-            owner.group_hosted[name] = home
-            if self.rank == 0:
-                assert self.group is not None
-                mirror.host_component(
-                    roots[component_name],
-                    name=name,
-                    prepared=owner.group_components,
-                    group=self.group,
-                    spool=lambda: owner._attempt_spool,
-                    rank=home,
-                    device=self._rank_device(torch),
-                    cancelled=owner._attempt_cancelled,
-                )
-        # Every rank may take a spread call. A rank homing a placeable component takes one
-        # only beside everything it holds (measured room), so it never gives up the
-        # component it hosts for a clip (`Executor.run`).
-        sparing = sorted(set(owner.group_hosted.values()))
-        if self.rank == 0:
-            assert self.group is not None
-            if hosted:
-                object.__setattr__(
-                    model, "_cozy_placement", mirror.GroupPlacement(hosted, self.group, torch)
-                )
-            for component_name, root in roots.items():
-                name = (self._group_model_key, component_name)
-                if name in owner.group_sharded or name in owner.group_hosted:
-                    continue
-                mirror.install_spread(
-                    root,
-                    name=name,
-                    prepared=owner.group_components,
-                    group=self.group,
-                    spool=lambda: owner._attempt_spool,
-                    device=self._rank_device(torch),
-                    cancelled=owner._attempt_cancelled,
-                )
+            spmd.host_component(
+                roots[component_name], name=component_name, home=home, rank=self.rank
+            )
+        if hosted:
+            object.__setattr__(model, "_cozy_placement", spmd.Placement(hosted, self.rank))
         self.facts["sequence_parallel"] = {
             "degree": self.world,
             "rank": self.rank,
             "components": list(installed),
             "hosted": hosted,
-            "spread_ranks": list(range(self.world)),
-            "sparing_ranks": sparing,
             "followers": list(self.group.pids()) if self.group is not None else [],
         }
         return None
-
-    def _attempt_cancelled(self) -> bool:
-        """A group's one attempt is cancelled (its calls on the other GPUs read this)."""
-        return bool(self._attempt_request) and self.mux.cancelled(self._attempt_request)
 
     def _warm_package(self) -> str:
         """Give the package its ONE chance to pay its deferred import cost off the lock.
@@ -1864,9 +1890,12 @@ class Executor:
                 f"{len(_sealed_entries())} device(s) ({sealed_devices!r})",
             }
         if cuda_start and importlib.util.find_spec("torch") is None:
-            return {"ok": False, "code": "torch_absent",
-                    "detail": "CUDA Runtime startup without Torch has no qualified "
-                              "device adapter; no GPU work was started"}
+            return {
+                "ok": False,
+                "code": "torch_absent",
+                "detail": "CUDA Runtime startup without Torch has no qualified "
+                "device adapter; no GPU work was started",
+            }
         if self.started or (command.import_only and self.imported):
             return self._start_reply([], reused=True)
         _restore_seal()
@@ -2820,7 +2849,9 @@ class Executor:
                 roots,
                 degree=self.world,
                 bits=type(model).__attention_bits__,
-                row=arch.common(map(arch.row, sms)) if self.world > 1 and all(sms) else None,
+                row=arch.common(map(arch.row, sms))
+                if self.world > 1 and sms and all(sms)
+                else None,
             )
             applied = self._reselect()
             self.device_facts = device_facts
@@ -3448,12 +3479,7 @@ class Executor:
             prepared = prepare(
                 registration,
                 command.payload,  # type: ignore[arg-type]  # an invoke's payload is a JSON object
-                input_metadata={
-                    path: InputMetadata(
-                        file.input_id, file.media_type, file.digest, file.length, file.order
-                    )
-                    for path, file in command.input_metadata.items()
-                },
+                input_metadata=_prepared_inputs(command),
             )
         except Exception as exc:
             outcome = classify(exc)
@@ -3477,7 +3503,9 @@ class Executor:
                     "code": "poisoned_generation" if self.poisoned else "executor_not_ready",
                     "detail": self.poisoned or "executor stopped during request preparation",
                 }
-            self.prepared[command.request_id] = replace(prepared, stages=waits.stages)
+            self.prepared[command.request_id] = replace(
+                prepared, stages=waits.stages, asked=command if self.world > 1 else None
+            )
             self.awaiting.add(command.request_id)
             # A prepared request never dispatched must not survive for the generation.
             for stale in list(self.prepared)[: -PREPARED_HELD or None]:
@@ -3546,12 +3574,10 @@ class Executor:
         spool = Path(command.spool)
         deadline = _deadline(command.deadline_s)
         torch = self.torch
-        self._attempt_spool = self.host._attempt_spool = spool
-        self.host._attempt_request = command.request_id
         if self.group is not None:
             self.group.working_peaks.clear()
             self.group.rank_records.clear()
-            self.group.spread_log.clear()
+            self.group.rank_timing.clear()
 
         # The lossy lane, carrying BOTH kinds of live record. A progress frame is not
         # retained anywhere: its `position` is the monotone unit count the worker's
@@ -3603,9 +3629,12 @@ class Executor:
             if frame.position is not None:
                 steps[frame.stage] = frame.position
             at = point[0] = {"stage": frame.stage, "step": steps.get(frame.stage, 0), **here}
-            swapped.extend((name, at) for name in kernel_ready.boundary())
-            if pin or served_attention is None:
-                return  # an override holds its kernel for every step
+            # A group's kernels change only between attempts: its followers took this attempt's
+            # set with its `run` and meet no boundary of GPU 0's, so GPU 0 decides nothing new here.
+            agreed = kernel_ready.agreed() if self.group is not None else None
+            swapped.extend((name, at) for name in kernel_ready.boundary(agreed))
+            if pin or served_attention is None or self.group is not None:
+                return  # an override, or a group's agreed selection, holds for every step
             if not segments:
                 segments.append(_segment("", 0, served_attention, started_us))
             if not self._upgrade_attention(CURRENT.get()):
@@ -3644,7 +3673,6 @@ class Executor:
                 WARNINGS.attempt() as warnings,
                 request_path.serving() as blocking,
                 self._request(command.request_id) as own_memory,
-                self._ranks_request(command.request_id) as rank_memory,
                 attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
                 if pin
                 else contextlib.nullcontext(
@@ -3653,6 +3681,7 @@ class Executor:
                 self._ranks_attention(pin, served_attention),
                 attention_sol.observing(ranks=sol_rank_counts, kernels=sol_kernels) as sol_counts,
                 attention_ulysses.observing() as served_impls,
+                self._ranks(command, prepared) as group_attempt,
             ):
                 if removed := attention.retired(command.attention_kernel):
                     said = f"attention kernel {removed} is gone: the normal choice runs"
@@ -3665,7 +3694,11 @@ class Executor:
                         spool=spool,
                         deadline=deadline,
                         device=self._device(),
-                        cancel=functools.partial(self.host.mux.cancelled, command.request_id),
+                        # A group's attempt also stops once another GPU's ended it (`_Ranks`).
+                        cancel=lambda: (
+                            self.host.mux.cancelled(command.request_id)
+                            or (self.group is not None and self.group.interrupted)
+                        ),
                         # An on-demand proxy stands for its model (`_OnDemand.__getattr__`).
                         models=cast("Mapping[str, Model[object]]", self.models),
                         recipes=cast("Discovered", self.discovered).recipes,  # started
@@ -3701,6 +3734,9 @@ class Executor:
                         calls=self.host._call_broker(command.request_id, self.host.call_interfaces),
                     ),
                 )
+                if group_attempt is not None:
+                    envelope, outcome = group_attempt.settle(envelope, outcome)
+                    rank_memory = group_attempt.memory
                 if (memory := self.host.requests.get(command.request_id)) is not None:
                     # A call that ran out of memory: what its memory learns from.
                     memory.failed = outcome.code in CAPACITY_CODES
@@ -3710,6 +3746,11 @@ class Executor:
             if record is None:
                 record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
+        if self.group is not None and self.group.interrupted and not self.group.broken:
+            try:
+                self._group_reform()
+            except Exception as exc:
+                self.poisoned = f"group: could not form again: {type(exc).__name__}: {exc}"[:300]
         self.handled[command.request_id] = (outcome, stage[0], record)
         # A failure the device raised (CUDA's or NCCL's own error, not capacity), or one that
         # left it faulted: this process serves nothing more, so it is poisoned and the machine
@@ -3720,7 +3761,7 @@ class Executor:
             and torch is not None  # `failed` already holds it; this narrows it
             and (outcome.code == DEVICE_FAULT or not accel.healthy(torch, self.device_kind))
         ):
-            self.poisoned = self.poisoned or f"device fault: {outcome.message}"[:300]
+            self._poison(f"device fault: {outcome.message}"[:300])
         if self.rank == 0:
             for member in self.model_executors or [self]:
                 self._emit_gemm(record, member)
@@ -3800,8 +3841,6 @@ class Executor:
         varena = [*own_memory, *rank_memory]
         used = {"varena": msgspec.to_builtins(varena)} if varena else None
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
-        self._attempt_spool = self.host._attempt_spool = None
-        self.host._attempt_request = ""
         if self.group is not None and self.group.broken and not self.poisoned:
             # A FOLLOWER DIED OR DIVERGED UNDER THIS ATTEMPT (cr-068): the group is one
             # executor, so this process is poisoned with it and the worker rebuilds all K.
@@ -4127,35 +4166,34 @@ class Executor:
         asked = functools.partial(
             Kernels, construction=self.construction, model_key=self._group_model_key
         )
-        with group.hold(range(1, group.degree)):
-            try:
-                replies = group.call(commands.encode(asked(sets=tuple(sorted(launches)))))
-                for follower, reply in zip(group.followers, replies, strict=True):
-                    if not reply.get("ok"):
-                        raise GpuDivergence(follower.gpu, "kernels", str(reply.get("detail")))
-                    missing = set(launches) - set(reply.get("built") or ())
-                    for name in sorted(set(reply.get("failed") or ()) & missing):
-                        self._refuse_install(
-                            name,
-                            "kernels_failed",
-                            f"{follower.gpu} has no build of it; the group serves without it",
-                        )
-                        self._drop((name,))
-                    launches = {n: launch for n, launch in launches.items() if n not in missing}
-                installed = self._install(launches) if launches else []
-                if not installed:
-                    return None
-                command = asked(sets=tuple(installed), install=True)
-                replies = group.call(commands.encode(command))
-                for follower, reply in zip(group.followers, replies, strict=True):
-                    if not reply.get("ok"):
-                        raise GpuDivergence(
-                            follower.gpu,
-                            "kernels",
-                            f"{_gpu(0)} installed {installed}: {reply.get('detail')}"[:800],
-                        )
-            except GroupRefusal as exc:
-                return self._group_refusal(exc)
+        try:
+            replies = group.call(commands.encode(asked(sets=tuple(sorted(launches)))))
+            for follower, reply in zip(group.followers, replies, strict=True):
+                if not reply.get("ok"):
+                    raise GpuDivergence(follower.gpu, "kernels", str(reply.get("detail")))
+                missing = set(launches) - set(reply.get("built") or ())
+                for name in sorted(set(reply.get("failed") or ()) & missing):
+                    self._refuse_install(
+                        name,
+                        "kernels_failed",
+                        f"{follower.gpu} has no build of it; the group serves without it",
+                    )
+                    self._drop((name,))
+                launches = {n: launch for n, launch in launches.items() if n not in missing}
+            installed = self._install(launches) if launches else []
+            if not installed:
+                return None
+            command = asked(sets=tuple(installed), install=True)
+            replies = group.call(commands.encode(command))
+            for follower, reply in zip(group.followers, replies, strict=True):
+                if not reply.get("ok"):
+                    raise GpuDivergence(
+                        follower.gpu,
+                        "kernels",
+                        f"{_gpu(0)} installed {installed}: {reply.get('detail')}"[:800],
+                    )
+        except GroupRefusal as exc:
+            return self._group_refusal(exc)
         return None
 
     def kernels(self, command: Kernels) -> Frame:
@@ -4218,16 +4256,14 @@ class Executor:
             executor.attention = replace(applied, waiting=())
             return False
         executor.attention = fresh
-        if executor.group is not None:
-            with executor.group.hold(range(1, executor.group.degree)):
-                if executor._agree_attention(poison=False):
-                    # Every GPU back on the prepared selection; one that cannot take it back
-                    # leaves a divergent group, refused.
-                    executor.attention_defaults.restore()
-                    executor.attention = applied
-                    executor._agree_attention()
-                    executor.attention = replace(applied, waiting=())
-                    return False
+        if executor.group is not None and executor._agree_attention(poison=False):
+            # Every GPU back on the prepared selection; one that cannot take it back
+            # leaves a divergent group, refused.
+            executor.attention_defaults.restore()
+            executor.attention = applied
+            executor._agree_attention()
+            executor.attention = replace(applied, waiting=())
+            return False
         assert executor.backend is not None
         executor.attention_defaults = attention.snapshot(dict(executor.backend.roots))
         return True
@@ -4350,7 +4386,7 @@ class Executor:
             )
         except attention.AttentionRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "rank": self.rank}
-        # One attempt's producer states live across its mirrored calls; the restore or the
+        # One attempt's producer states live across its calls; the restore or the
         # next selection closes them.
         store: dict[str, object] = {}
         self._attention_hold.callback(close_producer_states, store)
@@ -4365,107 +4401,6 @@ class Executor:
             detail = f"{_gpu(int(reply.get('rank', -1)))}: {reply.get('detail', '')}"[:900]
             raise InvalidRequest(detail, code=str(reply.get("code")))
         return cast("list[_AttentionAnswer]", replies)  # `select_attention`'s
-
-    def request_memory(self, command: RequestMemory) -> RankMemory:
-        """A follower's part of rank 0's attempt: its own request, begun, planned and ended
-        with rank 0's (`_ranks_request`), its record in the end's reply."""
-        state, rank, request_id = self.host._rank_request, self.rank, command.request_id
-        refused = functools.partial(RankMemory, ok=False, rank=rank, request_id=request_id)
-        if not request_id or command.construction not in self.constructions:
-            return refused(code="construction_absent")
-        if command.phase == "begin":
-            if state is not None:
-                return refused(code="request_memory_busy")
-            context = self.constructions[command.construction]._request(request_id)
-            rows = context.__enter__()
-            self.host._rank_request = _RankRequest(command.construction, request_id, context, rows)
-        elif state is None or (state.id, state.construction) != (
-            request_id,
-            command.construction,
-        ):
-            return refused(code="request_memory_absent")
-        elif command.phase == "plan":
-            self._plan_request(request_id, command.steps)
-        else:
-            self.host._rank_request = None
-            state.context.__exit__(None, None, None)
-            own = state.rows[0] if state.rows else None
-            waited = IDLE_WAITED.pop("", 0.0)
-            return RankMemory(
-                ok=True, rank=rank, request_id=request_id, memory=own, idle_waited_ms=waited
-            )
-        return RankMemory(ok=True, rank=rank, request_id=request_id)
-
-    def _rank_memory_command(self, command: RequestMemory) -> list[RankMemory]:
-        assert self.group is not None
-        try:
-            replies = [
-                msgspec.convert(reply, RankMemory)
-                for reply in self.group.call(commands.encode(command))
-            ]
-        except msgspec.ValidationError as exc:
-            self.poisoned = "group request memory reply was malformed"
-            raise GroupRefusal(self.poisoned, code="group_broken") from exc
-        if (
-            {reply.rank for reply in replies} != set(range(1, self.world))
-            or len(replies) != self.world - 1
-            or any(not reply.ok or reply.request_id != command.request_id for reply in replies)
-        ):
-            self.poisoned = "group request memory did not settle on every rank"
-            raise GroupRefusal(self.poisoned, code="group_broken")
-        return replies
-
-    @contextlib.contextmanager
-    def _ranks_request(self, request_id: str) -> Iterator[list[GpuMemory]]:
-        """Every follower's request beside this one; their records land in the list."""
-        records: list[GpuMemory] = []
-        if self.group is None:
-            yield records
-            return
-        begun = False
-        try:
-            self._rank_memory_command(
-                RequestMemory(construction=self.construction, request_id=request_id, phase="begin")
-            )
-            begun = True
-            yield records
-        finally:
-            if not self.group.broken:
-                command = RequestMemory(
-                    construction=self.construction, request_id=request_id, phase="end"
-                )
-                if begun:
-                    replies = self._rank_memory_command(command)
-                    if self.host.memory is not None and any(r.memory is None for r in replies):
-                        self.poisoned = "a GPU rank omitted its own request memory record"
-                        raise GroupRefusal(self.poisoned, code="group_broken")
-                    records.extend(reply.memory for reply in replies if reply.memory is not None)
-                    if waited := sum(reply.idle_waited_ms for reply in replies):
-                        IDLE_WAITED[request_id] = IDLE_WAITED.get(request_id, 0.0) + waited
-                else:
-                    # A partial begin still closes the ranks that entered; the original
-                    # refusal, not an absent state on another rank, remains the failure.
-                    self.group.call(commands.encode(command))
-
-    def _plan_request(self, request_id: str, steps: Sequence[str | Collection[str]]) -> None:
-        """`ctx.plan`: the attempt's request takes the steps as its plan, on every GPU."""
-        request = self.host.requests.get(request_id)
-        if request is not None:
-            request.plan(list(steps))
-        if self.residency is not None:  # a step's components keep their holds (`using`)
-            self.residency.plan(steps, request=request)
-        if self.group is not None and self.rank == 0:
-            normalized = tuple(
-                (step,) if isinstance(step, str) else tuple(sorted(step)) for step in steps
-            )
-            self._rank_memory_command(
-                RequestMemory(
-                    construction=self.construction,
-                    request_id=request_id,
-                    phase="plan",
-                    steps=normalized,
-                )
-            )
 
     @contextlib.contextmanager
     def _ranks_attention(self, pin: str, applied: attention.Applied) -> Iterator[None]:
@@ -5017,7 +4952,6 @@ _FOLLOWER_COMMANDS = frozenset(
         "run",
         "attention",
         "kernels",
-        "request_memory",
         "shutdown",
     }
 )
@@ -5033,7 +4967,7 @@ def answer(executor: Executor, frame: Frame) -> Frame | None:
             "detail": f"{_gpu(executor.rank)} answers {sorted(_FOLLOWER_COMMANDS)}, not {name!r}",
         }
     if name == "run":
-        # A follower's call serves rank 0's request, with the kernels the group serves from it.
+        # A follower's part of GPU 0's attempt, with the kernels the group serves from it.
         with request_path.serving():
             # The frame's kernels are names, as rank 0 sent them.
             began = kernel_ready.boundary(cast("Iterable[str]", frame.get("kernels") or ()))
@@ -5291,11 +5225,7 @@ def _idle(executor: Executor, order: _Order) -> None:
         return executor.host.memory is not None and executor.host.memory.host_pending()
 
     def ready() -> bool:
-        return (
-            (bool(graphs.IDLE.jobs) or pins())
-            and not executor.awaiting_invoke()
-            and executor.host._rank_request is None
-        )
+        return (bool(graphs.IDLE.jobs) or pins()) and not executor.awaiting_invoke()
 
     while not executor.poisoned:  # a faulted device takes no idle work: the machine ends it
         with order.idle(answered, ready) as answered, executor._execution_context():

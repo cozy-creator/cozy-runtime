@@ -1,53 +1,44 @@
-"""Transport sharded component arguments as JSON control and tensor snapshots.
+"""The values one GPU of a group hands the others (`spmd.Ranks.cross`): JSON for the structure,
+the tensors apart, each crossing by one broadcast from the GPU that holds it.
 
-A mirrored call's tensors cross over the group's own collectives (`Broadcast`); a call to
-one follower's tensors live in the call's shared spool. Followers take the exact dtype and
-shape onto their own device. Values are snapshots; aliases, generators, callbacks
-and other Python state are not transported. A module can cross only as the identity
-of a prepared component root whose owning scope is active on every rank.
+A value is JSON scalars, lists, tuples, str-keyed dicts, tensors and model outputs
+(transformers' `ModelOutput`); anything else is refused by name.
 """
 
 from __future__ import annotations
 
-import ctypes
 import dataclasses
-import math
 import sys
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Any
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import msgspec
 
-from cozy_runtime.accel.attention import _ACTIVE_LAYOUT, AttentionLayout
-from cozy_runtime.author._model import LoRAServing
+from cozy_runtime.author._errors import Origin, Terminal
 from cozy_runtime.internal import execution_evidence
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.parallel.plan import GroupRefusal
+
+if TYPE_CHECKING:
+    import torch
 
 _TAG = "__sp__"
 
 
 class UncrossableArgument(GroupRefusal):
-    """A model-call argument outside the wire's value vocabulary."""
+    """A value outside the wire's vocabulary."""
 
     default_code = "uncrossable_argument"
 
 
 class _Tensor(msgspec.Struct, frozen=True, tag_field=_TAG, tag="tensor"):
-    """A tensor's bytes: the spool file `v`, or the `v`th broadcast of the call."""
+    """The `v`th tensor of the value; `host`: it lives in host memory on the GPU that sent it."""
 
-    v: str
+    v: int
     dtype: str
     shape: list[int]
-
-
-class _Component(msgspec.Struct, frozen=True, tag_field=_TAG, tag="component"):
-    """A prepared component root, by (model, component)."""
-
-    v: tuple[str, str]
+    host: bool
 
 
 class _Tuple(msgspec.Struct, frozen=True, tag_field=_TAG, tag="tuple"):
@@ -55,166 +46,58 @@ class _Tuple(msgspec.Struct, frozen=True, tag_field=_TAG, tag="tuple"):
 
 
 class _Output(msgspec.Struct, frozen=True, tag_field=_TAG, tag="output"):
-    """A model output (transformers' `ModelOutput`): rebuilt only from a class the
-    receiving rank has already imported."""
+    """A model output, rebuilt only from a class the receiving GPU has already imported."""
 
     v: dict[str, Json]
     kind: str = msgspec.field(name="class")
 
 
-_Envelope = _Tensor | _Component | _Tuple | _Output
+_Envelope = _Tensor | _Tuple | _Output
 
 
-class Scope(msgspec.Struct, frozen=True):
-    """One component scope active on the leader, as a follower re-enters it."""
-
-    model: str
-    method: str
-    components: tuple[str, ...]
-    #: Component -> the leader's attempt-fixed mode and bake implementation.
-    lora: dict[str, LoRAServing]
-
-
-class RunCommand(msgspec.Struct, frozen=True, tag_field="cmd", tag="run"):
-    """One component call as every follower receives it: a sharded forward, a hosted module
-    call (`module`, `results`) or a spread method call (`method`, `p2p`, `spare`)."""
-
-    component: tuple[str, str]
-    spool: str
-    payloads: str
-    scopes: tuple[Scope, ...]
-    grad_enabled: bool
-    inference_mode: bool
-    #: device kind -> autocast dtype name
-    autocast: dict[str, str]
-    #: the leader's closed attention layout, never ambient Python context
-    attention_layout: AttentionLayout | None
-    args: list[Json]
-    kwargs: dict[str, Json]
-    module: str | msgspec.UnsetType = msgspec.UNSET
-    results: str | msgspec.UnsetType = msgspec.UNSET
-    method: str | msgspec.UnsetType = msgspec.UNSET
-    p2p: bool | msgspec.UnsetType = msgspec.UNSET
-    spare: bool | msgspec.UnsetType = msgspec.UNSET
-    #: the tensors cross by `Broadcast`, after this command, rather than the spool
-    broadcast: bool = False
-    #: the kernels the group serves from this call on (`kernel_ready.agreed`)
-    kernels: tuple[str, ...] = ()
-
-    @classmethod
-    def read(cls, command: Mapping[str, object]) -> RunCommand:
-        try:
-            return msgspec.convert(command, cls)
-        except msgspec.ValidationError as exc:
-            raise UncrossableArgument(f"malformed mirrored call: {exc}") from exc
-
-
-class TensorSpool:
-    """Where one mirrored call's tensor payloads live: a directory rank 0 writes and every
-    follower reads. Files are numbered per call and removed by the caller with the call."""
-
-    def __init__(
-        self, directory: Path, components: Mapping[tuple[str, str], Any] | None = None
-    ) -> None:
-        self.directory = directory
-        self.written = 0
-        # References identify already prepared local roots, never a serialized module graph.
-        self.components = dict(components or {})
-        self.component_names = {id(root): key for key, root in self.components.items()}
-
-    def write(self, tensor: Any) -> str:
-        self.directory.mkdir(parents=True, exist_ok=True)
-        name = f"tensor-{self.written}.raw"
-        self.written += 1
-        # data_ptr includes a slice's offset; storage bytes do not. Keep the tensor alive
-        # while copying exactly its logical bytes, including scalars and empty tensors.
-        flat = tensor.detach().to("cpu").resolve_conj().resolve_neg().contiguous()
-        payload = ctypes.string_at(flat.data_ptr(), flat.numel() * flat.element_size())
-        (self.directory / name).write_bytes(payload)
-        return name
-
-    def read(self, name: str, dtype: str, shape: list[int], device: Any) -> Any:
-        import torch
-
-        if "/" in name or not name.startswith("tensor-"):
-            raise UncrossableArgument(f"malformed tensor payload name {name!r}")
-        raw = bytearray((self.directory / name).read_bytes())
-        kind = getattr(torch, dtype, None)
-        if not isinstance(kind, torch.dtype):
-            raise UncrossableArgument(f"unknown tensor dtype {dtype!r} on the wire")
-        expected = math.prod(shape) * torch.empty((), dtype=kind).element_size()
-        if len(raw) != expected:
-            raise UncrossableArgument(
-                f"tensor payload {name!r} has {len(raw)} bytes, expected {expected}"
-            )
-        if not raw:
-            return torch.empty(shape, dtype=kind, device=device)
-        return torch.frombuffer(raw, dtype=kind).reshape(shape).to(device)
-
-    def clear(self) -> None:
-        if not self.directory.is_dir():
-            return
-        for entry in self.directory.iterdir():
-            entry.unlink(missing_ok=True)
-        self.written = 0
-
-
-class Broadcast:
-    """One mirrored call's tensors, sent over the group's collectives straight from GPU 0's
-    memory to every follower's, in the order `marshal` met them, after the command: no byte
-    crosses the host or a file (a 15 s H3 step's inputs are ~125 MB)."""
-
-    def __init__(self, components: Mapping[tuple[str, str], Any] | None = None) -> None:
-        self.tensors: list[Any] = []
-        self.components = dict(components or {})
-        self.component_names = {id(root): key for key, root in self.components.items()}
-
-    def write(self, tensor: Any) -> str:
-        self.tensors.append(tensor)
-        return str(len(self.tensors) - 1)
-
-    def send(self, pg: Any, device: Any) -> None:
-        """GPU 0's side, over the group as it is formed now (a rerun forms it again)."""
-        import torch
-
-        with torch.utils._python_dispatch._disable_current_modes():
-            for tensor in self.tensors:
-                if tensor.numel():
-                    value = tensor.detach().resolve_conj().resolve_neg()
-                    value = value if device is None else value.to(device)
-                    torch.distributed.broadcast(_bytes(value.contiguous()), src=0, group=pg)
-
-    def receive(self, run: RunCommand, pg: Any, device: Any) -> Broadcast:
-        """A follower's side: every tensor the command names, in GPU 0's order, onto `device`."""
-        import torch
-
-        specs = sorted((int(t.v), t.dtype, t.shape) for t in _tensors([run.args, run.kwargs]))
-        with torch.utils._python_dispatch._disable_current_modes():
-            for index, (at, dtype, shape) in enumerate(specs):
-                kind = getattr(torch, dtype, None)
-                if at != index or not isinstance(kind, torch.dtype):
-                    raise UncrossableArgument(f"malformed broadcast tensor {at} ({dtype})")
-                tensor = torch.empty(shape, dtype=kind, device=device)
-                if tensor.numel():
-                    torch.distributed.broadcast(_bytes(tensor), src=0, group=pg)
-                self.tensors.append(tensor)
-        return self
-
-    def read(self, name: str, dtype: str, shape: list[int], device: Any) -> Any:
-        return self.tensors[int(name)]
-
-    def clear(self) -> None:
-        self.tensors.clear()
-
-
-def _bytes(tensor: Any) -> Any:
+def marshal(value: object, tensors: list[torch.Tensor], *, path: str = "") -> Json:
+    """`value` as JSON-native tagged data; its tensors are appended to `tensors`."""
     import torch
 
-    return tensor.reshape(-1).view(torch.uint8)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, torch.Tensor):
+        tensors.append(value)
+        dtype = str(value.dtype).removeprefix("torch.")
+        host = value.device.type == "cpu"
+        return msgspec.to_builtins(_Tensor(len(tensors) - 1, dtype, list(value.shape), host))
+    if isinstance(value, OrderedDict) and dataclasses.is_dataclass(type(value)):
+        kind = type(value)
+        items = {k: marshal(v, tensors, path=f"{path}.{k}") for k, v in value.items()}
+        return msgspec.to_builtins(_Output(items, f"{kind.__module__}:{kind.__qualname__}"))
+    if isinstance(value, tuple):
+        return msgspec.to_builtins(
+            _Tuple([marshal(v, tensors, path=f"{path}[{i}]") for i, v in enumerate(value)])
+        )
+    if isinstance(value, list):
+        return [marshal(v, tensors, path=f"{path}[{i}]") for i, v in enumerate(value)]
+    if isinstance(value, dict):
+        out: dict[str, Json] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or key == _TAG:
+                raise UncrossableArgument(
+                    f"{path or 'value'}: dict key {key!r} cannot cross to the group's other GPUs"
+                )
+            out[key] = marshal(item, tensors, path=f"{path}.{key}" if path else key)
+        return out
+    raise UncrossableArgument(
+        f"{path or 'value'} is a {type(value).__name__}, which cannot cross to the group's other "
+        "GPUs: a value that crosses is JSON scalars, lists, tuples, str-keyed dicts, tensors "
+        "and model outputs"
+    )
+
+
+def specs(value: Json) -> list[_Tensor]:
+    """The tensor envelopes in wire data, in the order `marshal` met them."""
+    return sorted(_tensors(value), key=lambda t: t.v)
 
 
 def _tensors(value: Json) -> Iterator[_Tensor]:
-    """The tensor envelopes in wire data (a frame's dict keys may arrive in any order)."""
     if isinstance(value, list):
         for item in value:
             yield from _tensors(item)
@@ -226,174 +109,72 @@ def _tensors(value: Json) -> Iterator[_Tensor]:
                 yield from _tensors(item)
 
 
-def marshal(value: object, spool: TensorSpool | Broadcast, *, path: str = "") -> Json:
-    """One call argument -> JSON-native tagged data, or refuse by name."""
-    import torch
-
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, torch.Tensor):
-        dtype = str(value.dtype).removeprefix("torch.")
-        return msgspec.to_builtins(_Tensor(spool.write(value), dtype, list(value.shape)))
-    if isinstance(value, torch.nn.Module):
-        key = spool.component_names.get(id(value))
-        if key is None:
-            raise UncrossableArgument(
-                f"{path or 'argument'} is not a prepared component in an active model scope"
-            )
-        return msgspec.to_builtins(_Component(key))
-    if isinstance(value, OrderedDict) and dataclasses.is_dataclass(type(value)):
-        kind = type(value)
-        items = {k: marshal(v, spool, path=f"{path}.{k}") for k, v in value.items()}
-        return msgspec.to_builtins(_Output(items, f"{kind.__module__}:{kind.__qualname__}"))
-    if isinstance(value, tuple):
-        members = [marshal(v, spool, path=f"{path}[{i}]") for i, v in enumerate(value)]
-        return msgspec.to_builtins(_Tuple(members))
+def unmarshal(value: Json, tensors: list[torch.Tensor]) -> object:
+    """Wire data with its tensors back in place."""
     if isinstance(value, list):
-        return [marshal(v, spool, path=f"{path}[{i}]") for i, v in enumerate(value)]
-    if isinstance(value, dict):
-        out: dict[str, Json] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise UncrossableArgument(
-                    f"{path or 'argument'}: dict key {key!r} is {type(key).__name__}, and only "
-                    "str keys cross to the group's other GPUs"
-                )
-            if key == _TAG:
-                raise UncrossableArgument(
-                    f"{path or 'argument'}: {_TAG!r} is the wire's own tag key and cannot be a "
-                    "model-call dict key"
-                )
-            out[key] = marshal(item, spool, path=f"{path}.{key}" if path else key)
-        return out
-    raise UncrossableArgument(
-        f"{path or 'argument'} is a {type(value).__name__}, which cannot cross to the group's "
-        "other GPUs. "
-        "A mirrored model call carries JSON scalars, lists, tuples, str-keyed dicts, torch "
-        "tensors (through the attempt spool); a generator, closure, "
-        "callback, a request view or a live handle cannot be sent to another GPU's process"
-    )
-
-
-def unmarshal(value: Json, spool: TensorSpool | Broadcast, *, device: Any) -> object:
-    """Wire data -> the argument, on THIS rank's device."""
-    if isinstance(value, list):
-        return [unmarshal(v, spool, device=device) for v in value]
+        return [unmarshal(v, tensors) for v in value]
     if not isinstance(value, dict):
         return value
     if _TAG not in value:
-        return {k: unmarshal(v, spool, device=device) for k, v in value.items()}
+        return {k: unmarshal(v, tensors) for k, v in value.items()}
     try:
         envelope = msgspec.convert(value, _Envelope)
     except msgspec.ValidationError as exc:
         raise UncrossableArgument(f"malformed wire envelope: {exc}") from exc
     if isinstance(envelope, _Tensor):
-        return spool.read(envelope.v, envelope.dtype, envelope.shape, device)
-    if isinstance(envelope, _Component):
-        if envelope.v not in spool.components:
-            raise UncrossableArgument("component reference has no prepared active owner")
-        return spool.components[envelope.v]
+        return tensors[envelope.v]
     if isinstance(envelope, _Tuple):
-        return tuple(unmarshal(v, spool, device=device) for v in envelope.v)
+        return tuple(unmarshal(v, tensors) for v in envelope.v)
     module, _, qualname = envelope.kind.partition(":")
     kind = getattr(sys.modules.get(module), qualname, None)
     if not (
         isinstance(kind, type) and dataclasses.is_dataclass(kind) and issubclass(kind, OrderedDict)
     ):
         raise UncrossableArgument(f"model output class {envelope.kind!r} is not loaded")
-    return kind(**{k: unmarshal(v, spool, device=device) for k, v in envelope.v.items()})
+    return kind(**{k: unmarshal(v, tensors) for k, v in envelope.v.items()})
 
 
-#: dtypes a point-to-point result may carry, by position in its header; its bytes cross as uint8
-_P2P_DTYPES: tuple[str, ...] = ("float32", "float16", "bfloat16", "float64", "int64", "int32")
-_P2P_DTYPES += ("uint8", "bool", "int8", "int16", "float8_e4m3fn", "float8_e5m2")
-_P2P_RANK = 8
-#: header codes for a call that sends no tensor: declined (the rank had no room) or failed
-_P2P_DECLINED = -1
-_P2P_FAILED = -2
+#: dtypes a spread result may carry (`spread`: one tensor per call)
+DTYPES: tuple[str, ...] = ("float32", "float16", "bfloat16", "float64", "int64", "int32")
+DTYPES += ("uint8", "bool", "int8", "int16", "float8_e4m3fn", "float8_e5m2")
 
 
-def p2p_head(value: object) -> list[int]:
-    """`value`'s point-to-point header. A spread call returns one tensor (`author.spread`): the
-    same check on every rank of the group, before any byte is sent."""
+def one_tensor(value: object) -> torch.Tensor:
+    """A spread call returns one tensor (`author.spread`)."""
+    import torch
+
     dtype = str(getattr(value, "dtype", "")).removeprefix("torch.")
-    shape = [int(n) for n in getattr(value, "shape", [0] * (_P2P_RANK + 1))]
-    if dtype not in _P2P_DTYPES or len(shape) > _P2P_RANK:
+    if not isinstance(value, torch.Tensor) or dtype not in DTYPES:
         raise UncrossableArgument(
-            f"a spread call returns one tensor of rank <= {_P2P_RANK}, not "
-            f"{type(value).__name__} {dtype}".rstrip()
+            f"a spread call returns one tensor, not {type(value).__name__} {dtype}".rstrip()
         )
-    return [_P2P_DTYPES.index(dtype), len(shape), *shape]
-
-
-def send_tensor(tensor: Any, head: list[int], dst: int, pg: Any) -> None:
-    """One tensor to rank `dst` over the group: its `p2p_head`, then its bytes. A decoded video
-    clip is ~200 MB; the attempt spool would copy it through the host twice."""
-    import torch
-
-    _send_head(head, dst, pg, tensor.device)
-    torch.distributed.send(tensor.contiguous().reshape(-1).view(torch.uint8), dst=dst, group=pg)
-
-
-def send_nothing(dst: int, pg: Any, device: Any, *, failed: bool) -> None:
-    """A header with no tensor behind it, so a receiver waiting on this rank never hangs."""
-    _send_head([_P2P_FAILED if failed else _P2P_DECLINED, 0], dst, pg, device)
-
-
-def _send_head(head: list[int], dst: int, pg: Any, device: Any) -> None:
-    import torch
-
-    head = head + [0] * (_P2P_RANK + 2 - len(head))
-    torch.distributed.send(torch.tensor(head, dtype=torch.int64, device=device), dst=dst, group=pg)
-
-
-def recv_tensor(src: int, pg: Any, device: Any) -> Any:
-    """The tensor rank `src` sent, or None when it sent a header alone (its reply says why)."""
-    import torch
-
-    head = torch.empty(_P2P_RANK + 2, dtype=torch.int64, device=device)
-    torch.distributed.recv(head, src=src, group=pg)
-    code, ndim, *shape = head.tolist()
-    if code < 0:
-        return None
-    dtype = getattr(torch, _P2P_DTYPES[code])
-    raw = torch.empty(math.prod(shape[:ndim]) * dtype.itemsize, dtype=torch.uint8, device=device)
-    torch.distributed.recv(raw, src=src, group=pg)
-    return raw.view(dtype).reshape(shape[:ndim])
+    return value
 
 
 class RunReply(msgspec.Struct, frozen=True):
-    """A follower's answer to one `RunCommand`."""
+    """A follower's answer to its `run`: how its handler ended, and its part of the record."""
 
     ok: bool
     code: str = ""
     detail: str = ""
-    #: Sol attention calls by kind, on a sharded forward
+    terminal: Terminal = "failed"
+    origin: Origin = "runtime"
+    #: the shape of its result (`spmd.signature`); GPU 0 compares it with its own
+    signature: str = ""
+    #: its last store meeting, so GPU 0 can clear the attempt's keys
+    meetings: int = 0
+    #: Sol attention calls by kind
     sol_calls: dict[str, int] = {}
     working_peak_bytes: int = 0
     evidence: execution_evidence.GpuEvidence | None = None
-    #: a hosted call's marshalled result
-    result: Json = None
-    #: why a spread call was declined; "" when it ran
-    declined: str = ""
+    #: its own varena request's record (`executor_replies.GpuMemory`)
+    memory: Json = None
     #: its kernels not serving yet (`kernel_ready.pending`), and those it began serving
     kernels: dict[str, str] = {}
     began: list[str] = []
-
-
-def run_call(
-    run: RunCommand, spool: TensorSpool | Broadcast, *, device: Any
-) -> tuple[tuple[object, ...], dict[str, object]]:
-    """A follower's side of a `RunCommand`: its arguments on THIS rank's device."""
-    args = tuple(unmarshal(a, spool, device=device) for a in run.args)
-    return args, {k: unmarshal(v, spool, device=device) for k, v in run.kwargs.items()}
-
-
-@contextmanager
-def attention_context(run: RunCommand) -> Iterator[None]:
-    """Recreate only the leader's closed attention layout, never ambient Python context."""
-    token = _ACTIVE_LAYOUT.set(run.attention_layout)
-    try:
-        yield
-    finally:
-        _ACTIVE_LAYOUT.reset(token)
+    #: its own Ulysses exchanges this attempt (`ulysses.taken`), each step track's
+    #: `(end unix ms, ms)` points on the clock GPU 0 shares, and its stages' ms, its host
+    #: stalls (`host · <code>`) among them: where it waited
+    exchange: dict[str, float] = {}
+    steps: dict[str, list[tuple[int, float]]] = {}
+    stages: dict[str, float] = {}

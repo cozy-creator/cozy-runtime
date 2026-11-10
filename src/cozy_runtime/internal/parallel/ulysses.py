@@ -12,7 +12,7 @@ One round of metadata over the group's store comes first: every rank proposes it
 level native selection takes for it, its room made, or its refusal; every rank takes the finest
 proposed. A refusal there is every rank's, before anything crosses. Room taken after it (another
 program, between selection and the split) fails that rank alone: the group's interrupt ends the
-collectives its peers entered and the attempt ends short of memory (`mirror.mirror_component`).
+collectives its peers entered and the attempt ends short of memory (`spmd`).
 """
 
 from __future__ import annotations

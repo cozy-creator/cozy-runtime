@@ -81,6 +81,8 @@ def generate(ctx: Context, payload: Request, model: Flow, out: Outputs, tel: Tel
 - `cozy_runtime.accel`: speed only. `kernels`, `fusion`, `stepcache`, `moe`, `lora`, `rows`,
   `attention` (layouts, `attention_scope`, producers), `hold_dtype`, `graph_keys`, `uncaptured`,
   `placeable`, `sequence_parallel`, `spread`, `concurrently`.
+- On several GPUs (`sequence_parallel`) every GPU runs the function, as torchrun runs a script, and
+  a `_cp_plan` model splits its work inside its own calls: write it as for one GPU.
 
 Package code runs as plain Python too: with no executor, `retained` holds the tensors, `split`
 runs whole and a Model method is an ordinary method.

@@ -78,15 +78,12 @@ def site(kind: str) -> str | None:
 
 
 def checkpoint() -> None:
-    """Stop at an owned eager boundary; group cancellation stays with mirrored calls.
-
-    One rank must not leave a collective while another enters it. A CUDA capture also keeps
-    its prepared interval intact; its caller checks cancellation before the next launch.
+    """Stop at an owned eager boundary. In a group, the GPU that stops ends the others' calls
+    (`spmd`). A CUDA capture keeps its prepared interval intact; its caller checks cancellation
+    before the next launch.
     """
     context = ATTEMPT.get()
     if context is None or _capturing():
-        return
-    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
         return
     context.raise_if_cancelled()
 

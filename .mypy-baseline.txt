@@ -174,10 +174,7 @@ src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not a
 src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/cp.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/cp.py: [no-untyped-call] Call to untyped function "get_active_backend" of "_AttentionBackendRegistry" in typed context
-src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/group.py: [explicit-any] Explicit "Any" is not allowed
@@ -202,22 +199,6 @@ src/cozy_runtime/internal/parallel/links.py: [explicit-any] Explicit "Any" is no
 src/cozy_runtime/internal/parallel/links.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/links.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/links.py: [possibly-undefined] Name "started" may be undefined
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/mirror.py: [misc] Type of decorated function contains type "Any" ("_Wrapped[[VarArg(Any), KwArg(Any)], Any, [VarArg(Any), KwArg(Any)], Any]")
-src/cozy_runtime/internal/parallel/mirror.py: [possibly-undefined] Name "result" may be undefined
 src/cozy_runtime/internal/parallel/ulysses.py: [attr-defined] Module "torch.distributed" does not explicitly export attribute "PrefixStore"
 src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
@@ -225,22 +206,6 @@ src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is 
 src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/ulysses.py: [union-attr] Item "None" of "Work | None" has no attribute "wait"
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
