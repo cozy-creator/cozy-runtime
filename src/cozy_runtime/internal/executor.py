@@ -897,6 +897,8 @@ class Executor:
         #: a follower's watcher aborted its collectives; cleared when the group forms again
         self._interrupted = threading.Event()
         self._device_ready = False
+        #: opens the running Start's or Load's varena request once the device is up
+        self._boundary: Callable[[], None] | None = None
         #: HOST ONLY: process-lifetime execution stream, selected on every Runtime worker.
         #: Library workspaces/tensors may retain it until exit; do not destroy it at unload.
         self.execution_stream: Any = None
@@ -1100,6 +1102,8 @@ class Executor:
             self._open_memory(torch)
         except ResidencyError as exc:
             return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
+        if self._boundary is not None:
+            self._boundary()
         accel.first_launches(torch, self.device_kind)
         self._device_ready = True
         place(self._device())
@@ -1708,7 +1712,36 @@ class Executor:
 
     # ------------------------------------------------------------ the process (proto-061)
 
+    @contextlib.contextmanager
+    def _device_work(self) -> Iterator[None]:
+        """A Start's or a Load's device work is a request to varena, as a call is
+        (`varena.request_boundary`): an allocation with no room waits for memory held outside
+        this process, which varena does only inside a request. It opens once the device is up
+        (at once when it already is, else from `_initialize_device`) and always closes. Idle
+        work never enters it."""
+        outer = self._boundary
+        begun: list[int] = []
+
+        def begin() -> None:
+            if not begun and self.device_kind == "cuda":
+                begun.append(self.rank if self.world > 1 else 0)
+                varena.request_boundary(begun[0], begin=True)
+
+        self._boundary = begin
+        try:
+            if self._device_ready:
+                begin()
+            yield
+        finally:
+            self._boundary = outer
+            for index in begun:
+                varena.request_boundary(index, begin=False)
+
     def start(self, command: Start) -> dict[str, Any]:
+        with self._device_work():
+            return self._start(command)
+
+    def _start(self, command: Start) -> dict[str, Any]:
         """Bring EVERY rank up before any construction: seal, group, torch, package, warmup.
 
         Rank 0 spawns its followers first and hands them this command, so every rank's
@@ -2393,6 +2426,10 @@ class Executor:
 
     def _prepare_first(self, command: Load) -> dict[str, Any]:
         """Construct and fill one construction (or one model of a many-model one)."""
+        with self._device_work():
+            return self._prepare(command)
+
+    def _prepare(self, command: Load) -> dict[str, Any]:
         if self.poisoned:
             return {
                 "ok": False,

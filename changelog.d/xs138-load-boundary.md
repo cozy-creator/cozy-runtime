@@ -1,0 +1,1 @@
+A Start's and a Load's device work is a request to varena, as a call is. varena waits for memory held outside the process only inside a request, so a first load on a full card waits for room as before, where it would otherwise fail at once. Idle work stays outside.
