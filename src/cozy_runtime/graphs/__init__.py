@@ -1260,7 +1260,14 @@ def _record(
             entered.enter_context(scope)
             entered.enter_context(lease)
             stage = "its warm-up"
-            state = entered.enter_context(_capture_state(torch, module, owner.stream))
+            # Its weights are inputs, checked by identity and version: a copy of each held
+            # beside them took the room a capped card's warm-up needed (SDXL at 6 GiB).
+            weights = (
+                recorder.binding.immutable_buffer_ids()
+                if recorder.binding is not None
+                else frozenset()
+            )
+            state = entered.enter_context(_capture_state(torch, module, owner.stream, weights))
             stream = owner.stream
             stream.wait_stream(current)
             with torch.cuda.stream(stream):
@@ -1385,11 +1392,13 @@ def _record(
 
 
 @contextmanager
-def _capture_state(torch: Any, module: Any, stream: Any) -> Iterator[_State]:
+def _capture_state(
+    torch: Any, module: Any, stream: Any, weights: frozenset[int]
+) -> Iterator[_State]:
     """Restore warm-up state and join its stream before the prepared weight lease ends."""
     current, state = torch.cuda.current_stream(), None
     try:
-        state = _State(torch, module)
+        state = _State(torch, module, immutable_buffers=weights)
         yield state
     finally:
         current.wait_stream(stream)
