@@ -870,8 +870,8 @@ def component_method(qualname: str, parameters: Iterable[str]) -> None:
 def _refuse_lazy(method: str, result: object) -> None:
     if inspect.isgenerator(result) or inspect.iscoroutine(result) or inspect.isasyncgen(result):
         raise CapabilityError(
-            f"{method} returned a {type(result).__name__}: a lazy object that touches model "
-            "components after the method completes escapes its component-use lease",
+            f"{method} returned a {type(result).__name__}, which would use the model after "
+            "the method returns: return the computed values instead",
             code="lazy_escape",
         )
 
@@ -1069,16 +1069,15 @@ class Model[PipelineT]:
         self._cozy_require_ready(what)
         if self._cozy_active is None and remote_scope(self) is None:
             raise CapabilityError(
-                f"{what} outside an active component-use scope: the runtime joins the entry's "
-                "lease to the scope, and there is nowhere for it to live otherwise",
+                f"{what} outside a call of the model's methods: use it inside one",
                 code="no_active_scope",
             )
 
     def _cozy_require_ready(self, what: str) -> None:
         if not self._cozy_ready:
             raise CapabilityError(
-                f"{type(self).__name__}.{what}: no generation is Ready — construction is "
-                "transactional and nothing is observable before it completes",
+                f"{type(self).__name__}.{what} before the model finished loading: use it "
+                "after load() returns",
                 code="not_ready",
             )
 
@@ -1095,9 +1094,9 @@ class Model[PipelineT]:
                     fields=[name],
                 )
             raise CapabilityError(
-                f"{type(self).__name__}.{name} = …: the model generation is immutable after "
-                "construction — a model instance never hides unaccounted state; declare a "
-                "loader.cache(...) handle for reusable derived entries",
+                f"{type(self).__name__}.{name} = …: a model's attributes are set in load() "
+                "only: keep per-request values in local variables, and derived tensors you "
+                "reuse in a loader.cache(...) entry",
                 code="persistent_allocation",
                 fields=[name],
             )

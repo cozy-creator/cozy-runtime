@@ -498,9 +498,8 @@ def _classify(name: str, annotation: object, where: str) -> Param:
     if (model := model_class(base)) is not None:
         if markers:
             raise ConformanceError(
-                f"{where}: model parameter {name} carries {markers[0]!r} — the Annotated "
-                "override-marker plane is EMPTY at launch: a bare typed parameter is "
-                "unconditionally the whole declaration: remove the marker",
+                f"{where}: model parameter {name} is Annotated with {markers[0]!r}: declare "
+                f"it as `{name}: {model.__name__}`, and its default in defaults=",
                 code="empty_marker_plane",
                 fields=[name],
             )

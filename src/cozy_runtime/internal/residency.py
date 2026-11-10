@@ -2891,10 +2891,9 @@ def _widened(
     if model.memory.device.type == "cpu" and site.dtype == torch.float32:
         return site.dtype
     raise ResidencyError(
-        f"{model.name}: {name} serves {served} and the module was changed to {site.dtype} "
-        "after placement: serve a placed component in another dtype with "
-        "`cozy_runtime.author.hold_dtype(module, dtype)`, never `module.to(dtype)`, "
-        "`.half()` or `.float()`"
+        f"{model.name}: {name} was cast to {site.dtype} after the Runtime placed it in "
+        f"{served}: use `cozy_runtime.accel.hold_dtype(module, dtype)` instead of "
+        "`.to(dtype)`, `.half()` or `.float()`"
     )
 
 

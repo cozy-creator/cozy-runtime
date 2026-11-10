@@ -108,8 +108,7 @@ def _av() -> Any:
         import av
     except ImportError:
         raise OutputError(
-            "audio/video encode needs the `media` extra (PyAV): install "
-            "cozy-runtime[media]. Without it the codec plane does not exist in this venv",
+            "encoding audio or video needs PyAV: depend on cozy-runtime[media]",
             code="encoder_unavailable",
         ) from None
     return av
