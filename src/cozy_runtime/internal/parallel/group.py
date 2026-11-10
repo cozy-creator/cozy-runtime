@@ -552,7 +552,7 @@ class RankGroup:
         if again and dist.is_initialized():
             dist.destroy_process_group()
         self.pg, self.formed = None, False
-        formed()
+        _ENDED.clear()  # as `formed()`, which this method's `formed` argument shadows
         self.store = dist.TCPStore(
             "127.0.0.1", 0, self.degree, is_master=True, wait_for_workers=False, timeout=NEVER
         )
