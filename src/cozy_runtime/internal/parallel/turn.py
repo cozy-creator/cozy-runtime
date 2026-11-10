@@ -131,10 +131,14 @@ def _lead(lead: torch.Size) -> tuple[int, ...]:
 
 
 def _whole(*rows: Tensor) -> bool:
-    """Each row contiguous, at most 4 leading dimensions and 2**31 rows: what the kernels read
-    and write."""
+    """Each row contiguous and 16-aligned (its start and every leading stride), at most 4 leading
+    dimensions and 2**31 rows: what the kernels read and write, a row's elements 16 B at a time."""
     return rows[0][..., 0].numel() < 1 << 31 and all(
-        t.stride(-1) == 1 and t.dim() <= 5 for t in rows
+        t.stride(-1) == 1
+        and t.dim() <= 5
+        and t.data_ptr() % 16 == 0
+        and all(stride % 16 == 0 for stride in t.stride()[:-1])
+        for t in rows
     )
 
 
@@ -191,19 +195,17 @@ if not TRITON_ABSENT:
         live = whole[:, None]
         i0, i1, i2, i3 = _index(r, n1, n2, n3)
         cols = tl.arange(0, D)[None, :]
-        rows = tl.load(
-            x + _at(i0, i1, i2, i3, x0, x1, x2, x3)[:, None] + cols, mask=live, other=0.0
-        )
+        at_x = tl.multiple_of(_at(i0, i1, i2, i3, x0, x1, x2, x3), 16)
+        rows = tl.load(x + at_x[:, None] + cols, mask=live, other=0.0)
         turn = tl.load(sign + tl.arange(0, D)[:, None] * D + cols).to(x.dtype.element_ty)
         t = tl.dot(rows, turn, out_dtype=tl.float32) * c
         if SHIFT:
-            t -= tl.load(
-                h + _at(i0, i1, i2, i3, h0, h1, h2, h3)[:, None] + cols, mask=live, other=0.0
-            )
+            at_h = tl.multiple_of(_at(i0, i1, i2, i3, h0, h1, h2, h3), 16)
+            t -= tl.load(h + at_h[:, None] + cols, mask=live, other=0.0)
         scale = tl.maximum(tl.max(tl.abs(t) * (1.0 / 127.0), axis=1), tiny).to(s.dtype.element_ty)
         q = tl.minimum(tl.maximum(t / scale.to(tl.float32)[:, None], -127.0), 127.0)
         q = tl.where(q < 0, -1.0, 1.0) * tl.floor(tl.abs(q) + 0.5)
-        at = _at(i0, i1, i2, i3, y0, y1, y2, y3)[:, None] + cols
+        at = tl.multiple_of(_at(i0, i1, i2, i3, y0, y1, y2, y3), 16)[:, None] + cols
         tl.store(y + at, q.to(tl.int8), mask=live)
         tl.store(s + _at(i0, i1, i2, i3, s0, s1, s2, s3), scale, mask=whole)
 
@@ -219,14 +221,13 @@ if not TRITON_ABSENT:
         live = whole[:, None]
         i0, i1, i2, i3 = _index(r, n1, n2, n3)
         cols = tl.arange(0, D)[None, :]
-        values = tl.load(
-            q + _at(i0, i1, i2, i3, q0, q1, q2, q3)[:, None] + cols, mask=live, other=0
-        )
+        at_q = tl.multiple_of(_at(i0, i1, i2, i3, q0, q1, q2, q3), 16)
+        values = tl.load(q + at_q[:, None] + cols, mask=live, other=0)
         turn = tl.load(sign + tl.arange(0, D)[:, None] * D + cols).to(out.dtype.element_ty)
         summed = tl.dot(values.to(out.dtype.element_ty), turn, out_dtype=tl.float32)
         scale = tl.load(s + _at(i0, i1, i2, i3, s0, s1, s2, s3), mask=whole, other=0.0)
         rows = summed * (scale.to(tl.float32) * c)[:, None]
-        at = _at(i0, i1, i2, i3, o0, o1, o2, o3)[:, None] + cols
+        at = tl.multiple_of(_at(i0, i1, i2, i3, o0, o1, o2, o3), 16)[:, None] + cols
         tl.store(out + at, rows.to(out.dtype.element_ty), mask=live)
 
 
@@ -242,6 +243,7 @@ def _entries() -> tuple[TritonEntry, ...]:
              "sign": "*bf16", **sizes, **strides, "tiny": "fp32", "c": "fp32", "D": "constexpr",
              "SHIFT": "constexpr", "T": "constexpr", "ROWS": "constexpr"},
             {"D": order, "SHIFT": shift, "T": _CODES[dtype], "ROWS": _ROWS},
+            aligned=("x", "y", "h", "sign") if shift else ("x", "y", "sign"),
             num_warps=4,
             num_stages=1,
         )
@@ -254,6 +256,7 @@ def _entries() -> tuple[TritonEntry, ...]:
             {"q": "*i8", "s": f"*{name}", "out": f"*{name}", "sign": "*bf16", **sizes, **strides,
              "c": "fp32", "D": "constexpr", "T": "constexpr", "ROWS": "constexpr"},
             {"D": order, "T": _CODES[dtype], "ROWS": _ROWS},
+            aligned=("q", "out", "sign"),
             num_warps=4,
             num_stages=1,
         )
