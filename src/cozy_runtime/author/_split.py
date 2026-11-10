@@ -9,7 +9,11 @@ import math
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Protocol, cast, overload
+
+if TYPE_CHECKING:
+    import torch
+    from torch import Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,7 +32,7 @@ class Pieces(Protocol):
     """The memory's side of `split`: `split` runs `run(most)` in windows of at most `most` of
     `total` elements, the least `finest`, once; `piece` marks each window's start."""
 
-    def split(
+    def split[T](
         self,
         name: str,
         key: str,
@@ -37,15 +41,32 @@ class Pieces(Protocol):
         out_bytes: int,
         item_bytes: float,
         holds: int,
-        run: Callable[[int], Any],
+        run: Callable[[int], T],
         pure: bool = False,
-    ) -> Any: ...
+    ) -> T: ...
 
     def piece(self) -> None: ...
 
     def windows(
         self, name: str, key: str, needs: Sequence[int]
     ) -> tuple[int, Callable[[], AbstractContextManager[None]]]: ...
+
+
+class Sliceable[W](Protocol):
+    """What `split` cuts: a tensor, or an object standing for one whose windows are `W`
+    (`x[index]`). Run whole, `fn` is handed `x` itself, which stands for its whole window."""
+
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+
+    @property
+    def dtype(self) -> torch.dtype: ...
+
+    def element_size(self) -> int: ...
+
+    def dim(self) -> int: ...
+
+    def __getitem__(self, index: tuple[slice[int | None], ...], /) -> W: ...
 
 
 _RUNTIME: Pieces | None = None
@@ -56,15 +77,39 @@ def install(runtime: Pieces | None) -> None:
     _RUNTIME = runtime
 
 
-def split(
-    fn: Callable[..., Any],
-    x: Any,
+@overload
+def split[W](
+    fn: Callable[[W], Tensor],
+    x: Sliceable[W],
     *cuts: Cut,
     most: int | None = None,
-    out: Any = None,
+    out: None = None,
     holds: int = 5,
     host: bool = False,
-) -> Any:
+) -> Tensor: ...
+
+
+@overload
+def split[W](
+    fn: Callable[[W, Tensor], object],
+    x: Sliceable[W],
+    *cuts: Cut,
+    most: int | None = None,
+    out: Tensor,
+    holds: int = 5,
+    host: bool = False,
+) -> Tensor: ...
+
+
+def split[W](
+    fn: Callable[[W], Tensor] | Callable[[W, Tensor], object],
+    x: Sliceable[W],
+    *cuts: Cut,
+    most: int | None = None,
+    out: Tensor | None = None,
+    holds: int = 5,
+    host: bool = False,
+) -> Tensor:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
     window of `x` to that window of its result. Without a managing memory it runs whole.
 
@@ -109,9 +154,10 @@ def split(
             pure,
         )
     if runtime is None or not cuts:
+        entire = cast("W", x)  # run whole, `fn` takes `x` as its own window (`Sliceable`)
         if out is None:
-            return fn(x)
-        fn(x, out)
+            return cast("Callable[[W], Tensor]", fn)(entire)  # no `out`: the first overload
+        cast("Callable[[W, Tensor], object]", fn)(entire, out)  # `out`: the second overload
         return out
     return runtime.split(
         _name(fn),
@@ -224,26 +270,24 @@ def _equal(length: int, cut: Cut, count: int) -> list[tuple[int, int]] | None:
 type Window = tuple[tuple[int, int], ...]
 
 
-def _key(
-    fn: Callable[[Any], Any], shape: tuple[int, ...], cuts: tuple[Cut, ...], dtype: Any
-) -> str:
+def _key(fn: object, shape: tuple[int, ...], cuts: tuple[Cut, ...], dtype: torch.dtype) -> str:
     """Bytes per element depend on the op and its uncut extents."""
     cut = {c.dim % len(shape) for c in cuts}
     rest = tuple(n if i not in cut else -1 for i, n in enumerate(shape))
     return f"{getattr(fn, '__module__', '')}.{_name(fn)}{rest}:{dtype}"
 
 
-def _item_bytes(cuts: tuple[Cut, ...], x: Any) -> float:
+def _item_bytes[W](cuts: tuple[Cut, ...], x: Sliceable[W]) -> float:
     """Output bytes per input element."""
     return float(math.prod(c.scale for c in cuts) * x.element_size())
 
 
-def _bytes(shape: tuple[int, ...], cuts: tuple[Cut, ...], x: Any) -> int:
+def _bytes[W](shape: tuple[int, ...], cuts: tuple[Cut, ...], x: Sliceable[W]) -> int:
     """The whole output's bytes, which `split` allocates beside its windows."""
     return int(math.prod(shape) * _item_bytes(cuts, x))
 
 
-def _name(fn: Callable[[Any], Any]) -> str:
+def _name(fn: object) -> str:
     return str(getattr(fn, "__qualname__", type(fn).__qualname__))
 
 
@@ -308,29 +352,31 @@ def _largest(shape: tuple[int, ...], cuts: tuple[Cut, ...], longest: Sequence[in
     return rest * math.prod(longest)
 
 
-def _run(
-    fn: Callable[..., Any],
-    x: Any,
+def _run[W](
+    fn: Callable[[W], Tensor] | Callable[[W, Tensor], object],
+    x: Sliceable[W],
     cuts: tuple[Cut, ...],
     windows: list[Window],
     piece: Callable[[], None],
-    into: Any = None,
-) -> Any:
+    into: Tensor | None = None,
+) -> Tensor:
     ndim = x.dim()
     dims = [c.dim % ndim for c in cuts]
     if into is not None:  # each window writes its own rows of `into` (`split(out=)`)
+        write = cast("Callable[[W, Tensor], object]", fn)  # `out`: the second overload
         for window in windows:
             index = [slice(None)] * ndim
             for d, (a, b) in zip(dims, window, strict=True):
                 index[d] = slice(a, b)
             piece()
-            fn(x[tuple(index)], into[tuple(index)])
+            write(x[tuple(index)], into[tuple(index)])
         return into
+    fn = cast("Callable[[W], Tensor]", fn)  # no `out`: the first overload
     if len(windows) == 1:
-        return fn(x)
+        return fn(cast("W", x))  # run whole, `fn` takes `x` as its own window (`Sliceable`)
     blend = any(c.overlap for c in cuts)
-    out: Any = None
-    total: Any = None
+    out: Tensor | None = None
+    total: Tensor | None = None
     sizes = [math.ceil(x.shape[d] * c.scale - 1e-9) for d, c in zip(dims, cuts, strict=True)]
     for window in windows:
         index = [slice(None)] * ndim
@@ -362,10 +408,12 @@ def _run(
             shape[d] = length
             weight = weight * out.new_tensor(ramp).view(shape)
         out[tuple(place)] += part[trim].to(out.dtype) * weight
-        total[tuple(s if i in dims else slice(None) for i, s in enumerate(place))] += weight
+        held = cast("Tensor", total)  # blending: made with `out` at the first window
+        held[tuple(s if i in dims else slice(None) for i, s in enumerate(place))] += weight
+    whole = cast("Tensor", out)  # made at the first of at least two windows
     if blend:
-        return out.div_(total).to(part.dtype)
-    return out
+        return whole.div_(cast("Tensor", total)).to(part.dtype)  # type: ignore[possibly-undefined]  # >= 2 windows ran
+    return whole
 
 
 def _ramp(length: int, overlap: int, start: bool, end: bool) -> list[float]:

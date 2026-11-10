@@ -25,7 +25,16 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Literal, Protocol, TypeVar, cast, overload, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Literal,
+    Protocol,
+    TypedDict,
+    TypeVar,
+    cast,
+    overload,
+    runtime_checkable,
+)
 
 from tensorfs.executor import Answer, Publish, PublishPart
 
@@ -51,7 +60,18 @@ from cozy_runtime.author._files import (
     digest_bytes,
 )
 from cozy_runtime.author._media import AudioMedia, ImageMedia, VideoMedia, normalize, slot_kind
-from cozy_runtime.author._observations import DEVICE, Attribution, EventRing, Observation, Scalar
+from cozy_runtime.author._observations import (
+    DEVICE,
+    Attribution,
+    EventRing,
+    Kind,
+    Observation,
+    Scalar,
+)
+from cozy_runtime.canonical_json import JsonValue
+
+if TYPE_CHECKING:
+    from PIL.Image import Image
 
 T = TypeVar("T")
 S = TypeVar("S")
@@ -98,6 +118,26 @@ class ProgressFrame:
     call_attempt: int | None = None
 
 
+class _VideoFormat(TypedDict):
+    """A streamed MP4's video track, as `StreamingMP4Encoder` takes it."""
+
+    width: int
+    height: int
+    frame_rate: Fraction
+    pixel_aspect_ratio: Fraction
+    color_primaries: int
+    color_transfer: int
+    color_matrix: int
+    color_range: int
+
+
+class _LoopState(TypedDict):
+    said: bool
+    calls: int
+    shown: float
+    began: tuple[float, object] | None
+
+
 @dataclass(frozen=True, slots=True)
 class _ProgressScope:
     telemetry: Telemetry
@@ -137,13 +177,13 @@ class HostFrame:
     raw: Path
     raw_bytes: int
     charge: int
-    facts: dict[str, Any]
+    facts: dict[str, JsonValue]
 
     @property
     def media_type(self) -> str:
         return _codec.FRAME_MEDIA_TYPES[self.codec]
 
-    def row(self) -> dict[str, Any]:
+    def row(self) -> dict[str, JsonValue]:
         """The seam row: a spool FILE NAME and facts, never an absolute path."""
         return {
             "handle": self.handle,
@@ -240,7 +280,8 @@ class Attempt:
     def emit(self, kind: str, name: str, value: Scalar = None, /, **fields: Scalar) -> Observation:
         """One RETAINED record: the bounded ring, its emit-boundary checks, then the lane."""
         with self._recording:
-            observation = self.ring.emit(cast("Any", kind), name, value, **fields)
+            # The ring checks `kind` against its `Kind`s and refuses another.
+            observation = self.ring.emit(cast("Kind", kind), name, value, **fields)
             if self.sink is not None:
                 self.sink(observation)
         return observation
@@ -427,7 +468,7 @@ class Outputs(_Bound):
 
         return _codec.AAC_FRAME_SAMPLES
 
-    def save_image(self, image: object, *, format: str = "png") -> ImageFile:
+    def save_image(self, image: ImageFrame | Image, *, format: str = "png") -> ImageFile:
         frame = as_frame(image)
         if format not in ("png", "webp"):
             raise OutputError(
@@ -442,7 +483,9 @@ class Outputs(_Bound):
             charge=len(frame.pixels),
         )
 
-    def save_audio(self, waveform: object, *, sample_rate: int, format: str = "flac") -> AudioFile:
+    def save_audio(
+        self, waveform: _codec.Samples, *, sample_rate: int, format: str = "flac"
+    ) -> AudioFile:
         self._attempt.check_open("Outputs.save_audio")
         if format != "flac":
             raise OutputError(
@@ -463,10 +506,10 @@ class Outputs(_Bound):
 
     def save_video(
         self,
-        frames: object,
+        frames: _codec.Samples,
         *,
         fps: float,
-        audio: object = None,
+        audio: _codec.Samples | None = None,
         sample_rate: int | None = None,
         format: str = "mp4",
     ) -> VideoFile:
@@ -480,7 +523,7 @@ class Outputs(_Bound):
             raise OutputError(f"fps {fps!r} is not a positive frame rate", code="frame_rate")
         video = _codec.snapshot_video(frames, self._attempt.max_output_bytes)
         _, height, width, _ = video.shape
-        shaped = getattr(frames, "shape", ())
+        shaped: tuple[int, ...] = getattr(frames, "shape", ())
         if len(shaped) == 4 and (int(shaped[1]), int(shaped[2])) != (height, width):
             self._attempt.warn("video", f"H.264 takes even sides, so it was cut to {width}x{height}")
         planar = None
@@ -494,7 +537,7 @@ class Outputs(_Bound):
             self._check_rate(sample_rate)
             planar, clipped = _codec.snapshot_audio(audio, self._attempt.max_output_bytes)
             self._clip_row(clipped)
-        facts: dict[str, Any] = {
+        facts: dict[str, JsonValue] = {
             "shape": list(video.shape),
             "fps": float(fps),
             "video_bytes": len(video),
@@ -598,7 +641,7 @@ class Outputs(_Bound):
             return audio_samples
 
         return self._save_mp4(
-            dict(
+            _VideoFormat(
                 width=even[0],
                 height=even[1],
                 frame_rate=rate,
@@ -677,7 +720,7 @@ class Outputs(_Bound):
             return audio_samples
 
         return self._save_mp4(
-            dict(
+            _VideoFormat(
                 width=copy.width,
                 height=copy.height,
                 frame_rate=copy.frame_rate,
@@ -756,7 +799,7 @@ class Outputs(_Bound):
 
     def _save_mp4(
         self,
-        video: dict[str, Any],
+        video: _VideoFormat,
         audio_format: DecodedAudioFormat | None,
         source: _AuthorEvents,
         feed: Callable[[_codec.StreamingMP4Encoder], int],
@@ -1064,7 +1107,7 @@ class Outputs(_Bound):
         kind: type[A],
         codec: str,
         parts: tuple[Buffer, ...],
-        facts: dict[str, Any],
+        facts: dict[str, JsonValue],
         *,
         charge: int,
     ) -> A:
@@ -1299,7 +1342,7 @@ class Telemetry(_Bound):
         *,
         stage: str | None = None,
         overall_range: tuple[float, float] | None = None,
-    ) -> Any:
+    ) -> Callable[[int], None]:
         """Return one counted-work hook carrying stage and optional overall coordinates.
 
         It is also the STEP-TIME instrument: the interval between consecutive calls is
@@ -1382,7 +1425,7 @@ class Telemetry(_Bound):
         """
         attempt = self._attempt
         counts: dict[tuple[str, int], Callable[[int], None]] = {}
-        state: dict[str, Any] = {"said": False, "calls": 0, "shown": 0.0, "began": None}
+        state: _LoopState = {"said": False, "calls": 0, "shown": 0.0, "began": None}
 
         def stage(otherwise: str) -> str:
             current = _stage.get()
@@ -1454,7 +1497,7 @@ class Telemetry(_Bound):
             if succeeded and bounds is not None:
                 self._progress_frame(stage, overall_fraction=self._overall(bounds[1], scoped=False))
 
-    def _child_progress(self, payload: Mapping[str, Any], scope: _ProgressScope) -> None:
+    def _child_progress(self, payload: Mapping[str, object], scope: _ProgressScope) -> None:
         """Relay measured child coordinates without making child completion parent completion."""
         self._attempt.check_open("Telemetry.child_progress")
         stage_name = payload.get("stage")
@@ -1484,18 +1527,18 @@ class Telemetry(_Bound):
             and total > 0
         ):
             position = total = None
-        step_ms = payload.get("step_ms", 0.0)
+        timing = payload.get("step_ms", 0.0)
+        step_ms = 0.0
         try:
-            valid_timing = (
-                not isinstance(step_ms, bool)
-                and isinstance(step_ms, (int, float))
-                and math.isfinite(step_ms)
-                and step_ms >= 0
-            )
+            if (
+                not isinstance(timing, bool)
+                and isinstance(timing, (int, float))
+                and math.isfinite(timing)
+                and timing >= 0
+            ):
+                step_ms = timing
         except OverflowError:
-            valid_timing = False
-        if not valid_timing:
-            step_ms = 0.0
+            pass
         call_request, call_attempt = payload.get("call_request"), payload.get("call_attempt")
         if not isinstance(call_request, str) or not 0 < len(call_request) <= 255:
             call_request = None
@@ -1730,6 +1773,10 @@ class EgressResponse:
     body: bytes
 
 
+#: `(url, method, headers, body)` to the response the broker fetched.
+type EgressBroker = Callable[[str, str, dict[str, str], bytes | None], object]
+
+
 class Egress(_Bound):
     """Worker-brokered outbound HTTP (`net`) — connector endpoints only (§1.3).
 
@@ -1743,7 +1790,7 @@ class Egress(_Bound):
 
     __slots__ = ("_broker",)
 
-    def __init__(self, attempt: Attempt, broker: Any = None) -> None:
+    def __init__(self, attempt: Attempt, broker: EgressBroker | None = None) -> None:
         super().__init__(attempt)
         self._broker = broker
 

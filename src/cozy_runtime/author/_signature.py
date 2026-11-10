@@ -13,9 +13,9 @@ import math
 import re
 import types
 import typing
-from collections.abc import Callable, Iterator, Mapping, Sequence, Set
+from collections.abc import Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, get_args, get_origin
+from typing import Literal, get_args, get_origin
 
 import msgspec
 
@@ -35,6 +35,7 @@ from cozy_runtime.author._files import (
     asset_kinds,
     field_preparation,
 )
+from cozy_runtime.author._handler import Handler
 from cozy_runtime.author._markers import (
     PREPARATIONS,
     Bound,
@@ -70,7 +71,7 @@ class Param:
 class PreflightSpec:
     """Hook identity + result schema — the package interface's "schedule-builder identity"."""
 
-    fn: Callable[..., object]
+    fn: Handler
     identity: str
     payload_type: object
     settings_type: object | None
@@ -259,7 +260,7 @@ class ModelBinding:
     path: str
     """`<callable>.models.<param>` — renaming a parameter is a breaking package interface change."""
     param: str
-    model_class: type[Model[Any]]
+    model_class: type[Model[object]]
     components: Mapping[str, tuple[str, ...]]
     sequence_parallel: tuple[int, ...] = ()
     """`@sequence_parallel(degrees=...)` on the class: the degrees it shards at (cr-068)."""
@@ -304,7 +305,7 @@ class ModelSpec:
         return tuple(sorted({c for names in self.components.values() for c in names}))
 
     @classmethod
-    def of(cls, model: type[Model[Any]]) -> ModelSpec:
+    def of(cls, model: type[Model[object]]) -> ModelSpec:
         parameters = inspect.signature(model).parameters.values()
         return cls(
             model.__name__,
@@ -397,7 +398,7 @@ class Declaration:
 class Surface(Declaration):
     """One imported callable: its record, with the live objects an executor runs."""
 
-    fn: Callable[..., object]
+    fn: Handler
     is_async: bool
     params: tuple[Param, ...]
     demand_bound: Bound | None = None
@@ -460,7 +461,7 @@ def _asset_fields(tp: object, prefix: str, seen: frozenset[type] = frozenset()) 
             yield from _asset_fields(item, name + ".", seen | {base})
 
 
-def _hints(fn: Callable[..., object]) -> Mapping[str, object]:
+def _hints(fn: Handler) -> Mapping[str, object]:
     try:
         return typing.get_type_hints(fn, include_extras=True)
     except Exception as exc:  # a forward reference that never resolves is a BUILD failure
@@ -469,7 +470,7 @@ def _hints(fn: Callable[..., object]) -> Mapping[str, object]:
         ) from exc
 
 
-def model_class(annotation: object) -> type[Model[Any]] | None:
+def model_class(annotation: object) -> type[Model[object]] | None:
     """The Model class a model parameter names: `M`, or `M[P]` by its origin
     (`quantize_calibrated`'s `Model[Any]`), as `weights_class` reads `Weights[M]`."""
     cls = get_origin(annotation) or annotation
@@ -535,14 +536,14 @@ def _classify(name: str, annotation: object, where: str) -> Param:
 
 
 def analyze(
-    fn: Callable[..., object],
+    fn: Handler,
     *,
     name: str,
     publishes: bool = False,
     emits_media: bool = False,
     weights_outputs: tuple[WeightsOutput, ...] = (),
     demand_bound: Bound | None = None,
-    preflight: Callable[..., object] | None = None,
+    preflight: Handler | None = None,
     hidden: bool = False,
     child_task: bool = False,
     accelerator: bool = True,
@@ -552,7 +553,7 @@ def analyze(
     model_defaults: Mapping[str, str] | None = None,
     model_components: Mapping[str, tuple[str, ...]] | None = None,
     model_on_demand: tuple[str, ...] = (),
-    model_classes: Mapping[str, type[Model[Any]]] | None = None,
+    model_classes: Mapping[str, type[Model[object]]] | None = None,
 ) -> Surface:
     """Derive the whole surface from the signature. Every refusal here is a BUILD refusal.
     `model_classes` names a model argument's class in place of its annotation."""
@@ -560,7 +561,7 @@ def analyze(
     signature = inspect.signature(fn)
     hints = {**_hints(fn), **(model_classes or {})}
     params: list[Param] = []
-    wire_fields: list[Any] = []
+    wire_fields: list[tuple[str, object] | tuple[str, object, object]] = []
     for parameter in signature.parameters.values():
         if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
             raise ConformanceError(
@@ -717,7 +718,7 @@ def analyze(
         slots=tuple(
             Slot(
                 p.name,
-                ModelSpec.of(typing.cast(type[Model[Any]], p.annotation)),
+                ModelSpec.of(typing.cast(type[Model[object]], p.annotation)),
                 p.role == "weights",
             )
             for p in params
@@ -761,7 +762,7 @@ def assets_payload(
         )
     return msgspec.defstruct(
         f"{fn_name}Request",
-        [(binding.parameter, typing.cast(Any, binding.wire_type))],
+        [(binding.parameter, binding.wire_type)],
         bases=(payload_type,),
         module=module,
         kw_only=True,
@@ -830,7 +831,7 @@ BYTE_ACCESS = frozenset({"read_bytes", "open", "tobytes", "read", "stream", "pro
 
 
 def analyze_preflight(
-    fn: Callable[..., object], payload_type: object, assets: Param | None = None
+    fn: Handler, payload_type: object, assets: Param | None = None
 ) -> PreflightSpec:
     """The ONE pre-admission author hook: pure `(payload[, settings]) -> frozen facts`.
 

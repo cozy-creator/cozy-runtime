@@ -14,7 +14,7 @@ import types
 import typing
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, is_dataclass
-from typing import Annotated, Any, Literal, TypeVar, get_args, get_origin
+from typing import Annotated, Literal, TypeVar, get_args, get_origin
 
 import msgspec
 
@@ -173,7 +173,7 @@ def value_domain(tp: object) -> tuple[object, ...] | None:
     return None
 
 
-def field_values(value: object) -> dict[str, Any]:
+def field_values(value: object) -> dict[str, object]:
     """The declared fields of a struct instance as a plain mapping."""
     if isinstance(value, msgspec.Struct):
         return {f: getattr(value, f) for f in type(value).__struct_fields__}

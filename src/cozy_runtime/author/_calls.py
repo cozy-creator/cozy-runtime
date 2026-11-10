@@ -15,7 +15,7 @@ import time
 from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar, cast, overload
+from typing import Concatenate, ParamSpec, Protocol, TypeVar, cast, overload
 
 import msgspec
 from tensorfs.executor import (
@@ -39,6 +39,7 @@ from cozy_runtime.author._decode import MediaReads
 from cozy_runtime.author._defaults import fit
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._files import _UNBOUND, File, Files, References, Tree, asset_dec_hook
+from cozy_runtime.author._handler import Handler
 from cozy_runtime.author._memo import Memoize, memo_policy
 from cozy_runtime.author._model import WARNINGS, Model
 from cozy_runtime.author._model_defaults import model_components, model_defaults
@@ -92,7 +93,7 @@ class ChildCallError(CapabilityError):
 
 @dataclass(frozen=True, slots=True)
 class _Export:
-    implementation: Callable[..., object]
+    implementation: Handler
     module: str
     name: str
     memoize: Memoize | None = None
@@ -185,7 +186,7 @@ def invocable[**P, R](
     proxy.__doc__ = fn.__doc__
     proxy.__annotations__ = dict(fn.__annotations__)
     # No __wrapped__ / raw / local bypass is exposed by the public callable.
-    metadata = cast(Any, proxy)
+    metadata = cast("_Invocable", proxy)  # a function takes these attributes
     signature = inspect.signature(fn)
     parameters = list(signature.parameters.values())
     metadata.__signature__ = signature.replace(parameters=parameters[1:])
@@ -195,13 +196,18 @@ def invocable[**P, R](
     return proxy
 
 
-def _export(fn: Callable[..., object]) -> _Export | None:
+class _Invocable(Protocol):
+    __signature__: inspect.Signature
+    _cozy_export: _Export
+
+
+def _export(fn: object) -> _Export | None:
     value = getattr(fn, "_cozy_export", None)
     return value if isinstance(value, _Export) else None
 
 
-def prefetch(
-    callee: Callable[..., object],
+def prefetch[**P, R](
+    callee: Callable[P, R],
     *,
     models: Mapping[str, ModelChoice | None] | None = None,
 ) -> None:
@@ -272,7 +278,7 @@ class PendingCall[R](Awaitable[R]):
         self.progress_scope = _progress_scope.get()
         self.progress_sequence = 0
 
-    def __await__(self) -> Generator[Any, None, R]:
+    def __await__(self) -> Generator[object, None, R]:
         if self.task is None:
             self.task = asyncio.create_task(self.broker.run(self))
         return self.task.__await__()
@@ -315,7 +321,7 @@ class _Broker:
         self.nudges: Nudges | None = None
         self.nudged = 0
         self.nudge = asyncio.Event()
-        self.calls: dict[int, PendingCall[Any]] = {}
+        self.calls: dict[int, PendingCall[object]] = {}
         self.next_index = 0
         self.closed = False
         self.activated: set[int] = set()
@@ -381,7 +387,7 @@ class _Broker:
         module: str,
         export: str,
         arguments: Mapping[str, object],
-    ) -> PendingCall[Any]:
+    ) -> PendingCall[object]:
         ctx = self.context
         if self.closed or ctx is None or ctx.request_id != self.request_id:
             raise CapabilityError("package call escaped its attempt", code="escaped_handle")
@@ -467,7 +473,8 @@ class _Broker:
         payload = application_json.encode(encoded)
         if len(payload) > MAX_CALL_BYTES:
             raise CapabilityError("package call exceeds inline bound", code="child_payload_bound")
-        call = PendingCall[Any](self, self.next_index, binding, payload, ctx, tuple(saved.values()))
+        saved_files = tuple(saved.values())
+        call = PendingCall[object](self, self.next_index, binding, payload, ctx, saved_files)
         self.next_index += 1
         self.calls[call.index] = call
         return call
@@ -583,7 +590,7 @@ class _Broker:
             nudges.close()
 
     @staticmethod
-    def _observe(call: PendingCall[Any], answer: Answer) -> None:
+    def _observe[T](call: PendingCall[T], answer: Answer) -> None:
         child_id = answer.child_request_id
         if child_id:
             if len(child_id) > 256 or call.request_id not in ("", child_id):
@@ -601,7 +608,7 @@ class _Broker:
                 scope.telemetry._child_progress(progress.payload, scope)
 
     @staticmethod
-    def _intent(call: PendingCall[Any]) -> ChildCall:
+    def _intent[T](call: PendingCall[T]) -> ChildCall:
         return ChildCall(
             call_index=call.index,
             module=call.binding.module,
@@ -645,7 +652,7 @@ def _invoke_proxy(
     module: str,
     export: str,
     arguments: Mapping[str, object],
-) -> PendingCall[Any]:
+) -> PendingCall[object]:
     broker = _current.get()
     if broker is None:
         raise CapabilityError("package call has no admitted attempt", code="child_broker_absent")

@@ -14,10 +14,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, ParamSpec, TypedDict, TypeVar, Unpack, overload
+from typing import ParamSpec, TypedDict, TypeVar, Unpack, overload
 
 from cozy_runtime.author._calls import _export
 from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.author._handler import Handler
 from cozy_runtime.author._memo import Memoize, memo_policy, one_memo
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import (
@@ -44,7 +45,7 @@ class RegistrationOptions(TypedDict, total=False):
     accelerator: bool | None
     weights: tuple[WeightsOutput, ...]
     private: bool
-    preflight: Callable[..., object] | None
+    preflight: Handler | None
 
 
 class RegistrationError(ConformanceError):
@@ -58,16 +59,16 @@ class Registration:
     """One registered callable plus the doors it opened."""
 
     name: str
-    fn: Callable[..., object]
+    fn: Handler
     invocable: bool = False
     memoize: Memoize | None = None
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
     #: A model argument's class where the Runtime names it (`cozy_runtime.derive.recipes`).
-    model_classes: Mapping[str, type[Model[Any]]] = field(default_factory=dict)
+    model_classes: Mapping[str, type[Model[object]]] = field(default_factory=dict)
     weights_outputs: tuple[WeightsOutput, ...] = ()
-    preflight: Callable[..., object] | None = None
+    preflight: Handler | None = None
     child_task: bool = False
     """`private=True`: called by this package's own code only; never a root request."""
     accelerator: bool = True
@@ -197,9 +198,9 @@ class App:
         accelerator: bool | None = None,
         weights: tuple[WeightsOutput, ...] = (),
         private: bool = False,
-        preflight: Callable[..., object] | None = None,
+        preflight: Handler | None = None,
         tool: Tool | None = None,
-        model_classes: Mapping[str, type[Model[Any]]] | None = None,
+        model_classes: Mapping[str, type[Model[object]]] | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         policy = memo_policy(memoize)
         for option, value in (("accelerator", accelerator), ("private", private)):

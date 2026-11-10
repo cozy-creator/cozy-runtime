@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any
+from types import ModuleType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from av.video.reformatter import ColorRange, Colorspace
 
 
 def normalize(
@@ -29,17 +33,19 @@ def normalize(
     return primaries, transfer, matrix, color_range
 
 
-def colorspace(av: Any, value: int) -> Any:
+def colorspace(av: ModuleType, value: int) -> Colorspace:
     names = {1: "ITU709", 4: "FCC", 5: "ITU601", 7: "SMPTE240M", 9: "BT2020"}
     try:
-        return av.video.reformatter.Colorspace[names[value]]
+        found: Colorspace = av.video.reformatter.Colorspace[names[value]]
+        return found
     except KeyError as exc:
         raise ValueError(f"unsupported video color matrix {value}") from exc
 
 
-def range_value(av: Any, value: int) -> Any:
+def range_value(av: ModuleType, value: int) -> ColorRange:
     names = {1: "MPEG", 2: "JPEG"}
     try:
-        return av.video.reformatter.ColorRange[names[value]]
+        found: ColorRange = av.video.reformatter.ColorRange[names[value]]
+        return found
     except KeyError as exc:
         raise ValueError(f"unsupported video color range {value}") from exc

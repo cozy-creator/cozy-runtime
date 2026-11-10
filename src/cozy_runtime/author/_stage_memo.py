@@ -13,9 +13,10 @@ import functools
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Protocol
+from typing import Concatenate, Protocol, cast
 
 from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.author._handler import Handler
 
 
 class StageMemo(Protocol):
@@ -24,12 +25,19 @@ class StageMemo(Protocol):
     def call(
         self,
         model: object,
-        fn: Callable[..., object],
+        fn: Handler,
         components: tuple[str, ...],
         args: tuple[object, ...],
         kwargs: dict[str, object],
         run: Callable[[], object],
     ) -> object: ...
+
+
+class Memoizing(Protocol):
+    """A model whose methods `memoized` wraps: the Runtime installs its `StageMemo`."""
+
+    @property
+    def _cozy_memo(self) -> StageMemo | None: ...
 
 
 _EXACT: ContextVar[list[bool] | None] = ContextVar("cozy_stage_memo_exact", default=None)
@@ -52,13 +60,13 @@ def exactness() -> Iterator[list[bool]]:
         _EXACT.reset(token)
 
 
-def memoized(
-    fn: Callable[..., Any],
-    scoped: Callable[..., Any],
+def memoized[M: Memoizing, **P, R](
+    fn: Callable[Concatenate[M, P], R],
+    scoped: Callable[Concatenate[M, P], R],
     components: tuple[str, ...],
     *,
     is_async: bool,
-) -> Callable[..., Any]:
+) -> Callable[Concatenate[M, P], R]:
     """Wrap `scoped` (the scope-opening wrapper) so the lookup runs BEFORE admission."""
     if is_async:
         raise ConformanceError(
@@ -68,11 +76,12 @@ def memoized(
         )
 
     @functools.wraps(fn)
-    def wrapper(self: Any, /, *args: object, **kwargs: object) -> object:
-        memo: StageMemo | None = self._cozy_memo
+    def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> R:
+        memo = self._cozy_memo
         if memo is None:
             return scoped(self, *args, **kwargs)
-        return memo.call(self, fn, components, args, kwargs, lambda: scoped(self, *args, **kwargs))
+        found = memo.call(self, fn, components, args, kwargs, lambda: scoped(self, *args, **kwargs))
+        return cast("R", found)  # `run()`'s result, or the stored copy of one
 
     wrapper.__dict__["__memoize__"] = True
     return wrapper

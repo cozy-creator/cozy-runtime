@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Buffer, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, get_args, get_origin
 
@@ -19,7 +19,7 @@ MAX_WEIGHTS_NEW_BYTES = (1 << 53) - 1
 _OUTPUT_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _REF = re.compile(r"^sha256:[0-9a-f]{64}$")
 
-ReadBytes = Callable[["Checkpoint", str, str, str, int, Any], None]
+ReadBytes = Callable[["Checkpoint", str, str, str, int, Buffer], None]
 ReadValues = Callable[["Checkpoint", str, str, int, memoryview], None]
 
 
@@ -49,7 +49,7 @@ class WeightsOutput:
             )
 
 
-class Weights[M: Model[Any]]:
+class Weights[M: Model[object]]:
     """The raw checkpoint of `M`'s layout (bare `Weights`: any layout). Never constructed.
 
     Read it here, or pass it to `ctx.tensorfs_source` and `derive.quantize_artifact`.
@@ -107,7 +107,7 @@ class Weights[M: Model[Any]]:
         except KeyError:
             raise CapabilityError("model tensor is absent", code="weights_reader_tensor") from None
 
-    def read_into(self, component: str, key: str, role: str, offset: int, into: Any) -> None:
+    def read_into(self, component: str, key: str, role: str, offset: int, into: Buffer) -> None:
         """Stored bytes of one part (`""`: a plain tensor's), at most MAX_WEIGHTS_SOURCE_READ
         per call."""
         source = self._view()
@@ -118,7 +118,7 @@ class Weights[M: Model[Any]]:
             )
         self._bytes(source, component, key, role, offset, into)
 
-    def read_values_into(self, component: str, key: str, offset: int, into: Any) -> None:
+    def read_values_into(self, component: str, key: str, offset: int, into: Buffer) -> None:
         """Decode a flat logical element range into a contiguous writable float32 buffer."""
         source = self._view()
         if type(offset) is not int or not 0 <= offset <= MAX_WEIGHTS_NEW_BYTES:
@@ -130,7 +130,7 @@ class Weights[M: Model[Any]]:
         self._values(source, component, key, offset, _float32(into))
 
 
-def _float32(value: Any) -> memoryview:
+def _float32(value: Buffer) -> memoryview:
     try:
         target = memoryview(value)
     except TypeError:
@@ -151,7 +151,7 @@ def _float32(value: Any) -> memoryview:
     return target.cast("B")
 
 
-def weights_class(annotation: object) -> type[Model[Any]] | None:
+def weights_class(annotation: object) -> type[Model[object]] | None:
     """`M` of a `Weights[M]` annotation (`Model` for `Weights` or `Weights[Any]`), else None."""
     if annotation is not Weights and get_origin(annotation) is not Weights:
         return None

@@ -7,11 +7,18 @@ Blob and artifact integrity must continue to hash their exact bytes instead.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import msgspec
 
 from cozy_runtime.internal import canonical
+
+#: A JSON scalar as plain Python.
+type JsonScalar = str | int | float | bool | None
+
+#: A JSON value as plain Python, as written: a mapping, sequence, string, number, bool or None.
+type JsonValue = Mapping[str, JsonValue] | Sequence[JsonValue] | str | int | float | bool | None
 
 
 def encode(value: Any) -> bytes:
