@@ -13,7 +13,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
+from typing import TYPE_CHECKING, Annotated, Literal, NoReturn, cast
 
 import msgspec
 
@@ -571,10 +571,10 @@ def parse(raw: bytes, source: str = "package interface") -> PackageInterface:
     return interface
 
 
-def read_bytes(raw: bytes, source: str = "package interface") -> dict[str, Any]:
+def read_bytes(raw: bytes, source: str = "package interface") -> dict[str, Json]:
     """The validated document as untyped JSON, for readers not yet moved to `parse`."""
     parse(raw, source)
-    parsed: dict[str, Any] = canonical.parse(raw)
+    parsed: dict[str, Json] = canonical.parse(raw)
     return parsed
 
 

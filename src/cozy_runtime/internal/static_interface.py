@@ -37,7 +37,7 @@ import typing
 from collections.abc import Callable, Mapping, Sequence, Set
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 
 import msgspec
 
@@ -175,7 +175,7 @@ _VOCAB_MODULES = {
 _TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.vlm")
 
 
-_ARITHMETIC: dict[type[ast.operator], Callable[[Any, Any], object]] = {
+_ARITHMETIC: dict[type[ast.operator], Callable[[float, float], object]] = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
@@ -201,13 +201,13 @@ class Unfolded(ValueError):
         self.node = node
 
 
-def fold_constant(node: ast.expr, other: Callable[[ast.expr], Any]) -> Any:
+def fold_constant(node: ast.expr, other: Callable[[ast.expr], object]) -> object:
     """A literal/arithmetic expression's value, executing nothing: `other` values names and
     calls."""
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, (ast.Tuple, ast.List)):
-        items: list[Any] = []
+        items: list[object] = []
         for item in node.elts:
             if isinstance(item, ast.Starred):
                 spread = fold_constant(item.value, other)
@@ -218,7 +218,7 @@ def fold_constant(node: ast.expr, other: Callable[[ast.expr], Any]) -> Any:
                 items.append(fold_constant(item, other))
         return tuple(items) if isinstance(node, ast.Tuple) else items
     if isinstance(node, ast.JoinedStr):
-        parts = []
+        parts: list[str] = []
         for value in node.values:
             if isinstance(value, ast.FormattedValue):
                 if value.conversion != -1 or value.format_spec is not None:
@@ -239,11 +239,11 @@ def fold_constant(node: ast.expr, other: Callable[[ast.expr], Any]) -> Any:
         }
     if isinstance(node, ast.Subscript):
         # `STRENGTHS[0]`, `TIERS["2k"]`: one member of a folded tuple, list or dict.
-        value, key = fold_constant(node.value, other), fold_constant(node.slice, other)
-        if not isinstance(value, (tuple, list, dict)) or isinstance(key, (bool, slice)):
+        folded, key = fold_constant(node.value, other), fold_constant(node.slice, other)
+        if not isinstance(folded, (tuple, list, dict)) or isinstance(key, (bool, slice)):
             raise Unfolded(node, "a subscript of something not a folded tuple, list or dict")
         try:
-            return value[key]
+            return folded[key]  # type: ignore[call-overload]  # any folded key: a wrong one raises below
         except (IndexError, KeyError, TypeError) as exc:
             raise Unfolded(node, f"an index its value doesn't have ({exc})") from exc
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert)):
@@ -257,7 +257,12 @@ def fold_constant(node: ast.expr, other: Callable[[ast.expr], Any]) -> Any:
         left, right = fold_constant(node.left, other), fold_constant(node.right, other)
         if isinstance(node.op, ast.Add) and isinstance(left, str) and isinstance(right, str):
             return left + right
-        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (left, right)):
+        if (
+            not isinstance(left, (int, float))
+            or not isinstance(right, (int, float))
+            or isinstance(left, bool)
+            or isinstance(right, bool)
+        ):
             raise Unfolded(node, "arithmetic on non-numbers")
         if (arithmetic := _ARITHMETIC.get(type(node.op))) is not None:
             return arithmetic(left, right)
@@ -779,7 +784,8 @@ class Reader:
                         module, node, "min/max needs a nonempty literal sequence", "static_computed"
                     )
                 try:
-                    literals = typing.cast(Sequence[typing.Any], values)
+                    # each is an int, float, bool or str (above); a mix raises TypeError below
+                    literals = typing.cast("Sequence[float | str]", values)
                     return min(literals) if callee.key == "builtins.min" else max(literals)
                 except TypeError:
                     self.refuse(
@@ -997,7 +1003,7 @@ class Reader:
                 else self.translate(module, arg)
                 for arg in args
             )
-            return generic[params if len(params) != 1 else params[0]]  # type: ignore[index]
+            return generic[params if len(params) != 1 else params[0]]  # type: ignore[index]  # a vocabulary generic
         self.refuse(module, node, "a subscript of something that is not a generic type")
 
     # --------------------------------------------------------------- classes
@@ -1093,10 +1099,11 @@ class Reader:
         try:
             built = msgspec.defstruct(
                 node.name,
-                typing.cast(list[tuple[str, type, typing.Any]], fields),
+                # translated annotations and folded defaults: msgspec refuses a wrong one below
+                typing.cast("list[tuple[str, type, object]]", fields),
                 bases=tuple(bases) or None,
                 module=module.name,
-                **keywords,  # type: ignore[arg-type]
+                **keywords,  # type: ignore[arg-type]  # folded keywords: msgspec refuses a wrong one
             )
         except (TypeError, ValueError) as exc:
             self.refuse(module, node, f"msgspec refuses the struct: {exc}", "static_unsupported")
@@ -1271,17 +1278,20 @@ class Reader:
             try:
                 if value.args:
                     raise TypeError("Serving takes keywords only")
-                facts: dict[str, Any] = {
-                    str(k.arg): self.fold(module, k.value) for k in value.keywords
-                }
-                return author.Serving(**facts)
+                facts = {str(k.arg): self.fold(module, k.value) for k in value.keywords}
+                return author.Serving(**facts)  # type: ignore[arg-type]  # folded: TypeError below
             except author.ConformanceError as exc:
                 self.refuse(module, value, exc.message, exc.code)
             except TypeError as exc:
                 self.refuse(module, value, str(exc), "static_unsupported")
         return None
 
-    def declared(self, module: Module, call: ast.Call, factory: Callable[..., object]) -> None:
+    def declared(
+        self,
+        module: Module,
+        call: ast.Call,
+        factory: Callable[..., object],  # any author factory: its own TypeError judges the call
+    ) -> None:
         """Refuse a declaration its author factory refuses: the import-time rule, applied to
         the folded arguments."""
         try:
@@ -1524,8 +1534,20 @@ class Registration:
     #: `app.tool`'s own options.
     tool: author.Tool | None = None
 
-    def declaration(self, **found: Any) -> Declaration:
-        """Its record, with what its signature declares (`found`)."""
+    def declaration(
+        self,
+        *,
+        payload_type: object,
+        result_type: object,
+        contexts: tuple[str, ...],
+        services: tuple[str, ...],
+        slots: tuple[Slot, ...],
+        assets: AssetsBinding | None,
+        facts: int = 0,
+        parameters: tuple[str, ...] | None = None,
+        parameter_defaults: Mapping[str, object] | None = None,
+    ) -> Declaration:
+        """Its record, with what its signature declares."""
         return Declaration(
             name=self.name,
             module=self.module.name,
@@ -1539,7 +1561,15 @@ class Registration:
             model_defaults=self.model_defaults,
             model_components=self.model_components,
             model_on_demand=self.model_on_demand,
-            **found,
+            payload_type=payload_type,
+            result_type=result_type,
+            contexts=contexts,
+            services=services,
+            facts=facts,
+            slots=slots,
+            assets=assets,
+            parameters=parameters,
+            parameter_defaults={} if parameter_defaults is None else parameter_defaults,
         )
 
 
@@ -2467,7 +2497,7 @@ def _registration(
     tool: author.Tool | None = None
     if method == "tool":
         try:
-            tool = author.Tool(**box)  # type: ignore[arg-type]
+            tool = author.Tool(**box)  # type: ignore[arg-type]  # folded: ConformanceError below
         except author.ConformanceError as exc:
             reader.refuse(module, decorator or fn, exc.message, exc.code)
     return Registration(
