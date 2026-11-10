@@ -60,11 +60,6 @@ packages = ["src/cozy_runtime"]
 [tool.uv]
 package = true
 
-# rc/varena-v2 builds against its own TensorFS, which isn't published yet. The release drops this for the published
-# TensorFS and sets the ranges above. To move it: new rev, then `uv lock`.
-[tool.uv.sources]
-tensorfs = { git = "https://github.com/cozy-creator/cozy-creator", rev = "a4f2f9545458efbb22cb3e0b36a110d21eb9a91d", subdirectory = "crates/tensorfs-py" }
-
 [tool.basedpyright]
 # scripts/typecheck.sh runs this against real torch, Diffusers, Transformers and TensorFS.
 include = ["src", "checks", "examples"]
