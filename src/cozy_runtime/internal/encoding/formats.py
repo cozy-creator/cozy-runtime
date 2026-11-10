@@ -300,6 +300,10 @@ class Leaf(Protocol):
     _buffers: dict[str, torch.Tensor | None]
     _non_persistent_buffers_set: set[str]
 
+    def __call__(self, x: Tensor, /) -> Tensor:
+        """The linear op it replaced, on its encoded weight."""
+        ...
+
     def roles(self) -> dict[str, Tensor]:
         """Each role's tensor as the leaf keeps it (cast or swizzled from the stored part)."""
         ...

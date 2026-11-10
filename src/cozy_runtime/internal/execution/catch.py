@@ -353,7 +353,12 @@ def passing(module: nn.Module, args: Args, kwargs: Kwargs) -> Iterator[None]:
     key = phase.execution_key(f"{type(module).__qualname__}:{shapes}", "runtime.pass/1")
     assert key is not None
     request.memory.remember_working_phase(key, owners(request))
-    with phase.observing(device, "eager", request.working_phases, key=key) as observation:
+    with phase.observing(
+        device,
+        "eager",
+        request.working_phases,  # type: ignore[arg-type]  # residency's rows: WorkingPhase on the boundary branch
+        key=key,
+    ) as observation:
         yield
         if observation is not None:
             # An eager observation holds the stream it ran on (`phase.observing`).
