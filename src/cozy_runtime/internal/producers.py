@@ -44,12 +44,17 @@ class Processor:
         component: str,
         path: str,
     ) -> None:
+        from cozy_runtime.internal.attention import BY_NAME  # it imports this module
+
         self.original = original
         self.producer = producer
         self.backend = backend
         self.kernel = kernel
         self.component = component
         self.path = path
+        base = BY_NAME.get(producer.base)
+        # Its base quantizes Q and V itself: they may cross as int8 (`attention_ulysses.Local`).
+        self.narrow = base is not None and base.local.narrow
 
     @property
     def _attention_backend(self) -> object:
@@ -100,7 +105,7 @@ class Processor:
             if group is None:
                 raise ValueError(f"{self.producer.name}: no Ulysses group to exchange over")
             return attention_ulysses.exchange(
-                query, key, value, group, compute, f"{self.component}/{self.path}"
+                query, key, value, group, compute, f"{self.component}/{self.path}", self.narrow
             )
 
         def served(implementation: str) -> None:

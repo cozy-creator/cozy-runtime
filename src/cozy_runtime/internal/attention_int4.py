@@ -93,4 +93,6 @@ def attention(
     return out.transpose(1, 2) if wide else out
 
 
-KITCHEN_INT4QK = Local(attention, upstream._named("cozy _attn4 (int4 Q·Kᵀ, Kitchen int8 P·V)"))
+KITCHEN_INT4QK = Local(
+    attention, upstream._named("cozy _attn4 (int4 Q·Kᵀ, Kitchen int8 P·V)"), narrow=True
+)

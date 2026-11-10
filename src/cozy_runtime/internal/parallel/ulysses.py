@@ -43,6 +43,8 @@ type Wait = Callable[[], None]
 _ROUNDS = 4
 #: Each group's Q/K/V to one peer, at least, for a group's crossing to outlast its launches.
 _ROUND_BYTES = 16 << 20
+#: Hadamard matrices by device, dtype and order (`_narrow`).
+_TURNS: dict[tuple[Any, Any, int], Tensor] = {}
 
 
 def group(config: object) -> ProcessGroup:
@@ -199,21 +201,53 @@ def _start(
     return waited
 
 
-def _pack(source: Tensor, target: Tensor, start: int, world: int) -> None:
-    """`source`'s heads from `start`, into send rows block per GPU; heads past its end are the
-    padding every GPU agreed."""
+def _turn(dim: int, like: Tensor) -> Tensor:
+    """The orthonormal Hadamard matrix of order `dim` (a power of two): its own inverse."""
+    key = (like.device, like.dtype, dim)
+    found = _TURNS.get(key)
+    if found is None:
+        turn = torch.ones(1, 1)
+        while turn.shape[0] < dim:
+            turn = torch.cat([torch.cat([turn, turn], 1), torch.cat([turn, -turn], 1)])
+        found = _TURNS[key] = (turn * dim**-0.5).to(like.device, like.dtype)
+    return found
+
+
+def _narrow(x: Tensor) -> tuple[Tensor, Tensor]:
+    """`x`'s rows turned and scaled to their own absmax, as int8; and those scales."""
+    turned = x @ _turn(x.shape[-1], x)
+    scale = torch.linalg.vector_norm(turned, float("inf"), dim=-1, keepdim=True) / 127
+    scale.clamp_(min=torch.finfo(x.dtype).tiny)
+    return turned.div_(scale).round_().clamp_(-127, 127).to(torch.int8), scale
+
+
+def _widen(values: Tensor, scale: Tensor) -> Tensor:
+    """`_narrow`'s rows back in `scale`'s dtype."""
+    return values.to(scale.dtype).mul_(scale) @ _turn(values.shape[-1], scale)
+
+
+def _pack(
+    source: Tensor, target: Tensor, start: int, world: int, scale: Tensor | None = None
+) -> None:
+    """`source`'s heads from `start`, into send rows block per GPU (narrowed where `scale`
+    takes their scales); heads past its end are the padding every GPU agreed."""
     batch, rows, heads, dim = source.shape
     local = target.shape[2]
     grouped = target.view(world, rows, batch, local, dim)
+    factors = None if scale is None else scale.view(world, rows, batch, local, 1)
     if start + world * local > heads:
         grouped.zero_()
+        if factors is not None:
+            factors.zero_()
     for peer in range(world):
         first = start + peer * local
         count = min(local, max(heads - first, 0))
         if count:
-            grouped[peer, :, :, :count].permute(1, 0, 2, 3).copy_(
-                source[:, :, first : first + count]
-            )
+            part = source[:, :, first : first + count]
+            if factors is not None:
+                part, factor = _narrow(part)
+                factors[peer, :, :, :count].permute(1, 0, 2, 3).copy_(factor)
+            grouped[peer, :, :, :count].permute(1, 0, 2, 3).copy_(part)
 
 
 def _send(
@@ -225,26 +259,48 @@ def _send(
     local: int,
     matrix: list[list[int]],
     rank: int,
+    narrow: bool,
 ) -> tuple[Wait, list[Tensor]]:
-    """A head group's q, k and v packed and crossing; its receivers."""
+    """A head group's q, k and v packed and crossing; its receivers, Q and V with their scales
+    where `narrow`."""
     batch, rows, _, dim = (int(n) for n in sources[0].shape)
     world = len(matrix)
-    sends = [sources[0].new_empty((world * rows, batch, local, dim)) for _ in range(3)]
-    receives = [sources[0].new_empty((total, batch, local, dim)) for _ in range(3)]
-    for source, target in zip(sources, sends, strict=True):
-        _pack(source, target, start, world)
+    sends: list[Tensor] = []
+    receives: list[Tensor] = []
+    scales: list[tuple[Tensor, Tensor]] = []
+    for index, source in enumerate(sources):
+        wire = narrow and index != 1
+        dtype = torch.int8 if wire else source.dtype
+        target = source.new_empty((world * rows, batch, local, dim), dtype=dtype)
+        scale = source.new_empty((world * rows, batch, local, 1)) if wire else None
+        _pack(source, target, start, world, scale)
+        sends.append(target)
+        receives.append(source.new_empty((total, batch, local, dim), dtype=dtype))
+        if scale is not None:
+            scales.append((scale, source.new_empty((total, batch, local, 1))))
+    sends += [sent for sent, _ in scales]
+    receives += [received for _, received in scales]
     return _start(handle, engines, sends, receives, matrix, rank), receives
 
 
+def _operands(receives: list[Tensor]) -> list[Tensor]:
+    """A group's received q, k and v as the kernel takes them: [batch, sequence, heads, dim]."""
+    q, k, v, *scales = receives
+    if scales:
+        q, v = _widen(q, scales[0]), _widen(v, scales[1])
+    return [t.permute(1, 0, 2, 3).contiguous() for t in (q, k, v)]
+
+
 def _land(
-    out: Tensor, wait: Wait, returned: Tensor, start: int, world: int, waits: list[Any]
+    out: Tensor, wait: Wait, returned: list[Tensor], start: int, world: int, waits: list[Any]
 ) -> None:
     """A group's attended rows, back on this GPU, into its heads of `out`."""
     batch, mine, _, dim = out.shape
-    local = returned.shape[2]
+    local = returned[0].shape[2]
     _waited(out, wait, waits)
+    rows = _widen(*returned) if len(returned) == 2 else returned[0]
     part = out[:, :, start : start + world * local].view(batch, mine, world, local, dim)
-    part.copy_(returned.view(world, mine, batch, local, dim).permute(2, 1, 0, 3, 4))
+    part.copy_(rows.view(world, mine, batch, local, dim).permute(2, 1, 0, 3, 4))
 
 
 def _waited(on: Tensor, wait: Wait, waits: list[Any]) -> None:
@@ -342,16 +398,20 @@ def exchange(
     handle: ProcessGroup,
     compute: Compute,
     site: str = "",
+    narrow: bool = False,
 ) -> Tensor:
     """`compute` over whole sequences per head subset, back to this GPU's rows of every head.
-    `site` names the caller's attention module where it knows it: every GPU must be there."""
+    `site` names the caller's attention module where it knows it: every GPU must be there.
+    `narrow`: the kernel quantizes Q and V to int8 or narrower itself, so they and its output
+    cross as int8, each head's row Hadamard-turned and scaled to its own absmax (about 5/8 of
+    the bytes). K crosses as it is: its mean dominates its rows until the kernel's shift."""
     meet = _rendezvous(handle)
     held = catch.LEAF.acquire(blocking=False)
     try:
         # One model pass owns its group's collective order.
         with meet.lock:
             meet.sequence += 1
-            return _exchange(meet, query, key, value, handle, compute, held, site)
+            return _exchange(meet, query, key, value, handle, compute, held, site, narrow)
     finally:
         if held:
             catch.LEAF.release()
@@ -366,10 +426,12 @@ def _exchange(
     compute: Compute,
     held: bool,
     called: str,
+    narrow: bool,
 ) -> Tensor:
     rank, world = meet.rank, meet.world
     batch, mine, heads, dim = (int(n) for n in query.shape)
     b = query.element_size()
+    narrow = narrow and dim & (dim - 1) == 0  # a Hadamard turn's order
     padded = heads + (-heads % world)
     steps = _steps(padded, world)
     geometry = (batch, padded, dim, b)
@@ -396,7 +458,8 @@ def _exchange(
     proposal: dict[str, Any] = {
         "rows": mine,
         "at": max(catch.LEVELS.get(site, floor), floor),
-        "site": f"{called or 'attention'} [{batch} x {padded} heads x {dim}, {b} B]",
+        "site": f"{called or 'attention'} [{batch} x {padded} heads x {dim}, {b} B"
+        + (", int8 wire]" if narrow else "]"),
     }
     selection: dict[str, Any] = {}
     try:
@@ -431,33 +494,37 @@ def _exchange(
         out = query.new_empty((batch, mine, padded, dim))
         sources = (query, key, value)
         # In flight: the next group's q, k, v, and the last group's output (`_need`).
-        arriving = [_send(handle, engines, sources, starts[0], total, local, sent, rank)]
+        arriving = [_send(handle, engines, sources, starts[0], total, local, sent, rank, narrow)]
         crossed = True
-        returning: list[tuple[Wait, Tensor, int]] = []
+        returning: list[tuple[Wait, list[Tensor], int]] = []
         for index, start in enumerate(starts):
             wait, receives = arriving.pop()
             if index + 1 < len(starts):
                 following = starts[index + 1]
                 arriving.append(
-                    _send(handle, engines, sources, following, total, local, sent, rank)
+                    _send(handle, engines, sources, following, total, local, sent, rank, narrow)
                 )
             _waited(query, wait, arrived)
             del wait  # its sends go: the current stream is past their crossing
-            first = _Clock.mark(query)
-            attended = compute(*(t.permute(1, 0, 2, 3).contiguous() for t in receives))
-            inner.append((first, _Clock.mark(query)))
+            operands = _operands(receives)
             del receives
+            first = _Clock.mark(query)
+            attended = compute(*operands)
+            inner.append((first, _Clock.mark(query)))
+            del operands
             if attended.shape != (batch, total, local, dim) or attended.dtype != query.dtype:
                 raise ValueError("Ulysses attention returned incompatible output")
             if returning:
                 _land(out, *returning.pop(), world, landed)
             flat = attended.permute(1, 0, 2, 3).contiguous()
             del attended
-            returned = query.new_empty((world * mine, batch, local, dim))
+            sends = list(_narrow(flat)) if narrow else [flat]
+            del flat
+            returned = [t.new_empty((world * mine, *t.shape[1:])) for t in sends]
             returning.append(
-                (_start(handle, engines, [flat], [returned], back, rank), returned, start)
+                (_start(handle, engines, sends, returned, back, rank), returned, start)
             )
-            del flat, returned
+            del sends, returned
         _land(out, *returning.pop(), world, landed)
         submitted = True
     except BaseException:
@@ -467,13 +534,10 @@ def _exchange(
     finally:
         if token is not None:
             vt.split_end(device, token, submitted=submitted)
-    row = batch * local * dim * b
-    _CLOCK.add(
-        began,
-        _Clock.mark(query),
-        (inner, arrived, landed),
-        len(starts) * row * (3 * mine * (world - 1) + total - mine),
-    )
+    width = 1 + b / dim if narrow else b  # a narrowed element's bytes, its scale's share too
+    row = len(starts) * batch * local * dim
+    moved = row * (mine * (world - 1) * (2 * width + b) + (total - mine) * width)
+    _CLOCK.add(began, _Clock.mark(query), (inner, arrived, landed), round(moved))
     return out[:, :, :heads] if padded != heads else out
 
 

@@ -57,7 +57,9 @@ def _named(implementation: str) -> Callable[..., str]:
     return lambda *_: implementation
 
 
-KITCHEN_SOL = Local(forward, _named("comfy_kitchen.sol_attn(int8, layout tau, current-call stats)"))
+KITCHEN_SOL = Local(
+    forward, _named("comfy_kitchen.sol_attn(int8, layout tau, current-call stats)"), narrow=True
+)
 KITCHEN_SOL_FP4_LOWMEM = Local(
     forward,
     _named(
@@ -73,5 +75,7 @@ KITCHEN_SOL_FP4_FIXED_MEANS = Local(
     ),
 )
 KITCHEN_SOL_INT4QK = Local(
-    forward, _named("dense=cozy _attn4(int4 Q·Kᵀ); sparse=comfy_kitchen.sol_attn(int8)")
+    forward,
+    _named("dense=cozy _attn4(int4 Q·Kᵀ); sparse=comfy_kitchen.sol_attn(int8)"),
+    narrow=True,
 )
