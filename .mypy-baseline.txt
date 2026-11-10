@@ -3,7 +3,6 @@ src/cozy_runtime/_application_json.py: [explicit-any] Explicit "Any" is not allo
 src/cozy_runtime/_application_json.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/_kernels/__init__.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/_kernels/__init__.py: [possibly-undefined] Name "_gemm" may be undefined
-src/cozy_runtime/_kernels/_norm.pyi: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/_concurrent.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/_concurrent.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/_concurrent.py: [explicit-any] Explicit "Any" is not allowed
@@ -388,10 +387,6 @@ src/cozy_runtime/canonical_json.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/canonical_json.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/canonical_json.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/cli/image_prepare.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/derive/facade.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/facade.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/facade.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/facade.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allowed
@@ -406,8 +401,6 @@ src/cozy_runtime/derive/microscale.py: [explicit-any] Explicit "Any" is not allo
 src/cozy_runtime/derive/native_quantization.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/native_quantization.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/native_quantization.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/operations.py: [misc] Type of decorated function contains type "Any" ("def (*, source: Weights[Any], plan: QuantizationPlan, tel: Telemetry, max_relative_frobenius: float | None = ...) -> PendingCall[ModelArtifact]")
 src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
@@ -416,12 +409,6 @@ src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not al
 src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/recipes.py: [misc] Type of decorated function contains type "Any" ("def (*, source: Weights[Any], lane: str, package: str, release: str, recipe: str = ..., tel: Telemetry) -> PendingCall[ModelArtifact]")
-src/cozy_runtime/derive/recipes.py: [misc] Type of decorated function contains type "Any" ("def (*, source: Weights[Any], model: Model[Any], lane: str, package: str, release: str, recipe: str = ..., tel: Telemetry) -> PendingCall[ModelArtifact]")
 src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
@@ -771,7 +758,6 @@ src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after de
 src/cozy_runtime/internal/decode_schemes.py: [no-any-unimported] Argument 4 to "_k_quant" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/decode_schemes.py: [no-any-unimported] Argument 5 to "_k_quant" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/decode_schemes.py: [unreachable] Statement is unreachable
-src/cozy_runtime/internal/delivery.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/derive.py: [redundant-cast] Redundant cast to Module
 src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore" comment
