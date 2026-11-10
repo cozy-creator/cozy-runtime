@@ -11,7 +11,7 @@ import dataclasses
 import sys
 from collections import OrderedDict
 from collections.abc import Iterator
-from typing import Any
+from typing import TYPE_CHECKING
 
 import msgspec
 
@@ -19,6 +19,9 @@ from cozy_runtime.author._errors import Origin, Terminal
 from cozy_runtime.internal import execution_evidence
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.parallel.plan import GroupRefusal
+
+if TYPE_CHECKING:
+    import torch
 
 _TAG = "__sp__"
 
@@ -52,7 +55,7 @@ class _Output(msgspec.Struct, frozen=True, tag_field=_TAG, tag="output"):
 _Envelope = _Tensor | _Tuple | _Output
 
 
-def marshal(value: object, tensors: list[Any], *, path: str = "") -> Json:
+def marshal(value: object, tensors: list[torch.Tensor], *, path: str = "") -> Json:
     """`value` as JSON-native tagged data; its tensors are appended to `tensors`."""
     import torch
 
@@ -106,7 +109,7 @@ def _tensors(value: Json) -> Iterator[_Tensor]:
                 yield from _tensors(item)
 
 
-def unmarshal(value: Json, tensors: list[Any]) -> object:
+def unmarshal(value: Json, tensors: list[torch.Tensor]) -> object:
     """Wire data with its tensors back in place."""
     if isinstance(value, list):
         return [unmarshal(v, tensors) for v in value]
@@ -136,13 +139,16 @@ DTYPES: tuple[str, ...] = ("float32", "float16", "bfloat16", "float64", "int64",
 DTYPES += ("uint8", "bool", "int8", "int16", "float8_e4m3fn", "float8_e5m2")
 
 
-def one_tensor(value: object) -> None:
+def one_tensor(value: object) -> torch.Tensor:
     """A spread call returns one tensor (`author.spread`)."""
+    import torch
+
     dtype = str(getattr(value, "dtype", "")).removeprefix("torch.")
-    if dtype not in DTYPES or not hasattr(value, "shape"):
+    if not isinstance(value, torch.Tensor) or dtype not in DTYPES:
         raise UncrossableArgument(
             f"a spread call returns one tensor, not {type(value).__name__} {dtype}".rstrip()
         )
+    return value
 
 
 class RunReply(msgspec.Struct, frozen=True):

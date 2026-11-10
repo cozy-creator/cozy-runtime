@@ -1,7 +1,6 @@
 """Spread one component's pure method calls over the GPUs of its group."""
 
 from collections.abc import Callable, Iterable, Iterator
-from typing import cast
 
 from cozy_runtime.author import _group
 
@@ -27,4 +26,4 @@ def spread[*Ts, R](
     group = _group.CURRENT[0]
     if group is None or group.world < 2:
         return (method(*args) for args in arguments)
-    return cast("Iterator[R]", group.spread(method, arguments))
+    return group.spread(method, arguments)

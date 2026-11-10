@@ -32,7 +32,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import msgspec
 import numpy as np
@@ -262,8 +262,8 @@ class Entry:
                 else torch.empty(0, dtype=dtype)
             )
             at = self.meta.devices[name]
-            at = device if device is not None and at != "cpu" else at
-            tensors[name] = flat.reshape(tuple(row.shape)).to(at, copy=True)
+            to = device if device is not None and at != "cpu" else at
+            tensors[name] = flat.reshape(tuple(row.shape)).to(to, copy=True)
         return _rebuild(self.meta.structure, tensors)
 
 
@@ -660,7 +660,7 @@ class GenerationMemo:
             if (stage, numerics) in engine.disputed:
                 raise Unmemoizable("disputed")
         except Unmemoizable as exc:
-            _tell(ranks, name, None)
+            _tell(ranks, name, None, self.torch)
             result = run()
             stats.skips[str(exc)] += 1
             engine.record(Call(name, "skip", str(exc), ms=(time.perf_counter() - started) * 1e3))
@@ -681,7 +681,7 @@ class GenerationMemo:
             if entry is None and (entry := engine.fetch(key, stage, numerics)) is not None:
                 tier = "machine"
                 engine.put(key, entry)
-            _tell(ranks, name, entry)
+            _tell(ranks, name, entry, self.torch)
             if entry is None:
                 return self._miss(name, stats, key, stage, numerics, run, started)
             result = entry.materialize(self.torch)
@@ -744,14 +744,12 @@ class GenerationMemo:
         return normalized
 
 
-def _tell(ranks: spmd.Ranks | None, name: str, entry: Entry | None) -> None:
+def _tell(ranks: spmd.Ranks | None, name: str, entry: Entry | None, torch: ModuleType) -> None:
     """GPU 0 decided: every other GPU of its group runs the stage too, or takes this entry."""
     if ranks is None:
         return
     ranks.told({"hit": entry is not None, "key": entry.meta.key if entry else ""}, f"memo {name}")
     if entry is not None:
-        import torch
-
         ranks.cross(torch.frombuffer(entry.payload, dtype=torch.uint8), 0, f"memo {name} entry")
 
 
@@ -761,8 +759,9 @@ def _follow(ranks: spmd.Ranks, name: str, torch: ModuleType, run: Callable[[], o
     told = ranks.told(None, f"memo {name}")
     if not told["hit"]:
         return run()
-    payload = ranks.cross(None, 0, f"memo {name} entry")
-    entry = Entry.parse(bytes(cast(Any, payload).numpy()), str(told["key"]))
+    # `_tell` sends the entry as one uint8 tensor
+    payload = cast(Tensor, ranks.cross(None, 0, f"memo {name} entry"))
+    entry = Entry.parse(payload.numpy().tobytes(), str(told["key"]))
     return entry.materialize(torch, ranks.device)
 
 

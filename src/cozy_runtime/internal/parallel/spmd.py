@@ -17,14 +17,23 @@ import random
 import sys
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, cast
 
 import msgspec
 
 from cozy_runtime.author import _group
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.parallel import wire
 from cozy_runtime.internal.parallel.group import gather
 from cozy_runtime.internal.parallel.plan import GroupRefusal
+
+if TYPE_CHECKING:
+    import torch
+    from torch.distributed import ProcessGroup
+    from torch.utils.hooks import RemovableHandle
+
+#: One GPU's row at a meeting: what it is at, and what it states there.
+type Row = dict[str, Json]
 
 
 class UngatedShardedForward(GroupRefusal):
@@ -42,8 +51,8 @@ class Ranks:
         *,
         rank: int,
         world: int,
-        pg: Any,
-        device: Any,
+        pg: ProcessGroup,
+        device: torch.device,
         tag: str,
         gpu: Callable[[int], str],
     ) -> None:
@@ -57,7 +66,7 @@ class Ranks:
         self.lock = threading.Lock()
         self.nccl = dist.get_backend(pg) == "nccl"
 
-    def meet(self, value: Mapping[str, object], what: str) -> list[dict[str, Any]]:
+    def meet(self, value: Mapping[str, Json], what: str) -> list[Row]:
         """Every GPU's `value` at this point of the program. GPUs at different points raise,
         naming each; a GPU whose handler already ended is named at once (`gather`)."""
         with self.lock:
@@ -66,7 +75,7 @@ class Ranks:
             keys = [f"{n}/{rank}" for rank in range(self.world)]
             self.store.set(keys[self.rank], json.dumps({"what": what, **value}))
             ended = [f"end/{rank}" for rank in range(self.world)]
-            rows = [json.loads(raw) for raw in gather(self.store, keys, what, ended)]
+            rows: list[Row] = [json.loads(raw) for raw in gather(self.store, keys, what, ended)]
             if n > 1:
                 self.store.delete_key(f"{n - 1}/{self.rank}")
         if len({row["what"] for row in rows}) > 1:
@@ -93,14 +102,17 @@ class Ranks:
     def all(self, flag: bool, what: str) -> bool:
         return all(row["flag"] for row in self.meet({"flag": bool(flag)}, what))
 
-    def told(self, value: Mapping[str, object] | None, what: str) -> dict[str, Any]:
+    def told(self, value: Mapping[str, Json] | None, what: str) -> Row:
         """GPU 0's `value` on every GPU."""
-        return self.meet({"told": dict(value or {}) if self.rank == 0 else None}, what)[0]["told"]
+        told = self.meet({"told": dict(value or {}) if self.rank == 0 else None}, what)[0]["told"]
+        if not isinstance(told, dict):
+            raise GroupRefusal(f"{what}: GPU 0 told no value", code="group_diverged")
+        return told
 
     def cross(self, value: object, owner: int, what: str) -> object:
         """`value` as GPU `owner` holds it, on every GPU: its structure through the store, each
         tensor by one broadcast from `owner`, onto this GPU (host tensors stay on the host)."""
-        tensors: list[Any] = []
+        tensors: list[torch.Tensor] = []
         structure = wire.marshal(value, tensors) if self.rank == owner else None
         rows = self.meet({"structure": structure}, what)
         structure = rows[owner]["structure"]
@@ -110,29 +122,31 @@ class Ranks:
         ]
         return wire.unmarshal(structure, received)
 
-    def spread(
-        self, method: Callable[..., Any], arguments: Iterable[tuple[Any, ...]]
-    ) -> Iterator[Any]:
+    def spread[*Ts, R](
+        self, method: Callable[[*Ts], R], arguments: Iterable[tuple[*Ts]]
+    ) -> Iterator[R]:
         """Call n runs on GPU n mod K; a round's K results cross from their GPUs to every GPU,
         and come out in call order."""
         name = getattr(method, "__qualname__", getattr(method, "__name__", "spread"))
         calls, at = iter(arguments), 0
         while batch := list(itertools.islice(calls, self.world)):
             mine = method(*batch[self.rank]) if self.rank < len(batch) else None
-            if mine is not None:
-                wire.one_tensor(mine)
-            tensors: list[Any] = []
-            head = wire.marshal(mine, tensors)
+            sent = wire.one_tensor(mine) if self.rank < len(batch) else None
+            tensors: list[torch.Tensor] = []
+            head = wire.marshal(sent, tensors)
             rows = self.meet({"head": head}, f"spread {name} {at}-{at + len(batch) - 1}")
             for owner in range(len(batch)):
-                spec = rows[owner]["head"]
-                tensor = mine if owner == self.rank else None
-                yield self._broadcast(tensor, msgspec.convert(spec, wire._Tensor), owner)
+                spec = msgspec.convert(rows[owner]["head"], wire._Tensor)
+                received = self._broadcast(sent if owner == self.rank else None, spec, owner)
+                # every call returns one tensor (`author.spread`): GPU `owner`'s is that tensor
+                yield cast(R, mine if owner == self.rank else received)
             at += len(batch)
             if len(batch) < self.world:
                 return
 
-    def _broadcast(self, tensor: Any, spec: wire._Tensor, owner: int) -> Any:
+    def _broadcast(
+        self, tensor: torch.Tensor | None, spec: wire._Tensor, owner: int
+    ) -> torch.Tensor:
         import torch
         import torch.distributed as dist
         from torch.utils._python_dispatch import _disable_current_modes
@@ -140,14 +154,14 @@ class Ranks:
         dtype = getattr(torch, spec.dtype)
         wire_device = self.device if self.nccl else torch.device("cpu")
         with _disable_current_modes():
-            if self.rank == owner:
+            if tensor is not None:
                 buffer = tensor.detach().resolve_conj().resolve_neg().contiguous()
                 buffer = buffer.to(wire_device)
             else:
                 buffer = torch.empty(spec.shape, dtype=dtype, device=wire_device)
             if buffer.numel():
                 dist.broadcast(buffer.reshape(-1).view(torch.uint8), src=owner, group=self.pg)
-        if self.rank == owner:
+        if tensor is not None:
             return tensor
         return buffer.cpu() if spec.host else buffer.to(self.device)
 
@@ -179,14 +193,14 @@ def seed(entropy: int) -> None:
         numpy.random.seed(entropy & 0xFFFFFFFF)
 
 
-def install_call_check(component: Any, name: str) -> None:
+def install_call_check(component: torch.nn.Module, name: str) -> None:
     """Before each call of a sharded root, every GPU meets at it: a GPU at another call, or one
     whose handler already returned, is named instead of hanging a collective. Arguments may
     differ: a GPU's own rows of a table the plan splits are its own."""
     if getattr(component, "_cozy_spmd_check", None) is not None:
         return
 
-    def check(module: Any, args: Any, kwargs: Any = None) -> None:
+    def check(module: torch.nn.Module, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
         ranks = current()
         if ranks is None:
             raise UngatedShardedForward(
@@ -195,25 +209,24 @@ def install_call_check(component: Any, name: str) -> None:
             )
         ranks.meet({}, f"{name} call")
 
-    handle = component.register_forward_pre_hook(check, with_kwargs=True)
+    handle: RemovableHandle = component.register_forward_pre_hook(check, with_kwargs=True)
     with contextlib.suppress(Exception):
-        component._cozy_spmd_check = handle
+        object.__setattr__(component, "_cozy_spmd_check", handle)
 
 
 _hosting = threading.local()
 
 
-def host_component(component: Any, *, name: str, home: int, rank: int) -> None:
+def host_component(component: torch.nn.Module, *, name: str, home: int, rank: int) -> None:
     """Every module call into `component`, its root or any submodule, runs on GPU `home`, which
     alone holds its bytes; its result crosses to every GPU (`Ranks.cross`)."""
     for path, module in component.named_modules():
-        module._call_impl = _hosted(
-            module._call_impl, f"{name}.{path}" if path else name, home, rank
-        )
+        what = f"{name}.{path}" if path else name
+        object.__setattr__(module, "_call_impl", _hosted(module._call_impl, what, home, rank))
 
 
-def _hosted(call: Callable[..., Any], what: str, home: int, rank: int) -> Callable[..., Any]:
-    def hosted(*args: Any, **kwargs: Any) -> Any:
+def _hosted[**P](call: Callable[P, object], what: str, home: int, rank: int) -> Callable[P, object]:
+    def hosted(*args: P.args, **kwargs: P.kwargs) -> object:
         if getattr(_hosting, "inside", False):
             return call(*args, **kwargs)
         ranks = current()
@@ -258,9 +271,7 @@ def signature(value: object, depth: int = 0) -> str:
     if isinstance(value, torch.Tensor):
         return f"{str(value.dtype).removeprefix('torch.')}{list(value.shape)}"
     if isinstance(value, msgspec.Struct):
-        fields = value.__struct_fields__
-        inner = ",".join(f"{f}={signature(getattr(value, f), depth + 1)}" for f in fields)
-        return f"{type(value).__name__}({inner})"
+        return _record(value, value.__struct_fields__, depth)
     kind = getattr(value, "kind", None)
     if isinstance(kind, str) and hasattr(value, "media_type"):
         return f"file:{kind}"
@@ -269,7 +280,10 @@ def signature(value: object, depth: int = 0) -> str:
     if isinstance(value, dict):
         return "{" + ",".join(f"{k}:{signature(v, depth + 1)}" for k, v in value.items()) + "}"
     if dataclasses.is_dataclass(value):
-        fields = [f.name for f in dataclasses.fields(value)]
-        inner = ",".join(f"{f}={signature(getattr(value, f), depth + 1)}" for f in fields)
-        return f"{type(value).__name__}({inner})"
+        return _record(value, tuple(f.name for f in dataclasses.fields(value)), depth)
     return type(value).__name__
+
+
+def _record(value: object, fields: tuple[str, ...], depth: int) -> str:
+    inner = ",".join(f"{f}={signature(getattr(value, f), depth + 1)}" for f in fields)
+    return f"{type(value).__name__}({inner})"

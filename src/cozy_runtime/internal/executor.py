@@ -117,6 +117,7 @@ from cozy_runtime.author._executor_requests import encode as encode_request
 from cozy_runtime.author._files import File, GrantedInput, References, Tree
 from cozy_runtime.author._invoke import (
     Invocation,
+    InvocationResult,
     PreparedRequest,
     prepare,
     run_prepared,
@@ -675,7 +676,9 @@ class _Ranks:
         #: each follower's own varena record
         self.memory: list[GpuMemory] = []
 
-    def settle(self, envelope: Any, outcome: Outcome) -> tuple[Any, Outcome]:
+    def settle(
+        self, envelope: InvocationResult | None, outcome: Outcome
+    ) -> tuple[InvocationResult | None, Outcome]:
         """GPU 0's handler ended with `outcome`. A failure ends every GPU's attempt (`interrupt`);
         then every follower answers. The attempt's outcome is the first GPU's, in GPU order, that
         did not just end because another did; all succeeded, their results' shapes agree."""
@@ -1470,7 +1473,7 @@ class Executor:
         rows: list[GpuMemory] = []
         sol: dict[str, int] = {}
         served = attention_ulysses.Seen()
-        envelope: Any = None
+        envelope: InvocationResult | None = None
         outcome: Outcome | None = None
         working = 0
         stage_memo.ENGINE.open(None, spool)
@@ -1534,7 +1537,7 @@ class Executor:
         if failed and (
             outcome.code == DEVICE_FAULT or not accel.healthy(self.torch, self.device_kind)
         ):
-            self.poisoned = self.poisoned or f"device fault: {outcome.message}"[:300]
+            self._poison(f"device fault: {outcome.message}"[:300])
         reply = wire.RunReply(
             ok=outcome.terminal == "succeeded",
             code=outcome.code,
@@ -1558,6 +1561,10 @@ class Executor:
             memory=msgspec.to_builtins(rows[0]) if rows else None,
         )
         return {**msgspec.to_builtins(reply), "rank": self.rank, "poisoned": bool(self.poisoned)}
+
+    def _poison(self, why: str) -> None:
+        """This process serves nothing more; its first cause stays its cause."""
+        self.poisoned = self.poisoned or why
 
     @staticmethod
     def _ended(outcome: Outcome, interrupted: bool) -> Outcome:
@@ -3747,7 +3754,7 @@ class Executor:
         # ends it, freeing everything (12167 and 12293 ran on a faulted one and failed again).
         failed = outcome.terminal == "failed" and torch is not None
         if failed and (outcome.code == DEVICE_FAULT or not accel.healthy(torch, self.device_kind)):
-            self.poisoned = self.poisoned or f"device fault: {outcome.message}"[:300]
+            self._poison(f"device fault: {outcome.message}"[:300])
         if self.rank == 0:
             for member in self.model_executors or [self]:
                 self._emit_gemm(record, member)

@@ -431,12 +431,14 @@ class Outputs(_Bound):
         return _codec.AAC_FRAME_SAMPLES
 
     def save_image(self, image: object, *, format: str = "png") -> ImageFile:
-        frame = as_frame(image)
         if format not in ("png", "webp"):
             raise OutputError(
                 f"image format {format!r} has no encoder: choose png or lossless webp",
                 code="encoder_unavailable",
             )
+        if not self._attempt.writes:
+            return self._unwritten_file(ImageFile, format)
+        frame = as_frame(image)
         return self._register_frame(
             ImageFile,
             format,
@@ -453,6 +455,8 @@ class Outputs(_Bound):
                 code="encoder_unavailable",
             )
         self._check_rate(sample_rate)
+        if not self._attempt.writes:
+            return self._unwritten_file(AudioFile, "flac")
         planar, clipped = _codec.snapshot_audio(waveform, self._attempt.max_output_bytes)
         self._clip_row(clipped)
         channels, samples = planar.shape
@@ -481,6 +485,8 @@ class Outputs(_Bound):
             )
         if not (isinstance(fps, (int, float)) and 0 < fps < 1000 and fps == fps):
             raise OutputError(f"fps {fps!r} is not a positive frame rate", code="frame_rate")
+        if not self._attempt.writes:
+            return self._unwritten_file(VideoFile, "mp4")
         video = _codec.snapshot_video(frames, self._attempt.max_output_bytes)
         _, height, width, _ = video.shape
         shaped = getattr(frames, "shape", ())
@@ -644,7 +650,7 @@ class Outputs(_Bound):
             samples = sum(e.sample_count for e in source if isinstance(e, DecodedAudioChunk))
             frames = sum(shape.frame_count for shape in shapes)
             handle = self._attempt.next_handle(VideoFile.kind)
-            return self._unwritten(handle, _facts(shapes[0]), audio_format, frames, samples)
+            return self._unwritten(handle, _Picture.of(shapes[0]), audio_format, frames, samples)
         paths = []
         for video in videos:
             if (
@@ -725,7 +731,7 @@ class Outputs(_Bound):
     def _unwritten(
         self,
         handle: str,
-        video: Mapping[str, Any],
+        picture: _Picture,
         audio: DecodedAudioFormat | None,
         frames: int,
         samples: int,
@@ -733,17 +739,17 @@ class Outputs(_Bound):
         """A video saved on a group's other GPU: its asset and the facts GPU 0's would have."""
         saved = SavedVideo(
             video=VideoFile(handle, media_type="video/mp4", attempt=self._attempt.request_id),
-            width=video["width"],
-            height=video["height"],
+            width=picture.width,
+            height=picture.height,
             frame_count=frames,
-            frame_rate=video["frame_rate"],
-            pixel_aspect_ratio=video["pixel_aspect_ratio"],
+            frame_rate=picture.frame_rate,
+            pixel_aspect_ratio=picture.pixel_aspect_ratio,
             video_codec="h264",
             video_profile=None,
-            color_primaries=video["color_primaries"],
-            color_transfer=video["color_transfer"],
-            color_matrix=video["color_matrix"],
-            color_range=video["color_range"],
+            color_primaries=picture.color_primaries,
+            color_transfer=picture.color_transfer,
+            color_matrix=picture.color_matrix,
+            color_range=picture.color_range,
             audio=(
                 SavedAudioFacts(
                     "aac",
@@ -762,11 +768,11 @@ class Outputs(_Bound):
         self._attempt.unwritten[handle] = saved
         return saved
 
-    def _shape(self, video: VideoFile) -> Any:
+    def _shape(self, video: VideoFile) -> SavedVideo | _codec.EncodedVideoFacts:
         """A video's facts on a group's other GPU: its own unwritten save's, or an input's probe."""
         if (saved := self._attempt.unwritten.get(video.ref)) is not None:
             return saved
-        if not isinstance(video, VideoFile) or video._local is None:
+        if video._local is None:
             raise CapabilityError(
                 "joined videos must be hydrated inputs of this attempt", code="foreign_asset"
             )
@@ -835,7 +841,7 @@ class Outputs(_Bound):
             # the author's events still run: only the encode is gone
             samples = feed(cast(_codec.StreamingMP4Encoder, counted))
             frames = sum(copy.frames) if copy is not None else counted.video_frames
-            return self._unwritten(handle, video, audio_format, frames, samples)
+            return self._unwritten(handle, _Picture(**video), audio_format, frames, samples)
         tail = handle.rsplit("/", 1)[-1]
         temporary = self._attempt.spool / f".video-{tail}.partial"
         final = self._attempt.spool / f"video-{tail}"
@@ -1099,6 +1105,8 @@ class Outputs(_Bound):
     def save_file(self, path: Path | str, *, media_type: str = "application/octet-stream") -> File:
         """Copies immediately: a MUTABLE AUTHOR PATH is never retained (§3.4 step 2). Typed as
         `save_bytes` types its bytes."""
+        if not self._attempt.writes:
+            return self._unwritten_file(_saved(media_type), media_type)
         return self._register(Path(path).read_bytes(), _saved(media_type), media_type)
 
     def temporary_file(self, suffix: str = "") -> Path:
@@ -1120,16 +1128,9 @@ class Outputs(_Bound):
                 f"over its {self._attempt.max_output_bytes}-byte aggregate limit",
                 code="output_too_large",
             )
-        handle = self._attempt.next_handle(kind.kind)
         if not self._attempt.writes:
-            unwritten = kind(
-                handle,
-                media_type=media_type,
-                size_bytes=len(data),
-                attempt=self._attempt.request_id,
-            )
-            self._attempt.pending[handle] = unwritten
-            return unwritten
+            return self._unwritten_file(kind, media_type)
+        handle = self._attempt.next_handle(kind.kind)
         blob = self._attempt.spool / f"{kind.kind}-{handle.rsplit('/', 1)[-1]}"
         blob.write_bytes(data)
         asset = kind(
@@ -1164,12 +1165,6 @@ class Outputs(_Bound):
                 code="output_too_large",
             )
         handle = self._attempt.next_handle(kind.kind)
-        if not self._attempt.writes:
-            unwritten = kind(
-                handle, media_type=_codec.FRAME_MEDIA_TYPES[codec], attempt=self._attempt.request_id
-            )
-            self._attempt.pending[handle] = unwritten
-            return unwritten
         path = self._attempt.spool / f"{kind.kind}-{handle.rsplit('/', 1)[-1]}.raw"
         raw_bytes = 0
         with path.open("wb") as spool:
@@ -1182,6 +1177,16 @@ class Outputs(_Bound):
         if self._attempt.settle_at_save:
             settle_frame(self._attempt, handle)
         return asset
+
+    def _unwritten_file(self, kind: type[A], codec: str) -> A:
+        """A save on a group's other GPU: GPU 0's is the run's, so this one names its asset and
+        reads, copies, encodes and writes nothing."""
+        self._attempt.check_open("Outputs.save")
+        handle = self._attempt.next_handle(kind.kind)
+        media_type = _codec.FRAME_MEDIA_TYPES.get(codec, codec)
+        unwritten = kind(handle, media_type=media_type, attempt=self._attempt.request_id)
+        self._attempt.pending[handle] = unwritten
+        return unwritten
 
     def _pending_bytes(self) -> int:
         return (
@@ -1367,10 +1372,31 @@ class _Unwritten:
         return None
 
 
-def _facts(shape: Any) -> dict[str, Any]:
-    names = ("width", "height", "frame_rate", "pixel_aspect_ratio")
-    names += ("color_primaries", "color_transfer", "color_matrix", "color_range")
-    return {name: getattr(shape, name) for name in names}
+@dataclass(frozen=True, slots=True)
+class _Picture:
+    """A video's picture facts, which a save a group's other GPU does not write still states."""
+
+    width: int
+    height: int
+    frame_rate: Fraction
+    pixel_aspect_ratio: Fraction
+    color_primaries: int
+    color_transfer: int
+    color_matrix: int
+    color_range: int
+
+    @classmethod
+    def of(cls, shape: SavedVideo | _codec.EncodedVideoFacts) -> _Picture:
+        return cls(
+            shape.width,
+            shape.height,
+            shape.frame_rate,
+            shape.pixel_aspect_ratio,
+            shape.color_primaries,
+            shape.color_transfer,
+            shape.color_matrix,
+            shape.color_range,
+        )
 
 
 class _UnwrittenJoin(VideoJoin):
@@ -1379,7 +1405,7 @@ class _UnwrittenJoin(VideoJoin):
     def __init__(self, outputs: Outputs, audio: DecodedAudioFormat | None) -> None:
         self._outputs, self._attempt, self._audio = outputs, outputs._attempt, audio
         self._attempt.next_handle("join")
-        self._shapes: list[Any] = []
+        self._shapes: list[SavedVideo | _codec.EncodedVideoFacts] = []
         self._samples = 0
 
     def append(
@@ -1406,7 +1432,7 @@ class _UnwrittenJoin(VideoJoin):
         handle = self._attempt.next_handle(VideoFile.kind)
         frames = sum(shape.frame_count for shape in self._shapes)
         return self._outputs._unwritten(
-            handle, _facts(self._shapes[0]), self._audio, frames, self._samples
+            handle, _Picture.of(self._shapes[0]), self._audio, frames, self._samples
         )
 
 

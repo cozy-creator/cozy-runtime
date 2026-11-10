@@ -6,7 +6,7 @@ the attempt's group here for its duration; None outside a group attempt."""
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
-from typing import Any, Protocol
+from typing import Protocol
 
 
 class Group(Protocol):
@@ -17,9 +17,9 @@ class Group(Protocol):
         """True on every GPU when `flag` is True on every GPU."""
         ...
 
-    def spread(
-        self, method: Callable[..., Any], arguments: Iterable[tuple[Any, ...]]
-    ) -> Iterator[Any]:
+    def spread[*Ts, R](
+        self, method: Callable[[*Ts], R], arguments: Iterable[tuple[*Ts]]
+    ) -> Iterator[R]:
         """`method(*args)` per entry, each on one GPU, every result on every GPU, in order."""
         ...
 
