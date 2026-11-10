@@ -407,13 +407,6 @@ src/cozy_runtime/derive/native_quantization.py: [explicit-any] Explicit "Any" is
 src/cozy_runtime/derive/native_quantization.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/native_quantization.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/operations.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/operations.py: [misc] Type of decorated function contains type "Any" ("def (*, source: Weights[Any], plan: QuantizationPlan, tel: Telemetry, max_relative_frobenius: float | None = ...) -> PendingCall[ModelArtifact]")
 src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/quantization.py: [explicit-any] Explicit "Any" is not allowed
@@ -433,22 +426,6 @@ src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not 
 src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/safetensors_io.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/graphs/__init__.py: [assignment] Incompatible types in assignment (expression has type "tuple[Any, Any] | None", variable has type "None")
 src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
@@ -796,14 +773,6 @@ src/cozy_runtime/internal/decode_schemes.py: [no-any-unimported] Argument 5 to "
 src/cozy_runtime/internal/decode_schemes.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/delivery.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/derive.py: [redundant-cast] Redundant cast to Module
 src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore" comment
 src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore" comment
@@ -830,8 +799,6 @@ src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is n
 src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/encoding/leaves.py: [unused-ignore] Unused "type: ignore" comment
-src/cozy_runtime/internal/encoding/selection.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/encoding/selection.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/execution/__init__.py: [no-untyped-call] Call to untyped function "Event" in typed context
 src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
@@ -1000,14 +967,6 @@ src/cozy_runtime/internal/invocable_interface.py: [explicit-any] Explicit "Any" 
 src/cozy_runtime/internal/invocable_interface.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/invocable_interface.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/invocable_interface.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/kernel_compile.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/kernel_compile.py: [misc] Type of decorated function contains type "Any" ("Callable[[Path], _GeneratorContextManager[dict[str, Any], None, None]]")
 src/cozy_runtime/internal/kernel_ready.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
@@ -1058,12 +1017,7 @@ src/cozy_runtime/internal/lora_composition.py: [no-any-return] Returning Any fro
 src/cozy_runtime/internal/lora_composition.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/lora_composition.py: [unused-ignore] Unused "type: ignore" comment
 src/cozy_runtime/internal/lora_composition.py: [unused-ignore] Unused "type: ignore" comment
-src/cozy_runtime/internal/memo_implementation.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/memo_implementation.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/model_values.py: [redundant-cast] Redundant cast to Module
-src/cozy_runtime/internal/numerical_environment.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/numerical_environment.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/numerical_environment.py: [misc] Type of decorated function contains type "Any" ("Callable[[_Determinism, Any], _GeneratorContextManager[None, None, None]]")
 src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
 src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
 src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
@@ -1088,7 +1042,6 @@ src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 8 to "_d
 src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 9 to "_decode" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 9 to "_dequant" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/nvfp4_linear.py: [unreachable] Statement is unreachable
-src/cozy_runtime/internal/pacing.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/package_interface.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/package_interface.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
@@ -1221,22 +1174,6 @@ src/cozy_runtime/internal/prebuilt.py: [possibly-undefined] Name "x" may be unde
 src/cozy_runtime/internal/prebuilt.py: [possibly-undefined] Name "x" may be undefined
 src/cozy_runtime/internal/prebuilt.py: [union-attr] Item "None" of "Any | None" has no attribute "data_ptr"
 src/cozy_runtime/internal/prebuilt.py: [union-attr] Item "None" of "Any | None" has no attribute "stride"
-src/cozy_runtime/internal/prepare_diagnostics.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/prepare_diagnostics.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/prepare_diagnostics.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/producers.py: [arg-type] Argument 1 to "Processor" has incompatible type "_Processor | Tensor | Module"; expected "_Processor"
 src/cozy_runtime/internal/producers.py: [operator] "Tensor" not callable
 src/cozy_runtime/internal/residency.py: [assignment] Incompatible types in assignment (expression has type "str", variable has type "_Part | None")
@@ -1327,8 +1264,6 @@ src/cozy_runtime/internal/sage3.py: [no-any-unimported] Argument 16 to "group_me
 src/cozy_runtime/internal/sage3.py: [no-any-unimported] Argument 17 to "group_mean_kernel" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/sage3.py: [no-any-unimported] Argument 7 to "group_mean_kernel" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/seam.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
@@ -1365,14 +1300,6 @@ src/cozy_runtime/internal/tolerant.py: [explicit-any] Explicit "Any" is not allo
 src/cozy_runtime/internal/triton_kernels.py: [call-overload] No overload variant of "device" matches argument type "object"
 src/cozy_runtime/internal/triton_kernels.py: [call-overload] No overload variant of "device" matches argument type "object"
 src/cozy_runtime/internal/triton_kernels.py: [call-overload] No overload variant of "device" matches argument type "object"
-src/cozy_runtime/internal/triton_kernels.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/triton_kernels.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/triton_kernels.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/triton_kernels.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/triton_kernels.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/triton_kernels.py: [misc] Type of decorated function contains type "Any" ("Callable[[dict[str, Any], Path, Callable[[float], None]], dict[str, object]]")
-src/cozy_runtime/internal/triton_kernels.py: [misc] Type of decorated function contains type "Any" ("Callable[[dict[str, Any], Path, Callable[[float], None]], dict[str, object]]")
-src/cozy_runtime/internal/triton_kernels.py: [misc] Type of decorated function contains type "Any" ("_lru_cache_wrapper[dict[str, Any]]")
 src/cozy_runtime/internal/triton_kernels.py: [no-any-unimported] Argument 1 to "_compiled" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/triton_kernels.py: [no-any-unimported] Argument 1 to "_tuned" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/triton_kernels.py: [no-any-unimported] Argument 2 to "__call__" becomes "Any" due to an unfollowed import
@@ -1405,9 +1332,6 @@ src/cozy_runtime/internal/weights.py: [misc] List comprehension has incompatible
 src/cozy_runtime/internal/weights.py: [possibly-undefined] Name "down" may be undefined
 src/cozy_runtime/internal/weights.py: [possibly-undefined] Name "up" may be undefined
 src/cozy_runtime/internal/weights.py: [redundant-expr] If condition in comprehension is always false
-src/cozy_runtime/internal/zygote.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/zygote.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/zygote.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any, int], _GeneratorContextManager[None, None, None]]")
 src/cozy_runtime/lm/__init__.py: [arg-type] Argument "layers" to "__init__" of "Cache" has incompatible type "list[_Keys | _State]"; expected "list[CacheLayerMixin | LinearAttentionCacheLayerMixin] | None"
 src/cozy_runtime/lm/__init__.py: [arg-type] Argument 1 to "_ids" has incompatible type "Constraint | None"; expected "Constraint"
 src/cozy_runtime/lm/__init__.py: [arg-type] Argument 1 to "append" of "_Warnings" has incompatible type "tuple[str, dict[str, str]]"; expected "tuple[str, dict[str, str | bool | int | float | None]]"
