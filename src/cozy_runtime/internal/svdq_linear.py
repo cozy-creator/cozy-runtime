@@ -29,12 +29,12 @@ import math
 from collections.abc import Callable, Mapping
 from functools import partial
 from types import ModuleType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from cozy_runtime import _kernels
 from cozy_runtime.accel.kernels import Launch, TritonEntry, TritonKernels
 from cozy_runtime.internal import arch, int8_linear, kernel_ready, prebuilt, verify
-from cozy_runtime.internal.encoding.formats import E2M1_VALUES, NVFP4_BLOCK, Tensor
+from cozy_runtime.internal.encoding.formats import E2M1_VALUES, NVFP4_BLOCK, Dtype, Tensor
 
 if TYPE_CHECKING:
     from torch import device as Device
@@ -65,9 +65,9 @@ try:
     import triton
     import triton.language as tl
 except ImportError as _absent:  # pragma: no cover - a CPU-only or non-Linux environment
+    TRITON_ABSENT = f"triton does not import ({_absent})"
     if TYPE_CHECKING:
         raise
-    TRITON_ABSENT = f"triton does not import ({_absent})"
 else:
     TRITON_ABSENT = ""
 
@@ -330,17 +330,24 @@ def _opened(torch: ModuleType, device: Device, wait: bool) -> Launch | None:
         raise
 
 
+#: `_quantized`'s operands, and `_native_quantized`'s.
+type _Operand = tuple[Tensor, Tensor, Tensor, Tensor]
+type _NativeOperand = tuple[Tensor, Tensor, Tensor, Tensor, int]
+
+
 def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
     """The Triton build's verdict here (`checked`), on ragged rows and columns."""
 
-    def quantized(x: Tensor, roles: Mapping[str, Tensor]) -> tuple[object, Tensor, Tensor, Tensor]:
+    def quantized(
+        x: Tensor, roles: Mapping[str, Tensor]
+    ) -> tuple[_Operand, Tensor, Tensor, Tensor]:
         q, sx, low, g = _quantized(torch, launch, x, roles)
         return (q, sx, low, g), q, sx, low
 
     def multiplied(
-        made: object, roles: Mapping[str, Tensor], bias: Tensor | None, half: object
+        made: _Operand, roles: Mapping[str, Tensor], bias: Tensor | None, half: Dtype
     ) -> Tensor:
-        q, sx, low, g = cast("tuple[Tensor, Tensor, Tensor, Tensor]", made)
+        q, sx, low, g = made
         return _multiplied(torch, launch, q, sx, low, g, roles, bias, half)
 
     return checked(torch, device, quantized, multiplied, (200, 144, 256))
@@ -350,28 +357,29 @@ def probe_native(torch: ModuleType, device: Device, module: object) -> verify.Ve
     """The prebuilt kernels' verdict here (`checked`): two row tiles, the second ragged, two
     column tiles and an odd number of k-steps."""
 
-    def quantized(x: Tensor, roles: Mapping[str, Tensor]) -> tuple[object, Tensor, Tensor, Tensor]:
+    def quantized(
+        x: Tensor, roles: Mapping[str, Tensor]
+    ) -> tuple[_NativeOperand, Tensor, Tensor, Tensor]:
         made = _native_quantized(torch, x, roles)
         q, sx = operand(torch, made[0], made[1])
         rows = made[4]
         return made, q[:rows], sx[:rows].view(torch.float8_e4m3fn), made[2][:rows]
 
     def multiplied(
-        made: object, roles: Mapping[str, Tensor], bias: Tensor | None, half: object
+        made: _NativeOperand, roles: Mapping[str, Tensor], bias: Tensor | None, half: Dtype
     ) -> Tensor:
         weight, scale = tiles(torch, roles["weight"], roles["scale"])
         tiled = {**roles, "weight": weight, "scale": scale}
-        operands = cast("tuple[Tensor, Tensor, Tensor, Tensor, int]", made)
-        return _native_multiplied(torch, operands, tiled, bias, half)
+        return _native_multiplied(torch, made, tiled, bias, half)
 
     return checked(torch, device, quantized, multiplied, (300, 256, 320))
 
 
-def checked(
+def checked[M](
     torch: ModuleType,
     device: Device,
-    quantized: Callable[[Tensor, Mapping[str, Tensor]], tuple[object, Tensor, Tensor, Tensor]],
-    multiplied: Callable[[object, Mapping[str, Tensor], Tensor | None, object], Tensor],
+    quantized: Callable[[Tensor, Mapping[str, Tensor]], tuple[M, Tensor, Tensor, Tensor]],
+    multiplied: Callable[[M, Mapping[str, Tensor], Tensor | None, Dtype], Tensor],
     shape: tuple[int, int, int],
 ) -> verify.Verdict:
     """One build's two kernels against the law, each dtype and built rank, with and without `c`
@@ -384,7 +392,8 @@ def checked(
     rows, n, k = shape
 
     def draw(*shape: int) -> Tensor:
-        return torch.randn(*shape, generator=generator, device=device, dtype=torch.float32)
+        drawn: Tensor = torch.randn(*shape, generator=generator, device=device, dtype=torch.float32)
+        return drawn
 
     errors: dict[str, float] = {}
     for r in RANKS:
@@ -539,13 +548,13 @@ def _native_multiplied(
     quantized: tuple[Tensor, Tensor, Tensor, Tensor, int],
     roles: Mapping[str, Tensor],
     bias: Tensor | None,
-    half: object,
+    half: Dtype,
 ) -> Tensor:
     """`svdq_gemm`: `[M, N]` in `half`, from `_native_quantized`'s operands and a tiled weight."""
     act, ascales, low, g, rows = quantized
     n, r = int(roles["lowrank_up"].shape[0]), int(roles["lowrank_up"].shape[1])
     c = roles.get("channel_scale")
-    out = torch.empty(rows, n, dtype=half, device=act.device)
+    out: Tensor = torch.empty(rows, n, dtype=half, device=act.device)
     if rows == 0:
         return out
     bias = None if bias is None else _aligned(bias.to(half))
@@ -632,7 +641,7 @@ def eager(
     x: Tensor,
     roles: Mapping[str, Tensor],
     bias: Tensor | None,
-    out_dtype: object,
+    out_dtype: Dtype,
 ) -> Tensor:
     """The law in torch ops: what the kernels compute, on any device."""
     cols = int(roles["pre_quant_scale"].numel())
@@ -655,7 +664,7 @@ def linear(
     x: Tensor,
     roles: Mapping[str, Tensor],
     bias: Tensor | None,
-    out_dtype: object,
+    out_dtype: Dtype,
     tiled: bool = False,
 ) -> Tensor:
     """`x @ Wᵀ + bias` for one leaf's roles (`SvdqNvfp4NativeLeaf`): `weight` u8 `[N, K/2]`,
@@ -716,13 +725,13 @@ def _multiplied(
     g: Tensor,
     roles: Mapping[str, Tensor],
     bias: Tensor | None,
-    half: object,
+    half: Dtype,
 ) -> Tensor:
     """`_gemm`: `[M, N]` in `half`, from `_quantized`'s operands."""
     rows, cols = int(q.shape[0]), 2 * int(q.shape[1])
     n, r = int(roles["lowrank_up"].shape[0]), int(roles["lowrank_up"].shape[1])
     c = roles.get("channel_scale")
-    out = torch.empty(rows, n, dtype=half, device=q.device)
+    out: Tensor = torch.empty(rows, n, dtype=half, device=q.device)
     launch(
         _gemm, (-(-rows // TILE_M) * -(-n // TILE_N), 1, 1),
         q, sx.view(torch.uint8), roles["weight"], roles["scale"].view(torch.uint8), g,

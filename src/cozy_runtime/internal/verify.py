@@ -37,7 +37,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import TextIO
 
 from cozy_runtime import __version__
 from cozy_runtime._build_provenance import COMMIT
@@ -223,9 +223,17 @@ def _crashed(path: Path) -> bool:
     return False
 
 
-#: This process's probes in flight, the crash file faulthandler writes while any is, and whether
-#: faulthandler wrote to stderr before.
-_ARMED: list[Any] = [0, None, False]
+@dataclass(slots=True)
+class _Armed:
+    """This process's probes in flight, the crash file faulthandler writes while any is, and
+    whether faulthandler wrote to stderr before."""
+
+    probes: int = 0
+    crash: TextIO | None = None
+    stderr: bool = False
+
+
+_ARMED = _Armed()
 _ARMING = threading.Lock()
 
 
@@ -236,27 +244,27 @@ def _armed(directory: Path) -> Iterator[str]:
     its process from one whose process was ended. Its name; empty where it cannot be written."""
     name = f"crash-{os.getpid()}-{_START}"
     with _ARMING:
-        if _ARMED[0] == 0:
+        if _ARMED.probes == 0:
             try:
-                _ARMED[2] = faulthandler.is_enabled()
-                _ARMED[1] = (directory / name).open("w")
-                faulthandler.enable(_ARMED[1], all_threads=True)
+                _ARMED.stderr = faulthandler.is_enabled()
+                _ARMED.crash = (directory / name).open("w")
+                faulthandler.enable(_ARMED.crash, all_threads=True)
             except OSError:
-                _ARMED[1] = None
-        _ARMED[0] += 1
+                _ARMED.crash = None
+        _ARMED.probes += 1
     try:
-        yield name if _ARMED[1] is not None else ""
+        yield name if _ARMED.crash is not None else ""
     finally:
         with _ARMING:
-            _ARMED[0] -= 1
-            if _ARMED[0] == 0 and _ARMED[1] is not None:
-                if _ARMED[2]:
+            _ARMED.probes -= 1
+            if _ARMED.probes == 0 and _ARMED.crash is not None:
+                if _ARMED.stderr:
                     faulthandler.enable(all_threads=True)  # stderr again, as the executor keeps it
                 else:
                     faulthandler.disable()
-                _ARMED[1].close()
+                _ARMED.crash.close()
                 (directory / name).unlink(missing_ok=True)
-                _ARMED[1] = None
+                _ARMED.crash = None
 
 
 def _read_start() -> str:

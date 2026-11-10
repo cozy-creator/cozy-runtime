@@ -36,9 +36,9 @@ try:
     import triton
     import triton.language as tl
 except ImportError:  # the eager reference still runs
+    triton = None
     if TYPE_CHECKING:
         raise
-    triton = None
 
 TORCH = {
     "f32": "float32",

@@ -32,15 +32,16 @@ import json
 import os
 import sys
 import sysconfig
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
 import msgspec
 from msgspec import Struct
 
 from cozy_runtime.accel.kernels import (
+    JitKernel,
     KernelsUnavailable,
     Launch,
     TritonEntry,
@@ -55,7 +56,7 @@ from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_ready, to
 try:
     import torch
     import triton
-    from triton.backends.compiler import BaseBackend, GPUTarget
+    from triton.backends.compiler import GPUTarget
     from triton.backends.nvidia import driver as _cuda_driver
     from triton.compiler import ASTSource
     from triton.compiler.compiler import (
@@ -63,19 +64,77 @@ try:
         get_cache_invalidating_env_vars,
         make_backend,
     )
-    from triton.knobs import CompileTimes
     from triton.runtime.build import _get_cache_manager
     from triton.runtime.cache import get_cache_key, get_cache_manager
     from triton.runtime.driver import driver as triton_driver
-    from triton.runtime.jit import JITFunction
 except ImportError as _absent:  # pragma: no cover - exercised by the typed refusal
+    TRITON_ABSENT = f"torch and triton do not import ({_absent})"
     if TYPE_CHECKING:
         raise
-    TRITON_ABSENT = f"torch and triton do not import ({_absent})"
 else:
     TRITON_ABSENT = ""
 
 WARP_SIZE = 32
+
+#: What a device argument may be, as `torch.device` takes it.
+type DeviceLike = torch.device | str | int
+
+
+# What this module reads of Triton's objects (Triton ships no types).
+class _Source(Protocol):
+    """`ASTSource`: what an entry compiles from."""
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def signature(self) -> dict[str, str]: ...
+
+
+class _Backend(Protocol):
+    """`BaseBackend`: one architecture's compiler."""
+
+    def parse_options(self, options: Mapping[str, object]) -> object: ...
+
+
+class _Target(Protocol):
+    """`GPUTarget`."""
+
+    @property
+    def backend(self) -> str: ...
+
+    @property
+    def arch(self) -> int | str: ...
+
+    @property
+    def warp_size(self) -> int: ...
+
+
+class _Run(Protocol):
+    """A `CompiledKernel` at one grid: its launch."""
+
+    def __call__(self, *args: object) -> None: ...
+
+
+class _Compiled(Protocol):
+    """`CompiledKernel`: one entry compiled and loaded."""
+
+    @property
+    def hash(self) -> str: ...
+
+    @property
+    def src(self) -> _Source: ...
+
+    def __getitem__(self, grid: tuple[int, ...]) -> _Run: ...
+
+    def _init_handles(self) -> None: ...
+
+
+class _Times(Protocol):
+    """`CompileTimes`."""
+
+    @property
+    def total(self) -> float: ...
 
 
 def _require_triton() -> None:
@@ -83,24 +142,25 @@ def _require_triton() -> None:
         raise KernelsUnavailable("kernels_absent", TRITON_ABSENT)
 
 
-def _source(entry: TritonEntry) -> ASTSource:
+def _source(entry: TritonEntry) -> _Source:
     """The exact `ASTSource` an entry compiles from: builder and loader share it."""
     fn = entry.kernel
     attrs = {(fn.arg_names.index(name),): [["tt.divisibility", 16]] for name in entry.aligned}
     # Triton compiles by name but launches by position: its launcher reads the signature's order
     # as the call's, so a constexpr listed out of place sends every argument after it one off.
     signature = dict(sorted(entry.signature.items(), key=lambda row: fn.arg_names.index(row[0])))
-    return ASTSource(fn, signature, constexprs=dict(entry.constexprs), attrs=attrs)
+    source: _Source = ASTSource(fn, signature, constexprs=dict(entry.constexprs), attrs=attrs)
+    return source
 
 
-def _backend(arch: int) -> BaseBackend:
+def _backend(arch: int) -> _Backend:
     """One compiler backend per architecture: constructing one runs `ptxas --version`."""
     if arch not in _BACKENDS:
         _BACKENDS[arch] = make_backend(GPUTarget("cuda", arch, WARP_SIZE))
     return _BACKENDS[arch]
 
 
-_BACKENDS: dict[int, BaseBackend] = {}
+_BACKENDS: dict[int, _Backend] = {}
 
 
 def _cache_key(entry: TritonEntry, arch: int) -> str:
@@ -342,7 +402,7 @@ class _Card:
     `.warmup` calls, so they compile for `arch` with no GPU (and no context) in the builder."""
 
     def __init__(self, arch: int) -> None:
-        self.target = GPUTarget("cuda", arch, WARP_SIZE)
+        self.target: _Target = GPUTarget("cuda", arch, WARP_SIZE)
 
     def get_current_device(self) -> int:
         return 0
@@ -350,7 +410,7 @@ class _Card:
     def get_current_stream(self, device: int) -> int:
         return 0
 
-    def get_current_target(self) -> GPUTarget:
+    def get_current_target(self) -> _Target:
         return self.target
 
 
@@ -471,7 +531,7 @@ class _Launcher:
     def __init__(
         self,
         arch: int,
-        compiled: dict[str, CompiledKernel],
+        compiled: dict[str, _Compiled],
         names: dict[str, tuple[str, ...]],
         key: str,
         index: int,
@@ -480,7 +540,7 @@ class _Launcher:
         self.arch, self.compiled, self.names, self.key = arch, compiled, names, key
         self.index, self.aligned = index, aligned
 
-    def __call__(self, kernel: JITFunction, grid: tuple[int, ...], *args: object) -> None:
+    def __call__(self, kernel: JitKernel, grid: tuple[int, ...], *args: object) -> None:
         if torch.cuda.current_device() != self.index:
             # Triton launches on this thread's device, where these mean nothing.
             raise ValueError(
@@ -511,7 +571,7 @@ class _Launcher:
 _LOADED: dict[tuple[str, int], _Launcher] = {}
 
 
-def load(kernels: TritonKernels, *, device: object) -> Launch:
+def load(kernels: TritonKernels, *, device: DeviceLike) -> Launch:
     """`kernels` compiled for `device`, loaded onto it from Triton's cache; never a compile
     here. Waits for the key's live build by its measured progress; a build that ended without
     publishing is typed. Idempotent per (process, set, device)."""
@@ -530,7 +590,7 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
     state = kernel_compile.wait(store, found, kernels.name)
     if state.state != "ready":
         raise KernelsUnavailable("kernels_failed", f"{kernels.name} sm{arch}: {state.line()}")
-    compiled: dict[str, CompiledKernel] = {}
+    compiled: dict[str, _Compiled] = {}
     names: dict[str, tuple[str, ...]] = {}
     keyed = cast("_Spec", found.spec)["entries"]  # a triton job's (`job`)
     for entry in kernels.entries:
@@ -542,7 +602,7 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
                 "kernels_corrupt",
                 f"{entry.key}: the store marks sm{arch} built, Triton's cache lacks {digest[:12]}",
             )
-        kernel = CompiledKernel(_source(entry), group, digest)
+        kernel: _Compiled = CompiledKernel(_source(entry), group, digest)
         try:
             with torch.cuda.device(index):  # Triton loads onto the thread's current device
                 kernel._init_handles()
@@ -558,7 +618,7 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
     return launcher
 
 
-def ready(kernels: TritonKernels, wait: bool = False, *, device: object) -> Launch | None:
+def ready(kernels: TritonKernels, wait: bool = False, *, device: DeviceLike) -> Launch | None:
     """`load`, when this machine's build of `kernels` for `device` is done; None while it
     compiles (started here when nobody had). Waits for it when `wait`, or when the build only
     copies what the set's package ships: a prebuilt set never serves its first request eager."""
@@ -586,7 +646,7 @@ def opened(
     probe: Callable[[Launch], verify.Verdict],
     wait: bool = False,
     *,
-    device: object,
+    device: DeviceLike,
 ) -> Launch | None:
     """A Runtime set's opener: `ready`, then `probe` of its launcher against the exact law on
     this card (`kernel_ready.verified`, keyed by the build), else `kernel_ready.Refused`."""
@@ -600,13 +660,13 @@ def opened(
 kernel_ready.TRITON[:] = [opened]
 
 
-def _compiled(*, src: ASTSource, times: CompileTimes, cache_hit: bool, **_: object) -> None:
+def _compiled(*, src: _Source, times: _Times, cache_hit: bool, **_: object) -> None:
     """Triton compiling a kernel at its first launch: on a request thread, it blocked it."""
     if not cache_hit:
         request_path.note(f"triton compile: {src.name}", times.total / 1000)
 
 
-def _tuned(*, fn: JITFunction, duration: float | None, cache_hit: bool, **_: object) -> None:
+def _tuned(*, fn: JitKernel, duration: float | None, cache_hit: bool, **_: object) -> None:
     """Triton timing an autotuned kernel's configurations to choose one."""
     if not cache_hit and duration:
         request_path.note(f"triton autotune: {fn.__name__}", duration * 1000)

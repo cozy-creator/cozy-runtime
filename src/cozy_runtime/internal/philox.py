@@ -29,9 +29,9 @@ try:
     import triton
     import triton.language as tl
 except ImportError as _absent:  # pragma: no cover - a CPU-only or non-Linux environment
+    TRITON_ABSENT = f"triton does not import ({_absent})"
     if TYPE_CHECKING:
         raise
-    TRITON_ABSENT = f"triton does not import ({_absent})"
 else:
     TRITON_ABSENT = ""
 

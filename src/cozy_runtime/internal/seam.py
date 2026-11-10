@@ -38,7 +38,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, NoReturn
+from typing import NoReturn
 
 from cozy_runtime.internal.canonical import DOC_MAX_BYTES
 
@@ -241,7 +241,7 @@ class Channel:
 
     def recv(
         self, timeout: float | None = None, *, total_timeout: float | None = None
-    ) -> dict[str, Any] | None:
+    ) -> Frame | None:
         """One frame, or None when the peer is gone (a disposable executor's normal end)."""
         deadline = time.monotonic() + total_timeout if total_timeout is not None else None
         head = self._read_exact(

@@ -775,10 +775,10 @@ def _exact_weight(torch: ModuleType, provider: Provider, roles: Mapping[str, Ten
         branch = _f64(roles["lowrank_up"]) @ _f64(roles["lowrank_down"])
         return nvfp4 * _f64(roles["pre_quant_scale"]).reshape(1, -1) + branch
     if provider.suite in ("nvfp4-decode", "nvfp4-native"):
-        packed = roles["weight"].cpu()
-        rows, cols = int(packed.shape[0]), 2 * int(packed.shape[1])
-        nibbles = torch.stack((packed & 0x0F, packed >> 4), dim=-1).reshape(rows, cols).long()
-        lut = torch.tensor(E2M1_VALUES, dtype=torch.float64)
+        stored = roles["weight"].cpu()
+        rows, cols = int(stored.shape[0]), 2 * int(stored.shape[1])
+        nibbles = torch.stack((stored & 0x0F, stored >> 4), dim=-1).reshape(rows, cols).long()
+        lut: Tensor = torch.tensor(E2M1_VALUES, dtype=torch.float64)
         blocks = roles["scale"].cpu().double().repeat_interleave(NVFP4_BLOCK, dim=1)
         exact = lut[nibbles] * blocks * roles["scale_2"].cpu().double()
         return exact.to(roles["weight"].device)
@@ -807,7 +807,9 @@ def _f64(tensor: Tensor) -> Tensor:
 def _activation(torch: ModuleType, device: torch.device, dtype: torch.dtype) -> Tensor:
     """The same seeded activation for every route, so a deviation is about the route."""
     generator = torch.Generator(device="cpu").manual_seed(0x517E)
-    x = torch.randn(FIDELITY_TOKENS, BENCH_SHAPE[1], generator=generator, dtype=torch.float32)
+    x: Tensor = torch.randn(
+        FIDELITY_TOKENS, BENCH_SHAPE[1], generator=generator, dtype=torch.float32
+    )
     return (x * 0.5).to(device=device, dtype=dtype)
 
 
@@ -866,7 +868,7 @@ def vector_cases() -> list[VectorCase]:
 def vector_tensor(torch: ModuleType, part: VectorPart, device: torch.device) -> Tensor:
     """A vector part's tensor: base64 little-endian bytes, viewed in its dtype. An `F4` part
     is its packed bytes, u8 `[R, C/2]`, as the fill plane hands it to a decoder."""
-    flat = torch.frombuffer(bytearray(base64.b64decode(part.bits)), dtype=torch.uint8)
+    flat: Tensor = torch.frombuffer(bytearray(base64.b64decode(part.bits)), dtype=torch.uint8)
     if part.dtype == "F4":
         return flat.reshape(*part.shape[:-1], part.shape[-1] // 2).to(device)
     name = TORCH_DTYPES[TENSORFS_DTYPES[part.dtype]]
@@ -875,7 +877,7 @@ def vector_tensor(torch: ModuleType, part: VectorPart, device: torch.device) -> 
 
 def decode_case(
     torch: ModuleType, provider: Provider, case: VectorCase, device: torch.device
-) -> Tensor:
+) -> Tensor | None:
     """`case` decoded by `provider` bound to its params: the logical tensor, or None when the
     provider refuses the case's shape or params."""
     bound = replace(provider, params=params_of(case.encoding.params))  # type: ignore[type-var]
@@ -883,7 +885,7 @@ def decode_case(
         return None
     roles = {part.role: vector_tensor(torch, part, device) for part in case.parts}
     dtype = getattr(torch, TORCH_DTYPES[TENSORFS_DTYPES[case.dtype]])
-    destination = torch.empty(*case.shape, dtype=dtype, device=device)
+    destination: Tensor = torch.empty(*case.shape, dtype=dtype, device=device)
     bound.decode(torch, roles, destination)
     return destination
 
@@ -946,7 +948,7 @@ def _cores_reference(
 ) -> Tensor:
     """The spec's f32 value of `roles` by the cores' eager reference, on the host: a second
     implementation of the arithmetic the Triton kernels run."""
-    reference = torch.empty(*shape, dtype=torch.float32)
+    reference: Tensor = torch.empty(*shape, dtype=torch.float32)
     host = {role: part.cpu() for role, part in roles.items()}
     run(provider.adapter, Cores(torch, kernel=False), host, dict(provider.params), reference)
     return reference

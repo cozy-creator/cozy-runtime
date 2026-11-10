@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from types import ModuleType
-from typing import cast
 
 import numpy as np
 from tensorfs import raw
@@ -67,7 +66,7 @@ def read_values_into(
             raise CapabilityError(
                 "logical model decoder is unavailable", code="weights_reader_decoder_unavailable"
             ) from exc
-        torch = cast("ModuleType", installed)
+        torch = installed
     target = torch.frombuffer(into, dtype=torch.float32)
     params = dict(tensor.encoding.params)
     parts = raw.parts(source, component, key)

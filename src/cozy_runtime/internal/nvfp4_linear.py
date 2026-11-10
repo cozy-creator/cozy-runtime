@@ -35,6 +35,7 @@ from cozy_runtime.accel.kernels import (
 from cozy_runtime.internal import arch, int8_linear, kernel_ready, prebuilt, svdq_linear, verify
 from cozy_runtime.internal.encoding.formats import (
     NVFP4_BLOCK,
+    Dtype,
     Tensor,
     from_blocked,
     nvfp4_values,
@@ -59,14 +60,13 @@ DECODE, EAGER = "cozy-nvfp4-decode", "torch-decode"
 #: comfy-kitchen's W4A4 by its `kernel_ready` name's head.
 KITCHEN = "comfy-kitchen nvfp4 W4A4"
 
-
 try:
     import triton
     import triton.language as tl
 except ImportError as _absent:  # pragma: no cover - a CPU-only or non-Linux environment
+    TRITON_ABSENT = f"triton does not import ({_absent})"
     if TYPE_CHECKING:
         raise
-    TRITON_ABSENT = f"triton does not import ({_absent})"
 else:
     TRITON_ABSENT = ""
 
@@ -337,7 +337,7 @@ def matmul(
     blocked_scale: Tensor,
     linear_scale: Callable[[], Tensor],
     scale_2: Tensor,
-    out_dtype: Tensor,
+    out_dtype: Dtype,
 ) -> Tensor:
     """`x @ W.T` for one stored `nvfp4-w4a4/1` weight (`weight` u8 `[N, K/2]`, `blocked_scale` its
     E4M3 block scales in cuBLASLt's 128x4 layout, `scale_2` the f32 `[1]` second level).
@@ -356,7 +356,7 @@ def matmul(
             try:
                 with readable(weight, blocked_scale, scale_2) as (w, scales, second):
                     payload, block, tensor_scale = _quantized(torch, module, flat)
-                    out = module.scaled_mm_nvfp4(
+                    out: Tensor = module.scaled_mm_nvfp4(
                         payload, w, tensor_scale, second, block, scales, out_dtype=out_dtype
                     )
                 return out[:rows].reshape(*x.shape[:-1], rows_out)
@@ -394,7 +394,8 @@ def matmul(
         )
         for i in range(0, rows_out, step)
     ]
-    return torch.cat(parts, dim=-1).to(out_dtype)
+    joined: Tensor = torch.cat(parts, dim=-1)
+    return joined.to(out_dtype)
 
 
 def _quantized(torch: ModuleType, module: ModuleType, flat: Tensor) -> tuple[Tensor, ...]:
@@ -422,7 +423,7 @@ def _rows(
     rows, cols, rows_out = int(flat.shape[0]), int(flat.shape[1]), int(weight.shape[0])
     scales, tiles = blocked_scale.view(torch.uint8), int(blocked_scale.shape[1]) // 4
     span = -(-cols // (split * 8 * GEMV_W)) * 8 * GEMV_W
-    out = torch.empty(rows, rows_out, dtype=torch.bfloat16, device=flat.device)
+    out: Tensor = torch.empty(rows, rows_out, dtype=torch.bfloat16, device=flat.device)
     part = (
         torch.empty(split, rows, rows_out, dtype=torch.float32, device=flat.device)
         if split > 1
@@ -447,7 +448,7 @@ def _decoded(
     """The stored weight decoded to bf16 `[N, K]` in one launch."""
     rows_out, cols = int(weight.shape[0]), 2 * int(weight.shape[1])
     scales, tiles = blocked_scale.view(torch.uint8), int(blocked_scale.shape[1]) // 4
-    decoded = torch.empty(rows_out, cols, dtype=torch.bfloat16, device=weight.device)
+    decoded: Tensor = torch.empty(rows_out, cols, dtype=torch.bfloat16, device=weight.device)
     launch(
         _dequant, (-(-rows_out // 64), -(-cols // 128), 1),
         weight, scales, scale_2, decoded, rows_out, cols, tiles, 64, 128,

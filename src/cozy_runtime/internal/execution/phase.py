@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import tensorfs.varena.torch as vt
 import torch
@@ -19,10 +19,6 @@ if TYPE_CHECKING:
     from tensorfs.varena._facts import SplitSelection
 
 Mode = Literal["eager", "capture", "replay", "preparation"]
-
-#: Any: varena's split selection, a plain dict in the TensorFS 0.22.1 stub.
-type Record = dict[str, Any]
-
 
 class WorkingPhase(TypedDict):
     """One working-demand row (`observing`): varena's phase observation without its split

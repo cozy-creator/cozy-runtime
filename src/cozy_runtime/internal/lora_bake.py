@@ -42,9 +42,9 @@ try:
     import triton
     import triton.language as tl
 except ImportError:  # a host without Triton bakes eagerly
+    triton = None
     if TYPE_CHECKING:
         raise
-    triton = None
 
 Strategy = Literal["bake", "per_step"]
 #: How a bake runs on a GPU: its fused kernels, or the eager reference.
