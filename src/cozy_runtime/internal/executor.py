@@ -63,7 +63,7 @@ from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, S
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, NoReturn, TypedDict, cast
 
 import msgspec
 import tensorfs
@@ -115,6 +115,7 @@ from cozy_runtime.author._executor_requests import encode as encode_request
 from cozy_runtime.author._files import File, GrantedInput, References, Tree
 from cozy_runtime.author._invoke import (
     Invocation,
+    InvocationResult,
     PreparedRequest,
     prepare,
     run_prepared,
@@ -129,7 +130,7 @@ from cozy_runtime.author._model import (
     WarningRow,
     component_use,
 )
-from cozy_runtime.author._observations import DEVICE, PLANS, Attribution
+from cozy_runtime.author._observations import DEVICE, PLANS, Attribution, Observation
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._weights import Weights as RawWeights
@@ -304,6 +305,8 @@ _OPEN_MAX = 10240
 
 #: Each callable an attempt may call, by (module, export).
 type CallBindings = dict[tuple[str, str], _CallType]
+#: One reply, event or document on the seam: JSON, readers narrow (`seam.Channel.send`).
+type Reply = dict[str, object]
 
 
 def _capture_seal() -> None:
@@ -372,7 +375,7 @@ def _restore_seal() -> tuple[str, ...]:
     return changed
 
 
-def _env_document() -> dict[str, Any]:
+def _env_document() -> Reply:
     """The seal holds for every reply once re-imposed; names package code changed are reported."""
     changed = _restore_seal()
     return {"env_intact": not _env_changes(), "env_changed": list(changed)}
@@ -723,8 +726,56 @@ class _CompositeResidency:
         }
 
 
-def _construction_record(facts: Mapping[str, Any]) -> dict[str, Any]:
+class _Delivery(TypedDict, total=False):
+    """A model's delivery facts, as a group prepare sums them (`plan.wire_document`)."""
+
+    variant: str
+    label: str
+    materialization: str
+    routes: dict[str, int]
+    kernels: dict[str, int]
+
+
+class _PrepareFacts(TypedDict, total=False):
+    """The prepare facts this executor writes (`Executor.facts`) and reads back."""
+
+    prepared_unix_ms: int
+    prepare_ms: float
+    fill_ms: float
+    warm_ms: float
+    cuda_init_ms: float
+    stages: list[tuple[str, float]]
+    #: (parameters on meta, parameters on a real device, the bytes those real ones hold)
+    substrate_census: list[int]
+    filled: int
+    filled_bytes: int
+    device_free_bytes: int
+    device_total_bytes: int
+    allocator_bytes: int
+    reserved_bytes: int
+    rss_bytes: int
+    gpu_name: str
+    torch_version: str
+    cuda_version: str
+    declared_scopes: dict[str, list[str]]
+    layouts: dict[str, object]
+    attention: object
+    delivery: _Delivery
+
+
+class _AttentionAnswer(TypedDict, total=False):
+    """A follower's `attention` reply (`select_attention`)."""
+
+    ok: bool
+    rank: int
+    hosts: dict[str, dict[str, int]]
+    code: str
+    detail: str
+
+
+def _construction_record(prepare: Mapping[str, object]) -> Reply:
     """A prepare's run-record entry: when it ended, how long it took and its legs."""
+    facts = cast("_PrepareFacts", prepare)  # this executor wrote them
     return {
         "prepared_unix_ms": int(facts.get("prepared_unix_ms", 0)),
         "prepare_ms": float(facts.get("prepare_ms", 0)),
@@ -754,7 +805,7 @@ class _OnDemand:
         active: tuple[str, tuple[str, ...]] | None = getattr(self._model, "_cozy_active", None)
         return active
 
-    def __getattr__(self, name: str) -> Any:  # Any: forwards to the model it builds
+    def __getattr__(self, name: str) -> Any:  # type: ignore[explicit-any]  # forwards to its model
         with self._lock:
             if self._model is None:
                 self._model = self._build()
@@ -803,7 +854,7 @@ def _attention_divergence(mine: executor_commands.Choice, reply: Mapping[str, ob
     return attention.difference(mine, theirs)
 
 
-def _segment(stage: str, step: int, held: attention.Applied, at_us: int = 0) -> dict[str, Any]:
+def _segment(stage: str, step: int, held: attention.Applied, at_us: int = 0) -> Reply:
     """A selection a run served from step `step` of `stage` on (`execution_evidence`)."""
     return {
         "stage": stage,
@@ -872,7 +923,7 @@ class Executor:
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
         self.on_demand: frozenset[str] = frozenset()
         #: each on-demand model built so far, by parameter: its prepare facts (the run record's)
-        self.built_on_demand: dict[str, dict[str, Any]] = {}
+        self.built_on_demand: dict[str, Reply] = {}
         self.active = ""
         self.started = False
         #: torch, the Runtime and the package are imported (`Start.import_only`); no device yet
@@ -881,18 +932,18 @@ class Executor:
         self.forked: set[int] = set()
         self.package_warmed = False
         #: rank 0 only: each follower's own start ledger, in rank order
-        self.follower_stages: list[list[Any]] = []
+        self.follower_stages: list[list[object]] = []
         #: this generation's load reply
-        self.load_reply: dict[str, Any] = {}
+        self.load_reply: Reply = {}
         #: follower only: the attempt spool and allocator bytes at its first mirrored call
         self._run_entry: Path | None = None
         #: follower only: every kernel its processors held across that attempt's calls
         self._run_held = attention.Applied({}, ())
         self._rank_request: _RankRequest | None = None
         #: HOST ONLY: this process's start, for the execution record (wall ms and its legs)
-        self.boot: dict[str, Any] = {}
+        self.boot: Reply = {}
         #: HOST ONLY: this rank's pid, host ordinal, GPU uuid and arch, read once after device init
-        self._identity: dict[str, Any] | None = None
+        self._identity: Reply | None = None
         #: THIS process's rank in its generation's group and the group's size (cr-068). A
         #: plain executor is rank 0 of a world of 1 and forms nothing; rank 0 of a wider
         #: world spawns and drives the followers; a follower's channel is rank 0's seam.
@@ -979,7 +1030,7 @@ class Executor:
         #: a follower's hold of rank 0's attention selection for the current attempt
         self._attention_hold = contextlib.ExitStack()
         self._producer_hold: tuple[str, dict[str, object]] | None = None
-        self.facts: dict[str, Any] = {}
+        self.facts: Reply = {}
         #: what this generation's plan serves decoded because the device refused its leaf
         self.refused_leaves: tuple[RefusedLeaves, ...] = ()
         self.schema_digests: dict[str, str] = {}
@@ -996,7 +1047,7 @@ class Executor:
 
     # ------------------------------------------------------------------ prepare
 
-    def handle(self, command: KnownCommand) -> dict[str, Any]:
+    def handle(self, command: KnownCommand) -> Reply:
         """Answer one decoded worker command (`shutdown` ends the loop before this)."""
         match command:
             case Hello():
@@ -1041,7 +1092,7 @@ class Executor:
             case Shutdown():
                 raise AssertionError("shutdown ends the command loop")
 
-    def hello(self) -> dict[str, Any]:
+    def hello(self) -> Reply:
         """What TensorD (`Hello`) and rank 0 (`group._Hello`) read: who this process is, its
         versions, its memory protocol and its seal."""
         return {
@@ -1062,7 +1113,7 @@ class Executor:
 
     # ------------------------------------------------------------- the group (cr-068)
 
-    def _initialize_device(self, torch: ModuleType) -> dict[str, Any] | None:
+    def _initialize_device(self, torch: ModuleType) -> Reply | None:
         """Runtime's ONE explicit accelerator init boundary, idempotent per process.
 
         Under a group every rank pins its own card: rank r of a seal naming K entries is
@@ -1156,7 +1207,7 @@ class Executor:
         host.execution = execution
         host.memory = memory
 
-    def _rank_identity(self) -> dict[str, Any]:
+    def _rank_identity(self) -> Reply:
         owner = self.host
         if owner._identity is None:
             owner._identity = execution_evidence.identity(
@@ -1174,9 +1225,9 @@ class Executor:
         start_us: int,
         end_us: int,
         impl: str = "",
-        segments: Sequence[Mapping[str, Any]] = (),
+        segments: Sequence[Mapping[str, object]] = (),
         refused: Mapping[str, int] | None = None,
-    ) -> dict[str, Any]:
+    ) -> Reply:
         """The attempt's execution record: degree, every GPU, and the setup it ran on."""
         gpus = [
             execution_evidence.record(
@@ -1203,7 +1254,7 @@ class Executor:
                 gpus.append({**row, "attention": {**row["attention"], "requested": pin}})
         facts = self.facts
         transport = self.host.transport
-        crossing: dict[str, Any] = {}
+        crossing: Reply = {}
         if transport is not None:
             from cozy_runtime.internal.parallel import ulysses
 
@@ -1258,7 +1309,7 @@ class Executor:
             device = torch.device("cpu")
         return device
 
-    def join(self, command: Join) -> dict[str, Any]:
+    def join(self, command: Join) -> Reply:
         """A FOLLOWER's first half of the group: rank 0's store reached and its device current.
         Its answer is the readiness every GPU gives before any enters group init (`form`)."""
         if self.rank == 0:
@@ -1302,7 +1353,7 @@ class Executor:
             return self._unformed(exc, "join")
         return {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
 
-    def form(self, command: Form) -> dict[str, Any]:
+    def form(self, command: Form) -> Reply:
         """A FOLLOWER's second half: every GPU said it is ready, so it enters group init."""
         forming, self._forming = self._forming, None
         if forming is None:
@@ -1326,7 +1377,7 @@ class Executor:
             copy_engine.install(exchange, self.pg)
         return reply
 
-    def _unformed(self, exc: Exception, step: str) -> dict[str, Any]:
+    def _unformed(self, exc: Exception, step: str) -> Reply:
         self.poisoned = f"{step} failed: {type(exc).__name__}"
         detail = f"{_gpu(self.rank)} could not {step} the group: {type(exc).__name__}: {exc}"
         return {
@@ -1343,7 +1394,7 @@ class Executor:
         name = self.transport.links.exchange
         return "" if name == "nccl" else name
 
-    def _host_tier(self) -> Any:
+    def _host_tier(self) -> varena.Pages | None:
         """This GPU's host tier, which a host-staged exchange's inbox comes from."""
         memory = self.host.memory
         return memory.pages if memory is not None else None
@@ -1384,7 +1435,7 @@ class Executor:
         if self.host.comms is not None:
             self.host.comms.pg = self.host.pg
 
-    def run(self, command: dict[str, Any]) -> dict[str, Any]:
+    def run(self, command: Reply) -> Reply:
         """Run a prepared sharded component, or one this rank hosts, under its leader's
         scope and execution modes. A hosted call's result returns through the spool."""
         if self.rank == 0:
@@ -1422,14 +1473,14 @@ class Executor:
             }
         _model, component = target
         sol_counts: dict[str, int] = {}
-        result: Any = None
+        result: object = None
         models = {key[0]: model for key, (model, _root) in self.group_components.items()}
         started_us = execution_evidence.now_us()
         # A spread call rank 0 waits on over the group: a header always answers it.
         answered = False
         try:
             scoped = {scope.model: scope for scope in wire.RunCommand.read(command).scopes}
-            spool = Path(command["spool"])
+            spool = Path(cast("str", command["spool"]))  # a run command names its spool
             held = attention.observed(
                 {f"{m}/{c}": root for (m, c), (_, root) in self.group_components.items()}
             )
@@ -1481,7 +1532,8 @@ class Executor:
                 stack.enter_context(self.torch.set_grad_enabled(command["grad_enabled"]))
                 if not (hosted or spread):
                     stack.enter_context(cp.gated_call())
-                for kind, dtype in (command.get("autocast") or {}).items():
+                autocast = cast("dict[str, str]", command.get("autocast") or {})  # kind -> dtype
+                for kind, dtype in autocast.items():
                     stack.enter_context(
                         self.torch.autocast(device_type=kind, dtype=getattr(self.torch, dtype))
                     )
@@ -1592,7 +1644,7 @@ class Executor:
             return f"{DOES_NOT_FIT}: {exc}"[:300]
         return None
 
-    def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> dict[str, Any]:
+    def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> Reply:
         """A group that could not form or hold is THIS process's poison: the worker
         rebuilds the whole cgroup, never a partial group."""
         self.poisoned = f"group: {exc.code}"
@@ -1602,7 +1654,7 @@ class Executor:
 
     def _install_group(
         self, torch: ModuleType, model: Model[object], homes: Mapping[str, int]
-    ) -> dict[str, Any] | None:
+    ) -> Reply | None:
         """Every rank shards its replica, takes its side of the mirror, and keeps the placeable
         components TensorD homed on its GPU (`Binding.homes`)."""
         if self.world <= 1:
@@ -1759,11 +1811,11 @@ class Executor:
             for index in begun:
                 varena.request_boundary(index, begin=False)
 
-    def start(self, command: Start) -> dict[str, Any]:
+    def start(self, command: Start) -> Reply:
         with self._device_work():
             return self._start(command)
 
-    def _start(self, command: Start) -> dict[str, Any]:
+    def _start(self, command: Start) -> Reply:
         """Bring EVERY rank up before any construction: seal, group, torch, package, warmup.
 
         Rank 0 spawns its followers first and hands them this command, so every rank's
@@ -1988,11 +2040,11 @@ class Executor:
         self.boot = {
             "started_unix_ms": int(time.time() * 1000 - took_ms),
             "ms": round(took_ms, 1),
-            "legs_ms": {**self.boot.get("legs_ms", {}), **dict(stages)},
+            "legs_ms": {**cast("dict[str, float]", self.boot.get("legs_ms", {})), **dict(stages)},
         }
         return self._start_reply(stages, warmup_error=warmup_error, compiles=compiles)
 
-    def fork(self, command: Fork) -> dict[str, Any]:
+    def fork(self, command: Fork) -> Reply:
         """Fork this import-only process into an executor of `command.root` (`fork/1`).
 
         The child's imports are done; its device start initializes CUDA for the first time
@@ -2076,7 +2128,7 @@ class Executor:
         child.discovered = self.discovered
         child.surface_names = dict(self.surface_names)
         legs = {
-            **self.boot.get("legs_ms", {}),
+            **cast("dict[str, float]", self.boot.get("legs_ms", {})),  # the boot's legs
             "fork": round((time.perf_counter() - started) * 1000, 1),
         }
         child.boot = {**self.boot, "legs_ms": legs}
@@ -2089,7 +2141,7 @@ class Executor:
         reused: bool = False,
         warmup_error: str = "",
         compiles: str = "",
-    ) -> dict[str, Any]:
+    ) -> Reply:
         total = free = -1
         if self.torch is not None and accel.present(self.torch, self.device_kind):
             memory = accel.allocation(self.torch, self.device_kind, self.host.memory)
@@ -2195,7 +2247,7 @@ class Executor:
             )
         return identity
 
-    def _close_after(self, reply: dict[str, Any]) -> dict[str, Any]:
+    def _close_after(self, reply: Reply) -> Reply:
         """A refusal after followers were commanded leaves them mid-protocol: the process
         is poisoned and its group ends with it."""
         if self.host.group is not None and self.rank == 0:
@@ -2221,10 +2273,10 @@ class Executor:
         child.surface_names = dict(self.surface_names)
         return child
 
-    def _refusal(self, code: str, detail: str) -> dict[str, Any]:
+    def _refusal(self, code: str, detail: str) -> Reply:
         return {"ok": False, "code": code, "detail": detail}
 
-    def load(self, command: Load) -> dict[str, Any]:
+    def load(self, command: Load) -> Reply:
         """Construct and fill ONE construction under its key; a loaded key answers again.
 
         TensorD names the key and supplies endpoint options and memory budgets. Runtime
@@ -2263,7 +2315,7 @@ class Executor:
         self._register(key, child, reply)
         return self._load_reply(key, child, reused=False)
 
-    def _bind_parameters(self, command: Load) -> dict[str, Any] | None:
+    def _bind_parameters(self, command: Load) -> Reply | None:
         """A reuse binds aliases to the same path-ordered members."""
         members = self.model_executors or [self]
         rows = tuple(sorted(command.rows(), key=lambda row: row.binding.model_binding_path))
@@ -2290,7 +2342,7 @@ class Executor:
                 self.models.setdefault(name, model)
         return None
 
-    def _register(self, key: str, child: Executor, reply: dict[str, Any]) -> None:
+    def _register(self, key: str, child: Executor, reply: Reply) -> None:
         child.load_reply = reply
         self.constructions[key] = child
         self.discovered = child.discovered
@@ -2299,7 +2351,7 @@ class Executor:
         self._device_ready = child._device_ready or self._device_ready
         self.ready = True
 
-    def _load_reply(self, key: str, child: Executor, *, reused: bool) -> dict[str, Any]:
+    def _load_reply(self, key: str, child: Executor, *, reused: bool) -> Reply:
         return {
             **child.load_reply,
             "construction": key,
@@ -2314,7 +2366,7 @@ class Executor:
             for member in child.model_executors or [child]
         ]
 
-    def _follower_load(self, command: Load) -> dict[str, Any]:
+    def _follower_load(self, command: Load) -> Reply:
         """Rank r's half of rank 0's load: one construction, or one model of a many-model
         construction (`model_key`), filled under rank 0's agreed plan and ceiling."""
         if self.poisoned:
@@ -2357,7 +2409,7 @@ class Executor:
             self._register(key, container, reply)
         return reply
 
-    def activate(self, command: Activate) -> dict[str, Any]:
+    def activate(self, command: Activate) -> Reply:
         """Make one loaded construction the active one. Nothing moves: its weights are
         wanted by its first stage, and an idle construction's bytes leave the device only
         when a stage needs the room (least recently used first)."""
@@ -2380,7 +2432,7 @@ class Executor:
             "ms": 0.0,
         }
 
-    def unload(self, command: Unload) -> dict[str, Any]:
+    def unload(self, command: Unload) -> Reply:
         """Drop one construction: forget its weight sets, release its leases, drop every
         reference."""
         if self.poisoned:
@@ -2432,7 +2484,7 @@ class Executor:
             "construction": key,
         }
 
-    def residency_document(self) -> dict[str, Any]:
+    def residency_document(self) -> Reply:
         return {
             "ok": True,
             "constructions": [
@@ -2446,12 +2498,12 @@ class Executor:
             "active": self.active,
         }
 
-    def _prepare_first(self, command: Load) -> dict[str, Any]:
+    def _prepare_first(self, command: Load) -> Reply:
         """Construct and fill one construction (or one model of a many-model one)."""
         with self._device_work():
             return self._prepare(command)
 
-    def _prepare(self, command: Load) -> dict[str, Any]:
+    def _prepare(self, command: Load) -> Reply:
         if self.poisoned:
             return {
                 "ok": False,
@@ -3052,7 +3104,7 @@ class Executor:
         """Whether this model is built on first use (`on_demand=`)."""
         return self.world == 1 and binding.model_binding_path in self.host.on_demand
 
-    def _prepare_many(self, command: Load, rows: tuple[ModelLoad, ...]) -> dict[str, Any]:
+    def _prepare_many(self, command: Load, rows: tuple[ModelLoad, ...]) -> Reply:
         """Prepare one complete bounded multi-model callable in this device process; an
         on-demand model is built when the function first reads it (`_build_on_demand`)."""
         if not 1 <= len(rows) <= 16:
@@ -3078,7 +3130,7 @@ class Executor:
                 "detail": "model paths and parameters must be named and unique",
             }
 
-        children: list[tuple[str, Executor, dict[str, Any]]] = []
+        children: list[tuple[str, Executor, Reply]] = []
         for row in rows:
             binding = row.binding
             parameter = binding.model_parameter_name
@@ -3151,8 +3203,11 @@ class Executor:
             ).hexdigest()
         )
 
-        facts_rows = [(parameter, reply["facts"]) for parameter, _, reply in built]
-        last = facts_rows[-1][1] if facts_rows else {}
+        facts_rows = [
+            (parameter, cast("_PrepareFacts", reply["facts"]))  # each child's prepare reply
+            for parameter, _, reply in built
+        ]
+        last: _PrepareFacts = facts_rows[-1][1] if facts_rows else {}
         scopes = {
             f"{parameter}.{method}": [f"{parameter}/{component}" for component in components]
             for parameter, facts in facts_rows
@@ -3178,7 +3233,7 @@ class Executor:
             for name, count in (delivery.get("kernels") or {}).items():
                 kernels[str(name)] = kernels.get(str(name), 0) + int(count)
         materializations = {row.get("materialization", "") for row in deliveries.values()}
-        delivery = {
+        summary = {
             "variant": ", ".join(
                 f"{parameter}={row.get('variant', '')}" for parameter, row in deliveries.items()
             ),
@@ -3237,7 +3292,7 @@ class Executor:
             "torch_version": str(last.get("torch_version", "")),
             "cuda_version": str(last.get("cuda_version", "")),
             "custody": "joint",
-            "delivery": delivery,
+            "delivery": summary,
             "models": {parameter: facts for parameter, facts in facts_rows},
         }
         self.ready = True
@@ -3293,7 +3348,7 @@ class Executor:
         self.discovered = discovered
         self.surface_names = {surface.name: surface for surface in discovered.surfaces}
 
-    def _prepare_weightless(self, binding: Binding, started: float) -> dict[str, Any]:
+    def _prepare_weightless(self, binding: Binding, started: float) -> Reply:
         """A binding that declares NO MODEL: discover the release, be ready, import nothing.
 
         The whole cold path below is a fill, and there is nothing to fill. Returning here is
@@ -3336,7 +3391,7 @@ class Executor:
 
     def _target(
         self, command: PrepareRequest | Invoke, *, attempt: bool
-    ) -> Executor | dict[str, Any]:
+    ) -> Executor | Reply:
         """The construction a request or attempt runs on: the one it names, or the active."""
         key = command.construction or self.active
         child = self.constructions.get(key)
@@ -3388,13 +3443,13 @@ class Executor:
                     return True
         return False
 
-    def serve_request(self, command: PrepareRequest) -> dict[str, Any]:
+    def serve_request(self, command: PrepareRequest) -> Reply:
         target = self._target(command, attempt=False)
         if isinstance(target, dict):
             return target
         return target.prepare_request(command)
 
-    def serve_invoke(self, command: Invoke) -> dict[str, Any]:
+    def serve_invoke(self, command: Invoke) -> Reply:
         for construction in (self, *self.constructions.values()):  # its invoke came
             with construction._prepared_lock:
                 construction.awaiting.discard(command.request_id)
@@ -3436,7 +3491,7 @@ class Executor:
                 target.residency.open_attempt()
         return None
 
-    def prepare_request(self, command: PrepareRequest) -> dict[str, Any]:
+    def prepare_request(self, command: PrepareRequest) -> Reply:
         """Resolve ONE request through the kernel's pre-admission half, and retain it.
 
         The worker calls this BEFORE it prices a plan, so the normalized features and
@@ -3569,7 +3624,7 @@ class Executor:
             }
         return None
 
-    def invoke(self, command: Invoke, prepared: PreparedRequest, slot: _Slot) -> dict[str, Any]:
+    def invoke(self, command: Invoke, prepared: PreparedRequest, slot: _Slot) -> Reply:
         """ONE attempt through the author kernel, with the §3.4 freeze point held."""
         surface = self.surface_names[command.entrypoint]
         requested = _attention_pin(command.attention_kernel, command.bits)
@@ -3619,11 +3674,11 @@ class Executor:
         served_attention: attention.Applied | None = None
         sol_counts: dict[str, int] = {}
         sol_rank_counts: dict[int, dict[str, int]] = {}
-        sol_kernels: list[dict[str, Any]] = []
+        sol_kernels: list[dict[str, Scalar]] = []
         served_impls = attention_ulysses.Seen()
         # A kernel that finishes compiling mid-run serves from the next step or stage on
         # (`_upgrade_attention`): each selection the run served and from which step.
-        segments: list[dict[str, Any]] = []
+        segments: list[Reply] = []
         later: list[attention.Applied] = []
         #: each kernel that became ready mid-run, and the step from which it served; in a
         #: group, on which GPU
@@ -3641,7 +3696,7 @@ class Executor:
                 gpu = self.group.gpu
                 swapped.extend((kernel, {**point[0], "gpu": gpu(rank)}) for rank, kernel in began)
 
-        def boundary(frame: Any) -> None:
+        def boundary(frame: ProgressFrame | Observation) -> None:
             progress(frame)
             if isinstance(frame, ProgressFrame) and frame.call_request is None and frame.stage:
                 stage[0] = frame.stage
@@ -3839,8 +3894,8 @@ class Executor:
                 record.emit(
                     "confession", "attention.sol.kernel", fields.pop("source"), rank=0, **fields
                 )
-            for row in attention.failures(served_attention.totals(), sol_kernels):
-                record.emit("log", "attention kernel failed, a fallback served", "warn", **row)
+            for failure in attention.failures(served_attention.totals(), sol_kernels):
+                record.emit("log", "attention kernel failed, a fallback served", "warn", **failure)
         # Nothing was swapped, so the restore left the sites exactly as the entry walk read them.
         restored = (
             served_attention
@@ -3984,8 +4039,8 @@ class Executor:
         still match through attention._matches."""
         return "+".join(sorted(self.models)) + "/" if self.models else ""
 
-    def _attention_roots(self) -> dict[str, Any]:
-        roots: dict[str, Any] = {}
+    def _attention_roots(self) -> Reply:
+        roots: Reply = {}
         executors = self.model_executors or [self]
         for executor in executors:
             if executor.backend is None:
@@ -4041,7 +4096,7 @@ class Executor:
         native = {"int8": int8_linear.OP, "fp8": fp8_linear.OP, "w4a8": w4a8_linear.OP}
         for (component, leaf), sites in sorted(counted.items()):
             kernel, form = serving(leaf, index), FORMATS[leaf]
-            fields: dict[str, Any] = {"component": prefix + component, "sites": sites}
+            fields: dict[str, Scalar] = {"component": prefix + component, "sites": sites}
             record.emit("confession", "gemm.selected", kernel, format=form, leaf=leaf, **fields)
             wanted = native.get(form, kernel)
             reason = prebuilt.lost(form, sm) or (missing[0].reason if missing else "")
@@ -4285,7 +4340,7 @@ class Executor:
         executor.attention_defaults = attention.snapshot(dict(executor.backend.roots))
         return True
 
-    def _agree_attention(self, *, poison: bool = True) -> dict[str, Any] | None:
+    def _agree_attention(self, *, poison: bool = True) -> Reply | None:
         """THE GROUP SERVES ONE SELECTION, WHOLE, THAT EVERY GPU HAS READY: each site's kernel
         and Sol's dense reference. Every follower installs rank 0's through the
         `attention.install` rank 0 selected with, never waiting for a build, and answers what
@@ -4346,7 +4401,7 @@ class Executor:
 
     def _adopt_attention(
         self, command: Attention, choice: executor_commands.Choice
-    ) -> dict[str, Any]:
+    ) -> Reply:
         """A follower's half of `_agree_attention`: rank 0's whole selection installed here as
         this construction's prepared one, and what this GPU then serves."""
         target = self._follower_target(command.construction, command.model_key)
@@ -4381,7 +4436,7 @@ class Executor:
         serves = attention.chosen(roots)
         return {"ok": True, "rank": self.rank, "choice": msgspec.to_builtins(serves)}
 
-    def select_attention(self, command: Attention) -> dict[str, Any]:
+    def select_attention(self, command: Attention) -> Reply:
         """A FOLLOWER restores its prepared selection and, given rank 0's `pin` for the next
         attempt (empty is the prepared one), holds it and answers what its sites now hold."""
         if command.adopt is not UNSET:
@@ -4412,7 +4467,7 @@ class Executor:
         self._producer_hold = (command.construction, store)
         return {"ok": True, "rank": self.rank, "hosts": held.hosts}
 
-    def _followers_attention(self, pin: str | UnsetType = UNSET) -> list[dict[str, Any]]:
+    def _followers_attention(self, pin: str | UnsetType = UNSET) -> list[_AttentionAnswer]:
         assert self.group is not None
         self.group.broadcast(
             executor_commands.encode(Attention(construction=self.construction, pin=pin))
@@ -4421,7 +4476,7 @@ class Executor:
         for reply in (reply for reply in replies if not reply.get("ok")):
             detail = f"{_gpu(int(reply.get('rank', -1)))}: {reply.get('detail', '')}"[:900]
             raise InvalidRequest(detail, code=str(reply.get("code")))
-        return replies
+        return cast("list[_AttentionAnswer]", replies)  # `select_attention`'s
 
     def request_memory(self, command: executor_commands.RequestMemory) -> RankMemory:
         """A follower's part of rank 0's attempt: its own request, begun, planned and ended
@@ -4574,7 +4629,7 @@ class Executor:
             for row in choices.fallbacks:
                 record.emit("confession", "attention.fallback", row["selected"], **row)
 
-    def _execution_observation(self, choices: attention.Applied | None = None) -> dict[str, Any]:
+    def _execution_observation(self, choices: attention.Applied | None = None) -> Reply:
         # Observed generation facts; image and boot identity are added by the worker.
         # Optional kernel/lane fields stay absent until their execution is observed.
         return {
@@ -4623,7 +4678,7 @@ class Executor:
                 proxy.__module__ = module
                 imported.__dict__[export] = proxy
 
-    def _call_broker(self, request_id: str, rows: tuple[CallInterface, ...]) -> Any:
+    def _call_broker(self, request_id: str, rows: tuple[CallInterface, ...]) -> _Broker | None:
         """This attempt's broker over `rows`, bound once per executor (a served package's
         attempts share its Start's rows)."""
         if not rows:
@@ -4783,10 +4838,10 @@ class Executor:
         except msgspec.ValidationError as exc:
             raise SeamError("seam_answer_malformed", f"{exchange}: {exc}") from exc
 
-    def _progress_sink(self, request_id: str) -> Any:
+    def _progress_sink(self, request_id: str) -> Callable[[ProgressFrame | Observation], None]:
         """The lossy lane's sink for one attempt — the same one `invoke` installs."""
 
-        def progress(frame: Any) -> None:
+        def progress(frame: ProgressFrame | Observation) -> None:
             with contextlib.suppress(SeamError):
                 if isinstance(frame, ProgressFrame):
                     self.channel.send(
@@ -4876,7 +4931,7 @@ class Executor:
         recorded. The execution stream includes every explicitly joined consumer."""
         return accel.streams_idle(self.torch, self.device_kind, stream=self.host.execution_stream)
 
-    def map(self, command: Map) -> dict[str, Any]:
+    def map(self, command: Map) -> Reply:
         """TensorD's warming: one loaded construction's models at `command.level`, on every GPU
         of a group."""
         if self.poisoned:
@@ -4917,21 +4972,21 @@ class Executor:
             return self._group_refusal(exc, closing=False)
         return {"ok": True}
 
-    def _active_residency(self) -> dict[str, Any]:
+    def _active_residency(self) -> Mapping[str, object]:
         child = self.constructions.get(self.active)
         if child is None or child.residency is None:
             return {}
-        document: dict[str, Any] = child.residency.document()
+        document: Mapping[str, object] = child.residency.document()
         return document
 
-    def process_incarnations(self) -> list[dict[str, Any]]:
+    def process_incarnations(self) -> list[Reply]:
         """The actual rank births, including a follower that vanished before this probe."""
         ranks = [(self.rank, os.getpid())]
         if self.group is not None:
             ranks.extend((follower.rank, follower.pid) for follower in self.group.followers)
-        rows: list[dict[str, Any]] = []
+        rows: list[Reply] = []
         for rank, pid in ranks:
-            row: dict[str, Any] = {"rank": rank, "pid": pid, "started_ticks": None}
+            row: Reply = {"rank": rank, "pid": pid, "started_ticks": None}
             with contextlib.suppress(OSError, proctree.ProcessTreeUnsupported):
                 row["started_ticks"] = proctree.process_identity(pid).started_ticks
             rows.append(row)
@@ -4952,7 +5007,7 @@ class Executor:
             "reserved_bytes": memory["reserved_bytes"],
         }
 
-    def unsettled(self, target: Executor, exc: Exception, request_id: str) -> dict[str, Any]:
+    def unsettled(self, target: Executor, exc: Exception, request_id: str) -> Reply:
         """An attempt that raised outside its handler. A CUDA fault is sticky, so the tail's
         first sync raises it again: the process cannot serve another attempt, and the reply
         names the handler's own failure (else this one) and the stage it happened in. Memory
@@ -4992,14 +5047,14 @@ class Executor:
             "frames": [],
         }
 
-    def _settled(self, reply: dict[str, Any]) -> dict[str, Any]:
+    def _settled(self, reply: Reply) -> Reply:
         """An attempt's reply carries the after-state a `Probe` would read next, so the
         worker closes its ledger without another round trip; residency and RSS are already
         in the reply."""
         reply["after"] = {**self._device_figures(), "processes": self.process_incarnations()}
         return reply
 
-    def probe(self) -> dict[str, Any]:
+    def probe(self) -> Reply:
         processes = self.process_incarnations()
         if self.torch is None:
             # A process can be poisoned before Torch loads (a follower's rank divergence).
@@ -5030,7 +5085,7 @@ class Executor:
 _TELEMETRY = ("observations", "execution", "attribution")
 
 
-def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
+def _send_reply(channel: Channel, reply: Reply) -> None:
     """Put ONE reply on the seam. Telemetry never costs a reply its outcome."""
     if isinstance(execution := reply.get("execution"), dict):
         execution["reply_sent_unix_ms"] = round(time.time() * 1000, 1)
@@ -5042,13 +5097,14 @@ def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
         dropped = {f"dropped_{key}_for_credential": 1 for key in _TELEMETRY if key in reply}
         for key in _TELEMETRY:
             reply.pop(key, None)
-        reply["observation_caps"] = {**(reply.get("observation_caps") or {}), **dropped}
+        caps = cast("dict[str, int]", reply.get("observation_caps") or {})  # dropped-row counts
+        reply["observation_caps"] = {**caps, **dropped}
         channel.send(reply)
 
 
 def _serialize_result(
-    envelope: Any, spool: Path
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int]:
+    envelope: InvocationResult | None, spool: Path
+) -> tuple[Reply | None, list[Reply], int]:
     """Serialize the typed result EXACTLY ONCE, before its types are lost.
 
     msgspec encodes the whole annotated result struct — nested structs, lists and all — in
@@ -5093,9 +5149,9 @@ def _serialize_result(
     )
 
 
-def _assets_at(node: Any, path: str) -> list[dict[str, Any]]:
+def _assets_at(node: object, path: str) -> list[Reply]:
     """Every file node in the serialized result, with the field path that names it."""
-    found: list[dict[str, Any]] = []
+    found: list[Reply] = []
     if isinstance(node, dict):
         if "asset_ref" in node:
             return [{"output_id": path, **node}]
