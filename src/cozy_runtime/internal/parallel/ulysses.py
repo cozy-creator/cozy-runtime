@@ -234,23 +234,35 @@ def _send(
     return _start(handle, engines, sends, receives, matrix, rank), receives
 
 
-def _land(out: Tensor, wait: Wait, returned: Tensor, start: int, world: int) -> None:
+def _land(
+    out: Tensor, wait: Wait, returned: Tensor, start: int, world: int, waits: list[Any]
+) -> None:
     """A group's attended rows, back on this GPU, into its heads of `out`."""
     batch, mine, _, dim = out.shape
     local = returned.shape[2]
-    wait()
+    _waited(out, wait, waits)
     part = out[:, :, start : start + world * local].view(batch, mine, world, local, dim)
     part.copy_(returned.view(world, mine, batch, local, dim).permute(2, 1, 0, 3, 4))
 
 
+def _waited(on: Tensor, wait: Wait, waits: list[Any]) -> None:
+    """`wait`, between two marks: what the calling stream idled for a crossing."""
+    before = _Clock.mark(on)
+    wait()
+    waits.append((before, _Clock.mark(on)))
+
+
 class _Clock:
     """This GPU's exchanges on their calling stream, by CUDA events read once complete: each
-    one's span and the attention inside, so the rest is what communication left exposed."""
+    one's span, the attention inside and the waits for crossings (Q/K/V arriving, output
+    landing), so the rest of what communication left exposed is its packing."""
+
+    _SUMS = ("calls", "groups", "crossed", "exchange", "attention", "arriving", "landing")
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.pending: list[tuple[Any, Any, list[tuple[Any, Any]], int, int]] = []
-        self.totals = dict.fromkeys(("calls", "groups", "crossed", "exchange", "attention"), 0.0)
+        self.pending: list[tuple[Any, Any, tuple[list[Any], list[Any], list[Any]], int]] = []
+        self.totals = dict.fromkeys(self._SUMS, 0.0)
 
     @staticmethod
     def mark(on: Tensor) -> Any:
@@ -260,17 +272,24 @@ class _Clock:
         event.record()
         return event
 
-    def add(self, began: Any, ended: Any, inner: list[tuple[Any, Any]], crossed: int) -> None:
+    def add(
+        self,
+        began: Any,
+        ended: Any,
+        spans: tuple[list[Any], list[Any], list[Any]],
+        crossed: int,
+    ) -> None:
+        """`spans`: the attention, the waits for Q/K/V and the waits for output, as mark pairs."""
         if began is None or ended is None:
             return
         with self.lock:
-            self.pending.append((began, ended, inner, crossed, len(inner)))
+            self.pending.append((began, ended, spans, crossed))
             if len(self.pending) > 256:
                 self._fold(wait=False)
 
     def _fold(self, *, wait: bool) -> None:
         while self.pending:
-            began, ended, inner, crossed, groups = self.pending[0]
+            began, ended, spans, crossed = self.pending[0]
             if wait:
                 ended.synchronize()
             elif not ended.query():
@@ -278,17 +297,18 @@ class _Clock:
             self.pending.pop(0)
             totals = self.totals
             totals["calls"] += 1
-            totals["groups"] += groups
+            totals["groups"] += len(spans[0])
             totals["crossed"] += crossed
             totals["exchange"] += began.elapsed_time(ended)
-            totals["attention"] += sum(
-                a.elapsed_time(z) for a, z in inner if a is not None and z is not None
-            )
+            for name, pairs in zip(("attention", "arriving", "landing"), spans, strict=True):
+                totals[name] += sum(
+                    a.elapsed_time(z) for a, z in pairs if a is not None and z is not None
+                )
 
     def take(self) -> dict[str, float]:
         with self.lock:
             self._fold(wait=True)
-            totals, self.totals = self.totals, dict.fromkeys(self.totals, 0.0)
+            totals, self.totals = self.totals, dict.fromkeys(self._SUMS, 0.0)
         exchange, attention = totals["exchange"], totals["attention"]
         return {
             "calls": int(totals["calls"]),
@@ -297,6 +317,8 @@ class _Clock:
             "exchange_ms": round(exchange, 1),
             "attention_ms": round(attention, 1),
             "exposed_ms": round(exchange - attention, 1),
+            "arriving_ms": round(totals["arriving"], 1),
+            "landing_ms": round(totals["landing"], 1),
         }
 
 
@@ -306,7 +328,8 @@ _CLOCK = _Clock()
 def taken() -> dict[str, float]:
     """What this GPU's exchanges moved and took since the last take (`cozy run show`:
     `transport.exchange`): device ms on the calling stream, the attention inside them, and the
-    rest, which communication and its packing left exposed."""
+    rest, which communication left exposed: of it, the stream's waits for Q/K/V to arrive and
+    for output to land; what remains is packing."""
     return _CLOCK.take()
 
 
@@ -398,7 +421,10 @@ def _exchange(
     engines = copy_engine.for_group(handle)
     starts = range(0, padded, step)
     crossed = submitted = False
-    began, inner = _Clock.mark(query), []
+    began = _Clock.mark(query)
+    inner: list[Any] = []
+    arrived: list[Any] = []
+    landed: list[Any] = []
     try:
         out = query.new_empty((batch, mine, padded, dim))
         sources = (query, key, value)
@@ -408,7 +434,7 @@ def _exchange(
         returning: list[tuple[Wait, Tensor, int]] = []
         for index, start in enumerate(starts):
             wait, receives = arriving.pop()
-            wait()
+            _waited(query, wait, arrived)
             del wait  # its sends go: the current stream is past their crossing
             if index + 1 < len(starts):
                 following = starts[index + 1]
@@ -422,7 +448,7 @@ def _exchange(
             if attended.shape != (batch, total, local, dim) or attended.dtype != query.dtype:
                 raise ValueError("Ulysses attention returned incompatible output")
             if returning:
-                _land(out, *returning.pop(), world)
+                _land(out, *returning.pop(), world, landed)
             flat = attended.permute(1, 0, 2, 3).contiguous()
             del attended
             returned = query.new_empty((world * mine, batch, local, dim))
@@ -430,7 +456,7 @@ def _exchange(
                 (_start(handle, engines, [flat], [returned], back, rank), returned, start)
             )
             del flat, returned
-        _land(out, *returning.pop(), world)
+        _land(out, *returning.pop(), world, landed)
         submitted = True
     except BaseException:
         if crossed:
@@ -443,7 +469,7 @@ def _exchange(
     _CLOCK.add(
         began,
         _Clock.mark(query),
-        inner,
+        (inner, arrived, landed),
         len(starts) * row * (3 * mine * (world - 1) + total - mine),
     )
     return out[:, :, :heads] if padded != heads else out
