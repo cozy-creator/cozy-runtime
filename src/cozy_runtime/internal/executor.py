@@ -323,6 +323,12 @@ def _sealed_entries() -> tuple[str, ...]:
     )
 
 
+def _seal_fits(degree: int) -> bool:
+    """A GPU group is sealed to one device per rank; with none sealed, its ranks run on the CPU over gloo."""
+    entries = _sealed_entries()
+    return degree <= 1 or not entries or degree == len(entries)
+
+
 def _gpu_numbers(degree: int) -> list[int]:
     """The group's GPUs as nvidia-smi numbers them, from the seal's entries."""
     entries = _sealed_entries()[:degree]
@@ -1774,7 +1780,7 @@ class Executor:
         cuda_start = (
             self.device_kind == "cuda" and bool(command.devices) and not command.import_only
         )
-        if degree != expected or (degree > 1 and degree != len(_sealed_entries())):
+        if degree != expected or not _seal_fits(degree):
             self.poisoned = "sequence-parallel degree mismatch"
             return {
                 "ok": False,
@@ -1802,11 +1808,13 @@ class Executor:
                 "detail": f"the start names no readable PackageInterface: {exc}"[:900],
             }
         # Run 6132: an environment without torch runs on the devices it was given, untouched.
-        device = bool(command.devices) and importlib.util.find_spec("torch") is not None
-        constructs = device and any(
+        torch_present = importlib.util.find_spec("torch") is not None
+        device = bool(command.devices) and torch_present
+        builds = torch_present and any(
             not slot.weights for entry in interface.entrypoints for slot in entry.models
         )
-        if degree > 1 and not constructs:
+        constructs = device and builds
+        if degree > 1 and not builds:
             self.poisoned = "sequence-parallel construction unsupported"
             return {
                 "ok": False,
@@ -1917,7 +1925,13 @@ class Executor:
                             f"{reply.get('detail', '')}"[:800],
                             code="group_unformed",
                         )
-                if not command.import_only:
+                if not command.import_only and self.group.backend != "nccl":
+                    import torch
+
+                    self.torch = torch
+                    self.pg = self.group.form(torch, _SEALED)
+                    stage("group_form")
+                elif not command.import_only:
                     measured = links.measured(
                         links.directory(_SEALED),
                         _sealed_entries()[:degree],
@@ -2352,7 +2366,7 @@ class Executor:
         # mismatch refuses before any weight moves. Degree 1 (or absent) is a plain
         # executor, whatever the seal's width.
         degree = command.sequence_parallel_degree or 1
-        if degree != max(self.world, 1) or (degree > 1 and degree != len(_sealed_entries())):
+        if degree != max(self.world, 1) or not _seal_fits(degree):
             self.poisoned = "sequence-parallel degree mismatch"
             return {
                 "ok": False,
