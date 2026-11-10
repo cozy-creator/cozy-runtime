@@ -2765,6 +2765,12 @@ class Executor:
             # tiers it (§1.1).
             custody=binding.custody,
             unnormalized=normalized(config_checkpoint),
+            files=functools.partial(
+                stock.folder,
+                self.root / "models",
+                config_checkpoint.ck,
+                {name: checkpoint.ck for name, checkpoint in checkpoints.items()},
+            ),
         )
         adapter_graphs = [
             (checkpoint.id, checkpoint.asset(component, model_config.ADAPTERS))

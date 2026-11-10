@@ -372,7 +372,7 @@ class _File:
         func = node.func
         dotted = self._resolve(func)
         if isinstance(func, ast.Attribute):
-            if func.attr in ("from_pretrained", "from_single_file"):
+            if func.attr == "from_single_file":
                 self._add(node, "weights_io", f".{func.attr}(...)")
             if func.attr in ("wait_stream", "wait_event", "record_event") and (
                 isinstance(func.value, ast.Call)

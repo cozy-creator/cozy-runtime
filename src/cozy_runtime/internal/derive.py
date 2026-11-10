@@ -506,6 +506,7 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         seen.register(made[id(held)])
 
     def built() -> None:
+        stock.settle()
         made: dict[int, Any] = {}
         for module, name, held in constants:
             if module._parameters.get(name) is held:
@@ -545,6 +546,7 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         stack.callback(built)  # constants a construction outside `loader.construct` made
         stack.callback(BUILT.reset, BUILT.set(built))
         stack.enter_context(refuse_compile())
+        stack.enter_context(stock.routing())
         stack.enter_context(_capability(cap))
         stack.enter_context(_guard_mode(seen))
         yield cap

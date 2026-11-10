@@ -14,6 +14,10 @@ the single backend path. `load(T)` is sugar over a REGISTERED exact adapter and 
 duck-types `from_pretrained`. The runtime keeps no matcher of its own: a verdict that is
 not `ok` is the typed refusal `model_fit_refused`, carrying the Fit document verbatim.
 
+`loader.path` is the bound model's folder without weights: inside `load()`, `X.from_pretrained(
+loader.path, ...)` builds a Diffusers or Transformers model from it (`internal/stock.py`), and
+everything so built is filled as one construction when `load()` returns (`_finish`).
+
 Deliberately absent, and not to be added here: any checkpoint path, source carrier, catalog
 ref, device/dtype override, offload/pin/eviction knob, compile hook or selection surface.
 `Loader.engine(EngineSpec)` is the engine-hosted tier and rides cr-018/se-007 — no stub.
@@ -30,6 +34,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_checkable
 
@@ -55,6 +60,9 @@ FILLED: ContextVar[Callable[[object], None] | None] = ContextVar("filled", defau
 
 #: Told when a factory returned, before its census: the substrate's constants go weightless.
 BUILT: ContextVar[Callable[[], None] | None] = ContextVar("built", default=None)
+
+#: The loader whose `load()` runs on this context: `from_pretrained` builds into it.
+LOADING: ContextVar[Loader | None] = ContextVar("loading", default=None)
 
 
 # ---------------------------------------------------------------------- tensor schema
@@ -400,6 +408,8 @@ class Artifact:
     unnormalized: str = ""
     """Set when the checkpoint was stored as-is from an unrecognized layout: why, and the
     fix. A construction that fails on it refuses `checkpoint_unnormalized` with this text."""
+    files: Callable[[], Path] | None = field(default=None, repr=False, compare=False)
+    """Makes the model's folder without weights (`Loader.path`), on first use."""
     _prepare: Callable[[object], None] | None = field(default=None, repr=False, compare=False)
     _adapters: tuple[AdapterRef, ...] = ()
     _selection_snapshot: str = ""
@@ -442,9 +452,7 @@ class ModelAssets:
     """Verified read-only model files embedded in one CozyTensors artifact.
 
     Names are header paths, never config values. Reads return immutable bytes straight from
-    the checkpoint, whatever their size; there is no filesystem view. A path-only constructor is fed
-    the parsed bytes instead (e.g. a tokenizer's vocab dict and merges list): model loading
-    writes nothing, and a derivation's sandbox refuses any write.
+    the checkpoint, whatever their size. The same files as a folder are `Loader.path`.
     """
 
     def __init__(self, values: Mapping[str, bytes], guard: Callable[[str], None]) -> None:
@@ -794,10 +802,12 @@ class Loader:
         "_assets",
         "_backend",
         "_caches",
+        "_folder",
         "_mode",
         "_objects",
         "_open",
         "_owner",
+        "_pretrained",
         "_records",
     )
 
@@ -818,6 +828,9 @@ class Loader:
         self._records: list[ConstructionRecord] = []
         self._objects: list[object] = []
         self._caches: list[DerivedCache] = []
+        self._folder: Path | None = None
+        #: component -> the root `from_pretrained` built for it in this `load()`
+        self._pretrained: dict[str, object] = {}
 
     @property
     def device(self) -> Device:
@@ -825,6 +838,21 @@ class Loader:
         not a door."""
         self._require_open("loader.device")
         return device()
+
+    @property
+    def path(self) -> Path:
+        """The bound model's folder as its Diffusers or Transformers release lays it out:
+        `model_index.json`, each component's config, its tokenizer, processor and scheduler files,
+        never its weights; read-only. `X.from_pretrained(loader.path, ...)` builds from it."""
+        self._require_open("loader.path")
+        if self._folder is None:
+            if self._artifact.files is None:
+                raise CapabilityError(
+                    "this model has no folder: it is not a checkpoint the Runtime opened",
+                    code="model_folder_absent",
+                )
+            self._folder = self._artifact.files().resolve()
+        return self._folder
 
     @property
     def assets(self) -> ModelAssets:
@@ -920,6 +948,16 @@ class Loader:
         self._caches.append(cache)
         return cache
 
+    def _stored(self, key: str) -> TensorSpec | None:
+        """The checkpoint's row for a component-qualified destination, if it stores one."""
+        return self._artifact.tensor_schema.get(key)
+
+    def _finish(self) -> None:
+        """`load()` returned: what `from_pretrained` built in it is filled, as one construction."""
+        if self._pretrained:
+            built = Pretrained(dict(self._pretrained))
+            self.construct(lambda _: built)
+
     def records(self) -> tuple[ConstructionRecord, ...]:
         return tuple(self._records)
 
@@ -976,6 +1014,13 @@ class Loader:
         if (filled := FILLED.get()) is not None:
             filled(obj)
         return len(done), total
+
+
+@dataclass(frozen=True, slots=True)
+class Pretrained:
+    """What `from_pretrained` built in one `load()`, by component: one construction."""
+
+    components: Mapping[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1135,7 +1180,9 @@ def factory_type(factory: Callable[[Config], object]) -> type | None:
 @contextmanager
 def loading(loader: Loader) -> Iterator[Loader]:
     """A loader lives exactly as long as the load/unload call it was made for."""
+    token = LOADING.set(loader)
     try:
         yield loader
     finally:
+        LOADING.reset(token)
         loader.close()
