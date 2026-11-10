@@ -19,7 +19,7 @@ import threading
 from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, TypedDict, cast
+from typing import IO, TYPE_CHECKING, NotRequired, TypedDict, cast
 
 import tensorfs
 from tensorfs import Checkpoint as Checkpoint
@@ -73,6 +73,16 @@ class Bearers:
     def latest(self, actor: str, endpoint: str) -> str:
         held = self._latest.get((actor, endpoint))
         return "" if held is None else held[0]
+
+
+class DerivationWork(TypedDict):
+    """`Derivation.work`: what a derived output's replay key reads."""
+
+    base: str | None
+    sources: list[str]
+    order: list[list[str]]
+    max_new_bytes: int
+    provenance: NotRequired[dict[str, MetadataInput]]
 
 
 class ReusedQuantization(TypedDict):
@@ -186,9 +196,9 @@ class Derivation:
     #: The header's `provenance`: the recipe that writes it (`derive.recipes`).
     provenance: Mapping[str, MetadataInput] | None = None
 
-    def work(self, max_new_bytes: int) -> dict[str, object]:
+    def work(self, max_new_bytes: int) -> DerivationWork:
         """The derivation as its replay key reads it."""
-        work: dict[str, object] = {
+        work: DerivationWork = {
             "base": None if self.base is None else self.base.id,
             "sources": [source.id for source in self.sources],
             "order": [[component, key] for component, key in self.order],
