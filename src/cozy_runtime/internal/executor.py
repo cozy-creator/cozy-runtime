@@ -2841,6 +2841,8 @@ class Executor:
         object.__setattr__(model, "_cozy_residency", self.residency)
         # Its components' calls replay CUDA graphs once recorded (`graphs`), unless uncaptured.
         graphs.install(self.torch, model, {name: m.module for name, m in backend.models.items()})
+        # A plain loop's component call takes its request's numerics flags, as a method's scope.
+        contract.install(roots.values())
         stage_memo.install(
             model,
             torch=torch,
@@ -3229,7 +3231,7 @@ class Executor:
         recipes = package_interface.parse(Path(path).read_bytes(), path).recipes
         discovered = discover_installed(application, recipes=recipes)
         if torch is not None and (moved := contract.restore_flags(torch)):
-            # A library's import moved them (a package's own write is refused at describe).
+            # A library's import moved them (a package's own write is the package's flags).
             print(
                 f"[executor] put back numerics flags moved while importing "
                 f"{application}: {', '.join(moved)}",

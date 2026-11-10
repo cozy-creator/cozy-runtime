@@ -651,8 +651,8 @@ class Sealed(Protocol):
     def leave(self, entered: Sealing, method: str, ok: bool) -> None: ...
 
 
-#: The package contract's checks at each local scope (`internal/contract._Scopes`: the flags a
-#: package may not move, a refusal it returned past), installed when the executor seals torch.
+#: The package contract's checks at each local scope (`internal/contract._Scopes`: its request's
+#: numerics flags, a refusal it returned past), installed when the executor seals torch.
 CONTRACT: list[Sealed | None] = [None]
 
 
@@ -684,9 +684,9 @@ def uses_components(
 
     `deterministic=True`: the method, and what it calls on this GPU, runs with cuDNN
     deterministic and without benchmarking, as do its component calls on a group's other
-    GPUs; the setting is restored when the method returns, and `@memoize` keys on it. Every
-    other global numeric setting is the Runtime's policy; a package never sets
-    `torch.backends.*`.
+    GPUs; the setting is restored when the method returns, and `@memoize` keys on it. A
+    numerics flag the package sets (`torch.backends.*`) applies inside its request's model
+    calls and is put back after.
     """
     components = component_set(names)
     if not isinstance(deterministic, bool):

@@ -323,10 +323,9 @@ A model has exactly three lifecycle methods — `load(loader)`, optional `warm(c
 pre-serving work: the runtime calls it once per construction fill, after the fill and its
 verification and before the placement is DISPATCHABLE, on every worker including dynamic
 placements, with the device lease held and real tensors in place — never again on a component
-stage or evict, and again only when the construction is rebuilt. Whether to compile at all is
-the author's choice; inside `warm` the runtime refuses only the name-renaming
-`torch.compile(module)` spelling (the in-place `module.compile()` is allowed), the `Context`
-carries the device, the fill's deadline and cancellation and can reserve no package call, and
+stage or evict, and again only when the construction is rebuilt. `torch.compile` and
+`module.compile()` do nothing here (the Runtime records CUDA graphs and picks kernels), the
+`Context` carries the device, the fill's deadline and cancellation and can reserve no package call, and
 a raise is a typed construction failure (`warm_failed`, naming the exception) that keeps the
 placement OFFLINE. Its wall time is the `warm` leg of the prepare, on the fill's boot record.
 There is no entrypoint-level warm pass and no `ctx.boot_warmup`.

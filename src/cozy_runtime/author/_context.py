@@ -163,6 +163,8 @@ class Context:
     #: `progress(step, total)`'s frame, and a model method call's (`uses_components`) activity
     _progress: Callable[[int, int], None] | None = field(default=None, repr=False)
     _called: Callable[[str], None] | None = field(default=None, repr=False)
+    #: the package contract's state for this request: its own random streams and numerics flags
+    _contract: object = field(default=None, repr=False, compare=False)
 
     def tensorfs_source(self, weights: Weights[Model[object]]) -> Checkpoint:
         """An admitted `Weights` argument's checkpoint: its pipeline, components and stored
