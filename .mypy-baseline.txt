@@ -114,44 +114,6 @@ src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not 
 src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/fusion/_kernels.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/accel/fusion/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 10 to "channel_norm_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 11 to "channel_norm_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 11 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 12 to "channel_norm_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 12 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 13 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 14 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 15 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 15 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 16 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 16 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 17 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 17 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 18 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 18 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 19 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 19 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 2 to "_round" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 20 to "head_norm_rope_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 20 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 21 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 22 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 23 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 24 to "norm_modulate_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 4 to "_normed" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 5 to "_normed" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 6 to "_normed" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 8 to "swiglu_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 9 to "channel_norm_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/fusion/_kernels.py: [no-any-unimported] Argument 9 to "swiglu_kernel" becomes "Any" due to an unfollowed import
 src/cozy_runtime/accel/fusion/_kernels.py: [unreachable] Statement is unreachable
 src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
@@ -171,7 +133,6 @@ src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/kernels.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/accel/kernels.py: [misc] Type of decorated function contains type "Any" ("def (*tensors: Any) -> _GeneratorContextManager[None, None, None]")
 src/cozy_runtime/accel/kernels.py: [union-attr] Item "None" of "Any | None" has no attribute "_version"
 src/cozy_runtime/accel/lora.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/moe/__init__.py: [arg-type] Argument 1 to "_address" has incompatible type "Any | Tensor | Module"; expected "Tensor"
@@ -196,29 +157,6 @@ src/cozy_runtime/accel/moe/__init__.py: [unreachable] Right operand of "and" is 
 src/cozy_runtime/accel/moe/__init__.py: [unused-ignore] Unused "type: ignore" comment
 src/cozy_runtime/accel/moe/__init__.py: [unused-ignore] Unused "type: ignore" comment
 src/cozy_runtime/accel/moe/_kernels.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/accel/moe/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/accel/moe/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/accel/moe/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/accel/moe/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/accel/moe/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 10 to "experts_int8_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 10 to "grouped_bf16_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 11 to "experts_int8_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 11 to "grouped_bf16_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 12 to "grouped_bf16_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 12 to "grouped_int8_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 13 to "grouped_bf16_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 13 to "grouped_int8_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 14 to "grouped_bf16_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 14 to "grouped_int8_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 15 to "grouped_int8_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 16 to "grouped_int8_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 6 to "_tile" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 7 to "_tile" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 8 to "_tile" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 8 to "experts_bf16_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 9 to "_tile" becomes "Any" due to an unfollowed import
-src/cozy_runtime/accel/moe/_kernels.py: [no-any-unimported] Argument 9 to "experts_bf16_kernel" becomes "Any" due to an unfollowed import
 src/cozy_runtime/accel/moe/_kernels.py: [unreachable] Statement is unreachable
 src/cozy_runtime/accel/rows.py: [arg-type] Argument 1 to "get" of "dict" has incompatible type "Any | None"; expected "str"
 src/cozy_runtime/accel/rows.py: [arg-type] Argument 1 to "rows" has incompatible type "Tensor | Module"; expected Module
@@ -739,32 +677,12 @@ src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not all
 src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_fp8.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/attention_fp8.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 5 to "_amax" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 6 to "_amax" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 6 to "_cast" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 7 to "_amax" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 7 to "_cast" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_fp8.py: [no-any-unimported] Argument 8 to "_cast" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/attention_fp8.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/attention_kitchen_sol.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_kitchen_sol.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_kitchen_sol.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/attention_registry.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [no-any-unimported] Argument 5 to "finish_mean" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [no-any-unimported] Argument 6 to "finish_mean" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [no-any-unimported] Argument 7 to "finish_mean" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [no-any-unimported] Argument 7 to "partial_mean" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [no-any-unimported] Argument 8 to "partial_mean" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_sage2_fixed_mean.py: [no-any-unimported] Argument 9 to "partial_mean" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_sage3_fixed.py: [misc] Function is untyped after decorator transformation
 src/cozy_runtime/internal/attention_sage3_fixed.py: [no-any-return] Returning Any from function declared to return "Tensor"
-src/cozy_runtime/internal/attention_sage3_fixed.py: [no-any-unimported] Argument 18 to "center_and_correct" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_sage3_fixed.py: [no-any-unimported] Argument 19 to "center_and_correct" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_sage3_fixed.py: [no-any-unimported] Argument 20 to "center_and_correct" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/attention_site.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_site.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_sol.py: [assignment] Incompatible types in assignment (expression has type "Any | None", variable has type "Callable[..., Any]")
@@ -796,11 +714,7 @@ src/cozy_runtime/internal/attention_sol.py: [no-any-return] Returning Any from f
 src/cozy_runtime/internal/attention_sol.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/attention_sol.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/internal/attention_sol.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/internal/attention_sol_fa4.py: [misc] Function is untyped after decorator transformation
 src/cozy_runtime/internal/attention_sol_fa4.py: [no-any-return] Returning Any from function declared to return "Tensor"
-src/cozy_runtime/internal/attention_sol_fa4.py: [no-any-unimported] Argument 14 to "_approximate_and_merge" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_sol_fa4.py: [no-any-unimported] Argument 15 to "_approximate_and_merge" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/attention_sol_fa4.py: [no-any-unimported] Argument 16 to "_approximate_and_merge" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
@@ -846,90 +760,7 @@ src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allo
 src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/contract.py: [misc] Type of decorated function contains type "Any" ("_Wrapped[[VarArg(Any), KwArg(Any)], Any, [VarArg(Any), KwArg(Any)], Any]")
-src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 10 to "_blocks_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 10 to "_code" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 10 to "_grid" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 11 to "_code" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 12 to "_code" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 13 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 13 to "_code" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 14 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 14 to "_code" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 15 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 15 to "_code" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 16 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 16 to "_code" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 16 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 17 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 17 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 18 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 18 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 19 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 19 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 20 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 20 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 21 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 21 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 22 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 22 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 23 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 24 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 24 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 25 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 25 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 26 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 27 to "_affine_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 27 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 28 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 29 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 30 to "_table_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 4 to "_word" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 5 to "_blocks_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 5 to "_by_post" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 5 to "_store" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 6 to "_blocks_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 7 to "_blocks_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 8 to "_blocks_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 8 to "_grid" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 9 to "_blocks_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Argument 9 to "_grid" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Type of variable becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_cores.py: [no-any-unimported] Type of variable becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/decode_cores.py: [unreachable] Statement is unreachable
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/decode_schemes.py: [no-any-unimported] Argument 4 to "_k_quant" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/decode_schemes.py: [no-any-unimported] Argument 5 to "_k_quant" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/decode_schemes.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/delivery.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/derive.py: [explicit-any] Explicit "Any" is not allowed
@@ -969,7 +800,6 @@ src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is n
 src/cozy_runtime/internal/encoding/leaves.py: [unused-ignore] Unused "type: ignore" comment
 src/cozy_runtime/internal/encoding/selection.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/encoding/selection.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/execution/__init__.py: [no-untyped-call] Call to untyped function "Event" in typed context
 src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
@@ -980,7 +810,6 @@ src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is n
 src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/execution/catch.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/execution/catch.py: [misc] Type of decorated function contains type "Any" ("_Wrapped[[VarArg(Any), KwArg(Any)], Any, [VarArg(object), KwArg(object)], object]")
-src/cozy_runtime/internal/execution/catch.py: [no-untyped-call] Call to untyped function "is_initialized" in typed context
 src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 1 to "len" has incompatible type "Tensor | Module"; expected "Sized"
 src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 1 to "peak" has incompatible type "Tensor | int"; expected "int"
 src/cozy_runtime/internal/execution/cuts.py: [arg-type] Argument 2 to "peak" has incompatible type "tuple[int, Tensor | int]"; expected "Sequence[int]"
@@ -1155,16 +984,7 @@ src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is no
 src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/kernel_sources.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/kernel_sources.py: [misc] Type of decorated function contains type "Any" ("Callable[[Mapping[str, Any], Path, Callable[[float], None]], dict[str, object]]")
-src/cozy_runtime/internal/kernel_sources.py: [misc] Type of decorated function contains type "Any" ("Callable[[Mapping[str, Any], Path, Callable[[float], None]], dict[str, object]]")
 src/cozy_runtime/internal/lora_bake.py: [arg-type] Argument 5 to "_account" has incompatible type "int"; expected "Tensor"
-src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/lora_bake.py: [misc] Function is untyped after decorator transformation
 src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
@@ -1175,11 +995,6 @@ src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from funct
 src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/lora_bake.py: [no-any-return] Returning Any from function declared to return "Tensor"
-src/cozy_runtime/internal/lora_bake.py: [no-any-unimported] Argument 10 to "_bake_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/lora_bake.py: [no-any-unimported] Argument 10 to "_bake_nvfp4_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/lora_bake.py: [no-any-unimported] Argument 11 to "_bake_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/lora_bake.py: [no-any-unimported] Argument 11 to "_bake_nvfp4_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/lora_bake.py: [no-any-unimported] Argument 9 to "_bake_kernel" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/lora_bake.py: [possibly-undefined] Name "data" may be undefined
 src/cozy_runtime/internal/lora_bake.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/lora_bake.py: [unreachable] Statement is unreachable
@@ -1201,29 +1016,6 @@ src/cozy_runtime/internal/model_values.py: [redundant-cast] Redundant cast to Mo
 src/cozy_runtime/internal/numerical_environment.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/numerical_environment.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/numerical_environment.py: [misc] Type of decorated function contains type "Any" ("Callable[[_Determinism, Any], _GeneratorContextManager[None, None, None]]")
-src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/nvfp4_linear.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 1 to "signature" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 11 to "_gemv" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 12 to "_gemv" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 13 to "_gemv" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 2 to "_nibble" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 2 to "_weights" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 5 to "_gather" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 6 to "_gather" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 6 to "_packed" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 7 to "_scales" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 8 to "_decode" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 8 to "_dequant" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 9 to "_decode" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 9 to "_dequant" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/nvfp4_linear.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/pacing.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/package_interface.py: [explicit-any] Explicit "Any" is not allowed
@@ -1319,7 +1111,6 @@ src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is 
 src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/ulysses.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/parallel/ulysses.py: [no-untyped-call] Call to untyped function "Event" in typed context
 src/cozy_runtime/internal/parallel/ulysses.py: [union-attr] Item "None" of "Work | None" has no attribute "wait"
 src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/wire.py: [explicit-any] Explicit "Any" is not allowed
@@ -1342,14 +1133,6 @@ src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowe
 src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/philox.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/philox.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/philox.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/philox.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/philox.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/philox.py: [no-any-unimported] Argument 5 to "_words_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/philox.py: [no-any-unimported] Argument 6 to "_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/philox.py: [no-any-unimported] Argument 7 to "_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/philox.py: [no-any-unimported] Argument 8 to "_kernel" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/philox.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/philox.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/prebuilt.py: [possibly-undefined] Name "want" may be undefined
@@ -1440,16 +1223,6 @@ src/cozy_runtime/internal/residency.py: [explicit-any] Explicit "Any" is not all
 src/cozy_runtime/internal/residency.py: [misc] Type of decorated function contains type "Any" ("def (self: Binding, stream: Any = ..., *, replay: bool = ...) -> _GeneratorContextManager[dict[Any, Any], None, None]")
 src/cozy_runtime/internal/residency.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/residency.py: [no-any-return] Returning Any from function declared to return "Tensor"
-src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "Event" in typed context
-src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "Event" in typed context
-src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "Event" in typed context
-src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "Event" in typed context
-src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "Event" in typed context
-src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "is_initialized" in typed context
-src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "is_initialized" in typed context
-src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "is_initialized" in typed context
-src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "is_initialized" in typed context
-src/cozy_runtime/internal/residency.py: [no-untyped-call] Call to untyped function "is_initialized" in typed context
 src/cozy_runtime/internal/residency.py: [override] Signature of "__repr__" incompatible with supertype "torch._tensor.Tensor"
 src/cozy_runtime/internal/residency.py: [override] Signature of "__torch_dispatch__" incompatible with supertype "torch._tensor.Tensor"
 src/cozy_runtime/internal/residency.py: [redundant-expr] Left operand of "or" is always false
@@ -1459,10 +1232,6 @@ src/cozy_runtime/internal/residency.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/residency.py: [unused-ignore] Unused "type: ignore" comment
 src/cozy_runtime/internal/residency.py: [unused-ignore] Unused "type: ignore" comment
 src/cozy_runtime/internal/residency.py: [var-annotated] Need type annotation for "rows" (hint: "rows: list[<type>] = ...")
-src/cozy_runtime/internal/sage3.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/sage3.py: [no-any-unimported] Argument 16 to "group_mean_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/sage3.py: [no-any-unimported] Argument 17 to "group_mean_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/sage3.py: [no-any-unimported] Argument 7 to "group_mean_kernel" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
@@ -1483,19 +1252,6 @@ src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is 
 src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/static_invocable.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/svdq_linear.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/svdq_linear.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/svdq_linear.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 10 to "_quantize" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 11 to "_quantize" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 12 to "_quantize" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 13 to "_quantize" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 17 to "_gemm" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 18 to "_gemm" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 19 to "_gemm" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 20 to "_gemm" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 21 to "_gemm" becomes "Any" due to an unfollowed import
-src/cozy_runtime/internal/svdq_linear.py: [no-any-unimported] Argument 22 to "_gemm" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/svdq_linear.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/tolerant.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/tolerant.py: [explicit-any] Explicit "Any" is not allowed
@@ -1663,8 +1419,6 @@ src/cozy_runtime/lm/__init__.py: [misc] Cannot assign to a type
 src/cozy_runtime/lm/__init__.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any], _GeneratorContextManager[None, None, None]]")
 src/cozy_runtime/lm/__init__.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any], _GeneratorContextManager[list[Any], None, None]]")
 src/cozy_runtime/lm/__init__.py: [no-any-return] Returning Any from function declared to return "int"
-src/cozy_runtime/lm/__init__.py: [no-untyped-call] Call to untyped function "Event" in typed context
-src/cozy_runtime/lm/__init__.py: [no-untyped-call] Call to untyped function "Event" in typed context
 src/cozy_runtime/lm/__init__.py: [no-untyped-call] Call to untyped function "__init_subclass__" in typed context
 src/cozy_runtime/lm/__init__.py: [operator] "Tensor" not callable
 src/cozy_runtime/lm/__init__.py: [operator] "Tensor" not callable
@@ -1703,16 +1457,6 @@ src/cozy_runtime/lm/__init__.py: [unused-ignore] Unused "type: ignore" comment
 src/cozy_runtime/lm/__init__.py: [unused-ignore] Unused "type: ignore" comment
 src/cozy_runtime/lm/__init__.py: [unused-ignore] Unused "type: ignore" comment
 src/cozy_runtime/lm/_kernels.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/lm/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/lm/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/lm/_kernels.py: [misc] Function is untyped after decorator transformation
-src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 10 to "conv_steps_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 11 to "conv_steps_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 21 to "recurrent_steps_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 22 to "recurrent_steps_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 23 to "recurrent_steps_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 7 to "conv_step_kernel" becomes "Any" due to an unfollowed import
-src/cozy_runtime/lm/_kernels.py: [no-any-unimported] Argument 8 to "conv_step_kernel" becomes "Any" due to an unfollowed import
 src/cozy_runtime/lm/_kernels.py: [unreachable] Statement is unreachable
 src/cozy_runtime/vlm.py: [assignment] Incompatible types in assignment (expression has type "GenerationConfig", variable has type "Tensor | Module")
 src/cozy_runtime/vlm.py: [explicit-any] Explicit "Any" is not allowed
