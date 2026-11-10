@@ -225,14 +225,14 @@ class Placeholder(Tensor):
             cls, tuple(shape), dtype=dtype, device=device, storage_size=0
         )
 
-    def __repr__(self) -> str:
+    def __repr__(self, *, tensor_contents: object = None) -> str:
         return f"UnboundWeight({tuple(self.shape)}, {self.dtype}, {self.device})"
 
     def _varena_read(self) -> Tensor:  # type: ignore[no-redef]  # the default; a made copy's own reads its source
         raise ResidencyError("this weight has no declared source")
 
     @classmethod
-    def __torch_dispatch__(  # type: ignore[explicit-any]  # torch hands over any ATen op's operands and result
+    def __torch_dispatch__(  # type: ignore[explicit-any, override]  # any op, any operands
         cls,
         func: OpOverload[..., Any],
         types: Sequence[type],
