@@ -212,7 +212,7 @@ class Declared:
     finals: BindingLayout | None = None
 
 
-class Placeholder(Tensor):  # type: ignore[misc]  # Torch is optional in the checking environment.
+class Placeholder(Tensor):
     """Metadata between binds; a real read obtains ordinary owning Torch storage."""
 
     _varena_read: Callable[[], Tensor]
@@ -906,7 +906,7 @@ class Binding:
             self.completion_lost = True
             _UNPROVEN.append(self)
         error = torch.AcceleratorError(f"graph completion is unproven; retire executor: {cause}")
-        error.error_code = 999
+        error.error_code = 999  # type: ignore[attr-defined]  # torch's CUDA errors carry it; its stub doesn't
         raise error from cause
 
     def _finish(self, stream: torch.cuda.Stream | None) -> None:
@@ -1166,7 +1166,8 @@ class Memory:
         if self.device.type != "mps":
             if sys.platform == "linux":
                 return max(proctree.available_host_bytes(), 0)
-            return host_memory().free_bytes
+            else:
+                return host_memory().free_bytes
         figures = allocation(torch, "mps")
         free = int(figures["driver_free_bytes"])
         if self.budget_bytes is not None:
@@ -1386,7 +1387,7 @@ class Memory:
                 for hold in list(model.holds):
                     hold.shed()
                 with self.lock:
-                    if model.users or any(
+                    if model.users or any(  # type: ignore[redundant-expr]  # the calls above may open a user
                         b.count or b.retained or b.loading for b in model.groups()
                     ):
                         raise StaleBinding(
@@ -1922,7 +1923,7 @@ class Memory:
                     request.final_hits += 1
         block.final_data = _finals(block, raw)
 
-    @torch.inference_mode(False)  # type: ignore[untyped-decorator]
+    @torch.inference_mode(False)
     def _ensure(self, block: _Block, reclaim: bool, overlay: Hashable) -> None:
         if block.data is not None:
             return
@@ -3047,8 +3048,8 @@ def _layout(
         offset = 0
         for key, parts in block.parts.items():
             for role, part in parts.items():
-                for name, source in aliases[key].items():
-                    if source == role:
+                for name, aliased in aliases[key].items():
+                    if aliased == role:
                         for site in model.sites[name]:
                             block.raw_views[(id(site.table), site.name)] = (offset, part)
                 offset += (part.nbytes + 255) // 256 * 256
@@ -3225,7 +3226,7 @@ def uncached(module: nn.Module) -> None:
     for sub in module.modules():
         config = getattr(sub, "config", None)
         transformers = any(c.__module__.startswith("transformers.") for c in type(config).__mro__)
-        if transformers and getattr(config, "use_cache", None):
+        if config is not None and transformers and getattr(config, "use_cache", None):
             config.use_cache = False
 
 
@@ -3312,7 +3313,7 @@ def _gathering(module: nn.Module, memory: Memory) -> list[RemovableHandle]:
 
 def _paired(
     module: nn.Module,
-    enter: Callable[..., None],
+    enter: Callable[[tuple[object, ...], dict[str, object]], None],
     leave: Callable[[], None],
     owner: Model,
 ) -> list[RemovableHandle]:
