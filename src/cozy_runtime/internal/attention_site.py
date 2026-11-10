@@ -8,9 +8,10 @@ Runtime selection, outside an executor), the site runs torch's SDPA.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from diffusers.models.attention_dispatch import AttentionBackendName
     from torch import Tensor
 
 from cozy_runtime.internal import attention_ulysses
@@ -20,8 +21,10 @@ from cozy_runtime.internal import attention_upstream as upstream
 class Site:
     """A Runtime site's processor."""
 
-    _attention_backend: Any = None
-    _parallel_config: Any = None
+    #: the selected kernel's backend (`attention.install`), its name or Diffusers' member
+    _attention_backend: str | AttentionBackendName | None = None
+    #: Diffusers' context-parallel config, which a backend call passes through
+    _parallel_config: object = None
 
     def dispatch(
         self,

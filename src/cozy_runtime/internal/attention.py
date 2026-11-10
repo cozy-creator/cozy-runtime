@@ -37,7 +37,7 @@ from functools import partial
 from importlib import import_module, util
 from pathlib import Path
 from types import ModuleType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import msgspec
 
@@ -63,10 +63,13 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal import attention_upstream as upstream
 from cozy_runtime.internal.attention_site import Site
-from cozy_runtime.internal.attention_ulysses import Local
+from cozy_runtime.internal.attention_ulysses import BackendCall, Local
 from cozy_runtime.internal.encoding.formats import Tensor
 from cozy_runtime.internal.encoding.selection import DeviceFacts
 from cozy_runtime.internal.executor_commands import Choice
+
+if TYPE_CHECKING:
+    from diffusers.models.attention_dispatch import AttentionBackendName, _AttentionBackendRegistry
 
 # Tensors, torch modules and Diffusers' registry, backend members and processors are `Any`:
 # neither torch nor diffusers is installed in the check venv.
@@ -516,7 +519,7 @@ class Ready:
     (`attention_ulysses.function`), which Diffusers' member and a Runtime site both reach."""
 
     candidate: Candidate
-    function: Any
+    function: BackendCall
     #: The compiled artifact serving it: flat string fields, as an observation row carries them.
     artifact: dict[str, str] | None = None
 
@@ -525,7 +528,7 @@ class Ready:
         return self.candidate.name
 
 
-def _registry() -> Any:
+def _registry() -> type[_AttentionBackendRegistry]:
     """Diffusers' attention backend registry, or a typed absence."""
     try:
         from diffusers.models.attention_dispatch import _AttentionBackendRegistry
@@ -537,17 +540,17 @@ def _registry() -> Any:
     return _AttentionBackendRegistry
 
 
-def _member(candidate: Candidate) -> Any:
+def _member(candidate: Candidate) -> AttentionBackendName:
     """The Diffusers member serving this candidate, registered on first use."""
     return attention_ulysses.member(candidate.backend, _local(candidate))
 
 
-def _function(candidate: Candidate) -> Any:
+def _function(candidate: Candidate) -> BackendCall:
     """This candidate's backend call, with no Diffusers."""
     return attention_ulysses.function(candidate.backend, _local(candidate))
 
 
-def _handle(processor: object, entry: Ready) -> Any:
+def _handle(processor: object, entry: Ready) -> str | AttentionBackendName:
     """What a site's processor dispatches by: a Runtime site its backend's name, a Diffusers
     processor Diffusers' member."""
     return entry.candidate.backend if isinstance(processor, Site) else _member(entry.candidate)
@@ -577,7 +580,15 @@ def _local(candidate: Candidate) -> Local:
     return found
 
 
-def _dense_rows(candidate: Candidate) -> Any:
+class DenseRows(Protocol):
+    """A sparse kernel's dense rows: `(query=, key=, value=, scale=)`."""
+
+    def __call__(
+        self, *, query: Tensor, key: Tensor, value: Tensor, scale: float | None
+    ) -> Tensor: ...
+
+
+def _dense_rows(candidate: Candidate) -> DenseRows:
     """A sparse kernel's dense rows on CANDIDATE: `(query=, key=, value=, scale=)`."""
     local = _local(candidate)
 

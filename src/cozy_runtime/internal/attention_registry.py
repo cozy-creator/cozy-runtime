@@ -1,18 +1,21 @@
 """One bridge for Runtime-owned backends into Diffusers' closed backend enum."""
 
-from collections.abc import Callable, Sequence
-from typing import Any
+from __future__ import annotations
 
-# Diffusers' backend functions and enum members are `Any`: diffusers is not in the check venv.
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from diffusers.models.attention_dispatch import AttentionBackendName
 
 
 def register(
     name: str,
-    function: Callable[..., Any],
+    function: Callable[..., object],  # type: ignore[explicit-any]  # Diffusers takes any backend
     *,
-    constraints: Sequence[Callable[..., Any]] = (),
+    constraints: Sequence[Callable[..., bool]] = (),  # type: ignore[explicit-any]  # Diffusers' checks
     supports_context_parallel: bool = False,
-) -> Any:
+) -> AttentionBackendName:
     """Register once without changing Diffusers' global active backend.
 
     Diffusers 0.40 accepts registry entries but converts every dispatch name through

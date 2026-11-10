@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from cozy_runtime.internal.attention_ulysses import PartialOptions
 
 from cozy_runtime.internal import attention_sol
-from cozy_runtime.internal.attention_ulysses import Local
+from cozy_runtime.internal.attention_ulysses import Implementation, Local
 
 
 def sparse(
@@ -53,7 +53,7 @@ def forward(
     )
 
 
-def _named(implementation: str) -> Callable[..., str]:
+def _named(implementation: str) -> Implementation:
     return lambda *_: implementation
 
 
