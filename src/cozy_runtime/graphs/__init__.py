@@ -1304,13 +1304,13 @@ def _record(
                 reserve = vt.pool_bytes(peak[0]) + sum(
                     entry.held_bytes for entry in recorder.recordings.values()
                 )
-                if recorder.pool is None:
-                    recorder.pool = (
+                pool = recorder.pool
+                if pool is None:
+                    pool = recorder.pool = (
                         placed[0].graph_pool(placed[1])
                         if placed is not None
                         else domain.Pool(torch.cuda.graph_pool_handle())
                     )
-                pool = recorder.pool
                 # Its static inputs are the pool's, made in the capture (an allocation launches
                 # nothing), so their storage stays owned with the graph.
                 statics: list[Any] = []
