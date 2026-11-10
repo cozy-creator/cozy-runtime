@@ -2638,7 +2638,7 @@ class _Engine:
                     if (binding := self.addresses.get(id(module))) is not None:
                         stack.enter_context(binding.prepare(current))
                 domain.initialize()
-                side = domain.stream
+                side = cast("torch.cuda.Stream", domain.stream)  # initialize() sets it
                 side.wait_stream(current)
                 domain.prime_blas()
                 stack.enter_context(torch.cuda.stream(side))
