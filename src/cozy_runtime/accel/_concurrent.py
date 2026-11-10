@@ -6,7 +6,7 @@ import contextvars
 import functools
 import threading
 from collections.abc import Callable
-from typing import Any, overload
+from typing import overload
 
 from cozy_runtime.author._model import Model
 
@@ -25,7 +25,7 @@ def concurrently[A, B, C, D](
 ) -> tuple[A, B, C, D]: ...
 @overload
 def concurrently[T](*calls: Callable[[], T]) -> tuple[T, ...]: ...
-def concurrently(*calls: Callable[[], Any]) -> tuple[Any, ...]:
+def concurrently(*calls: Callable[[], object]) -> tuple[object, ...]:
     """Run independent calls; the results, in call order, once every call has finished.
 
     The author's statement: no call reads what another writes before this returns, and each
@@ -38,10 +38,10 @@ def concurrently(*calls: Callable[[], Any]) -> tuple[Any, ...]:
     A failure stops the calls not yet started here; the running ones finish, and the first
     failure in call order is raised.
     """
-    results: list[Any] = [None] * len(calls)
+    results: list[object] = [None] * len(calls)
     failures: list[BaseException | None] = [None] * len(calls)
     beside: list[threading.Thread] = []
-    local: list[tuple[int, Callable[[], Any]]] = []
+    local: list[tuple[int, Callable[[], object]]] = []
     for index, call in enumerate(calls):
         carried = _remote(call)
         if carried is None:
@@ -73,7 +73,10 @@ def concurrently(*calls: Callable[[], Any]) -> tuple[Any, ...]:
 
 
 def _capture(
-    call: Callable[[], Any], results: list[Any], failures: list[BaseException | None], index: int
+    call: Callable[[], object],
+    results: list[object],
+    failures: list[BaseException | None],
+    index: int,
 ) -> None:
     try:
         results[index] = call()
@@ -81,9 +84,9 @@ def _capture(
         failures[index] = exc
 
 
-def _remote(call: Callable[[], Any]) -> Callable[[], Any] | None:
+def _remote[T](call: Callable[[], T]) -> Callable[[], T] | None:
     """`call` carried to another thread when it is a Model method whose scope is remote."""
-    func: Any = call
+    func: object = call
     while isinstance(func, functools.partial):
         func = func.func
     owner = getattr(func, "__self__", None)
