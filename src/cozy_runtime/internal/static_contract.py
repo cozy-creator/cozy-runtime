@@ -216,7 +216,7 @@ def _aliases(reader: Reader, module: Module, nodes: Sequence[ast.AST]) -> dict[s
             for alias in node.names:
                 if alias.name != "*":
                     out[alias.asname or alias.name] = f"{base}.{alias.name}" if base else alias.name
-    assigned: dict[str, list[ast.expr]] = {}
+    assigned: dict[str, list[ast.AST]] = {}
     for node in nodes:
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -238,7 +238,7 @@ def _aliases(reader: Reader, module: Module, nodes: Sequence[ast.AST]) -> dict[s
             ),
         ):
             for name in _bound(node):
-                assigned.setdefault(name, []).append(node)  # type: ignore[arg-type]
+                assigned.setdefault(name, []).append(node)
     for name, values in assigned.items():
         if name in out or len(values) != 1 or not isinstance(values[0], (ast.Name, ast.Attribute)):
             continue
@@ -248,7 +248,14 @@ def _aliases(reader: Reader, module: Module, nodes: Sequence[ast.AST]) -> dict[s
     return out
 
 
-def _bound(node: ast.AST) -> Iterator[str]:
+def _bound(
+    node: ast.For
+    | ast.comprehension
+    | ast.With
+    | ast.FunctionDef
+    | ast.AsyncFunctionDef
+    | ast.Lambda,
+) -> Iterator[str]:
     """Names a loop, `with`, comprehension or function binds (its arguments)."""
     targets: list[ast.AST] = []
     if isinstance(node, (ast.For, ast.comprehension)):
@@ -256,7 +263,7 @@ def _bound(node: ast.AST) -> Iterator[str]:
     elif isinstance(node, ast.With):
         targets = [item.optional_vars for item in node.items if item.optional_vars is not None]
     else:
-        args = node.args  # type: ignore[attr-defined]
+        args = node.args
         yield from (a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs))
         yield from (a.arg for a in (args.vararg, args.kwarg) if a is not None)
     for target in targets:
