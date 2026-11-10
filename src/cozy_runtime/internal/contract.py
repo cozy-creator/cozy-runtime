@@ -492,7 +492,7 @@ else:
         return _getenv()(key)
 
 
-def _unchanged(event: str, args: tuple[Any, ...]) -> bool:  # Any: an audit event's arguments
+def _unchanged(event: str, args: tuple[Any, ...]) -> bool:  # type: ignore[explicit-any]  # an audit event's arguments
     """An env write (`putenv(key, value)`, `unsetenv(key)`) that leaves `key` as it is, both in
     `os.environ` and in the process's environment: it changes nothing."""
     key, value = args[0], args[1] if event == "os.putenv" else None
@@ -514,7 +514,7 @@ def _installed() -> tuple[str, ...]:
     return tuple({os.path.join(paths[name], "") for name in ("purelib", "platlib")})
 
 
-def audit(event: str, args: tuple[Any, ...]) -> None:  # Any: an audit event's arguments
+def audit(event: str, args: tuple[Any, ...]) -> None:  # type: ignore[explicit-any]  # an audit event's arguments
     """One of `AUDITED`, called by the audit hook itself (its frame and the hook's are skipped):
     refuse the package's env change, spawn or weight read; remember its thread (`_Scopes`). The
     Runtime's own (zygote forks, compile children, media encodes) pass."""
