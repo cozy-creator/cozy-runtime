@@ -19,7 +19,7 @@ from __future__ import annotations
 import importlib
 import sys
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Any, Protocol
 
 from cozy_runtime.author import (
     App,
@@ -47,7 +47,7 @@ from cozy_runtime.author._recipes import (
 async def quantize(
     ctx: Context,
     *,
-    source: Weights[Model[object]],
+    source: Weights[Any],  # type: ignore[explicit-any]  # static describe's any-layout spelling
     lane: str,
     package: str,
     release: str,
@@ -63,8 +63,8 @@ async def quantize(
 async def quantize_calibrated(
     ctx: Context,
     *,
-    source: Weights[Model[object]],
-    model: Model[object],
+    source: Weights[Any],  # type: ignore[explicit-any]  # static describe's any-layout spelling
+    model: Model[Any],  # type: ignore[explicit-any]  # static describe's any-layout spelling
     lane: str,
     package: str,
     release: str,
