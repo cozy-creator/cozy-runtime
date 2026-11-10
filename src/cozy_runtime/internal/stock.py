@@ -8,6 +8,7 @@ offload helpers do nothing: varena already pages every component.
 
 from __future__ import annotations
 
+import functools
 import importlib
 import importlib.util
 import sys
@@ -101,7 +102,7 @@ def _held(root: nn.Module, dtype: torch.dtype) -> None:
 def place(roots: Mapping[str, nn.Module]) -> None:
     """Placed component roots answer `.to()` and its kin from here on."""
     for root in roots.values():
-        answer_moves(root, lambda dtype, root=root: _held(root, dtype))
+        answer_moves(root, functools.partial(_held, root))
 
 
 def _nothing(*_: object, **__: object) -> None:
