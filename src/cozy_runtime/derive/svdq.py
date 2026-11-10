@@ -7,15 +7,21 @@ falls back to the historical Torch fitter; the independent release gate retains 
 from __future__ import annotations
 
 import random
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from contextvars import Token
 from types import ModuleType
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 from cozy_runtime import graphs
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.internal import svdq_linear
 
 from .microscale import NVFP4_BLOCK
+
+if TYPE_CHECKING:
+    import torch
+    from torch import Tensor, nn
+    from torch.utils.hooks import RemovableHandle
 
 #: The branch's rank (Nunchaku's and the xs-064 study's).
 RANK = 32
@@ -30,8 +36,8 @@ K_ALIGN = svdq_linear.K_ALIGN
 class Stats(NamedTuple):
     """One linear's calibration: per-channel `|x|` max `[K]` and sampled input rows `[n, K]`."""
 
-    xmax: Any
-    rows: Any
+    xmax: Tensor
+    rows: Tensor
 
 
 class Calibration:
@@ -42,11 +48,11 @@ class Calibration:
     it is open, so every call runs the hooks."""
 
     def __init__(
-        self, torch: ModuleType, components: Mapping[str, Any], keys: Iterable[str]
+        self, torch: ModuleType, components: Mapping[str, nn.Module], keys: Iterable[str]
     ) -> None:
         self.torch = torch
         wanted = set(keys)
-        self.modules: dict[str, Any] = {}
+        self.modules: dict[str, nn.Linear] = {}
         for component, root in components.items():
             for name, module in root.named_modules():
                 key = f"{component}.{name}.weight"
@@ -55,13 +61,13 @@ class Calibration:
         missing = sorted(wanted - set(self.modules))
         if missing:
             raise ValueError(f"calibration finds no linear for {missing[:3]} ({len(missing)})")
-        self._xmax: dict[str, Any] = {}
-        self._rows: dict[str, Any] = {}
+        self._xmax: dict[str, Tensor] = {}
+        self._rows: dict[str, Tensor] = {}
         self._seen: dict[str, int] = {}
-        self._handles: list[Any] = []
-        self._bypass: Any = None
+        self._handles: list[RemovableHandle] = []
+        self._bypass: Token[bool] | None = None
         self._slots = random.Random(0)
-        self._picks: dict[Any, Any] = {}
+        self._picks: dict[torch.device, torch.Generator] = {}
         self.completed = False
 
     def __enter__(self) -> Calibration:
@@ -75,7 +81,7 @@ class Calibration:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
-        graphs.BYPASS.reset(self._bypass)
+        graphs.BYPASS.reset(cast("Token[bool]", self._bypass))  # set by __enter__
         if placed_device().type == "cuda":
             self.torch.cuda.synchronize()  # the reservoir's row copies have landed
         missing = sorted(set(self.modules) - set(self._seen))
@@ -86,10 +92,10 @@ class Calibration:
             )
         self.completed = kind is None
 
-    def _hook(self, key: str) -> Any:
+    def _hook(self, key: str) -> Callable[[nn.Module, tuple[Tensor, ...]], None]:
         torch = self.torch
 
-        def record(module: Any, args: tuple[Any, ...]) -> None:
+        def record(module: nn.Module, args: tuple[Tensor, ...]) -> None:
             with torch.no_grad():
                 flat = args[0].detach().reshape(-1, args[0].shape[-1])
                 amax = flat.abs().amax(0).float()

@@ -24,11 +24,11 @@ from __future__ import annotations
 import sys
 import threading
 import weakref
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
-from types import ModuleType
-from typing import Any, cast
+from types import FrameType, ModuleType
+from typing import TYPE_CHECKING, Protocol, cast
 
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._loader import (
@@ -37,6 +37,18 @@ from cozy_runtime.author._loader import (
     FILLED,
     _members,
 )
+
+if TYPE_CHECKING:
+    from torch import Tensor, nn
+    from torch.overrides import TorchFunctionMode
+
+
+class _Op(Protocol):
+    """A torch function a mode intercepts."""
+
+    __name__: str
+
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
 
 
 class DeriveError(Exception):
@@ -220,7 +232,7 @@ def _capability(cap: _Capability) -> Iterator[None]:
 def _author_site() -> str:
     """The AUTHOR's frame, skipping the harness and torch — v1's `_package_site`. A
     refusal that names its own file names the wrong line."""
-    frame: Any = sys._getframe(1)
+    frame: FrameType | None = sys._getframe(1)
     while frame is not None:
         name = frame.f_code.co_filename
         if "/cozy_runtime/" not in name and "/torch/" not in name and "<" not in name:
@@ -388,14 +400,14 @@ def placing() -> Iterator[None]:
         _PLACEMENT.on = prior
 
 
-def _guard_mode(seen: Observations) -> Any:
+def _guard_mode(seen: Observations) -> TorchFunctionMode:
     torch = torch_module()
 
     class DeriveGuard(torch.overrides.TorchFunctionMode):  # type: ignore[misc,name-defined]
         def __torch_function__(
             self,
-            func: Any,
-            types: Any,
+            func: _Op,
+            types: Collection[type],
             args: tuple[object, ...] = (),
             kwargs: Mapping[str, object] | None = None,
         ) -> object:
@@ -480,9 +492,11 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
     cap = _Capability(variant)
     original = nn.Module.register_parameter
     original_buffer = nn.Module.register_buffer
-    constants: list[tuple[Any, str, Any]] = []
+    constants: list[tuple[nn.Module, str, nn.Parameter]] = []
 
-    def weightless(module: Any, name: str, held: Any, made: dict[int, Any]) -> None:
+    def weightless(
+        module: nn.Module, name: str, held: nn.Parameter, made: dict[int, nn.Parameter]
+    ) -> None:
         # A device move, performed BY THE RUNTIME, so the guard steps aside exactly here —
         # the fence is on WHO moves bytes, not on what (see `placing`).
         if id(held) not in made:
@@ -492,13 +506,13 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         seen.register(made[id(held)])
 
     def built() -> None:
-        made: dict[int, Any] = {}
+        made: dict[int, nn.Parameter] = {}
         for module, name, held in constants:
             if module._parameters.get(name) is held:
                 weightless(module, name, held, made)
         constants.clear()
 
-    def register(module: Any, name: str, param: Any) -> None:
+    def register(module: nn.Module, name: str, param: nn.Parameter | None) -> None:
         original(module, name, param)
         held = module._parameters.get(name)
         if held is None:
@@ -512,7 +526,9 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         else:
             weightless(module, name, held, {})
 
-    def register_buffer(module: Any, name: str, value: Any, persistent: bool = True) -> None:
+    def register_buffer(
+        module: nn.Module, name: str, value: Tensor | None, persistent: bool = True
+    ) -> None:
         original_buffer(module, name, value, persistent=persistent)
         held = module._buffers.get(name)
         if persistent and isinstance(held, torch.Tensor):

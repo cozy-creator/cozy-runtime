@@ -28,11 +28,20 @@ import os
 import struct
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 
 from cozy_runtime.author import UnsupportedInput
+
+
+class HeaderRow(TypedDict):
+    """One tensor's safetensors header entry."""
+
+    dtype: str
+    shape: list[int]
+    data_offsets: list[int]
+
 
 #: Bytes per element, by header dtype name. A name absent here is not refused by this
 #: module — it is carried verbatim as opaque bytes, because a passthrough tensor's dtype
@@ -120,10 +129,10 @@ class Writer:
             )
         self._rows.append((key, dtype, list(shape), raw))
 
-    def header(self) -> dict[str, Any]:
+    def header(self) -> dict[str, HeaderRow]:
         """The header these tensors WILL produce — available before any byte is written,
         which is what makes a header prediction checkable against the real thing."""
-        out: dict[str, Any] = {}
+        out: dict[str, HeaderRow] = {}
         offset = 0
         for key, dtype, shape, raw in sorted(self._rows, key=lambda r: r[0]):
             out[key] = {"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + len(raw)]}
@@ -177,8 +186,8 @@ class StreamingWriter:
             raise UnsupportedInput(f"{key!r}: no itemsize for dtype {dtype!r}")
         self._declared[key] = (dtype, list(shape), numel(shape) * want)
 
-    def header(self) -> dict[str, Any]:
-        out: dict[str, Any] = {}
+    def header(self) -> dict[str, HeaderRow]:
+        out: dict[str, HeaderRow] = {}
         offset = 0
         for key in sorted(self._declared):
             dtype, shape, length = self._declared[key]
