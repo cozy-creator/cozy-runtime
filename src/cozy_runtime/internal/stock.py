@@ -343,8 +343,12 @@ def _answer(model: object, info: bool) -> object:
     }  # fmt: skip
 
 
+class _Loads(Protocol):
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
+
+
 class _Original(Protocol):
-    def __get__(self, owner: None, cls: type) -> Callable[..., object]: ...
+    def __get__(self, owner: None, cls: type) -> _Loads: ...
 
 
 class _DiffusersClass(Protocol):

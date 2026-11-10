@@ -711,7 +711,8 @@ class _PlainDtype:
             )
         self.layouts = MappingProxyType(layouts)
         unchanged = all(dict(row) == dict(base.layout(key) or {}) for key, row in layouts.items())
-        self.identity = base.identity if unchanged else repr((base.identity, "plain-cast/1", dtype))
+        held = (base.identity, "plain-cast/1", dtype, *((keep,) if keep else ()))
+        self.identity = base.identity if unchanged else repr(held)
 
     def layout(self, key: str) -> Mapping[str, TensorLayout]:
         return self.layouts[key]
