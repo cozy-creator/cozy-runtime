@@ -123,20 +123,23 @@ def _steps(heads: int, world: int) -> list[int]:
 
 
 def _need(
-    step: int, batch: int, rows: int, heads: int, dim: int, b: int, world: int
+    step: int, batch: int, rows: int, heads: int, dim: int, b: int, world: int, narrow: bool
 ) -> tuple[int, ...]:
     """A group of `step` heads: the output held throughout. Whole: its q, k and v sent and
     received, its operands too; then they beside the local attention; then the attended rows and
     their return. Pipelined: beside a group's operands and its attention, the next group's sent,
-    received and operands (allocated with its send) and the last group's return; while the next
-    is packed, this group's sent too. Every rank's rows are taken as this one's: an estimate."""
+    received and operands (allocated with its send) and the last group's return. What crosses
+    is int8 with a scale a row where `narrow`. Every rank's rows are taken as this one's: an
+    estimate."""
     total, local = rows * world, step // world
     each = batch * rows * step * dim * b
+    wire = batch * rows * step * (dim + b) if narrow else each
     attention = sizing.Attention(batch, total, local, local, total, dim, b).need(local, total)
     out = batch * rows * heads * dim * b
     if step == heads:
-        return sizing.peak(out, (each,) * 9, (each, each, each, *attention), (each, each))
-    return sizing.peak(out, (each,) * 17, (*(each,) * 14, *attention))
+        sent = (*(wire,) * 6, *(each,) * 3)
+        return sizing.peak(out, sent, (each, each, each, *attention), (wire, wire))
+    return sizing.peak(out, (*(each,) * 6, *(wire,) * 8, *attention))
 
 
 def _pipelined(steps: Sequence[int], sizes: Sequence[int], batch: int, dim: int, b: int) -> int:
@@ -569,8 +572,12 @@ def _exchange(
     geometry = (batch, padded, dim, b)
     floor = min(meet.floors.get(geometry, 0), len(steps) - 1)
     # What a rank's rows and heads make of a group fixes the menu; each rank's menu stays its own.
+    # The wire's width as the call's total will make it (`narrow` decides on the agreed total).
+    wide = narrow(mine * world) if callable(narrow) else narrow
+    crosses = dim & (dim - 1) == 0 and wide
     menu = tuple(
-        (str(at), _need(step, batch, mine, padded, dim, b, world)) for at, step in enumerate(steps)
+        (str(at), _need(step, batch, mine, padded, dim, b, world, crosses))
+        for at, step in enumerate(steps)
     )
     levels = menu[floor:]
     site = f"ulysses:{hash(levels):x}"
