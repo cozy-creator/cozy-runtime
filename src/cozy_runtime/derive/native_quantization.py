@@ -24,6 +24,7 @@ from cozy_runtime.weights_store import Checkpoint, Output
 from .microscale import CONVROT_GROUP, NVFP4_BLOCK, W4A8_GROUP
 
 if TYPE_CHECKING:
+    from tensorfs._ext import ConfigInput, ConfigValue
     from tensorfs.api import QuantizeTensor
 
     from .quantization import ArtifactQuantizationPlan, QuantizationTensor
@@ -48,7 +49,7 @@ _NVFP4 = {
     "scale_layout": "row_major",
 }
 #: Each lane scheme's stored params, written alike by the Writer and the Python encoders.
-PARAMS: dict[str, dict[str, object]] = {
+PARAMS: dict[str, dict[str, ConfigInput]] = {
     "fp8.rowwise": {},
     "int8.convrot": {"rotation": "kron_regular_h4", "rotation_size": CONVROT_GROUP},
     "nvfp4": _NVFP4,
@@ -217,7 +218,7 @@ class Progress:
 class _Execution:
     def __init__(
         self,
-        future: Future[dict[str, object]],
+        future: Future[dict[str, ConfigValue]],
         control: tensorfs.ConversionControl,
         context: Context | None,
     ) -> None:
@@ -291,7 +292,7 @@ class _Execution:
 
 @dataclass(frozen=True)
 class _Work:
-    convert: Callable[[tensorfs.ConversionControl], dict[str, object]]
+    convert: Callable[[tensorfs.ConversionControl], dict[str, ConfigValue]]
 
     def submit(self, context: Context | None = None) -> _Execution:
         if context is not None:
@@ -344,7 +345,7 @@ def quantize(
 
 
 def _run(
-    convert: Callable[[tensorfs.ConversionControl], dict[str, object]],
+    convert: Callable[[tensorfs.ConversionControl], dict[str, ConfigValue]],
     pending: int,
     ctx: Context,
     tel: Telemetry,
@@ -363,13 +364,13 @@ def _run(
 
 
 def _run_native(
-    convert: Callable[[tensorfs.ConversionControl], dict[str, object]],
+    convert: Callable[[tensorfs.ConversionControl], dict[str, ConfigValue]],
     pending: int,
     ctx: Context,
     tel: Telemetry,
     *,
     stage: str,
-) -> dict[str, object]:
+) -> dict[str, ConfigValue]:
     # This helper joins before returning, like the existing bounded encoding loop.
     # It must not consume Context.plan's one whole GPU program slot: an author may
     # convert several outputs and then submit that program in the same request.
@@ -388,7 +389,7 @@ def _run_native(
             time.sleep(0.05)  # Observation never advances native reads/encoding/publication.
         (result,) = execution.wait()
         tel.progress(1.0, stage=stage)
-        return cast("dict[str, object]", result)
+        return cast("dict[str, ConfigValue]", result)
     except BaseException as error:
         failure = error
         raise
