@@ -33,8 +33,8 @@ except ImportError as _absent:  # pragma: no cover - a CPU-only or non-Linux env
 else:
     TRITON_ABSENT = ""
 
-#: Rows a program turns
-_ROWS = 64
+#: Rows a program turns: 32 at 4 warps keeps the turn's operands in registers (sm89: no spills)
+_ROWS = 32
 #: Orders served, and each dtype's name in a Triton signature
 _ORDERS = (64, 128)
 _TYPES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
