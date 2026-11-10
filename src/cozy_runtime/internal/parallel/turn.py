@@ -86,8 +86,8 @@ def narrow(
     launch: Launch | None, x: Tensor, out: Tensor, scale: Tensor, shift: Tensor | None = None
 ) -> None:
     """`law(x, shift)` into `out` (int8) and `scale` (`x`'s dtype, last dimension 1): the same
-    leading shape, any strides, `shift` broadcast to it; on `launch` where it serves."""
-    if launch is None:
+    leading shape, any strides, `shift` broadcast to it; on `launch` where it serves rows whole."""
+    if launch is None or not _whole(x, out, *(() if shift is None else (shift,))):
         values, factors = law(x, shift)
         out.copy_(values)
         scale.copy_(factors)
@@ -107,7 +107,7 @@ def narrow(
 
 def widen(launch: Launch | None, values: Tensor, scale: Tensor, out: Tensor) -> None:
     """`law_back(values, scale)` into `out`: the same leading shape, any strides."""
-    if launch is None:
+    if launch is None or not _whole(values, out):
         out.copy_(law_back(values, scale))
         return
     lead = values.shape[:-1]
@@ -127,14 +127,15 @@ def _on(t: Tensor) -> AbstractContextManager[object]:
 
 
 def _lead(lead: torch.Size) -> tuple[int, ...]:
-    if len(lead) > 4:
-        raise ValueError(f"the int8 wire's kernels take at most 4 leading dimensions, not {lead}")
     return (1,) * (4 - len(lead)) + tuple(lead)
 
 
+def _whole(*rows: Tensor) -> bool:
+    """Each row contiguous, at most 4 leading dimensions: what the kernels read and write."""
+    return all(t.stride(-1) == 1 and t.dim() <= 5 for t in rows)
+
+
 def _strides(t: Tensor) -> tuple[int, ...]:
-    if t.stride(-1) != 1 and t.shape[-1] != 1:
-        raise ValueError("the int8 wire's rows must be contiguous")
     lead = t.stride()[:-1]
     return (0,) * (4 - len(lead)) + tuple(lead)
 
