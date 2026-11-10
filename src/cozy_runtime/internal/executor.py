@@ -1474,6 +1474,8 @@ class Executor:
         outcome: Outcome | None = None
         working = 0
         stage_memo.ENGINE.open(None, spool)
+        if self.residency is not None:
+            self.residency.open_attempt()
         try:
             with (
                 self._request(command.request_id) as rows,
@@ -1521,6 +1523,11 @@ class Executor:
         finally:
             stage_memo.ENGINE.close(lambda *_, **__: None)
             shutil.rmtree(spool, ignore_errors=True)
+            # As GPU 0's last attempt out: its stream drains, then the last step's holds go.
+            with contextlib.suppress(Exception):
+                accel.drain(self.torch, self.device_kind)
+            if self.residency is not None:
+                self.residency.release()
         assert outcome is not None
         outcome = self._ended(outcome, self.host._interrupted.is_set())
         failed = outcome.terminal == "failed"
@@ -3673,7 +3680,11 @@ class Executor:
                         spool=spool,
                         deadline=deadline,
                         device=self._device(),
-                        cancel=functools.partial(self.host.mux.cancelled, command.request_id),
+                        # A group's attempt also stops once another GPU's ended it (`_Ranks`).
+                        cancel=lambda: (
+                            self.host.mux.cancelled(command.request_id)
+                            or (self.group is not None and self.group.interrupted)
+                        ),
                         models=self.models,
                         recipes=self.discovered.recipes,
                         progress=boundary,
