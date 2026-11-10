@@ -12,8 +12,8 @@ row).
 from __future__ import annotations
 
 import math
+import random
 import re
-import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass
 from fractions import Fraction
@@ -173,7 +173,7 @@ class ImageRequest(msgspec.Struct):
 
     def drawn_seed(self) -> int:
         """The seed given, else a fresh one the result reports."""
-        return self.seed if self.seed is not None else secrets.randbits(53)
+        return self.seed if self.seed is not None else random.getrandbits(53)
 
 
 class ImageResult(msgspec.Struct):

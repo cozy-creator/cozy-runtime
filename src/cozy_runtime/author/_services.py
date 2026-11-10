@@ -168,6 +168,10 @@ class Attempt:
     the media type and no size or digest until then."""
     settle_at_save: bool = False
     """Encode at the save instead (a fake harness: there is no worker to defer to)."""
+    writes: bool = True
+    """False on a group's other GPUs: GPU 0's saves are the run's, so a save here registers its
+    asset and writes, encodes and settles nothing. Its video facts are `unwritten`'s."""
+    unwritten: dict[str, SavedVideo] = field(default_factory=dict)
     entered: bool = False
     """Whether the package handler itself was entered."""
     pending: dict[str, File] = field(default_factory=dict)
@@ -481,7 +485,9 @@ class Outputs(_Bound):
         _, height, width, _ = video.shape
         shaped = getattr(frames, "shape", ())
         if len(shaped) == 4 and (int(shaped[1]), int(shaped[2])) != (height, width):
-            self._attempt.warn("video", f"H.264 takes even sides, so it was cut to {width}x{height}")
+            self._attempt.warn(
+                "video", f"H.264 takes even sides, so it was cut to {width}x{height}"
+            )
         planar = None
         if audio is not None:
             if sample_rate is None:
@@ -528,7 +534,8 @@ class Outputs(_Bound):
         even = (width - width % 2, height - height % 2)
         if even != (width, height):
             self._attempt.warn(
-                "video", f"H.264 takes even sides, so {width}x{height} was cut to {even[0]}x{even[1]}"
+                "video",
+                f"H.264 takes even sides, so {width}x{height} was cut to {even[0]}x{even[1]}",
             )
         audio_format = header.audio
 
@@ -629,6 +636,15 @@ class Outputs(_Bound):
         _codec.require_encoder()
         if not videos:
             raise OutputError("a joined video needs at least one video", code="media_header")
+        if not self._attempt.writes:
+            shapes = [self._shape(video) for video in videos]
+            source = _AuthorEvents(soundtrack([shape.frame_count for shape in shapes]))
+            header = next(source, None)
+            audio_format = header.audio if isinstance(header, DecodedMediaHeader) else None
+            samples = sum(e.sample_count for e in source if isinstance(e, DecodedAudioChunk))
+            frames = sum(shape.frame_count for shape in shapes)
+            handle = self._attempt.next_handle(VideoFile.kind)
+            return self._unwritten(handle, _facts(shapes[0]), audio_format, frames, samples)
         paths = []
         for video in videos:
             if (
@@ -704,7 +720,57 @@ class Outputs(_Bound):
         """
         self._attempt.check_open("Outputs.join_video")
         _codec.require_encoder()
-        return VideoJoin(self, audio)
+        return VideoJoin(self, audio) if self._attempt.writes else _UnwrittenJoin(self, audio)
+
+    def _unwritten(
+        self,
+        handle: str,
+        video: Mapping[str, Any],
+        audio: DecodedAudioFormat | None,
+        frames: int,
+        samples: int,
+    ) -> SavedVideo:
+        """A video saved on a group's other GPU: its asset and the facts GPU 0's would have."""
+        saved = SavedVideo(
+            video=VideoFile(handle, media_type="video/mp4", attempt=self._attempt.request_id),
+            width=video["width"],
+            height=video["height"],
+            frame_count=frames,
+            frame_rate=video["frame_rate"],
+            pixel_aspect_ratio=video["pixel_aspect_ratio"],
+            video_codec="h264",
+            video_profile=None,
+            color_primaries=video["color_primaries"],
+            color_transfer=video["color_transfer"],
+            color_matrix=video["color_matrix"],
+            color_range=video["color_range"],
+            audio=(
+                SavedAudioFacts(
+                    "aac",
+                    None,
+                    audio.channels,
+                    audio.sample_rate,
+                    _codec.AAC_FRAME_SAMPLES,
+                    samples,
+                )
+                if audio is not None
+                else None
+            ),
+            submitted_audio_samples=samples,
+        )
+        self._attempt.pending[handle] = saved.video
+        self._attempt.unwritten[handle] = saved
+        return saved
+
+    def _shape(self, video: VideoFile) -> Any:
+        """A video's facts on a group's other GPU: its own unwritten save's, or an input's probe."""
+        if (saved := self._attempt.unwritten.get(video.ref)) is not None:
+            return saved
+        if not isinstance(video, VideoFile) or video._local is None:
+            raise CapabilityError(
+                "joined videos must be hydrated inputs of this attempt", code="foreign_asset"
+            )
+        return _codec.probe_mp4(video._local)
 
     def _write_audio(
         self,
@@ -764,6 +830,11 @@ class Outputs(_Bound):
         """Write, probe and atomically register one MP4; `feed` writes `source` and returns
         its audio samples. Only encoder failures become `output_encode`."""
         handle = self._attempt.next_handle(VideoFile.kind)
+        if not self._attempt.writes:
+            counted = _Unwritten()
+            samples = feed(counted)  # the author's events still run: only the encode is gone
+            frames = sum(copy.frames) if copy is not None else counted.video_frames
+            return self._unwritten(handle, video, audio_format, frames, samples)
         tail = handle.rsplit("/", 1)[-1]
         temporary = self._attempt.spool / f".video-{tail}.partial"
         final = self._attempt.spool / f"video-{tail}"
@@ -971,6 +1042,10 @@ class Outputs(_Bound):
         if source.is_symlink() or not source.is_dir():
             raise OutputError("output tree must be a regular directory", code="output_tree")
         handle = self._attempt.next_handle("tree")
+        if not self._attempt.writes:
+            tree = Tree(handle, root=source, attempt=self._attempt.request_id)
+            self._attempt.pending_trees[handle] = tree
+            return tree
         target = self._attempt.spool / f"tree-{handle.rsplit('/', 1)[-1]}"
         target.mkdir()
         available = self._attempt.max_output_bytes - self._pending_bytes()
@@ -1045,6 +1120,15 @@ class Outputs(_Bound):
                 code="output_too_large",
             )
         handle = self._attempt.next_handle(kind.kind)
+        if not self._attempt.writes:
+            unwritten = kind(
+                handle,
+                media_type=media_type,
+                size_bytes=len(data),
+                attempt=self._attempt.request_id,
+            )
+            self._attempt.pending[handle] = unwritten
+            return unwritten
         blob = self._attempt.spool / f"{kind.kind}-{handle.rsplit('/', 1)[-1]}"
         blob.write_bytes(data)
         asset = kind(
@@ -1079,6 +1163,12 @@ class Outputs(_Bound):
                 code="output_too_large",
             )
         handle = self._attempt.next_handle(kind.kind)
+        if not self._attempt.writes:
+            unwritten = kind(
+                handle, media_type=_codec.FRAME_MEDIA_TYPES[codec], attempt=self._attempt.request_id
+            )
+            self._attempt.pending[handle] = unwritten
+            return unwritten
         path = self._attempt.spool / f"{kind.kind}-{handle.rsplit('/', 1)[-1]}.raw"
         raw_bytes = 0
         with path.open("wb") as spool:
@@ -1118,6 +1208,65 @@ class Outputs(_Bound):
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+
+class _Unwritten:
+    """What a save on a group's other GPU feeds its events into: it counts frames, no more."""
+
+    def __init__(self) -> None:
+        self.video_frames = 0
+
+    def write_video(self, rgb: object) -> None:
+        self.video_frames += 1
+
+    def write_audio(self, planar: object) -> None:
+        return None
+
+    def copy_video(self, before: Callable[[Fraction | None], None]) -> None:
+        return None
+
+
+def _facts(shape: Any) -> dict[str, Any]:
+    names = ("width", "height", "frame_rate", "pixel_aspect_ratio")
+    names += ("color_primaries", "color_transfer", "color_matrix", "color_range")
+    return {name: getattr(shape, name) for name in names}
+
+
+class _UnwrittenJoin:
+    """`Outputs.join_video` on a group's other GPU: soundtracks run, nothing is copied."""
+
+    def __init__(self, outputs: Outputs, audio: DecodedAudioFormat | None) -> None:
+        self._outputs, self._attempt, self._audio = outputs, outputs._attempt, audio
+        self._attempt.next_handle("join")
+        self._shapes: list[Any] = []
+        self._samples = 0
+
+    def append(
+        self,
+        video: VideoFile,
+        soundtrack: Callable[[int], Iterable[DecodedMediaEvent]] = lambda frames: (),
+        *,
+        last: bool = False,
+    ) -> VideoFile:
+        self._attempt.check_open("VideoJoin.append")
+        shape = self._outputs._shape(video)
+        self._shapes.append(shape)
+        for event in soundtrack(shape.frame_count):
+            if isinstance(event, DecodedAudioChunk):
+                self._samples += event.sample_count
+        self._attempt.shown.add(video.ref)
+        handle = self._attempt.next_handle("revision")
+        return VideoFile(handle, media_type="video/mp4", attempt=self._attempt.request_id)
+
+    def finish(self) -> SavedVideo:
+        self._attempt.check_open("VideoJoin.finish")
+        if not self._shapes:
+            raise OutputError("a joined video needs at least one video", code="media_header")
+        handle = self._attempt.next_handle(VideoFile.kind)
+        frames = sum(shape.frame_count for shape in self._shapes)
+        return self._outputs._unwritten(
+            handle, _facts(self._shapes[0]), self._audio, frames, self._samples
+        )
 
 
 class VideoJoin:

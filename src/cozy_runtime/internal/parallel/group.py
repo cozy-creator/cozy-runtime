@@ -1,8 +1,9 @@
 """Manage follower executors inside the leader's process scope.
 
 Each follower has a framed JSON command socket and joins the group's distributed
-collectives. A failed run or lost follower breaks the group and terminates its
-remaining followers, allowing blocked collectives to unwind. A wait ends with the reply or the
+collectives. A follower whose handler failed ends the attempt on every GPU (`interrupt`); a lost
+follower or a device fault breaks the group and terminates its remaining followers, allowing
+blocked collectives to unwind. A wait ends with the reply or the
 follower's death, and one that blocks says which GPU it waits on; only a store meeting has a clock
 (`gather`), since a GPU that left the call sets no key. A group forms only after every follower
 said it is ready; a follower that fails while GPU 0 is inside group init (which nothing can
@@ -20,12 +21,11 @@ import socket
 import sys
 import threading
 import time
-from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import ModuleType
-from typing import Any, Protocol, TypedDict
+from typing import Any, Protocol
 
 import msgspec
 
@@ -105,15 +105,6 @@ class _Hello(msgspec.Struct, frozen=True):
     rank: int
     world: int
     sealed: dict[str, str]
-
-
-class SpreadLog(TypedDict):
-    """One spread method this attempt: the calls each rank ran, why a rank declined, and
-    whether the spread was optional. Keys are rank numbers as strings: it crosses as JSON."""
-
-    calls: dict[str, int]
-    declined: dict[str, str]
-    spare: bool
 
 
 @dataclass(slots=True)
@@ -257,21 +248,31 @@ def warm(torch: ModuleType, backend: str, rank: int, world: int) -> None:
     torch.cuda.synchronize()
 
 
-def gather(store: Any, keys: Sequence[str], what: str) -> list[bytes]:
+def gather(store: Any, keys: Sequence[str], what: str, ended: Sequence[str] = ()) -> list[bytes]:
     """Every key's value, once every GPU has set its own. The store's own read waits for a missing
-    key for as long as the store lives; this ends as a collective does when the formation ends
-    (`abort_process_group`: an interrupt, or a GPU that failed), and after `GATHER` names the
-    GPUs that never arrived (`keys` are in GPU order)."""
+    key for as long as the store lives; this ends (code `ENDED`) when the formation ends
+    (`abort_process_group`: an interrupt, or a GPU that failed) or a missing GPU's `ended` key says
+    it failed; a missing GPU that returned is a divergence, named; and after `GATHER` it names the
+    GPUs that never arrived (`keys` and `ended` are in GPU order)."""
     import torch.distributed as dist
 
     keys = list(keys)
     deadline = time.monotonic() + GATHER.total_seconds()
     while True:
         if _ENDED.is_set():
-            raise dist.DistBackendError(f"{what}: another GPU ended this call")
+            raise GroupRefusal(f"{what}: another GPU ended this call", code=ENDED)
         try:
             store.wait(keys, _SLICE)
         except dist.DistStoreError:  # the slice passed
+            for rank, key in enumerate(ended):
+                if store.check([key]) and not store.check([keys[rank]]):
+                    if store.get(key) == b"failed":
+                        raise GroupRefusal(f"{what}: GPU {rank} failed", code=ENDED) from None
+                    raise GroupRefusal(
+                        f"{what}: GPU {rank} had already returned; the GPUs no longer run the "
+                        "same calls",
+                        code="group_diverged",
+                    ) from None
             if time.monotonic() < deadline:
                 continue
             missing = [f"GPU {rank}" for rank, key in enumerate(keys) if not store.check([key])]
@@ -345,8 +346,6 @@ class RankGroup:
         self.initializing = False
         #: the first fault, latched: a broken group never heals, it is rebuilt
         self.broken = ""
-        #: a call in flight may run again when a GPU runs out of memory (`mirror.mirrored`)
-        self.rerunnable = False
         #: `interrupt` ended this formation's collectives; `form(again=...)` clears it
         self.interrupted = False
         #: set once this formation's interrupt has aborted its communicator (set: none due)
@@ -357,19 +356,11 @@ class RankGroup:
         #: per follower rank, its executor's plane facts as its latest reply stated them
         #: per follower rank, its `execution_evidence` record folded over this attempt's calls
         self.rank_records: dict[int, execution_evidence.GpuEvidence] = {}
-        #: per spread method this attempt
-        self.spread_log: dict[str, SpreadLog] = {}
         #: each kernel a follower began serving at a command (`kernel_ready.boundary`), and its
         #: rank, until the attempt's record takes them
         self.began: list[tuple[int, str]] = []
         self._readers: list[threading.Thread] = []
-        #: Followers with a command in flight. A follower answers one command at a time, so
-        #: every caller that sends one holds its rank until the reply is read: calls made
-        #: from overlapped threads (`author.concurrently`) never interleave on one seam.
-        self._busy: set[int] = set()
-        #: ranks homing a component whose remote scope is open: kept free for its calls
-        self._reserved: Counter[int] = Counter()
-        self._leases = threading.Condition()
+        self._leases = threading.Lock()
 
     def gpu(self, rank: int) -> str:
         """How people name the GPU process `rank` drives: `GPU 3`, as nvidia-smi numbers it."""
@@ -439,12 +430,10 @@ class RankGroup:
                 )
             if head.reply != "run" or head.ok:
                 continue
-            if "rerun" in frame and self.rerunnable:
-                self.interrupt()  # GPU 0 may wait on it in a collective
-            elif "rerun" in frame or head.code not in SHORT:
-                self._break(
-                    f"{follower.gpu} failed its part of the call: {head.code}: {head.detail}"[:600]
-                )
+            if frame.get("poisoned"):
+                self._break(f"{follower.gpu} failed: {head.code}: {head.detail}"[:600])
+            else:
+                self.interrupt()  # its handler ended: every GPU's attempt ends with it
         follower.replies.put(None)
         self._break(follower.gone)
 
@@ -632,50 +621,6 @@ class RankGroup:
         reply or the follower's death, observed through its seam, never inferred from silence.
         A call's replies follow its collectives every step, so those waits are not `shown`."""
         return [self._reply(follower, name, shown) for follower in self.followers]
-
-    def call_one(self, rank: int, command: Mapping[str, object]) -> dict[str, Any]:
-        """One command to ONE follower and its reply: a hosted component's call."""
-        with self.hold((rank,)):
-            self.send_one(rank, command)
-            return self.reply_one(rank, str(command["cmd"]))
-
-    @contextlib.contextmanager
-    def hold(self, ranks: Iterable[int]) -> Iterator[None]:
-        """Wait until every rank in `ranks` is free, then keep them until the block ends."""
-        wanted = frozenset(ranks)
-        with self._leases:
-            busy = wanted & self._busy
-        if busy:  # told outside the lock; the wait below reads it again
-            self.waiting(f"waiting for {', '.join(map(self.gpu, sorted(busy)))}: another call")
-        with self._leases:
-            self._leases.wait_for(lambda: not wanted & self._busy)
-            self._busy |= wanted
-        try:
-            yield
-        finally:
-            self.give(wanted)
-
-    def take(self, ranks: Iterable[int]) -> tuple[int, ...]:
-        """The ranks among `ranks` that are free and not reserved, now kept by the caller.
-        Never waits: a spread round runs on whoever is idle."""
-        with self._leases:
-            taken = tuple(r for r in ranks if r not in self._busy and not self._reserved[r])
-            self._busy.update(taken)
-        return taken
-
-    def give(self, ranks: Iterable[int]) -> None:
-        with self._leases:
-            self._busy.difference_update(ranks)
-            self._leases.notify_all()
-
-    def reserve(self, ranks: Iterable[int]) -> None:
-        """Keep `ranks` out of spread rounds while a remote scope homed there is open."""
-        with self._leases:
-            self._reserved.update(ranks)
-
-    def unreserve(self, ranks: Iterable[int]) -> None:
-        with self._leases:
-            self._reserved.subtract(ranks)
 
     def send_one(self, rank: int, command: Mapping[str, object]) -> None:
         self.check_alive()

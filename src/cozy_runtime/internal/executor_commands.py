@@ -67,7 +67,7 @@ class Join(Command, frozen=True, kw_only=True, tag="join"):
     backend: str = "nccl"
     #: A socket follows: a byte on it aborts this follower's collectives (`RankGroup.interrupt`).
     abort: bool = False
-    #: The group forms again after a call ended short of memory (`mirror.mirror_component`).
+    #: The group forms again after an attempt ended on one of its GPUs (`spmd`).
     again: bool = False
     #: The NCCL route rank 0 chose from the group's measured links; set before joining.
     nccl: dict[str, str] = {}
@@ -102,13 +102,6 @@ class Map(Command, frozen=True, kw_only=True, tag="map"):
 
 class Unload(Command, frozen=True, kw_only=True, tag="unload"):
     construction: str
-
-
-class RequestMemory(Command, frozen=True, kw_only=True, tag="request_memory"):
-    construction: str
-    request_id: str
-    phase: Literal["begin", "plan", "end"]
-    steps: tuple[tuple[str, ...], ...] = ()
 
 
 class Activate(Command, frozen=True, kw_only=True, tag="activate"):
@@ -395,7 +388,6 @@ type KnownCommand = (
     | Fork
     | Map
     | Unload
-    | RequestMemory
     | Activate
     | Attention
     | Kernels
