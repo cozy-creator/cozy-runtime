@@ -60,6 +60,11 @@ packages = ["src/cozy_runtime"]
 [tool.uv]
 package = true
 
+# rc/interfaces builds against cozy-creator rc/interfaces' TensorFS (xs-081's executor protocol), which isn't published
+# yet. The release drops this for the published TensorFS. To move it: new rev, then `uv lock`.
+[tool.uv.sources]
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator", rev = "c7b324c6c108d995d61d84f9d63c291a3d9a18de", subdirectory = "crates/tensorfs-py" }
+
 [tool.basedpyright]
 # scripts/typecheck.sh runs this against real torch, Diffusers, Transformers and TensorFS.
 include = ["src", "checks", "examples"]
