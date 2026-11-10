@@ -156,6 +156,21 @@ def _pipelined(steps: Sequence[int], sizes: Sequence[int], batch: int, dim: int,
     return found
 
 
+def _groups(padded: int, step: int, world: int) -> list[tuple[int, int]]:
+    """The head groups of a call, as (first head, heads per GPU): `step` heads each; where the
+    exchange pipelines, the first and last take one head per GPU, so a call waits only for a
+    small crossing before its first attention and after its last."""
+    if step in (padded, world):
+        return [(first, step // world) for first in range(0, padded, step)]
+    groups = [(0, 1)]
+    first, end = world, padded - world
+    while first < end:
+        count = min(step, end - first)
+        groups.append((first, count // world))
+        first += count
+    return [*groups, (end, 1)]
+
+
 def _refusal(rows: Sequence[dict[str, Any]]) -> None:
     """Raise a refusal some rank reported, as what it was."""
     failed = [row for row in rows if row.get("error")]
@@ -643,7 +658,7 @@ def _exchange(
     narrow = dim & (dim - 1) == 0 and (narrow(total) if callable(narrow) else narrow)
     pipelined = meet.floors[geometry] = _pipelined(steps, sizes, batch, dim, b)
     at = max(pipelined, *(int(row["at"]) for row in proposals))
-    step, local = steps[at], steps[at] // world
+    step = steps[at]
     token = None
     if native:
         token = catch.begin(device, site, "ulysses", menu, at, selection, stream)
@@ -654,7 +669,7 @@ def _exchange(
     back = [list(sizes) for _ in range(world)]
     engines = copy_engine.for_group(handle)
     packer = _Packer(query, narrow)
-    starts = range(0, padded, step)
+    groups = _groups(padded, step, world)
     crossed = submitted = False
     began = _Clock.mark(query)
     inner: list[Any] = []
@@ -669,17 +684,17 @@ def _exchange(
             with packer.on(packer.out, packer.mark()):
                 shift = _Shift(key, total, handle)
 
-        def send(start: int) -> _Arriving:
+        def send(start: int, local: int) -> _Arriving:
             args = (sources, start, total, local, sent, rank, narrow, shift)
             return _send(handle, engines, packer, *args)
 
         # In flight: the next group's q, k, v, and the last group's output (`_need`).
-        arriving = send(starts[0])
+        arriving = send(*groups[0])
         returning: tuple[Wait, list[Tensor], int] | None = None
-        for index, start in enumerate(starts):
+        for index, (start, local) in enumerate(groups):
             current = arriving
-            if index + 1 < len(starts):
-                arriving = send(starts[index + 1])
+            if index + 1 < len(groups):
+                arriving = send(*groups[index + 1])
             before = _Clock.mark(query)
             operands = _unpack(packer, current)
             arrived.append((before, _Clock.mark(query)))
@@ -712,7 +727,7 @@ def _exchange(
         if token is not None:
             vt.split_end(device, token, submitted=submitted)
     width = 1 + b / dim if narrow else b  # a narrowed element's bytes, its scale's share too
-    row = len(starts) * batch * local * dim
+    row = batch * sum(local for _, local in groups) * dim
     moved = row * width * (mine * (world - 1) * 3 + (total - mine))
     _CLOCK.add(began, _Clock.mark(query), (inner, arrived, landed), round(moved))
     return out[:, :, :heads] if padded != heads else out
