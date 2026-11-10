@@ -586,115 +586,6 @@ src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/svdq.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [assignment] Incompatible types in assignment (expression has type "tuple[Any, Any] | None", variable has type "None")
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/__init__.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any, Any, Any], _GeneratorContextManager[_State, None, None]]")
-src/cozy_runtime/graphs/__init__.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any, Callable[[], object], Pool, Domain, int], tuple[Any, str]]")
-src/cozy_runtime/graphs/__init__.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any, Iterable[Any]], _GeneratorContextManager[None, None, None]]")
-src/cozy_runtime/graphs/__init__.py: [misc] Type of decorated function contains type "Any" ("_lru_cache_wrapper[Any]")
-src/cozy_runtime/graphs/__init__.py: [no-any-return] Returning Any from function declared to return "list[float]"
-src/cozy_runtime/graphs/__init__.py: [no-any-unimported] Base type TorchFunctionMode becomes "Any" due to an unfollowed import
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/graphs/domain.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/accel.py: [explicit-any] Explicit "Any" is not allowed
@@ -825,27 +716,6 @@ src/cozy_runtime/internal/cache_owners.py: [explicit-any] Explicit "Any" is not 
 src/cozy_runtime/internal/cache_owners.py: [misc] Type of decorated function contains type "Any" ("Callable[[list[Any]], _GeneratorContextManager[bool, None, None]]")
 src/cozy_runtime/internal/call_types.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/canonical.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/contract.py: [misc] Type of decorated function contains type "Any" ("_Wrapped[[VarArg(Any), KwArg(Any)], Any, [VarArg(Any), KwArg(Any)], Any]")
 src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
 src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
 src/cozy_runtime/internal/decode_cores.py: [misc] Function is untyped after decorator transformation
@@ -1226,8 +1096,6 @@ src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 9 to "_d
 src/cozy_runtime/internal/nvfp4_linear.py: [no-any-unimported] Argument 9 to "_dequant" becomes "Any" due to an unfollowed import
 src/cozy_runtime/internal/nvfp4_linear.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/pacing.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/package_interface.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/package_interface.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/parallel/copy_engine.py: [explicit-any] Explicit "Any" is not allowed
@@ -1474,13 +1342,6 @@ src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not al
 src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/static_interface.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/static_invocable.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/svdq_linear.py: [misc] Function is untyped after decorator transformation
