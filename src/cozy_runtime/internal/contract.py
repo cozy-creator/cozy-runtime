@@ -34,13 +34,16 @@ import weakref
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from types import FrameType
-from typing import Any, NoReturn
+from types import FrameType, ModuleType
+from typing import TYPE_CHECKING, Any, NoReturn, Protocol
 
 from cozy_runtime.author import _model
 from cozy_runtime.author._errors import ContractViolation
 from cozy_runtime.author._model import WARNINGS, WarningRow
 from cozy_runtime.internal import kernel_cache, numerical_environment
+
+if TYPE_CHECKING:
+    from cozy_runtime.internal.residency import Request
 
 #: Each rule's harm, said in its refusal (static_contract's refusals say the same).
 WHY = {
@@ -115,24 +118,30 @@ def _refuse(rule: str, what: str, site: str) -> NoReturn:
     )
 
 
-def _guard(
+def _guard[**P, R](
     rule: str,
     what: str,
-    original: Callable[..., Any],
+    original: Callable[P, R],
     *,
-    passes: Callable[[dict[str, Any]], bool] | None = None,
-) -> Any:
+    passes: Callable[[Mapping[str, object]], bool] | None = None,
+) -> Callable[P, R]:
     """`original`, refusing the package's calls; `passes(kwargs)`: a call that does no harm."""
 
     @functools.wraps(original)
-    def guarded(*args: Any, **kwargs: Any) -> Any:
+    def guarded(*args: P.args, **kwargs: P.kwargs) -> R:
         harmless = passes is not None and passes(kwargs)
         if not harmless and (site := _site(sys._getframe(1))) is not None:
             _refuse(rule, what, site)
         return original(*args, **kwargs)
 
-    guarded.__contract_original__ = original  # type: ignore[attr-defined]
+    guarded.__contract_original__ = original  # type: ignore[attr-defined]  # `_unguarded` reads it
     return guarded
+
+
+class _Function(Protocol):
+    """A torch function the seal replaced, as torch has it: any of several signatures."""
+
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
 
 
 # ------------------------------------------------------------------------------- the seal
@@ -149,16 +158,17 @@ _ROOM = (
     "set_per_process_memory_fraction",
 )
 #: The sealed room readers' originals: for varena's own gate cells, which read the driver.
-_ORIGINAL: dict[str, Callable[..., Any]] = {}
+_ORIGINAL: dict[str, _Function] = {}
 
 
-def unsealed(torch: Any, name: str) -> Callable[..., Any]:
+def unsealed(torch: ModuleType, name: str) -> _Function:
     """`torch.cuda.<name>` as torch has it, sealed or not. Never for sizing work."""
-    return _ORIGINAL.get(name) or getattr(torch.cuda, name)
+    found: _Function = _ORIGINAL.get(name) or getattr(torch.cuda, name)
+    return found
 
 
-def _raiser(name: str) -> Callable[..., NoReturn]:
-    def refused(*_: Any, **__: Any) -> NoReturn:
+def _raiser(name: str) -> _Function:
+    def refused(*_: object, **__: object) -> NoReturn:
         caller = sys._getframe(1)
         _refuse(
             "room_query", f"torch.cuda.{name}", f"{caller.f_code.co_filename}:{caller.f_lineno}"
@@ -168,7 +178,7 @@ def _raiser(name: str) -> Callable[..., NoReturn]:
     return refused
 
 
-def _replace(rule: str, owners: tuple[Any, ...], name: str, spelled: str) -> None:
+def _replace(rule: str, owners: tuple[ModuleType | None, ...], name: str, spelled: str) -> None:
     """Guard `name` on each of `owners` that has it (one function, several import paths)."""
     for owner in owners:
         found = getattr(owner, name, None)
@@ -178,10 +188,10 @@ def _replace(rule: str, owners: tuple[Any, ...], name: str, spelled: str) -> Non
 
 def _construction(
     rule: str,
-    cls: Any,
+    cls: type | None,
     spelled: str,
     method: str = "__new__",
-    passes: Callable[[dict[str, Any]], bool] | None = None,
+    passes: Callable[[Mapping[str, object]], bool] | None = None,
 ) -> None:
     """Guard building `cls` (or calling `method`) in place, so `isinstance` and subclasses
     keep their class."""
@@ -196,7 +206,7 @@ def _construction(
     setattr(cls, method, staticmethod(guarded) if method == "__new__" else guarded)
 
 
-def seal(torch: Any, application: str = "") -> None:
+def seal(torch: ModuleType, application: str = "") -> None:
     """Seal `torch` for the package whose App is `application` (`module:attribute`)."""
     for name in _ROOM:
         if hasattr(torch.cuda, name) and name not in _ORIGINAL:
@@ -236,7 +246,7 @@ def seal(torch: Any, application: str = "") -> None:
         _model.CONTRACT[0] = _Scopes(torch)
 
 
-def _wraps_stream(kwargs: dict[str, Any]) -> bool:
+def _wraps_stream(kwargs: Mapping[str, object]) -> bool:
     return "stream_id" in kwargs and "stream_ptr" not in kwargs
 
 
@@ -251,7 +261,10 @@ def _libraries(application: str) -> frozenset[str]:
 # ------------------------------------------------------------------------------- the flags
 
 #: The process-wide numerics a package could move, with how to put each back.
-_FLAGS: tuple[tuple[str, Callable[[Any], object], Callable[[Any, Any], object]], ...] = (
+#: torch is read and set by attribute path here, so it is the module object itself
+_FLAGS: tuple[
+    tuple[str, Callable[[ModuleType], object], Callable[[ModuleType, object], object]], ...
+] = (
     (
         "torch.backends.cuda.matmul.allow_tf32",
         lambda t: t.backends.cuda.matmul.allow_tf32,
@@ -319,11 +332,12 @@ _DETERMINISTIC = {
 _EXPECTED: list[dict[str, object] | None] = [None]
 
 
-def _unguarded(fn: Callable[..., Any]) -> Callable[..., Any]:
-    return getattr(fn, "__contract_original__", fn)
+def _unguarded[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
+    original: Callable[P, R] = getattr(fn, "__contract_original__", fn)
+    return original
 
 
-def _flags(torch: Any) -> dict[str, object]:
+def _flags(torch: ModuleType) -> dict[str, object]:
     read: dict[str, object] = {}
     for name, get, _ in _FLAGS:
         try:
@@ -333,12 +347,12 @@ def _flags(torch: Any) -> dict[str, object]:
     return read
 
 
-def pin(torch: Any) -> None:
+def pin(torch: ModuleType) -> None:
     """The flags as the Runtime's numerics policy set them: what every scope leaves."""
     _EXPECTED[0] = _flags(torch)
 
 
-def restore_flags(torch: Any) -> list[str]:
+def restore_flags(torch: ModuleType) -> list[str]:
     """Put back every flag moved since `pin`; the names of those moved."""
     expected = _EXPECTED[0]
     if expected is None:
@@ -358,7 +372,7 @@ def restore_flags(torch: Any) -> list[str]:
 
 #: The executor's `() -> (varena's refused allocations on its GPU, the execution request)`, once
 #: its memory opens; None from a TensorFS that counts none.
-REFUSALS: list[Callable[[], tuple[int, Any] | None] | None] = [None]
+REFUSALS: list[Callable[[], tuple[int, Request | None] | None] | None] = [None]
 
 
 class _Scopes:
@@ -369,7 +383,7 @@ class _Scopes:
     not judged for it: varena's count is the device's. A scope that ran on a thread the package
     started is a run warning (`contract_thread`): a package's thread launches no device work."""
 
-    def __init__(self, torch: Any) -> None:
+    def __init__(self, torch: ModuleType) -> None:
         self.torch = torch
         self._lock = threading.Lock()
         self._open: dict[int, int] = {}
@@ -455,7 +469,7 @@ _READ_ONLY = ("r", "rb", "rt", "br", "tr")
 # `_COPY` is `os.environ` keyed as `putenv` and `unsetenv` are audited (bytes on POSIX); `_held`
 # reads the process's own environment, which they write and `os.environ` only copies.
 if sys.platform == "win32":
-    _COPY: Mapping[Any, Any] = os.environ
+    _COPY: Mapping[str, str] = os.environ
 
     def _held(key: str) -> str | None:
         get = ctypes.WinDLL("kernel32").GetEnvironmentVariableW
@@ -466,7 +480,7 @@ if sys.platform == "win32":
         return value.value
 
 else:
-    _COPY: Mapping[Any, Any] = os.environb
+    _COPY: Mapping[bytes, bytes] = os.environb
 
     @functools.cache
     def _getenv() -> Callable[[bytes], bytes | None]:
@@ -478,7 +492,7 @@ else:
         return _getenv()(key)
 
 
-def _unchanged(event: str, args: tuple[Any, ...]) -> bool:
+def _unchanged(event: str, args: tuple[Any, ...]) -> bool:  # Any: an audit event's arguments
     """An env write (`putenv(key, value)`, `unsetenv(key)`) that leaves `key` as it is, both in
     `os.environ` and in the process's environment: it changes nothing."""
     key, value = args[0], args[1] if event == "os.putenv" else None
@@ -500,7 +514,7 @@ def _installed() -> tuple[str, ...]:
     return tuple({os.path.join(paths[name], "") for name in ("purelib", "platlib")})
 
 
-def audit(event: str, args: tuple[Any, ...]) -> None:
+def audit(event: str, args: tuple[Any, ...]) -> None:  # Any: an audit event's arguments
     """One of `AUDITED`, called by the audit hook itself (its frame and the hook's are skipped):
     refuse the package's env change, spawn or weight read; remember its thread (`_Scopes`). The
     Runtime's own (zygote forks, compile children, media encodes) pass."""
