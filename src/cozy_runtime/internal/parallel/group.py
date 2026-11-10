@@ -583,11 +583,11 @@ class RankGroup:
 
     def _form(
         self,
-        torch: Any,
+        torch: ModuleType,
         again: bool,
         exchange: str,
-        formed: Callable[[Any], None] | None,
-    ) -> Any:
+        formed: Callable[[object], None] | None,
+    ) -> object:
         dist = torch.distributed
         self.forming = "join"
         for follower in self.followers:
