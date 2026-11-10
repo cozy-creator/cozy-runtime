@@ -832,7 +832,8 @@ class Outputs(_Bound):
         handle = self._attempt.next_handle(VideoFile.kind)
         if not self._attempt.writes:
             counted = _Unwritten()
-            samples = feed(counted)  # the author's events still run: only the encode is gone
+            # the author's events still run: only the encode is gone
+            samples = feed(cast(_codec.StreamingMP4Encoder, counted))
             frames = sum(copy.frames) if copy is not None else counted.video_frames
             return self._unwritten(handle, video, audio_format, frames, samples)
         tail = handle.rsplit("/", 1)[-1]
@@ -1210,65 +1211,6 @@ class Outputs(_Bound):
             os.close(descriptor)
 
 
-class _Unwritten:
-    """What a save on a group's other GPU feeds its events into: it counts frames, no more."""
-
-    def __init__(self) -> None:
-        self.video_frames = 0
-
-    def write_video(self, rgb: object) -> None:
-        self.video_frames += 1
-
-    def write_audio(self, planar: object) -> None:
-        return None
-
-    def copy_video(self, before: Callable[[Fraction | None], None]) -> None:
-        return None
-
-
-def _facts(shape: Any) -> dict[str, Any]:
-    names = ("width", "height", "frame_rate", "pixel_aspect_ratio")
-    names += ("color_primaries", "color_transfer", "color_matrix", "color_range")
-    return {name: getattr(shape, name) for name in names}
-
-
-class _UnwrittenJoin:
-    """`Outputs.join_video` on a group's other GPU: soundtracks run, nothing is copied."""
-
-    def __init__(self, outputs: Outputs, audio: DecodedAudioFormat | None) -> None:
-        self._outputs, self._attempt, self._audio = outputs, outputs._attempt, audio
-        self._attempt.next_handle("join")
-        self._shapes: list[Any] = []
-        self._samples = 0
-
-    def append(
-        self,
-        video: VideoFile,
-        soundtrack: Callable[[int], Iterable[DecodedMediaEvent]] = lambda frames: (),
-        *,
-        last: bool = False,
-    ) -> VideoFile:
-        self._attempt.check_open("VideoJoin.append")
-        shape = self._outputs._shape(video)
-        self._shapes.append(shape)
-        for event in soundtrack(shape.frame_count):
-            if isinstance(event, DecodedAudioChunk):
-                self._samples += event.sample_count
-        self._attempt.shown.add(video.ref)
-        handle = self._attempt.next_handle("revision")
-        return VideoFile(handle, media_type="video/mp4", attempt=self._attempt.request_id)
-
-    def finish(self) -> SavedVideo:
-        self._attempt.check_open("VideoJoin.finish")
-        if not self._shapes:
-            raise OutputError("a joined video needs at least one video", code="media_header")
-        handle = self._attempt.next_handle(VideoFile.kind)
-        frames = sum(shape.frame_count for shape in self._shapes)
-        return self._outputs._unwritten(
-            handle, _facts(self._shapes[0]), self._audio, frames, self._samples
-        )
-
-
 class VideoJoin:
     """`Outputs.join_video`: an indexed copy join published as it grows."""
 
@@ -1407,6 +1349,65 @@ class VideoJoin:
             ),
         )
         return revision
+
+
+class _Unwritten:
+    """What a save on a group's other GPU feeds its events into: it counts frames, no more."""
+
+    def __init__(self) -> None:
+        self.video_frames = 0
+
+    def write_video(self, rgb: object) -> None:
+        self.video_frames += 1
+
+    def write_audio(self, planar: object) -> None:
+        return None
+
+    def copy_video(self, before: Callable[[Fraction | None], None]) -> None:
+        return None
+
+
+def _facts(shape: Any) -> dict[str, Any]:
+    names = ("width", "height", "frame_rate", "pixel_aspect_ratio")
+    names += ("color_primaries", "color_transfer", "color_matrix", "color_range")
+    return {name: getattr(shape, name) for name in names}
+
+
+class _UnwrittenJoin(VideoJoin):
+    """`Outputs.join_video` on a group's other GPU: soundtracks run, nothing is copied."""
+
+    def __init__(self, outputs: Outputs, audio: DecodedAudioFormat | None) -> None:
+        self._outputs, self._attempt, self._audio = outputs, outputs._attempt, audio
+        self._attempt.next_handle("join")
+        self._shapes: list[Any] = []
+        self._samples = 0
+
+    def append(
+        self,
+        video: VideoFile,
+        soundtrack: Callable[[int], Iterable[DecodedMediaEvent]] = lambda frames: (),
+        *,
+        last: bool = False,
+    ) -> VideoFile:
+        self._attempt.check_open("VideoJoin.append")
+        shape = self._outputs._shape(video)
+        self._shapes.append(shape)
+        for event in soundtrack(shape.frame_count):
+            if isinstance(event, DecodedAudioChunk):
+                self._samples += event.sample_count
+        self._attempt.shown.add(video.ref)
+        handle = self._attempt.next_handle("revision")
+        return VideoFile(handle, media_type="video/mp4", attempt=self._attempt.request_id)
+
+    def finish(self) -> SavedVideo:
+        self._attempt.check_open("VideoJoin.finish")
+        if not self._shapes:
+            raise OutputError("a joined video needs at least one video", code="media_header")
+        handle = self._attempt.next_handle(VideoFile.kind)
+        frames = sum(shape.frame_count for shape in self._shapes)
+        return self._outputs._unwritten(
+            handle, _facts(self._shapes[0]), self._audio, frames, self._samples
+        )
 
 
 class Telemetry(_Bound):

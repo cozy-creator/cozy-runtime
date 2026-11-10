@@ -15,6 +15,7 @@ from typing import Any
 
 import msgspec
 
+from cozy_runtime.author._errors import Origin, Terminal
 from cozy_runtime.internal import execution_evidence
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.parallel.plan import GroupRefusal
@@ -150,8 +151,8 @@ class RunReply(msgspec.Struct, frozen=True):
     ok: bool
     code: str = ""
     detail: str = ""
-    terminal: str = ""
-    origin: str = ""
+    terminal: Terminal = "failed"
+    origin: Origin = "runtime"
     #: the shape of its result (`spmd.signature`); GPU 0 compares it with its own
     signature: str = ""
     #: its last store meeting, so GPU 0 can clear the attempt's keys

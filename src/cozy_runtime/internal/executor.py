@@ -718,7 +718,7 @@ class _Ranks:
         answered = list(zip(group.followers, replies, strict=True))
         ranks.clear({0: ranks.sequence, **{f.rank: r.meetings for f, r in answered}})
         rows = [(0, mine)] + [
-            (f.rank, Outcome(r.terminal or "failed", r.origin or "runtime", r.code, r.detail))
+            (f.rank, Outcome(r.terminal, r.origin, r.code, r.detail))
             for f, r in answered
             if not r.ok
         ]
@@ -1568,10 +1568,11 @@ class Executor:
     def _ranks(self, command: Invoke, prepared: PreparedRequest) -> Iterator[_Ranks | None]:
         """GPU 0's side of a group attempt: every follower is sent the same request (`run`)
         before GPU 0's handler starts, and answers once its own ends (`_Ranks.settle`)."""
-        group = self.group
+        group, asked = self.group, prepared.asked
         if group is None:
             yield None
             return
+        assert isinstance(asked, PrepareRequest)
         entropy = secrets.randbits(63)
         tag = f"{entropy:016x}"
         ranks = spmd.Ranks(
@@ -1585,7 +1586,7 @@ class Executor:
         group.broadcast(
             {
                 "cmd": "run",
-                "prepare": executor_commands.encode(prepared.asked),
+                "prepare": executor_commands.encode(asked),
                 "invoke": executor_commands.encode(command),
                 "entropy": entropy,
                 "tag": tag,
@@ -4140,35 +4141,34 @@ class Executor:
         asked = functools.partial(
             Kernels, construction=self.construction, model_key=self._group_model_key
         )
-        with group.hold(range(1, group.degree)):
-            try:
-                replies = group.call(executor_commands.encode(asked(sets=tuple(sorted(launches)))))
-                for follower, reply in zip(group.followers, replies, strict=True):
-                    if not reply.get("ok"):
-                        raise GpuDivergence(follower.gpu, "kernels", str(reply.get("detail")))
-                    missing = set(launches) - set(reply.get("built") or ())
-                    for name in sorted(set(reply.get("failed") or ()) & missing):
-                        self._refuse_install(
-                            name,
-                            "kernels_failed",
-                            f"{follower.gpu} has no build of it; the group serves without it",
-                        )
-                        self._drop((name,))
-                    launches = {n: launch for n, launch in launches.items() if n not in missing}
-                installed = self._install(launches) if launches else []
-                if not installed:
-                    return None
-                command = asked(sets=tuple(installed), install=True)
-                replies = group.call(executor_commands.encode(command))
-                for follower, reply in zip(group.followers, replies, strict=True):
-                    if not reply.get("ok"):
-                        raise GpuDivergence(
-                            follower.gpu,
-                            "kernels",
-                            f"{_gpu(0)} installed {installed}: {reply.get('detail')}"[:800],
-                        )
-            except GroupRefusal as exc:
-                return self._group_refusal(exc)
+        try:
+            replies = group.call(executor_commands.encode(asked(sets=tuple(sorted(launches)))))
+            for follower, reply in zip(group.followers, replies, strict=True):
+                if not reply.get("ok"):
+                    raise GpuDivergence(follower.gpu, "kernels", str(reply.get("detail")))
+                missing = set(launches) - set(reply.get("built") or ())
+                for name in sorted(set(reply.get("failed") or ()) & missing):
+                    self._refuse_install(
+                        name,
+                        "kernels_failed",
+                        f"{follower.gpu} has no build of it; the group serves without it",
+                    )
+                    self._drop((name,))
+                launches = {n: launch for n, launch in launches.items() if n not in missing}
+            installed = self._install(launches) if launches else []
+            if not installed:
+                return None
+            command = asked(sets=tuple(installed), install=True)
+            replies = group.call(executor_commands.encode(command))
+            for follower, reply in zip(group.followers, replies, strict=True):
+                if not reply.get("ok"):
+                    raise GpuDivergence(
+                        follower.gpu,
+                        "kernels",
+                        f"{_gpu(0)} installed {installed}: {reply.get('detail')}"[:800],
+                    )
+        except GroupRefusal as exc:
+            return self._group_refusal(exc)
         return None
 
     def kernels(self, command: Kernels) -> Frame:
@@ -4231,16 +4231,14 @@ class Executor:
             executor.attention = replace(applied, waiting=())
             return False
         executor.attention = fresh
-        if executor.group is not None:
-            with executor.group.hold(range(1, executor.group.degree)):
-                if executor._agree_attention(poison=False):
-                    # Every GPU back on the prepared selection; one that cannot take it back
-                    # leaves a divergent group, refused.
-                    executor.attention_defaults.restore()
-                    executor.attention = applied
-                    executor._agree_attention()
-                    executor.attention = replace(applied, waiting=())
-                    return False
+        if executor.group is not None and executor._agree_attention(poison=False):
+            # Every GPU back on the prepared selection; one that cannot take it back
+            # leaves a divergent group, refused.
+            executor.attention_defaults.restore()
+            executor.attention = applied
+            executor._agree_attention()
+            executor.attention = replace(applied, waiting=())
+            return False
         assert executor.backend is not None
         executor.attention_defaults = attention.snapshot(dict(executor.backend.roots))
         return True

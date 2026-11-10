@@ -10,6 +10,7 @@ one broadcast per tensor from the GPU that holds it.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import itertools
 import json
 import random
@@ -47,10 +48,11 @@ class Ranks:
         gpu: Callable[[int], str],
     ) -> None:
         import torch.distributed as dist
+        from torch._C._distributed_c10d import PrefixStore
         from torch.distributed.distributed_c10d import _get_process_group_store
 
         self.rank, self.world, self.pg, self.device, self.gpu = rank, world, pg, device, gpu
-        self.store = dist.PrefixStore(f"cozy.spmd/{tag}/", _get_process_group_store(pg))
+        self.store = PrefixStore(f"cozy.spmd/{tag}/", _get_process_group_store(pg))
         self.sequence = 0
         self.lock = threading.Lock()
         self.nccl = dist.get_backend(pg) == "nccl"
@@ -133,10 +135,11 @@ class Ranks:
     def _broadcast(self, tensor: Any, spec: wire._Tensor, owner: int) -> Any:
         import torch
         import torch.distributed as dist
+        from torch.utils._python_dispatch import _disable_current_modes
 
         dtype = getattr(torch, spec.dtype)
         wire_device = self.device if self.nccl else torch.device("cpu")
-        with torch.utils._python_dispatch._disable_current_modes():
+        with _disable_current_modes():
             if self.rank == owner:
                 buffer = tensor.detach().resolve_conj().resolve_neg().contiguous()
                 buffer = buffer.to(wire_device)
@@ -265,8 +268,8 @@ def signature(value: object, depth: int = 0) -> str:
         return "[" + ",".join(signature(v, depth + 1) for v in value) + "]"
     if isinstance(value, dict):
         return "{" + ",".join(f"{k}:{signature(v, depth + 1)}" for k, v in value.items()) + "}"
-    if hasattr(value, "__dataclass_fields__"):
-        fields = value.__dataclass_fields__
+    if dataclasses.is_dataclass(value):
+        fields = [f.name for f in dataclasses.fields(value)]
         inner = ",".join(f"{f}={signature(getattr(value, f), depth + 1)}" for f in fields)
         return f"{type(value).__name__}({inner})"
     return type(value).__name__
