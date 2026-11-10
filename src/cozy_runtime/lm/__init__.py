@@ -729,7 +729,10 @@ def _draw(scores: Any, temperature: Any, top_p: Any, seed: Any, index: Any) -> A
     bits = _mix(key ^ _mix(entry))
     uniform = ((bits >> 8).float() + 0.5) * (1.0 / (1 << 24))
     noise = -torch.log(-torch.log(uniform))
-    return (z + noise).masked_fill_(outside, float("-inf")).argmax(-1)
+    # The top hash value rounds `uniform` to 1 and its noise to +inf (one entry in 2**24): on a
+    # score already at -inf (a token the constraint or `top_k` took out) that sum is NaN, which
+    # argmax would take.
+    return (z + noise).masked_fill_(outside | torch.isneginf(z), float("-inf")).argmax(-1)
 
 
 class _Draw:
