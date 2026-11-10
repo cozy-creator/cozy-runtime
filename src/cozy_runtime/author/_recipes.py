@@ -16,17 +16,22 @@ inputs through the model, constructed at the source's 16 bits, while their recor
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
 import msgspec
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.author._handler import Handler
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._weights import _OUTPUT_NAME, MAX_WEIGHTS_NEW_BYTES, Weights, WeightsOutput
+from cozy_runtime.canonical_json import JsonValue
 
 if TYPE_CHECKING:
+    from torch import nn
+
     from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._context import Context
     from cozy_runtime.author._services import Telemetry
@@ -94,24 +99,27 @@ class DerivationHook:
     """A lane that needs code: `function(ctx, tel, source, output)` writes weights output
     `output` from `source` (`ctx.output`, `ctx.adopt_model`) and returns the model."""
 
-    function: Callable[[Context, Telemetry, Weights[Any], str], ModelArtifact]
+    function: Callable[[Context, Telemetry, Weights[Model[object]], str], ModelArtifact]
 
 
 type Plan = QuantizationPlan | SelectionPlan | DerivationHook
 #: `calibrate(ctx, tel, model, record)`: runs real inputs through `model` inside
 #: `with record(components):`, `components` naming its modules (`{"transformer": module}`).
-type Calibrate = Callable[[Context, Telemetry, Any, Callable[[Mapping[str, Any]], Any]], None]
+type Calibrate[M] = Callable[
+    [Context, Telemetry, M, Callable[[Mapping[str, nn.Module]], AbstractContextManager[object]]],
+    None,
+]
 
 
 @dataclass(frozen=True, slots=True)
-class Recipe:
+class Recipe[M: Model[object], P: Plan]:
     """The recipe that writes `lane` from a checkpoint of `model`'s layout (`Model`: any)."""
 
     lane: str
-    model: type[Model[Any]]
-    plan: Plan
+    model: type[M]
+    plan: P
     #: A plan fitted to the model's activations: what runs real inputs through it (`Calibrate`).
-    calibrate: Calibrate | None = None
+    calibrate: Calibrate[M] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.lane, str) or _OUTPUT_NAME.fullmatch(self.lane) is None:
@@ -153,7 +161,7 @@ class DeclaredRecipe(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=Tr
     module: str
     export: str
     model: RecipeModel
-    plan: dict[str, Any]
+    plan: dict[str, JsonValue]
     #: a declared plan's; a hook's or a calibrated plan's joins its release, so the run computes it
     fingerprint: str = ""
     #: `module:name` of a calibrated plan's `calibrate` function; "" for none
@@ -167,16 +175,16 @@ def outputs(lanes: Iterable[str]) -> tuple[WeightsOutput, ...]:
     )
 
 
-def canonical(plan: Plan) -> dict[str, Any]:
+def canonical(plan: Plan) -> dict[str, JsonValue]:
     """`plan` as JSON: its fields without defaults, tagged by `kind`; a hook by its function."""
     if isinstance(plan, DerivationHook):
         return {"kind": "derivation", "hook": identity(plan.function)}
-    decoded: dict[str, Any] = msgspec.json.decode(msgspec.json.encode(plan))
+    decoded: dict[str, JsonValue] = msgspec.json.decode(msgspec.json.encode(plan))
     return decoded
 
 
 def fingerprint(
-    plan: dict[str, Any], package: str = "", release: str = "", calibrate: str = ""
+    plan: Mapping[str, JsonValue], package: str = "", release: str = "", calibrate: str = ""
 ) -> str:
     """The digest of a canonical plan. A hook, or a plan's `calibrate`, is code, so its package
     and release join it."""
@@ -188,6 +196,6 @@ def fingerprint(
     return canonical_json.digest(plan)
 
 
-def identity(function: Callable[..., Any]) -> str:
+def identity(function: Handler) -> str:
     """A module-level function as a recipe names it: `module:name`."""
     return f"{function.__module__}:{function.__name__}"

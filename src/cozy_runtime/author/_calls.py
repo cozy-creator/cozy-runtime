@@ -41,6 +41,7 @@ from cozy_runtime.author._executor_requests import (
     SavedFile,
 )
 from cozy_runtime.author._files import _UNBOUND, File, Files, References, Tree, asset_dec_hook
+from cozy_runtime.author._handler import Handler
 from cozy_runtime.author._memo import Memoize, memo_policy
 from cozy_runtime.author._model import WARNINGS, Model
 from cozy_runtime.author._model_defaults import model_components, model_defaults
@@ -90,7 +91,7 @@ class ChildCallError(CapabilityError):
 
 @dataclass(frozen=True, slots=True)
 class _Export:
-    implementation: Callable[..., object]
+    implementation: Handler
     module: str
     name: str
     memoize: Memoize | None = None
@@ -193,13 +194,13 @@ def invocable[**P, R](
     return proxy
 
 
-def _export(fn: Callable[..., object]) -> _Export | None:
+def _export(fn: object) -> _Export | None:
     value = getattr(fn, "_cozy_export", None)
     return value if isinstance(value, _Export) else None
 
 
-def prefetch(
-    callee: Callable[..., object],
+def prefetch[**P, R](
+    callee: Callable[P, R],
     *,
     models: Mapping[str, ModelChoice | None] | None = None,
 ) -> None:

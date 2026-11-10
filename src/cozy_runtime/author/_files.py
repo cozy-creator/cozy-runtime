@@ -21,7 +21,6 @@ from fractions import Fraction
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
-    Any,
     ClassVar,
     Final,
     Literal,
@@ -45,6 +44,7 @@ from cozy_runtime.author._errors import (
 )
 from cozy_runtime.author._markers import PREPARATIONS, FileBound, Preparation
 from cozy_runtime.author._walker import field_values, strip, unwrap_optional
+from cozy_runtime.canonical_json import JsonValue
 
 if TYPE_CHECKING:
     from cozy_runtime.author._decode import (
@@ -229,11 +229,15 @@ class File:
                 fields=[self._input_id] if self._input_id else (),
             )
 
-    def row(self) -> dict[str, Any]:
+    def row(self) -> dict[str, JsonValue]:
         """The manifest row. Names the fields it emits, so no local path can leak. A
         registered frame nobody has encoded yet (cr-079) has no size or digest to claim,
         and the row says so by omission: the output manifest is where those facts live."""
-        row: dict[str, Any] = {"ref": self.ref, "kind": self.kind, "media_type": self.media_type}
+        row: dict[str, JsonValue] = {
+            "ref": self.ref,
+            "kind": self.kind,
+            "media_type": self.media_type,
+        }
         if self.digest:
             row["size_bytes"] = self.size_bytes
             row["digest"] = self.digest
@@ -512,7 +516,7 @@ class References[T](Mapping[str, T]):
     def __repr__(self) -> str:
         return f"References({self._items!r})"
 
-    def wire(self) -> list[dict[str, Any]]:
+    def wire(self) -> list[dict[str, object]]:
         """`[{"key", "type", "file", "description", ...}]`, its values' fields unencoded."""
         values = cast(dict[str, msgspec.Struct], self._items)
         return [
@@ -521,7 +525,9 @@ class References[T](Mapping[str, T]):
         ]
 
 
-def _references(target: object, obj: Any, hook: Callable[[type, Any], Any]) -> References[Any]:
+def _references(
+    target: object, obj: object, hook: Callable[[type, object], object]
+) -> References[object]:
     """References from their wire list, each value converted to the prompt's media type."""
     (item,) = get_args(target) or (object,)
     item = getattr(item, "__bound__", None) or item
@@ -607,7 +613,7 @@ class Tree:
         """Every regular file in the tree, sorted. The whole read surface of an input."""
         return tuple(p for p in sorted(self.path.rglob("*")) if p.is_file())
 
-    def row(self) -> dict[str, Any]:
+    def row(self) -> dict[str, JsonValue]:
         return {
             "ref": self.ref,
             "kind": self.kind,
@@ -616,7 +622,7 @@ class Tree:
         }
 
 
-def asset_dec_hook(target: type, obj: Any) -> Any:
+def asset_dec_hook(target: type, obj: object) -> object:
     """msgspec `dec_hook` for file and tree request fields: a bare ref STRING, never a
     record.
 

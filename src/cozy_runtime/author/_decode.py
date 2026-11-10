@@ -23,6 +23,7 @@ from fractions import Fraction
 from itertools import chain
 from numbers import Integral
 from pathlib import Path
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import PIL.Image
@@ -367,7 +368,7 @@ class _AudioStreamDecoder:
 
     def __init__(
         self,
-        av: Any,
+        av: ModuleType,
         stream: Any,
         limits: DecodeLimits,
         budget: _Budget,
@@ -635,7 +636,7 @@ class _VideoClock:
 
     def __init__(
         self,
-        av: Any,
+        av: ModuleType,
         stream: Any,
         limits: DecodeLimits,
         end: Fraction | None,
@@ -866,7 +867,7 @@ def _soundtrack(container: Any, note: _Note | None = None) -> Any | None:
     return _first_stream(streams, "audio", note) if streams else None
 
 
-def _decoded(av: Any, container: Any, stream: Any, note: _Note) -> Iterator[Any]:
+def _decoded(av: ModuleType, container: Any, stream: Any, note: _Note) -> Iterator[Any]:
     """A stream's frames, as `container.decode` gives them, past any packet the decoder can't read,
     which is skipped with a warning as ffmpeg skips it."""
     for packet in container.demux(stream):
@@ -879,7 +880,7 @@ def _decoded(av: Any, container: Any, stream: Any, note: _Note) -> Iterator[Any]
 
 
 def _audio_events(
-    av: Any,
+    av: ModuleType,
     container: Any,
     stream: Any,
     limits: DecodeLimits,
@@ -900,7 +901,7 @@ def _audio_events(
 
 
 def _media_events(
-    av: Any,
+    av: ModuleType,
     path: Path,
     kind: str,
     limits: DecodeLimits,
@@ -1007,7 +1008,7 @@ def _media_events(
 
 
 def _seek(
-    av: Any, container: Any, stream: Any, target: Fraction, note: _Note
+    av: ModuleType, container: Any, stream: Any, target: Fraction, note: _Note
 ) -> Iterator[Any] | None:
     """The stream's frames from the keyframe at or before `target` seconds, or None when a
     seek does not reach one that starts by then and decodes."""
@@ -1035,7 +1036,7 @@ def _unsaid(_: str) -> None:
     """For a look ahead whose read says the same again."""
 
 
-def _first_picture_time(av: Any, path: Path) -> Fraction:
+def _first_picture_time(av: ModuleType, path: Path) -> Fraction:
     """The presentation time of a video's first decoded frame: the origin `end` counts from."""
     with path.open("rb") as source, av.open(source, mode="r") as container:
         stream = container.streams.video[0]
@@ -1075,7 +1076,7 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
         reads: MediaReads,
         asset: File,
         *,
-        av: Any,
+        av: ModuleType,
         budget: _Budget,
         events: Callable[[], Generator[_Event]],
     ) -> None:
@@ -1156,7 +1157,7 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
 
 
 @contextmanager
-def _reading(asset: File, av: Any, what: str) -> Iterator[None]:
+def _reading(asset: File, av: ModuleType | None, what: str) -> Iterator[None]:
     """One error boundary for every read: decode refusals name the field."""
     fields = [asset._input_id] if asset._input_id else []
     try:
@@ -1553,7 +1554,7 @@ def _collect_video(
     )
 
 
-def _stream_duration(av: Any, container: Any, stream: Any) -> Fraction:
+def _stream_duration(av: ModuleType, container: Any, stream: Any) -> Fraction:
     """A stream's presentation length from its header, else the container's (Matroska
     records only that), else from a packet scan without decoding (live WebM)."""
     time_base = _positive_fraction(stream.time_base, f"{stream.type} stream time base")
@@ -1577,7 +1578,7 @@ def _stream_duration(av: Any, container: Any, stream: Any) -> Fraction:
     return (last - first) * time_base
 
 
-def _probe_video(av: Any, path: Path, limits: DecodeLimits) -> VideoProbe:
+def _probe_video(av: ModuleType, path: Path, limits: DecodeLimits) -> VideoProbe:
     with path.open("rb") as source, av.open(source, mode="r") as container:
         stream = _first_stream(list(container.streams.video), "video")
         soundtrack = _soundtrack(container)
@@ -1604,7 +1605,7 @@ def _probe_video(av: Any, path: Path, limits: DecodeLimits) -> VideoProbe:
     )
 
 
-def _probe_audio(av: Any, path: Path, limits: DecodeLimits) -> AudioProbe:
+def _probe_audio(av: ModuleType, path: Path, limits: DecodeLimits) -> AudioProbe:
     with path.open("rb") as source, av.open(source, mode="r") as container:
         stream = _first_stream(list(container.streams.audio), "audio")
         audio_format = _stream_audio_format(stream, limits)
@@ -1657,7 +1658,7 @@ def _probe_image(path: Path, preparation: ImagePreparation) -> ImageProbe:
     return ImageProbe(width=width, height=height, source_width=width, source_height=height)
 
 
-def _av() -> Any:
+def _av() -> ModuleType:
     try:
         import av
     except ImportError as exc:
@@ -1809,7 +1810,7 @@ def _tight_rgb(
     frame: Any,
     reformatter: Any | None = None,
     *,
-    av: Any | None = None,
+    av: ModuleType | None = None,
     color_facts: tuple[int, int, int, int] | None = None,
 ) -> bytes:
     if reformatter is None or av is None or color_facts is None:

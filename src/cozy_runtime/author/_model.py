@@ -56,6 +56,7 @@ from cozy_runtime.author._errors import (
     InvalidRequest,
     OutputError,
 )
+from cozy_runtime.author._handler import Handler
 from cozy_runtime.author._loader import (
     Artifact,
     Backend,
@@ -80,7 +81,7 @@ _LOG = logging.getLogger(__name__)
 PipelineT = TypeVar("PipelineT", covariant=True)
 P = ParamSpec("P")
 R = TypeVar("R")
-ModelT = TypeVar("ModelT", bound="Model[Any]")
+ModelT = TypeVar("ModelT", bound="Model[object]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +288,9 @@ class _ScopedModel(Protocol):
     ParamSpec-preserving and fully typed without an `Any` seam (§1.7)."""
 
     def _cozy_scope(self, method: str, components: tuple[str, ...]) -> _Scope: ...
+
+    @property
+    def _cozy_memo(self) -> StageMemo | None: ...
 
 
 M = TypeVar("M", bound=_ScopedModel)
@@ -614,11 +618,11 @@ class Placement(Protocol):
 #: The remote scopes open in this context, innermost last: (model, method, components).
 #: Per context rather than per model, so a remote scope on a helper thread is visible to that
 #: thread's hosted calls and to nothing else.
-_REMOTE_SCOPES: contextvars.ContextVar[tuple[tuple[Model[Any], str, tuple[str, ...]], ...]] = (
+_REMOTE_SCOPES: contextvars.ContextVar[tuple[tuple[Model[object], str, tuple[str, ...]], ...]] = (
     contextvars.ContextVar("cozy_remote_scopes", default=())
 )
 #: The local scopes open in this context, innermost last: (model, method, components).
-_LOCAL_SCOPES: contextvars.ContextVar[tuple[tuple[Model[Any], str, tuple[str, ...]], ...]] = (
+_LOCAL_SCOPES: contextvars.ContextVar[tuple[tuple[Model[object], str, tuple[str, ...]], ...]] = (
     contextvars.ContextVar("cozy_local_scopes", default=())
 )
 #: Whether a `deterministic=True` scope is open in this context.
@@ -710,7 +714,7 @@ def memoize[M: _ScopedModel, **P, R](
         declared: _Declared = cast("_Declared", wrapper)
         declared.__uses_components__ = components
         declared.__deterministic__ = bool(getattr(fn, "__deterministic__", False))
-    return cast("Callable[Concatenate[M, P], R]", wrapper)
+    return wrapper
 
 
 def sequence_parallel(*, degrees: Sequence[int]) -> Callable[[type[ModelT]], type[ModelT]]:
@@ -783,7 +787,7 @@ def placeable(*names: str) -> Callable[[type[ModelT]], type[ModelT]]:
     return decorate
 
 
-def _is_async(fn: Callable[..., object]) -> bool:
+def _is_async(fn: Handler) -> bool:
     return inspect.iscoroutinefunction(inspect.unwrap(fn))
 
 
@@ -1157,7 +1161,7 @@ class _ComponentScope:
         "_using",
     )
 
-    def __init__(self, model: Model[Any], method: str, components: tuple[str, ...]) -> None:
+    def __init__(self, model: Model[object], method: str, components: tuple[str, ...]) -> None:
         self._model = model
         self._method = method
         self._components = components
@@ -1306,7 +1310,7 @@ class Generation:
     """One constructed, Ready model generation and the binding paths sharing it."""
 
     identity: ConstructionIdentity
-    model: Model[Any]
+    model: Model[object]
     record: ConstructionRecord
     paths: list[str] = field(default_factory=list)
 
@@ -1322,7 +1326,7 @@ def component_use(cls: type) -> Mapping[str, tuple[str, ...]]:
     return contract
 
 
-def _public_methods(cls: type) -> Iterator[tuple[str, Callable[..., object]]]:
+def _public_methods(cls: type) -> Iterator[tuple[str, Handler]]:
     """Author-defined public methods only — runtime-owned base members do not open scopes."""
     for name in dir(cls):
         if name.startswith("_") or name in _RUNTIME_MEMBERS or hasattr(Model, name):
@@ -1407,7 +1411,7 @@ class ModelRegistry:
             self._by_path[binding_path] = generation
             return cast("ModelT", generation.model)
 
-    def models(self, callable_name: str) -> Mapping[str, Model[Any]]:
+    def models(self, callable_name: str) -> Mapping[str, Model[object]]:
         """What `Invocation.models` needs for ONE callable, keyed by parameter name.
 
         Resolution is per binding PATH, never per parameter name: two entrypoints both
@@ -1445,7 +1449,7 @@ class ModelRegistry:
     def _construct(
         self,
         identity: ConstructionIdentity,
-        cls: type[Model[Any]],
+        cls: type[Model[object]],
         artifact: Artifact,
         mode: Mode,
         adapters: Sequence[AdapterRef] = (),
@@ -1547,7 +1551,7 @@ class ModelRegistry:
             object.__setattr__(model, "_cozy_loading", False)
         return Generation(identity, model, record)
 
-    def _loader(self, model: Model[Any], artifact: Artifact, mode: Mode) -> Loader:
+    def _loader(self, model: Model[object], artifact: Artifact, mode: Mode) -> Loader:
         return Loader(artifact, owner=model, backend=self._backend, mode=mode)
 
 

@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, final
+from typing import TYPE_CHECKING, Literal, final
 
 from cozy_runtime.author._errors import Cancelled, CapabilityError, DeadlineExceeded
 
@@ -28,8 +28,10 @@ if TYPE_CHECKING:
 
     from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._loader import Scheduler
+    from cozy_runtime.author._model import Model
     from cozy_runtime.author._recipes import DeclaredRecipe
     from cozy_runtime.author._weights import Weights
+    from cozy_runtime.graphs import Finite
     from cozy_runtime.weights_store import Checkpoint, Derivation, Output
 
 DeviceType = Literal["cuda", "cpu", "mps"]
@@ -144,7 +146,9 @@ class Context:
     """Monotonic-clock instant the attempt must not outlive."""
     device: Device = field(default_factory=Device)
     _cancel: Callable[[], bool] = field(default=lambda: False, repr=False)
-    _tensorfs_source: Callable[[Weights[Any]], Checkpoint] | None = field(default=None, repr=False)
+    _tensorfs_source: Callable[[Weights[Model[object]]], Checkpoint] | None = field(
+        default=None, repr=False
+    )
     _tensorfs_output: Callable[[str, Derivation], Output] | None = field(default=None, repr=False)
     _tensorfs_adopt: Callable[[Output], ModelArtifact] | None = field(default=None, repr=False)
     _release_gpus: Callable[[], None] | None = field(default=None, repr=False)
@@ -153,14 +157,14 @@ class Context:
         default=None, repr=False
     )
     #: the sums of what its last component root returned (`graphs.Finite`)
-    _finite: Any = field(default=None, repr=False)
+    _finite: Finite | None = field(default=None, repr=False)
     #: steps reported (`progress`, `on_step`): a component method that ran some handed back latents
     _steps: int = field(default=0, repr=False)
     #: `progress(step, total)`'s frame, and a model method call's (`uses_components`) activity
     _progress: Callable[[int, int], None] | None = field(default=None, repr=False)
     _called: Callable[[str], None] | None = field(default=None, repr=False)
 
-    def tensorfs_source(self, weights: Weights[Any]) -> Checkpoint:
+    def tensorfs_source(self, weights: Weights[Model[object]]) -> Checkpoint:
         """An admitted `Weights` argument's checkpoint: its pipeline, components and stored
         bytes."""
         self.raise_if_cancelled()

@@ -29,7 +29,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, get_args
+from typing import TYPE_CHECKING, cast, get_args
 
 import msgspec
 
@@ -86,6 +86,7 @@ from cozy_runtime.author._services import (
 from cozy_runtime.author._signature import Param, Surface
 from cozy_runtime.author._walker import field_values, strip, unwrap_optional, walk
 from cozy_runtime.author._weights import ReadBytes, ReadValues, Weights
+from cozy_runtime.canonical_json import JsonValue
 
 if TYPE_CHECKING:
     from cozy_runtime.weights_store import Checkpoint, Derivation, Output
@@ -100,7 +101,7 @@ class Invocation:
     deadline: float
     device: Device = field(default_factory=Device)
     cancel: Callable[[], bool] = field(default=lambda: False)
-    models: Mapping[str, Model[Any]] = field(default_factory=dict)
+    models: Mapping[str, Model[object]] = field(default_factory=dict)
     #: The package's declared recipes, which its `quantize` runs.
     recipes: tuple[DeclaredRecipe, ...] = ()
     trees: Mapping[str, tuple[Path, str]] = field(default_factory=dict)
@@ -119,7 +120,7 @@ class Invocation:
     max_input_bytes: int | None = None
     """An explicit deployment ceiling narrows every field's own `FileBound`. None honors each
     installed field's declared bound; a field that declares none has no size limit."""
-    sources: Mapping[str, Weights[Any]] = field(default_factory=dict)
+    sources: Mapping[str, Weights[Model[object]]] = field(default_factory=dict)
     """`Weights[M]` parameter -> its raw checkpoint, read through this attempt's source."""
     weights_bytes: ReadBytes | None = None
     weights_values: ReadValues | None = None
@@ -141,8 +142,8 @@ class Invocation:
 class InvocationResult:
     """The invocation result facts supplied by the author executor."""
 
-    result: Any
-    outputs: tuple[Mapping[str, Any], ...]
+    result: object
+    outputs: tuple[Mapping[str, JsonValue], ...]
     adjustments: tuple[AdjustmentRow, ...]
     features: RequestFeatures
     overlay_digest: str
@@ -246,7 +247,7 @@ def _bind_tensorfs(
         record.check_open("Context weights capability")
         ctx.raise_if_cancelled()
 
-    def source(weights: Weights[Any]) -> Checkpoint:
+    def source(weights: Weights[Model[object]]) -> Checkpoint:
         current()
         if source_reader is None or not any(
             weights is candidate for candidate in inv.sources.values()
@@ -427,7 +428,7 @@ def _payload_value(surface: Surface, payload: object) -> object:
     if surface.assets is None or surface.invocable:
         return payload
     annotation = next(p.annotation for p in surface.params if p.role == "payload")
-    cls: Any = annotation
+    cls = cast("type[msgspec.Struct]", annotation)  # an asset-bearing payload is a Struct
     return cls(**{f.name: getattr(payload, f.name) for f in msgspec.structs.fields(cls)})
 
 

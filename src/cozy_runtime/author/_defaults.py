@@ -321,7 +321,7 @@ def _prune(
 def _tier(info: mi.EnumType, value: str, path: str, rows: list[AdjustmentRow]) -> str:
     """A resolution an enum of `1080p`-style tiers doesn't name, as its nearest (`4k` is 2160p);
     any other enum's value as it is, for the decoder."""
-    tiers = {
+    tiers: dict[int, str] = {
         int(member.value[:-1]): member.value
         for member in info.cls
         if _TIER.fullmatch(str(member.value))
@@ -346,7 +346,7 @@ def _held(info: mi.Type, value: object) -> object:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return value
     if isinstance(info, mi.LiteralType):
-        members = [m for m in info.values if type(m) in (int, float)]
+        members = [m for m in info.values if isinstance(m, int | float) and type(m) in (int, float)]
         if not members or value in members:
             return value
         return min(members, key=lambda member: (abs(member - value), member))
@@ -374,6 +374,7 @@ def _branch(info: mi.UnionType, value: object) -> mi.Type | None:
     array-like member, besides structs told apart by their tag; a scalar's is the one member of
     its kind, if it has just one."""
     arrays = (mi.CollectionType, mi.TupleType)
+    kinds: tuple[type[mi.Type], ...]
     if isinstance(value, dict):
         kinds = (*_OBJECTS, mi.DictType)
     elif isinstance(value, list):

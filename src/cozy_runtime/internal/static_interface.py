@@ -70,6 +70,7 @@ from cozy_runtime.author._signature import (
     described,
 )
 from cozy_runtime.author._walker import is_struct
+from cozy_runtime.canonical_json import JsonValue
 from cozy_runtime.internal import vocabulary as author
 from cozy_runtime.internal.canonical import Json
 
@@ -1553,7 +1554,7 @@ class StaticRecipe:
     plan: author.QuantizationPlan | author.SelectionPlan | str
     calibrate: str = ""
 
-    def canonical(self) -> dict[str, object]:
+    def canonical(self) -> dict[str, JsonValue]:
         if isinstance(self.plan, str):
             return {"kind": "derivation", "hook": self.plan}
         return canonical(self.plan)

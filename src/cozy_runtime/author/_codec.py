@@ -41,13 +41,22 @@ from dataclasses import dataclass
 from fractions import Fraction
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import TYPE_CHECKING, Any
 
 from PIL import Image
 
 import cozy_runtime.author._color as _color
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author._errors import OutputError
+
+if TYPE_CHECKING:
+    import numpy as np
+    from numpy.typing import NDArray
+    from torch import Tensor
+
+#: What frames and waveforms save from: a torch tensor (on any device) or a numpy array.
+type Samples = Tensor | NDArray[np.generic]
 
 #: Raw-snapshot ceiling as a multiple of the attempt's output ceiling. H3's largest launch
 #: product (124 frames of 1344x768 RGB) is ~1.45x the 256 MiB output cap; 16x admits an
@@ -103,7 +112,7 @@ class Planar:
         return self.view().nbytes
 
 
-def _av() -> Any:
+def _av() -> ModuleType:
     try:
         import av
     except ImportError:
@@ -299,7 +308,7 @@ def audio_chunk(pcm_f32le: tuple[bytes, ...], sample_count: int) -> tuple[Planar
 
 
 def _audio_frames(
-    av: Any,
+    av: ModuleType,
     planar: Planar,
     sample_rate: int,
     fmt: str,
