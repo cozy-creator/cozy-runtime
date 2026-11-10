@@ -53,6 +53,7 @@ from cozy_runtime.internal.encoding.selection import (
 )
 from cozy_runtime.internal.fill import (
     Checkpoint,
+    FitVerdict,
     PlanRow,
     TensorRequirement,
     _refuse,
@@ -81,7 +82,7 @@ from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution
 if TYPE_CHECKING:
     import torch
     from torch import Tensor
-    from torch.nn import Module
+    from torch.nn import Linear, Module
 
 
 # ---------------------------------------------------------------------------- the backend
@@ -214,7 +215,7 @@ class Backend:
         """Completeness sets: a destination the census never reaches refuses the commit."""
         self.expected = {name: frozenset(keys) for name, keys in sets.items()}
 
-    def fit(self, walked: Census, *, encoded_leaves: str) -> Mapping[str, object] | None:
+    def fit(self, walked: Census, *, encoded_leaves: str) -> FitVerdict | None:
         """`fill.fit` over the serving census, per checkpoint the census reads."""
         by_checkpoint: dict[str, tuple[Checkpoint, list[str]]] = {}
         for component in walked.components:
@@ -227,7 +228,7 @@ class Backend:
                     [component],
                 )
             by_checkpoint.setdefault(checkpoint.id, (checkpoint, []))[1].append(component)
-        verdict: dict[str, object] | None = None
+        verdict: FitVerdict | None = None
         ignored: list[str] = []
         unstored: list[str] = []
         warnings: list[str] = []
@@ -257,12 +258,12 @@ class Backend:
             if not fit.get("ok"):
                 return fit
             verdict = fit
-            extras = [str(k) for k in fit.get("ignored", ())]  # type: ignore[attr-defined]
+            extras = [str(k) for k in fit.get("ignored", ())]
             ignored.extend(extras)
             if extras:
                 warnings.append(str(fit.get("warning") or self._skipped_line(extras)))
-            unstored.extend(str(k) for k in fit.get("unstored", ()))  # type: ignore[attr-defined]
-            counted: Mapping[str, int] = fit.get("routes", {})  # type: ignore[assignment]
+            unstored.extend(str(k) for k in fit.get("unstored", ()))
+            counted: Mapping[str, int] = fit.get("routes", {})
             for route in routes:
                 routes[route] += int(counted.get(route, 0))
         if verdict is None:
@@ -759,12 +760,18 @@ def _float32(torch: ModuleType, root: Module) -> None:
         future.set_swap_module_params_on_conversion(swapping)
     narrow = (torch.float16, torch.bfloat16)
 
-    def widen(_: Module, args: Any, kwargs: Any) -> Any:
-        def up(value: Any) -> Any:
-            narrowed = isinstance(value, torch.Tensor) and value.dtype in narrow
-            return value.float() if narrowed else value
+    def widen(
+        _: Module, args: tuple[object, ...], kwargs: dict[str, object]
+    ) -> tuple[tuple[object, ...], dict[str, object]]:
+        def up(value: object) -> object:
+            if isinstance(value, torch.Tensor) and value.dtype in narrow:
+                return value.float()
+            return value
 
-        return torch.utils._pytree.tree_map(up, (args, kwargs))
+        widened: tuple[tuple[object, ...], dict[str, object]] = torch.utils._pytree.tree_map(
+            up, (args, kwargs)
+        )
+        return widened
 
     for sub in root.modules():
         owned = (*sub._parameters.values(), *sub._buffers.values())
@@ -810,6 +817,8 @@ class LoRASource(Protocol):
 class LoRALayer(Protocol):
     active_adapters: Sequence[str]
     scaling: Mapping[str, float]
+    lora_A: Mapping[str, Linear]
+    lora_B: Mapping[str, Linear]
     _cozy_baked: bool
 
 
@@ -869,7 +878,7 @@ class _Bakes:
             ):
                 continue
             bake = _Bake(stored, repr((encoded.scheme, encoded.params)), leaf=leaf)
-            hooks = list(module._forward_hooks.values()) if module is not None else []
+            hooks: list[object] = list(module._forward_hooks.values()) if module is not None else []
             if any(site.startswith(block + ".") for block in blocks):
                 bake.hooks = [hook for hook in hooks if isinstance(hook, LoRASource)]
             target = site.removesuffix(".base_layer")
@@ -1103,10 +1112,11 @@ def _deltas(bake: _Bake) -> list[tuple[object, Tensor, Tensor, float]]:
     """An svdq leaf's LoRAs as it runs: each `(identity, down, up, scale)`, the bound factors of
     its PEFT layer's active adapters, then its model's hooks'."""
     out: list[tuple[object, Tensor, Tensor, float]] = []
-    layer = cast(Any, bake.layer)
-    for adapter in getattr(layer, "active_adapters", ()):
-        down, up = layer.lora_A[adapter], layer.lora_B[adapter]
-        out.append((down, down.weight, up.weight, float(layer.scaling[adapter])))
+    layer = bake.layer
+    if layer is not None:
+        for adapter in layer.active_adapters:
+            down, up = layer.lora_A[adapter], layer.lora_B[adapter]
+            out.append((down, down.weight, up.weight, float(layer.scaling[adapter])))
     for hook in bake.hooks:
         got = hook.lora_factors()
         if got is not None:
@@ -1135,7 +1145,7 @@ class Placement:
         self.steps: list[frozenset[str]] = []
         #: components whose blocks are held bound, with the stream their binds queued on, and
         #: those this step found no free room to hold
-        self.holds: dict[str, tuple[Hold, Any]] = {}
+        self.holds: dict[str, tuple[Hold, torch.cuda.Stream | None]] = {}
         self.unheld: set[str] = set()
         for name, model in self.models.items():
             PLACED[model.module] = (self, name)
@@ -1198,7 +1208,7 @@ class Placement:
     def _shed(self, component: str) -> None:
         self.holds.pop(component, None)
 
-    def graph_held(self, component: str) -> Any:
+    def graph_held(self, component: str) -> torch.cuda.Stream | None:
         """The stream `component`'s held blocks bound on, or None when they are not held."""
         held = self.holds.get(component)
         return None if held is None else held[1]
@@ -1238,12 +1248,12 @@ class Placement:
                     stack.callback(bakes._choice.reset, token)
             yield
 
-    def retain(self, component: str, paths: tuple[str, ...]) -> Any:
+    def retain(self, component: str, paths: tuple[str, ...]) -> Binding:
         """The region's address ownership, independent of its physical replay lease."""
         return self.models[component].retain(paths)
 
     def represent(
-        self, component: str, dtype: Any, *, resident_only: bool = False
+        self, component: str, dtype: torch.dtype, *, resident_only: bool = False
     ) -> Callable[[], None]:
         """Preflight every requested cast before capture applies any representation change. A CPU
         executor serves every component in float32 (`_float32`), so a hold there changes nothing."""
@@ -1261,7 +1271,7 @@ class Placement:
     def graph_accounted(self) -> bool:
         return bool(self.memory.cuda)
 
-    def graph_domain(self, component: str) -> Any:
+    def graph_domain(self, component: str) -> graphs.domain.Domain:
         return graphs.capture_device(self.torch, self.memory)
 
     def region(
@@ -1280,7 +1290,7 @@ class Placement:
         """Stock Torch owns the graph pool; the recording retains its binding and tensors."""
         return graphs.domain.Pool(self.torch.cuda.graph_pool_handle())
 
-    def graph_pass(self, component: str, entry: str) -> Any:
+    def graph_pass(self, component: str, entry: str) -> AbstractContextManager[Model]:
         return self.models[component].passing(entry, executing=True)
 
     def graph_idle(self) -> AbstractContextManager[object]:

@@ -16,10 +16,11 @@ import threading
 from collections import deque
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Sequence
 from concurrent.futures import Future
-from typing import IO, TYPE_CHECKING, Any, NamedTuple
+from typing import IO, TYPE_CHECKING, NamedTuple
 
 import msgspec
 import numpy as np
+from numpy.typing import NDArray
 
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import Context, Telemetry, UnsupportedInput, _numeric
@@ -39,7 +40,14 @@ from .microscale import (
     encode_nvfp4,
     encode_w4a8,
 )
-from .native_quantization import PARAMS, PER_ROW, QuantizationStats, _pool, _run_native
+from .native_quantization import (
+    PARAMS,
+    PER_ROW,
+    QuantizationStats,
+    QuantizedTensors,
+    _pool,
+    _run_native,
+)
 
 if TYPE_CHECKING:
     from tensorfs.api import NormalizeBf16Tensor
@@ -54,7 +62,7 @@ class _Encoding(NamedTuple):
     same. `pack` weights share a stored element (w4a8's codes are `[rows, cols / 2]` bytes)."""
 
     round_trip_bound: float
-    encode: Callable[[str, np.ndarray, float], Encoded]
+    encode: Callable[[str, NDArray[np.float32], float], Encoded]
     weight_dtype: str
     block: int
     companions: Callable[[int, int], tuple[tuple[str, str, tuple[int, ...]], ...]]
@@ -72,8 +80,8 @@ def _row_scale(rows: int, cols: int) -> tuple[tuple[str, str, tuple[int, ...]], 
 
 
 def _rowwise(
-    encode: Callable[[str, np.ndarray], Encoded],
-) -> Callable[[str, np.ndarray, float], Encoded]:
+    encode: Callable[[str, NDArray[np.float32]], Encoded],
+) -> Callable[[str, NDArray[np.float32], float], Encoded]:
     return lambda key, values, _amax: encode(key, values)
 
 
@@ -266,7 +274,7 @@ class _Bf16Result(msgspec.Struct):
     new_bytes_written: int
     required_buffer_bytes: int
     worst_relative_frobenius: float | None
-    tensors: list[dict[str, Any]] = msgspec.field(default_factory=list)
+    tensors: QuantizedTensors = msgspec.field(default_factory=list)
 
 
 def bf16_source_dtypes(sources: Sequence[str]) -> tuple[str, ...]:
@@ -601,7 +609,7 @@ def _in_order(
 
 def _read_chunks(
     source: Checkpoint, component: str, key: str, logical_dtype: str, shape: tuple[int, ...]
-) -> Iterator[np.ndarray]:
+) -> Iterator[NDArray[np.float32]]:
     """Whole rows of float32 values, about `_SOURCE_READ_CHUNK` source bytes at a time: a per-row
     encoded weight's decoded values (`model_values`), a plain tensor's converted."""
     if source.components[component].tensors[key].encoding is not None:
@@ -623,7 +631,7 @@ def _read_chunks(
 
 def _decoded_chunks(
     source: Checkpoint, component: str, key: str, shape: tuple[int, ...]
-) -> Iterator[np.ndarray]:
+) -> Iterator[NDArray[np.float32]]:
     rows, columns = shape
     step = max(1, _SOURCE_READ_CHUNK // max(columns * 4, 1))
     for first in range(0, rows, step):

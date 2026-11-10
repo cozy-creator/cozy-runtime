@@ -19,7 +19,7 @@ import threading
 from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, cast
+from typing import IO, TYPE_CHECKING, NotRequired, TypedDict, cast
 
 import tensorfs
 from tensorfs import Checkpoint as Checkpoint
@@ -31,7 +31,13 @@ from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._errors import CapabilityError
 
 if TYPE_CHECKING:
-    from tensorfs.api import NormalizeBf16Tensor, QuantizeTensor
+    from tensorfs._ext import ConfigInput, MetadataInput
+    from tensorfs.api import (
+        NormalizationResult,
+        NormalizeBf16Tensor,
+        QuantizationResult,
+        QuantizeTensor,
+    )
 
 #: The store's location when the machine names none (TensorFS's default, owner D3).
 DEFAULT_HOME = "~/.cache/tensorfs"
@@ -67,6 +73,27 @@ class Bearers:
     def latest(self, actor: str, endpoint: str) -> str:
         held = self._latest.get((actor, endpoint))
         return "" if held is None else held[0]
+
+
+class DerivationWork(TypedDict):
+    """`Derivation.work`: what a derived output's replay key reads."""
+
+    base: str | None
+    sources: list[str]
+    order: list[list[str]]
+    max_new_bytes: int
+    provenance: NotRequired[dict[str, MetadataInput]]
+
+
+class ReusedQuantization(TypedDict):
+    """A finished output's quantize answer: nothing encoded, every selected key reused."""
+
+    encoded_keys: int
+    reused_keys: int
+    source_bytes_read: int
+    new_bytes_written: int
+    saturated_elements: int
+    worst_relative_frobenius: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,11 +194,11 @@ class Derivation:
     sources: Sequence[Checkpoint] = ()
     order: Sequence[tuple[str, str]] = ()
     #: The header's `provenance`: the recipe that writes it (`derive.recipes`).
-    provenance: Mapping[str, object] | None = None
+    provenance: Mapping[str, MetadataInput] | None = None
 
-    def work(self, max_new_bytes: int) -> dict[str, object]:
+    def work(self, max_new_bytes: int) -> DerivationWork:
         """The derivation as its replay key reads it."""
-        work: dict[str, object] = {
+        work: DerivationWork = {
             "base": None if self.base is None else self.base.id,
             "sources": [source.id for source in self.sources],
             "order": [[component, key] for component, key in self.order],
@@ -261,7 +288,7 @@ class Output:
         writer = self._components.get(name)
         return writer if writer is not None else self._open(name, None)
 
-    def config(self, component: str, config: Mapping[str, object]) -> None:
+    def config(self, component: str, config: Mapping[str, ConfigInput]) -> None:
         """`component`'s own config in place of the one it inherits, or a new component's:
         set before anything is written to it."""
         if self.done is not None:
@@ -273,7 +300,9 @@ class Output:
             )
         self._open(component, config)
 
-    def _open(self, name: str, config: Mapping[str, object] | None) -> tensorfs.ComponentWriter:
+    def _open(
+        self, name: str, config: Mapping[str, ConfigInput] | None
+    ) -> tensorfs.ComponentWriter:
         if self._writer is None:
             raise CapabilityError("the output is committed or closed", code="weights_writer_closed")
         declared = self.declared.get(name)
@@ -327,7 +356,7 @@ class Output:
         dtype: str,
         shape: Sequence[int],
         scheme: str,
-        params: Mapping[str, object],
+        params: Mapping[str, MetadataInput],
         parts: Sequence[PartData],
     ) -> None:
         """An encoded tensor: its logical dtype and shape, scheme and params, and each part."""
@@ -350,7 +379,7 @@ class Output:
         tensors: Sequence[NormalizeBf16Tensor],
         *,
         max_buffer_bytes: int = 8 << 20,
-    ) -> tuple[Callable[[tensorfs.ConversionControl], dict[str, object]], int]:
+    ) -> tuple[Callable[[tensorfs.ConversionControl], NormalizationResult], int]:
         """Reserve missing BF16 bytes, then return one owning native normalization call.
 
         Supply the full immutable normalization selection, even when every key is already
@@ -397,7 +426,7 @@ class Output:
         for component in dict.fromkeys(row["component"] for row in tensors):
             self.component(component)
 
-        def convert(control: tensorfs.ConversionControl) -> dict[str, object]:
+        def convert(control: tensorfs.ConversionControl) -> NormalizationResult:
             result = writer.normalize_bf16(
                 source,
                 tensors,
@@ -421,7 +450,9 @@ class Output:
         calibration: Checkpoint | None = None,
         max_buffer_bytes: int = 8 << 20,
         component: str | None = None,
-    ) -> tuple[Callable[[tensorfs.ConversionControl], dict[str, object]], int]:
+    ) -> tuple[
+        Callable[[tensorfs.ConversionControl], QuantizationResult | ReusedQuantization], int
+    ]:
         """Reserve this output's grant once, then return one owning native Writer call.
 
         The derivation supplies the full immutable native selection; only missing entries
@@ -454,7 +485,8 @@ class Output:
 
         identity = accepted_identity(component)
         if self.done is not None:
-            if identity not in self.done.metadata.get("native_quantization", []):
+            recorded = self.done.metadata.get("native_quantization", [])
+            if not isinstance(recorded, list) or identity not in recorded:
                 raise CapabilityError(
                     "finished output has a different calibration or native producer; "
                     "derive a new output",
@@ -498,7 +530,7 @@ class Output:
         for name in dict.fromkeys(row["component"] for row in selected):
             self.component(name)
 
-        def convert(control: tensorfs.ConversionControl) -> dict[str, object]:
+        def convert(control: tensorfs.ConversionControl) -> QuantizationResult:
             result = writer.quantize(
                 source,
                 tensors,
