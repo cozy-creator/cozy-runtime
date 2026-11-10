@@ -135,12 +135,12 @@ def no_compile() -> Iterator[None]:
     def nothing(*_: object, **__: object) -> None:
         return None
 
-    torch.compile = compiled
+    setattr(torch, "compile", compiled)  # noqa: B010  # a module attribute mypy can't see
     torch.nn.Module.compile = nothing
     try:
         yield
     finally:
-        torch.compile = original
+        setattr(torch, "compile", original)  # noqa: B010
         torch.nn.Module.compile = original_method
 
 

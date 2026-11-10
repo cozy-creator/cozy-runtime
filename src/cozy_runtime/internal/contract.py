@@ -46,7 +46,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from types import FrameType, ModuleType
-from typing import TYPE_CHECKING, Any, NoReturn, Protocol
+from typing import TYPE_CHECKING, Any, NoReturn, Protocol, SupportsInt, cast
 
 from cozy_runtime.author import _model
 from cozy_runtime.author._context import CURRENT
@@ -151,8 +151,8 @@ class _Function(Protocol):
     def __call__(self, *args: object, **kwargs: object) -> object: ...
 
 
-def _marked(wrapper: _Function, original: object) -> _Function:
-    wrapper.__contract_original__ = original  # type: ignore[attr-defined]  # `_unguarded` reads it
+def _marked[F](wrapper: F, original: object) -> F:
+    object.__setattr__(wrapper, "__contract_original__", original)  # `_unguarded` reads it
     return wrapper
 
 
@@ -189,6 +189,10 @@ def _swap(
         found = getattr(owner, name, None)
         if callable(found) and not hasattr(found, "__contract_original__"):
             setattr(owner, name, make(found))
+
+
+def _ignoring(call: str, said: str, instead: _Function) -> Callable[[_Function], _Function]:
+    return lambda original: _instead(original, call, said, instead)
 
 
 def _nothing(*_: object, **__: object) -> None:
@@ -279,23 +283,13 @@ def seal(torch: ModuleType, application: str = "") -> None:
             ((cuda, cuda.memory), f"torch.cuda.{name}"),
             ((mps,), f"torch.mps.{name}"),
         ):
-            said = f"{spelled} does nothing here: {why}"
-            _swap(owners, name, lambda f, c=spelled, s=said: _instead(f, c, s, _nothing))
+            _swap(owners, name, _ignoring(spelled, f"{spelled} does nothing here: {why}", _nothing))
     _construction("cuda_graph", getattr(cuda, "CUDAGraph", None), "torch.cuda.CUDAGraph")
     _construction("cuda_graph", getattr(cuda, "graph", None), "torch.cuda.graph", "__init__")
     said = f"torch.cuda.make_graphed_callables returns its callables unchanged: {_COMPILE}"
-    _swap(
-        (cuda, graphs),
-        "make_graphed_callables",
-        lambda f: _instead(f, "torch.cuda.make_graphed_callables", said, _first),
-    )
-    _swap(
-        (torch,),
-        "compile",
-        lambda f: _instead(
-            f, "torch.compile", f"torch.compile does nothing here: {_COMPILE}", _compiled
-        ),
-    )
+    _swap((cuda, graphs), "make_graphed_callables", _ignoring("graphed", said, _first))
+    said = f"torch.compile does nothing here: {_COMPILE}"
+    _swap((torch,), "compile", _ignoring("torch.compile", said, _compiled))
     module_compile = vars(torch.nn.Module).get("compile")
     if module_compile is not None and not hasattr(module_compile, "__contract_original__"):
         said = f"nn.Module.compile does nothing here: {_COMPILE}"
@@ -328,16 +322,22 @@ def _attention(torch: ModuleType) -> None:
         "allow_fp16_bf16_reduction_math_sdp",
     ):
         spelled = f"torch.backends.cuda.{name}"
-        said = f"{spelled} does nothing here: {_ATTENTION}"
-        _swap((backends,), name, lambda f, c=spelled, s=said: _instead(f, c, s, _nothing))
+        _swap(
+            (backends,),
+            name,
+            _ignoring(spelled, f"{spelled} does nothing here: {_ATTENTION}", _nothing),
+        )
     try:
         attention: ModuleType | None = importlib.import_module("torch.nn.attention")
     except ImportError:
         attention = None
-    for owner, spelled in ((attention, "torch.nn.attention"), (backends, "torch.backends.cuda")):
-        name = "sdpa_kernel" if owner is attention else "sdp_kernel"
-        said = f"{spelled}.{name} does nothing here: {_ATTENTION}"
-        _swap((owner,), name, lambda f, c=f"{spelled}.{name}", s=said: _instead(f, c, s, _no_block))
+    for owner, name in ((attention, "sdpa_kernel"), (backends, "sdp_kernel")):
+        spelled = f"{getattr(owner, '__name__', '')}.{name}"
+        _swap(
+            (owner,),
+            name,
+            _ignoring(spelled, f"{spelled} does nothing here: {_ATTENTION}", _no_block),
+        )
 
 
 def _no_block(*_: object, **__: object) -> AbstractContextManager[None]:
@@ -361,7 +361,7 @@ def _devices(torch: ModuleType) -> None:
             return False
         return index < 0 or index == int(cuda.current_device())
 
-    def device_choice(original: _Function, spelled: str) -> _Function:
+    def device_choice(original: _Function, *, spelled: str) -> _Function:
         @functools.wraps(original)
         def chosen(*args: object, **kwargs: object) -> object:
             device = _first(*args, **kwargs)
@@ -372,7 +372,7 @@ def _devices(torch: ModuleType) -> None:
 
         return _marked(chosen, original)
 
-    def stream_choice(original: _Function, spelled: str, current: _Function) -> _Function:
+    def stream_choice(original: _Function, *, spelled: str, current: _Function) -> _Function:
         @functools.wraps(original)
         def chosen(*args: object, **kwargs: object) -> object:
             stream = _first(*args, **kwargs)
@@ -387,63 +387,65 @@ def _devices(torch: ModuleType) -> None:
 
         return _marked(chosen, original)
 
-    _swap((cuda,), "set_device", lambda f: device_choice(f, "torch.cuda.set_device"))
     accelerator = getattr(torch, "accelerator", None)
-    for name in ("set_device_index", "set_device_idx"):
-        _swap((accelerator,), name, lambda f, n=name: device_choice(f, f"torch.accelerator.{n}"))
-    _swap(
-        (cuda,),
-        "set_stream",
-        lambda f: stream_choice(f, "torch.cuda.set_stream", cuda.current_stream),
-    )
-    if accelerator is not None and hasattr(accelerator, "current_stream"):
-        current = accelerator.current_stream
-        _swap(
-            (accelerator,),
-            "set_stream",
-            lambda f: stream_choice(f, "torch.accelerator.set_stream", current),
-        )
-    scope = getattr(cuda, "device", None)
-    if isinstance(scope, type) and not hasattr(scope.__enter__, "__contract_original__"):
+    for owner, name in ((cuda, "set_device"), (accelerator, "set_device_index")):
+        spelled = f"{getattr(owner, '__name__', '')}.{name}"
+        _swap((owner,), name, functools.partial(device_choice, spelled=spelled))
+    for owner in (cuda, accelerator):
+        current = getattr(owner, "current_stream", None)
+        spelled = f"{getattr(owner, '__name__', '')}.set_stream"
+        if current is not None:
+            _swap(
+                (owner,),
+                "set_stream",
+                functools.partial(stream_choice, spelled=spelled, current=current),
+            )
+    scope: type[_DeviceScope] | None = getattr(cuda, "device", None)
+    if scope is not None and not hasattr(scope.__enter__, "__contract_original__"):
         entering = scope.__enter__
 
-        def enter(self: object) -> object:
-            index = getattr(self, "idx", -1)
-            outside = isinstance(index, int) and index >= 0 and not own(index)
-            if outside and _package(sys._getframe(1)):
+        def enter(self: _DeviceScope) -> object:
+            if self.idx >= 0 and not own(self.idx) and _package(sys._getframe(1)):
                 _warn(
-                    "torch.cuda.device", f"torch.cuda.device({index}) does nothing here: {_PLACES}"
+                    "torch.cuda.device",
+                    f"torch.cuda.device({self.idx}) does nothing here: {_PLACES}",
                 )
-                self.idx = -1  # type: ignore[attr-defined]  # torch.cuda.device's own field
+                self.idx = -1
             return entering(self)
 
-        scope.__enter__ = _marked(enter, entering)
+        scope.__enter__ = _marked(enter, entering)  # type: ignore[method-assign]  # torch's own, wrapped
     for cls, spelled, at in (
         (getattr(cuda, "Stream", None), "torch.cuda.Stream()", 0),
         (getattr(cuda, "ExternalStream", None), "torch.cuda.ExternalStream()", 1),
     ):
-        if not isinstance(cls, type) or "__new__" not in vars(cls):
-            continue
-        made = cls.__new__
-        if hasattr(made, "__contract_original__"):
-            continue
+        if isinstance(cls, type) and "__new__" in vars(cls):
+            made: _Function = vars(cls)["__new__"].__func__
+            if not hasattr(made, "__contract_original__"):
+                new = _marked(_current_stream(cuda, made, spelled, at), made)
+                cls.__new__ = staticmethod(new)  # type: ignore[assignment]  # torch's own, wrapped
 
-        def new(
-            kind: type,
-            *args: object,
-            _made: _Function = made,
-            _said: str = spelled,
-            _at: int = at,
-            **kwargs: object,
-        ) -> object:
-            # `current_stream()` and `default_stream()` wrap a stream that exists: they make none.
-            wraps = "stream_id" in kwargs and "stream_ptr" not in kwargs
-            if wraps or not _package(sys._getframe(1)):
-                return _made(kind, *args, **kwargs)
-            _warn(_said, f"{_said} is the current stream here: {_STREAM}")
-            return cuda.current_stream(kwargs.get("device", args[_at] if len(args) > _at else None))
 
-        cls.__new__ = staticmethod(_marked(new, made))  # type: ignore[assignment]  # torch's own, wrapped
+class _DeviceScope(Protocol):
+    """`torch.cuda.device`: the index it enters (-1: none)."""
+
+    idx: int
+
+    def __enter__(self) -> object: ...
+
+
+def _current_stream(cuda: ModuleType, made: _Function, said: str, at: int) -> _Function:
+    """A stream class's `__new__`: for the package, the current stream (one run warning).
+    `current_stream()` and `default_stream()` wrap a stream that exists: they make none."""
+
+    def new(*args: object, **kwargs: object) -> object:
+        wraps = "stream_id" in kwargs and "stream_ptr" not in kwargs
+        if wraps or not _package(sys._getframe(1)):
+            return made(*args, **kwargs)
+        _warn(said, f"{said} is the current stream here: {_STREAM}")
+        device = kwargs.get("device", args[at + 1] if len(args) > at + 1 else None)
+        return cuda.current_stream(device)
+
+    return new
 
 
 def _libraries(application: str) -> frozenset[str]:
@@ -473,9 +475,10 @@ class _Request:
 
     def generator(self, torch: ModuleType, where: TorchDevice) -> Generator | None:
         """This request's generator for `where`, once it seeded one; else None (the global)."""
+        index: int | None = where.index
         if where.type == "meta":
             return None
-        if where.type == "cuda" and where.index is None:
+        if where.type == "cuda" and index is None:
             where = torch.device("cuda", _cuda_index(torch))
         key = str(where)
         found = self.generators.get(key)
@@ -560,9 +563,9 @@ class _Rng:
                 setattr(torch.Tensor, name, self._draw(original, method=True))
         host, gpu = (torch, torch.random), (torch.cuda, getattr(torch.cuda, "random", None))
         on = functools.partial
-        bodies: tuple[tuple[tuple[object, ...], str, Callable[..., object]], ...] = (
+        bodies: tuple[tuple[tuple[object, ...], str, _Body], ...] = (
             (host, "manual_seed", self._manual_seed),
-            (host, "seed", lambda state: self._manual_seed(state, None)),
+            (host, "seed", self._manual_seed),
             (host, "initial_seed", on(self._initial, default="cpu")),
             (host, "get_rng_state", on(self._get, default="cpu")),
             (host, "set_rng_state", on(self._set, default="cpu")),
@@ -576,7 +579,7 @@ class _Rng:
             (gpu, "set_rng_state", on(self._set, default="cuda")),
         )
         for owners, name, body in bodies:
-            _swap(owners, name, lambda f, b=body, n=name: _per_request(f, b, read=n in _READS_RNG))
+            _swap(owners, name, functools.partial(_per_request, body=body, read=name in _READS_RNG))
         self._python()
         numpy = sys.modules.get("numpy")
         if numpy is not None:
@@ -609,40 +612,47 @@ class _Rng:
         found: TorchDevice = (
             torch.device("cuda", named) if isinstance(named, int) else torch.device(named)
         )
-        if found.type == "cuda" and found.index is None:
+        index: int | None = found.index
+        if found.type == "cuda" and index is None:
             found = torch.device("cuda", _cuda_index(torch))
         return found
 
-    def _manual_seed(self, state: _Request, seed: int | None) -> object:
+    def _manual_seed(self, state: _Request, *args: object, **kwargs: object) -> object:
         """`torch.manual_seed(seed)`, or `torch.seed()` (a fresh one, returned)."""
-        fresh = _fresh_seed() if seed is None else int(seed)
-        state.seeds = {"*": fresh}
+        seed = _seed(args, kwargs)
+        state.seeds = {"*": _fresh_seed() if seed is None else seed}
         state.generators.clear()
-        return fresh if seed is None else state.generator(self.torch, self.torch.device("cpu"))
+        if seed is None:
+            return state.seeds["*"]
+        return state.generator(self.torch, self.torch.device("cpu"))
 
-    def _cuda_seed(self, state: _Request, seed: int | None = None) -> None:
+    def _cuda_seed(self, state: _Request, *args: object, **kwargs: object) -> None:
+        """`torch.cuda.manual_seed(seed)`, or `torch.cuda.seed()`: the current GPU's."""
         key = str(self._where(None, "cuda"))
-        state.seeds[key] = _fresh_seed() if seed is None else int(seed)
+        seed = _seed(args, kwargs)
+        state.seeds[key] = _fresh_seed() if seed is None else seed
         state.generators.pop(key, None)
 
-    def _cuda_all(self, state: _Request, seed: int | None = None) -> None:
+    def _cuda_all(self, state: _Request, *args: object, **kwargs: object) -> None:
         for held in (state.seeds, state.generators):
             for key in [k for k in held if k.startswith("cuda")]:
                 del held[key]
-        state.seeds["cuda"] = _fresh_seed() if seed is None else int(seed)
+        seed = _seed(args, kwargs)
+        state.seeds["cuda"] = _fresh_seed() if seed is None else seed
 
-    def _initial(self, state: _Request, *, default: str) -> object:
+    def _initial(self, state: _Request, *_: object, default: str, **__: object) -> object:
         found = state.generator(self.torch, self._where(None, default))
         return _GLOBAL if found is None else found.initial_seed()
 
-    def _get(self, state: _Request, device: object = None, *, default: str) -> object:
-        found = state.generator(self.torch, self._where(device, default))
+    def _get(self, state: _Request, *args: object, default: str, **kwargs: object) -> object:
+        found = state.generator(self.torch, self._where(_first(*args, **kwargs), default))
         return _GLOBAL if found is None else found.get_state()
 
-    def _set(self, state: _Request, new: Tensor, device: object = None, *, default: str) -> None:
-        where = self._where(device, default)
+    def _set(self, state: _Request, *args: object, default: str, **kwargs: object) -> None:
+        new = kwargs.get("new_state", args[0] if args else None)
+        where = self._where(kwargs.get("device", args[1] if len(args) > 1 else None), default)
         made = state.generator(self.torch, where) or self.torch.Generator(device=where)
-        made.set_state(new)
+        made.set_state(cast("Tensor", new))
         state.generators[str(where)] = made
 
     def _fork(self, state: _Request, *args: object, **kwargs: object) -> object:
@@ -650,12 +660,10 @@ class _Rng:
         return _forked(state) if enabled else nullcontext()
 
     def _python(self) -> None:
-        shared = random._inst  # type: ignore[attr-defined]  # the module functions' own Random
+        shared = random._inst
         for name in random.__all__:
             bound = getattr(random, name, None)
-            if getattr(bound, "__self__", None) is not shared or hasattr(
-                bound, "__contract_original__"
-            ):
+            if not callable(bound) or getattr(bound, "__self__", None) is not shared:
                 continue
             seeding = name in ("seed", "setstate")
             setattr(random, name, _routed(name, bound, "random", random.Random, seeding))
@@ -680,7 +688,13 @@ _GLOBAL = object()
 _READS_RNG = frozenset({"initial_seed", "get_rng_state"})
 
 
-def _per_request(original: _Function, body: Callable[..., object], *, read: bool) -> _Function:
+class _Body(Protocol):
+    """A seed function's work inside a request, on its own streams (or `_GLOBAL`)."""
+
+    def __call__(self, state: _Request, *args: object, **kwargs: object) -> object: ...
+
+
+def _per_request(original: _Function, *, body: _Body, read: bool) -> _Function:
     """`original` outside every request; inside one, `body(state, ...)` on its own streams."""
 
     @functools.wraps(original)
@@ -691,6 +705,11 @@ def _per_request(original: _Function, body: Callable[..., object], *, read: bool
         return found
 
     return _marked(scoped, original)
+
+
+def _seed(args: tuple[object, ...], kwargs: Mapping[str, object]) -> int | None:
+    value = _first(*args, **kwargs)
+    return None if value is None else int(cast("SupportsInt", value))
 
 
 def _routed(
@@ -877,7 +896,7 @@ class _Numerics:
         self._by_name(type(backends.cuda.matmul), lambda _: "torch.backends.cuda.matmul")
         precision = getattr(backends, "_FP32Precision", None)
         if isinstance(precision, type):
-            self._by_name(precision, lambda o: f"torch.backends.{o.backend}.{o.op}")
+            self._by_name(precision, lambda o: "torch.backends.{backend}.{op}".format_map(vars(o)))
         pairs = (
             ("set_float32_matmul_precision", "get_float32_matmul_precision", ""),
             ("set_deterministic_debug_mode", "get_deterministic_debug_mode", ""),
@@ -920,7 +939,8 @@ class _Numerics:
 
     def _by_name(self, cls: type, prefix: Callable[[object], str]) -> None:
         """A class whose instances read and set their flags by attribute name."""
-        reading, setting = cls.__getattr__, cls.__setattr__  # type: ignore[attr-defined]  # torch defines both
+        reading: Callable[[object, str], object] = vars(cls)["__getattr__"]
+        setting: Callable[[object, str, object], None] = vars(cls)["__setattr__"]
         if hasattr(reading, "__contract_original__"):
             return
         numerics = self
@@ -944,8 +964,11 @@ class _Numerics:
             )
             numerics.write(name, value)
 
-        cls.__getattr__ = _marked(get, reading)  # type: ignore[attr-defined]
-        cls.__setattr__ = _marked(put, setting)  # type: ignore[assignment,method-assign]
+        for attribute, method in (
+            ("__getattr__", _marked(get, reading)),
+            ("__setattr__", _marked(put, setting)),
+        ):
+            setattr(cls, attribute, method)
 
     def _pair(self, torch: ModuleType, setter: str, getter: str, made: str) -> None:
         """`torch.set_x(value)` and `torch.get_x()`. `made`: a default for the tensors code makes.
@@ -979,8 +1002,11 @@ class _Numerics:
                 return get_()
             return self.read(name)
 
-        setattr(torch, setter, _marked(set_flag, set_))
-        setattr(torch, getter, _marked(get_flag, get_))
+        for attribute, made_flag in (
+            (setter, _marked(set_flag, set_)),
+            (getter, _marked(get_flag, get_)),
+        ):
+            setattr(torch, attribute, made_flag)
 
     def _deterministic(self, torch: ModuleType) -> None:
         """`use_deterministic_algorithms(mode, warn_only=)`, read back by its two getters."""
@@ -1006,7 +1032,7 @@ class _Numerics:
                 return
             self.write(name, (bool(mode), bool(warn_only)))
 
-        def part(index: int, original: _Function) -> _Function:
+        def part(index: int, original: _Function) -> Callable[[], object]:
             @functools.wraps(original)
             def get() -> object:
                 if name not in self.named or not _package(sys._getframe(1)):
@@ -1016,32 +1042,34 @@ class _Numerics:
 
             return _marked(get, original)
 
-        torch.use_deterministic_algorithms = _marked(use_flag, use)
-        torch.are_deterministic_algorithms_enabled = part(0, enabled)
-        torch.is_deterministic_algorithms_warn_only_enabled = part(1, warn_only)
+        for attribute, function in (
+            ("use_deterministic_algorithms", _marked(use_flag, use)),
+            ("are_deterministic_algorithms_enabled", part(0, enabled)),
+            ("is_deterministic_algorithms_warn_only_enabled", part(1, warn_only)),
+        ):
+            setattr(torch, attribute, function)
 
     def _choices(self, torch: ModuleType) -> None:
         """`preferred_linalg_library(backend=None)` and its kin: read with no argument."""
-        for owner, attribute in (
-            (torch.backends.cuda, "preferred_linalg_library"),
-            (torch.backends.cuda, "preferred_blas_library"),
-        ):
-            original = getattr(owner, attribute, None)
-            if original is None or hasattr(original, "__contract_original__"):
-                continue
-            name = f"torch.backends.cuda.{attribute}"
-            self.access[name] = (original, original)
+        for attribute in ("preferred_linalg_library", "preferred_blas_library"):
+            original = getattr(torch.backends.cuda, attribute, None)
+            if original is not None and not hasattr(original, "__contract_original__"):
+                name = f"torch.backends.cuda.{attribute}"
+                self.access[name] = (original, original)
+                setattr(
+                    torch.backends.cuda, attribute, _marked(self._chooser(name, original), original)
+                )
 
-            def choose(
-                backend: object = None, *, _name: str = name, _original: _Function = original
-            ) -> object:
-                if not _package(sys._getframe(1)):
-                    return _original(backend)
-                if backend is not None:
-                    self.write(_name, backend)
-                return self.read(_name)
+    def _chooser(self, name: str, original: _Function) -> _Function:
+        def choose(*args: object, **kwargs: object) -> object:
+            backend = _first(*args, **kwargs)
+            if not _package(sys._getframe(1)):
+                return original(*args, **kwargs)
+            if backend is not None:
+                self.write(name, backend)
+            return self.read(name)
 
-            setattr(owner, attribute, _marked(functools.wraps(original)(choose), original))
+        return choose
 
     def _blocks(self, torch: ModuleType) -> None:
         """`with torch.backends.cudnn.flags(...)` and its kin: the package's flags for the block."""
@@ -1052,30 +1080,29 @@ class _Numerics:
             getattr(backends, "mkldnn", None),
         ):
             original = getattr(module, "flags", None)
-            if module is None or original is None or hasattr(original, "__contract_original__"):
-                continue
-            prefix = module.__name__
-            signature = inspect.signature(original)
+            if (
+                module is not None
+                and original is not None
+                and not hasattr(original, "__contract_original__")
+            ):
+                module.flags = _marked(self._flags_block(module.__name__, original), original)
 
-            def flags(
-                *args: object,
-                _original: _Function = original,
-                _prefix: str = prefix,
-                _signature: inspect.Signature = signature,
-                **kwargs: object,
-            ) -> object:
-                if not _package(sys._getframe(1)):
-                    return _original(*args, **kwargs)
-                bound = _signature.bind(*args, **kwargs)
-                bound.apply_defaults()
-                wanted = {
-                    f"{_prefix}.{param}": value
-                    for param, value in bound.arguments.items()
-                    if value is not None and f"{_prefix}.{param}" in self.access
-                }
-                return self._block(wanted)
+    def _flags_block(self, prefix: str, original: _Function) -> _Function:
+        signature = inspect.signature(original)
 
-            module.flags = _marked(functools.wraps(original)(flags), original)
+        def flags(*args: object, **kwargs: object) -> object:
+            if not _package(sys._getframe(1)):
+                return original(*args, **kwargs)
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            wanted = {
+                f"{prefix}.{param}": value
+                for param, value in bound.arguments.items()
+                if value is not None and f"{prefix}.{param}" in self.access
+            }
+            return self._block(wanted)
+
+        return flags
 
     @contextmanager
     def _block(self, wanted: Mapping[str, object]) -> Iterator[None]:
@@ -1104,8 +1131,9 @@ NUMERICS = _Numerics()
 
 
 def install(roots: Iterable[nn.Module]) -> None:
-    """Each component root's call takes the numerics turn (`_Numerics`), as a model method's scope
-    does: so a plain loop calling a component gets its request's flags too."""
+    """Each call of a component root, or of one of its children (`vae.decode` calls only those),
+    takes the numerics turn (`_Numerics`) as a model method's scope does: so a plain loop
+    calling a component gets its request's flags too."""
     held = threading.local()
 
     def taken(module: nn.Module, *_: object) -> None:
@@ -1117,16 +1145,17 @@ def install(roots: Iterable[nn.Module]) -> None:
     def given(module: nn.Module, *_: object) -> None:
         stack: list[tuple[int, _Request | None]] = held.__dict__.get("stack", [])
         if stack and stack[-1][0] == id(module):
-            _, holder = stack.pop()
+            holder = stack.pop()[1]
             if moved := NUMERICS.give(holder):
                 _moved(moved, type(module).__name__)
 
     for root in roots:
-        if getattr(root, "_cozy_numerics", False):
-            continue
-        root.register_forward_pre_hook(taken, prepend=True)
-        root.register_forward_hook(given, always_call=True)
-        object.__setattr__(root, "_cozy_numerics", True)
+        for module in (root, *root.children()):
+            if getattr(module, "_cozy_numerics", False):
+                continue
+            module.register_forward_pre_hook(taken, prepend=True)
+            module.register_forward_hook(given, always_call=True)
+            object.__setattr__(module, "_cozy_numerics", True)
 
 
 def _moved(moved: list[str], method: str) -> None:
