@@ -816,7 +816,6 @@ src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore[assign
 src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore[assignment]" comment
 src/cozy_runtime/internal/derive.py: [unused-ignore] Unused "type: ignore[assignment]" comment
 src/cozy_runtime/internal/encoding/formats.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/encoding/formats.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/encoding/leaves.py: [call-arg] Too many arguments for "linear" of "EncodedLinear"
 src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/encoding/leaves.py: [explicit-any] Explicit "Any" is not allowed
