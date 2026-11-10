@@ -682,11 +682,15 @@ class _Ranks:
         self.settled = True
         group, ranks = self.group, self.ranks
         ok = outcome.terminal == "succeeded"
+        # A follower's failure interrupted the group first: GPU 0's own failure is its consequence.
+        followed = group.interrupted
         with contextlib.suppress(Exception):
             ranks.end(ok)
         if not ok:
             group.interrupt()
         mine = Executor._ended(outcome, group.interrupted)
+        if followed and not ok:
+            mine = Outcome("failed", "runtime", ENDED, outcome.message)
         try:
             frames = group.collect("run", shown=False)
         except GroupRefusal as lost:
@@ -721,6 +725,8 @@ class _Ranks:
         failed = [(rank, row) for rank, row in rows if row.terminal != "succeeded"]
         if failed:
             rank, cause = next(((r, o) for r, o in failed if o.code != ENDED), failed[0])
+            if cause.code == ENDED and rank == 0 and not ok:
+                cause = outcome  # no GPU names another cause: GPU 0's own
             if rank == 0:
                 return None, cause
             return None, replace(cause, message=ends(f"{group.gpu(rank)}: {cause.message}", 2048))
@@ -1434,7 +1440,7 @@ class Executor:
         except (KeyError, TypeError, ValueError, msgspec.ValidationError) as exc:
             self.poisoned = "a malformed run"
             return {"ok": False, "code": "gpu_divergence", "detail": f"{exc}"[:900]}
-        target = self._target(command, attempt=True)
+        target = self._target(command, attempt=False)  # GPU 0 activated it
         if isinstance(target, dict):
             return target
         return target._rank_attempt(asked, command, entropy, tag)

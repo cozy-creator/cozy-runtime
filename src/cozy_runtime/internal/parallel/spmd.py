@@ -10,7 +10,6 @@ one broadcast per tensor from the GPU that holds it.
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import itertools
 import json
 import random
@@ -22,10 +21,9 @@ from typing import Any
 import msgspec
 
 from cozy_runtime.author import _group
-from cozy_runtime.author._errors import classify
 from cozy_runtime.internal.parallel import wire
-from cozy_runtime.internal.parallel.group import ENDED, gather
-from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupRefusal
+from cozy_runtime.internal.parallel.group import gather
+from cozy_runtime.internal.parallel.plan import GroupRefusal
 
 
 class UngatedShardedForward(GroupRefusal):
@@ -89,19 +87,6 @@ class Ranks:
         for key in keys:
             with contextlib.suppress(Exception):
                 self.store.delete_key(key)
-
-    def agree(self, what: str, value: str) -> None:
-        """Every GPU is at `what` with the same `value` (a call's argument shapes)."""
-        rows = self.meet({"value": value}, what)
-        values = [row["value"] for row in rows]
-        if len(set(values)) > 1:
-            odd = next(r for r, v in enumerate(values) if v != values[0])
-            raise GpuDivergence(
-                self.gpu(odd),
-                what,
-                f"{self.gpu(0)} calls with {values[0][:300]}, "
-                f"{self.gpu(odd)} with {values[odd][:300]}",
-            )
 
     def all(self, flag: bool, what: str) -> bool:
         return all(row["flag"] for row in self.meet({"flag": bool(flag)}, what))
@@ -191,16 +176,10 @@ def seed(entropy: int) -> None:
         numpy.random.seed(entropy & 0xFFFFFFFF)
 
 
-def ended(exc: BaseException) -> bool:
-    """Whether `exc` only says another GPU ended the call this one waited in."""
-    if type(exc).__name__ == "DistBackendError":
-        return True
-    return getattr(exc, "code", None) == ENDED
-
-
 def install_call_check(component: Any, name: str) -> None:
-    """Before each call of a sharded root, every GPU meets at it with its argument shapes: a
-    GPU elsewhere, or calling with other shapes, is named instead of hanging a collective."""
+    """Before each call of a sharded root, every GPU meets at it: a GPU at another call, or one
+    whose handler already returned, is named instead of hanging a collective. Arguments may
+    differ: a GPU's own rows of a table the plan splits are its own."""
     if getattr(component, "_cozy_spmd_check", None) is not None:
         return
 
@@ -211,7 +190,7 @@ def install_call_check(component: Any, name: str) -> None:
                 f"sharded component {name!r} was called outside a group attempt: every GPU "
                 "of its group joins its collectives, and none is running one"
             )
-        ranks.agree(f"{name} call", shapes((args, kwargs or {})))
+        ranks.meet({}, f"{name} call")
 
     handle = component.register_forward_pre_hook(check, with_kwargs=True)
     with contextlib.suppress(Exception):
@@ -266,11 +245,6 @@ class Placement:
         )
 
 
-def shapes(value: object) -> str:
-    """A call's arguments as their tensors' shapes and dtypes and everything else's type."""
-    return signature(value)
-
-
 def signature(value: object, depth: int = 0) -> str:
     """`value`'s shape: tensor shapes and dtypes, files' kinds, containers' structure, and
     other values' types (numbers and text may differ between GPUs; their places may not)."""
@@ -296,12 +270,3 @@ def signature(value: object, depth: int = 0) -> str:
         inner = ",".join(f"{f}={signature(getattr(value, f), depth + 1)}" for f in fields)
         return f"{type(value).__name__}({inner})"
     return type(value).__name__
-
-
-def digest(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
-
-
-def outcome_row(exc: BaseException) -> dict[str, str]:
-    outcome = classify(exc)
-    return {"code": outcome.code, "detail": f"{type(exc).__name__}: {exc}"[:900]}

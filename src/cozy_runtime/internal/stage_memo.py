@@ -789,8 +789,8 @@ def install(
 ) -> None:
     """Give one constructed generation its memo, once per load. `headers` maps each component
     to the checkpoint header it fills from; `assets` is the header carrying assets and configs.
-    In a group only GPU 0 runs package code and commands the others' module calls, so a hit
-    there skips the call on every GPU; the group's width is part of the numerics. A
+    In a group GPU 0 decides each hit and hands its entry to the others (`_tell`), so a hit skips
+    the call on every GPU; the group's width is part of the numerics. A
     generation whose identity cannot be read serves unmemoized, never refused."""
     try:
         memo = _generation(
