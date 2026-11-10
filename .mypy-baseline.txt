@@ -95,9 +95,6 @@ src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not 
 src/cozy_runtime/accel/fusion/__init__.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/fusion/__init__.py: [misc] Cannot assign to a type
 src/cozy_runtime/accel/fusion/__init__.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any], _GeneratorContextManager[None, None, None]]")
-src/cozy_runtime/accel/fusion/__init__.py: [redundant-expr] If condition is always true
-src/cozy_runtime/accel/fusion/__init__.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/accel/fusion/__init__.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/accel/fusion/__init__.py: [unreachable] Right operand of "and" is never evaluated
 src/cozy_runtime/accel/fusion/__init__.py: [unreachable] Statement is unreachable
 src/cozy_runtime/accel/fusion/__init__.py: [unreachable] Statement is unreachable
@@ -146,7 +143,6 @@ src/cozy_runtime/accel/moe/__init__.py: [no-any-return] Returning Any from funct
 src/cozy_runtime/accel/moe/__init__.py: [operator] "Tensor" not callable
 src/cozy_runtime/accel/moe/__init__.py: [operator] Unsupported operand types for % (Module and "int")
 src/cozy_runtime/accel/moe/__init__.py: [operator] Unsupported operand types for * ("int" and Module)
-src/cozy_runtime/accel/moe/__init__.py: [redundant-expr] If condition is always false
 src/cozy_runtime/accel/moe/__init__.py: [union-attr] Item "Tensor" of "Tensor | Module" has no attribute "in_features"
 src/cozy_runtime/accel/moe/__init__.py: [union-attr] Item "Tensor" of "Tensor | Module" has no attribute "in_features"
 src/cozy_runtime/accel/moe/__init__.py: [union-attr] Item "Tensor" of "Tensor | Module" has no attribute "out_features"
@@ -172,8 +168,6 @@ src/cozy_runtime/accel/rows.py: [operator] "Tensor" not callable
 src/cozy_runtime/accel/rows.py: [operator] "Tensor" not callable
 src/cozy_runtime/accel/rows.py: [operator] "Tensor" not callable
 src/cozy_runtime/accel/rows.py: [operator] Unsupported operand types for - (Module and "int")
-src/cozy_runtime/accel/rows.py: [redundant-expr] If condition is always false
-src/cozy_runtime/accel/rows.py: [redundant-expr] If condition is always false
 src/cozy_runtime/accel/rows.py: [type-var] Value of type variable "SupportsRichComparisonT" of "min" cannot be "int | Tensor | Module"
 src/cozy_runtime/accel/rows.py: [union-attr] Item "Tensor" of "Tensor | Module" has no attribute "get"
 src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
@@ -210,7 +204,6 @@ src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowe
 src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/accel/stepcache.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/accel/stepcache.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/accel/stepcache.py: [unreachable] Statement is unreachable
 src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
@@ -218,17 +211,7 @@ src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_app.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_artifacts.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_call_results.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_call_results.py: [redundant-expr] Left operand of "and" is always true
 src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
@@ -240,8 +223,6 @@ src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_calls.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_calls.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_calls.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_codec.py: [explicit-any] Explicit "Any" is not allowed
@@ -323,8 +304,6 @@ src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_files.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_files.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_image.py: [redundant-expr] If condition is always true
 src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
@@ -336,10 +315,6 @@ src/cozy_runtime/author/_invoke.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_loader.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_markers.py: [call-overload] No overload variant of "Meta" matches argument types "dict[str, object]", "dict[str, dict[str, object]]"
 src/cozy_runtime/author/_markers.py: [no-any-return] Returning Any from function declared to return "Meta"
-src/cozy_runtime/author/_markers.py: [redundant-expr] If condition is always true
-src/cozy_runtime/author/_markers.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_markers.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_markers.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_markers.py: [unused-ignore] Unused "type: ignore" comment
 src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
@@ -375,16 +350,6 @@ src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_model.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_model.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
@@ -396,8 +361,6 @@ src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowe
 src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_recipes.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_recipes.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_recipes.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
@@ -410,13 +373,6 @@ src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allow
 src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_services.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_services.py: [misc] Tuple index out of range
-src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "and" is always true
-src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_services.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_signature.py: [explicit-any] Explicit "Any" is not allowed
@@ -457,12 +413,9 @@ src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowe
 src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/author/_weights.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/author/_weights.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/author/_weights.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/canonical_json.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/canonical_json.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/canonical_json.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/cli/image_prepare.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/derive/facade.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/facade.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/derive/facade.py: [explicit-any] Explicit "Any" is not allowed
@@ -712,8 +665,6 @@ src/cozy_runtime/internal/attention_sol.py: [misc] Type of decorated function co
 src/cozy_runtime/internal/attention_sol.py: [misc] Type of decorated function contains type "Any" ("_lru_cache_wrapper[dict[str, Any]]")
 src/cozy_runtime/internal/attention_sol.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/attention_sol.py: [no-any-return] Returning Any from function declared to return "Tensor"
-src/cozy_runtime/internal/attention_sol.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/internal/attention_sol.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/internal/attention_sol_fa4.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_ulysses.py: [explicit-any] Explicit "Any" is not allowed
@@ -731,7 +682,6 @@ src/cozy_runtime/internal/attention_upstream.py: [explicit-any] Explicit "Any" i
 src/cozy_runtime/internal/attention_upstream.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/attention_upstream.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/attention_upstream.py: [no-any-return] Returning Any from function declared to return "Tensor"
-src/cozy_runtime/internal/attention_upstream.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/internal/base_observation.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/cache_owners.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/cache_owners.py: [explicit-any] Explicit "Any" is not allowed
@@ -948,17 +898,10 @@ src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allo
 src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/executor.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/executor.py: [possibly-undefined] Name "torch" may be undefined
-src/cozy_runtime/internal/executor.py: [redundant-expr] If condition is always true
-src/cozy_runtime/internal/executor.py: [redundant-expr] If condition is always true
-src/cozy_runtime/internal/executor.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/internal/executor.py: [redundant-expr] Left operand of "or" is always false
-src/cozy_runtime/internal/executor.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/internal/executor.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/executor.py: [unreachable] Statement is unreachable
-src/cozy_runtime/internal/fp8_linear.py: [redundant-expr] Left operand of "and" is always true
 src/cozy_runtime/internal/int8_linear.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/interface_wheel.py: [assignment] Incompatible types in assignment (expression has type "object", variable has type "str")
-src/cozy_runtime/internal/interface_wheel.py: [redundant-expr] If condition is always false
 src/cozy_runtime/internal/interface_wheel.py: [unreachable] Subclass of "str" and "dict[Any, Any]" cannot exist: have distinct disjoint bases
 src/cozy_runtime/internal/interface_wheel.py: [unreachable] Subclass of "str" and "list[Any]" cannot exist: have distinct disjoint bases
 src/cozy_runtime/internal/invocable_interface.py: [explicit-any] Explicit "Any" is not allowed
@@ -1225,7 +1168,6 @@ src/cozy_runtime/internal/residency.py: [no-any-return] Returning Any from funct
 src/cozy_runtime/internal/residency.py: [no-any-return] Returning Any from function declared to return "Tensor"
 src/cozy_runtime/internal/residency.py: [override] Signature of "__repr__" incompatible with supertype "torch._tensor.Tensor"
 src/cozy_runtime/internal/residency.py: [override] Signature of "__torch_dispatch__" incompatible with supertype "torch._tensor.Tensor"
-src/cozy_runtime/internal/residency.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/internal/residency.py: [union-attr] Item "None" of "Any | None" has no attribute "use_cache"
 src/cozy_runtime/internal/residency.py: [unreachable] Statement is unreachable
 src/cozy_runtime/internal/residency.py: [unreachable] Statement is unreachable
@@ -1235,7 +1177,6 @@ src/cozy_runtime/internal/residency.py: [var-annotated] Need type annotation for
 src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
-src/cozy_runtime/internal/seam.py: [redundant-expr] Left operand of "or" is always false
 src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/stage_memo.py: [explicit-any] Explicit "Any" is not allowed
@@ -1297,7 +1238,6 @@ src/cozy_runtime/internal/weights.py: [explicit-any] Explicit "Any" is not allow
 src/cozy_runtime/internal/weights.py: [misc] List comprehension has incompatible type List[Callable[..., Any]]; expected List[LoRASource]
 src/cozy_runtime/internal/weights.py: [possibly-undefined] Name "down" may be undefined
 src/cozy_runtime/internal/weights.py: [possibly-undefined] Name "up" may be undefined
-src/cozy_runtime/internal/weights.py: [redundant-expr] If condition in comprehension is always false
 src/cozy_runtime/internal/zygote.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/zygote.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/zygote.py: [misc] Type of decorated function contains type "Any" ("Callable[[Any, int], _GeneratorContextManager[None, None, None]]")
@@ -1425,7 +1365,6 @@ src/cozy_runtime/lm/__init__.py: [operator] "Tensor" not callable
 src/cozy_runtime/lm/__init__.py: [operator] "Tensor" not callable
 src/cozy_runtime/lm/__init__.py: [operator] "Tensor" not callable
 src/cozy_runtime/lm/__init__.py: [possibly-undefined] Name "draft" may be undefined
-src/cozy_runtime/lm/__init__.py: [redundant-expr] Left operand of "and" is always true
 src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "conv_kernel_size"
 src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "conv_kernel_size"
 src/cozy_runtime/lm/__init__.py: [union-attr] Item "CacheLayerMixin" of "CacheLayerMixin | LinearAttentionCacheLayerMixin" has no attribute "conv_states"
