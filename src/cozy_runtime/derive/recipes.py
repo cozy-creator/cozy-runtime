@@ -44,7 +44,7 @@ from cozy_runtime.author._recipes import (
 
 # The code that decides a lane's bytes: its replay key changes with any of it.
 @invocable
-async def quantize(
+async def quantize(  # type: ignore[explicit-any,misc]  # static describe's any-layout spelling
     ctx: Context,
     *,
     source: Weights[Any],
@@ -60,7 +60,7 @@ async def quantize(
 
 
 @invocable
-async def quantize_calibrated(
+async def quantize_calibrated(  # type: ignore[explicit-any,misc]  # static describe's any-layout spelling
     ctx: Context,
     *,
     source: Weights[Any],
@@ -83,8 +83,8 @@ class Runner(Protocol):
         self,
         ctx: Context,
         tel: Telemetry,
-        source: Weights[Any],
-        model: Model[Any] | None,
+        source: Weights[Model[object]],
+        model: Model[object] | None,
         *,
         lane: str,
         package: str,
@@ -104,8 +104,8 @@ def install(runner: Runner | None) -> None:
 def _run(
     ctx: Context,
     tel: Telemetry,
-    source: Weights[Any],
-    model: Model[Any] | None,
+    source: Weights[Model[object]],
+    model: Model[object] | None,
     *,
     lane: str,
     package: str,

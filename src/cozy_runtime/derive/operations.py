@@ -5,9 +5,10 @@ from __future__ import annotations
 import fnmatch
 import re
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import Any
+from types import ModuleType
+from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author import (
@@ -39,6 +40,9 @@ from .quantization import (
     source_rows,
 )
 from .recipes import declared_plan, declared_recipe
+
+if TYPE_CHECKING:
+    from torch import nn
 
 # This is the platform's representable grant ceiling, not a model-size estimate.
 # Writer admission uses actual remaining added-role geometry (cr-151).
@@ -179,7 +183,7 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
 
 
 @invocable
-async def quantize(
+async def quantize(  # type: ignore[explicit-any,misc]  # static describe's any-layout spelling
     ctx: Context,
     *,
     source: Weights[Any],
@@ -198,7 +202,7 @@ async def quantize(
     )
 
 
-def _opened(ctx: Context, source: Weights[Any] | Checkpoint) -> Checkpoint:
+def _opened(ctx: Context, source: Weights[Model[object]] | Checkpoint) -> Checkpoint:
     return source if isinstance(source, Checkpoint) else ctx.tensorfs_source(source)
 
 
@@ -206,7 +210,7 @@ def quantize_into(
     ctx: Context,
     tel: Telemetry,
     *,
-    source: Weights[Any] | Checkpoint,
+    source: Weights[Model[object]] | Checkpoint,
     plan: QuantizationPlan,
     output: str,
     max_relative_frobenius: float | None = None,
@@ -238,7 +242,7 @@ def select_into(
     ctx: Context,
     tel: Telemetry,
     *,
-    source: Weights[Any] | Checkpoint,
+    source: Weights[Model[object]] | Checkpoint,
     plan: SelectionPlan,
     output: str,
 ) -> ModelArtifact:
@@ -280,10 +284,10 @@ app.entrypoint(
 
 def calibrate(
     ctx: Context,
-    torch: Any,
+    torch: ModuleType,
     *,
-    source: Weights[Any] | Checkpoint,
-    components: dict[str, Any],
+    source: Weights[Model[object]] | Checkpoint,
+    components: Mapping[str, nn.Module],
     plan: QuantizationPlan,
 ) -> svdq.Calibration:
     """A recorder of the inputs of every linear `plan` encodes as `svdq.nvfp4` (by its rules or
@@ -303,8 +307,8 @@ def calibrate(
 def run_recipe(
     ctx: Context,
     tel: Telemetry,
-    source: Weights[Any],
-    model: Model[Any] | None,
+    source: Weights[Model[object]],
+    model: Model[object] | None,
     *,
     lane: str,
     package: str,
@@ -344,7 +348,7 @@ def _calibrated(
     ctx: Context,
     tel: Telemetry,
     source: Checkpoint,
-    model: Model[Any] | None,
+    model: Model[object] | None,
     row: DeclaredRecipe,
     plan: QuantizationPlan,
 ) -> svdq.Calibration:
@@ -356,7 +360,7 @@ def _calibrated(
         )
     recorders: list[svdq.Calibration] = []
 
-    def record(components: Any) -> svdq.Calibration:
+    def record(components: Mapping[str, nn.Module]) -> svdq.Calibration:
         torch = sys.modules["torch"]  # the model's own: a module of it is in `components`
         recorders.append(calibrate(ctx, torch, source=source, components=components, plan=plan))
         return recorders[-1]

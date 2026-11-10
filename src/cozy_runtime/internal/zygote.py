@@ -18,7 +18,7 @@ import sys
 import threading
 import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Any
+from types import ModuleType
 
 from cozy_runtime.internal import config, proctree
 from cozy_runtime.internal.exits import Exit
@@ -28,7 +28,7 @@ LOADED = ("OMP_NUM_THREADS",)
 
 
 @contextlib.contextmanager
-def driverless(torch: Any, devices: int) -> Iterator[None]:
+def driverless(torch: ModuleType, devices: int) -> Iterator[None]:
     """Imports that ask whether CUDA exists (Diffusers does, at import) get the seal's answer.
     Torch asks the CUDA driver (`cuInit`) or NVML, and on current drivers either opens the
     device and starts a driver thread that outlives it: no child of that process can fork."""
@@ -101,7 +101,7 @@ def _device_files() -> list[str]:
     return sorted(found)
 
 
-def unsafe(torch: Any) -> str:
+def unsafe(torch: ModuleType | None) -> str:
     """Why this process must not fork, or "". Every fact is read, none assumed."""
     if len(_threads()) > 1:
         # A throwaway fork runs every pthread_atfork prepare handler; OpenBLAS stops its pool.

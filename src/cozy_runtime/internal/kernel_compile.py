@@ -40,12 +40,13 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from importlib import import_module
 from pathlib import Path
-from typing import Any
+from typing import TypedDict, cast
 
 from cozy_runtime import __version__
 from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.canonical_json import JsonValue
 from cozy_runtime.internal import config, filelock, kernel_cache, proctree
 
 #: kind -> the `module:function` a builder runs: `build(spec, staging, report) -> facts`. The
@@ -85,7 +86,8 @@ class Job:
 
     kind: str
     key: kernel_cache.Key
-    spec: Mapping[str, Any] = field(default_factory=dict)
+    #: carried to the builder as JSON; each builder reads its own spec type
+    spec: Mapping[str, object] = field(default_factory=dict)
     #: variables the builder runs under beyond the caller's own, e.g. a hidden GPU
     env: Mapping[str, str] = field(default_factory=dict)
 
@@ -108,8 +110,12 @@ class State:
             return f"ready (compiled in {self.ms / 1000:.1f} s)"
         return f"{self.state}: {self.detail}" if self.detail else self.state
 
-    def document(self) -> dict[str, Any]:
-        row: dict[str, Any] = {"kernel": self.kernel, "state": self.state, "line": self.line()}
+    def document(self) -> dict[str, JsonValue]:
+        row: dict[str, JsonValue] = {
+            "kernel": self.kernel,
+            "state": self.state,
+            "line": self.line(),
+        }
         if self.progress is not None:
             row["progress"] = round(self.progress, 3)
         if self.ms:
@@ -335,12 +341,19 @@ def _failed_path(key: kernel_cache.Key, scope: Path | None = None) -> Path:
     return (scope or _failures()) / f"{key.kernel}-{key.digest}-{__version__}+{COMMIT}.json"
 
 
-def _failure(key: kernel_cache.Key, scope: Path | None = None) -> dict[str, Any] | None:
+class _Failure(TypedDict):
+    """A builder's recorded failure (`_record_failure`)."""
+
+    code: str
+    detail: str
+
+
+def _failure(key: kernel_cache.Key, scope: Path | None = None) -> _Failure | None:
     try:
         found = json.loads(_failed_path(key, scope).read_text())
     except (OSError, ValueError):
         return None
-    return found if isinstance(found, dict) else None
+    return cast("_Failure", found) if isinstance(found, dict) else None  # `_record_failure`'s
 
 
 def _record_failure(
@@ -388,8 +401,25 @@ def ledger(store: kernel_cache.Store) -> Path:
     return ((store.trusted if shared else None) or store.own) / ".compile.json"
 
 
+class _LedgerJob(TypedDict):
+    key: str
+    bytes: int
+
+
+class _Budget(TypedDict):
+    bytes: int
+    cpus: int
+
+
+class _Book(TypedDict, total=False):
+    """The compile ledger: admitted compiler jobs by pid, and the machine's budget for them."""
+
+    jobs: dict[str, _LedgerJob]
+    budget: _Budget
+
+
 @contextlib.contextmanager
-def _ledger(path: Path) -> Iterator[dict[str, Any]]:
+def _ledger(path: Path) -> Iterator[_Book]:
     """The ledger, read and rewritten under its flock: `jobs` (pid -> admitted compiler job,
     pruned to live processes) and `budget`, the memory and CPUs the machine's compilers may
     take, measured again whenever no compiler job runs."""
@@ -397,6 +427,7 @@ def _ledger(path: Path) -> Iterator[dict[str, Any]]:
     fd = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o666)
     try:
         filelock.lock(fd)
+        book: _Book
         try:
             book = json.loads(path.read_text())
         except (OSError, ValueError):
@@ -423,7 +454,7 @@ def _alive(pid: str) -> bool:
     return True
 
 
-def _admits(book: dict[str, Any], job_bytes: int) -> bool:
+def _admits(book: _Book, job_bytes: int) -> bool:
     """A compiler job runs when the CPUs and memory the ledger holds have room for it; the
     first always runs."""
     jobs, budget = book["jobs"].values(), book["budget"]

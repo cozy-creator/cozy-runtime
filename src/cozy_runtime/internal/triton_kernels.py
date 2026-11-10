@@ -35,7 +35,7 @@ import sysconfig
 from collections.abc import Callable, Iterable
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
 import msgspec
 from msgspec import Struct
@@ -156,8 +156,38 @@ def shipped(kernels: TritonKernels) -> Path | None:
     return Path(file).parent / SHIPPED if file else None
 
 
+class _ShippedKernel(TypedDict):
+    group: str
+    files: list[str]
+
+
+class _Manifest(TypedDict, total=False):
+    """A package's `manifest.json` of prebuilt kernels (and the Runtime's launcher)."""
+
+    triton: str
+    kernels: dict[str, _ShippedKernel]
+    launcher: dict[str, dict[str, str]]
+
+
+class _Spec(TypedDict):
+    """A `job`'s spec, which its builder (`build`) reads."""
+
+    arch: int
+    entries: dict[str, str]
+    kernels: list[object]
+    shipped: str
+
+
+class _WarmSpec(TypedDict):
+    """A `warm_job`'s spec, which `build_warm` reads."""
+
+    arch: int
+    function: str
+    args: list[object]
+
+
 @functools.cache
-def _manifest(root: str) -> dict[str, Any]:
+def _manifest(root: str) -> _Manifest:
     try:
         found = json.loads((Path(root) / "manifest.json").read_text())
     except (OSError, ValueError):
@@ -180,8 +210,9 @@ def _launcher_shipped() -> dict[str, str] | None:
 def _prebuilt(found: kernel_compile.Job) -> bool:
     """Whether this set's build only copies: its package ships every kernel, the Runtime this
     Python's launcher."""
-    root = str(found.spec.get("shipped", ""))
-    return _shipped(root, found.spec["entries"].values()) and _launcher_shipped() is not None
+    spec = cast("_Spec", found.spec)  # a triton job's (`job`)
+    root = str(spec.get("shipped", ""))
+    return _shipped(root, spec["entries"].values()) and _launcher_shipped() is not None
 
 
 def _seed(root: str, keys: Iterable[str]) -> None:
@@ -248,7 +279,7 @@ class _Kernel(Struct, frozen=True):
         )
 
 
-def spec(kernels: TritonKernels, arch: int) -> dict[str, Any]:
+def spec(kernels: TritonKernels, arch: int) -> _Spec:
     """What `kernels`' builder does for `arch`: each entry's Triton key, its kernel by module and
     name, and where its package ships it prebuilt."""
     _require_triton()
@@ -274,9 +305,7 @@ def job(kernels: TritonKernels, arch: int) -> kernel_compile.Job:
 
 
 @request_path.forbid("kernel build: triton")
-def build(
-    spec: dict[str, Any], staging: Path, report: Callable[[float], None]
-) -> dict[str, object]:
+def build(spec: _Spec, staging: Path, report: Callable[[float], None]) -> dict[str, object]:
     """The compile manager's builder: every entry into Triton's own cache (its package's, when it
     ships them all), then Triton's launcher module, so a launch compiles nothing. `staging` stays
     empty: the published entry marks the cache filled."""
@@ -292,7 +321,7 @@ def build(
     return {"entries": len(spec["kernels"]), "prebuilt": prebuilt}
 
 
-def compile_entries(spec: dict[str, Any], report: Callable[[float], None]) -> None:
+def compile_entries(spec: _Spec, report: Callable[[float], None]) -> None:
     """Every entry of a `job`'s spec compiled into Triton's own cache, each under its key."""
     arch, entries = int(spec["arch"]), spec["entries"]
     todo = [msgspec.convert(row, _Kernel).entry() for row in spec["kernels"]]
@@ -335,7 +364,7 @@ def warm_job(
     _require_triton()
     key = {**inputs, "arch": arch, "args": args, "triton": triton.__version__,
            "cache": triton.knobs.cache.dir}  # fmt: skip
-    spec = {"arch": arch, "function": function, "args": args}
+    spec: _WarmSpec = {"arch": arch, "function": function, "args": args}
     return kernel_compile.Job(
         "triton-warm", kernel_cache.Key.of(kernel, key), spec, {"CUDA_VISIBLE_DEVICES": ""}
     )
@@ -343,7 +372,7 @@ def warm_job(
 
 @request_path.forbid("kernel build: triton warm")
 def build_warm(
-    spec: dict[str, Any], staging: Path, report: Callable[[float], None]
+    spec: _WarmSpec, staging: Path, report: Callable[[float], None]
 ) -> dict[str, object]:
     """The compile manager's builder for a `warm_job`: its function's `.warmup` calls compile
     for the job's card through `_Card`. `staging` stays empty, as `build`'s does."""
@@ -389,12 +418,13 @@ def _copy(store: kernel_cache.Store, found: kernel_compile.Job) -> bool:
     if lock is None:
         return False
     try:
-        root = str(found.spec["shipped"])
+        spec = cast("_Spec", found.spec)  # a triton job's (`job`)
+        root = str(spec["shipped"])
 
         def fill(staging: Path) -> dict[str, object]:
-            _seed(root, found.spec["entries"].values())
+            _seed(root, spec["entries"].values())
             _seed_launcher()
-            return {"entries": len(found.spec["kernels"]), "prebuilt": True, "compile_ms": 0.0}
+            return {"entries": len(spec["kernels"]), "prebuilt": True, "compile_ms": 0.0}
 
         store.publish(found.key, fill)
     finally:
@@ -502,8 +532,9 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
         raise KernelsUnavailable("kernels_failed", f"{kernels.name} sm{arch}: {state.line()}")
     compiled: dict[str, CompiledKernel] = {}
     names: dict[str, tuple[str, ...]] = {}
+    keyed = cast("_Spec", found.spec)["entries"]  # a triton job's (`job`)
     for entry in kernels.entries:
-        digest = found.spec["entries"][entry.key]
+        digest = keyed[entry.key]
         name = f"{entry.kernel.__name__}.json"
         group = get_cache_manager(digest).get_group(name) or {}
         if name not in group:

@@ -18,7 +18,8 @@ from __future__ import annotations
 import platform
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, NoReturn
+from types import ModuleType
+from typing import NoReturn
 
 from cozy_runtime.internal import accel, arch, canonical
 from cozy_runtime.internal.encoding.adapters import CoreDequant
@@ -44,8 +45,6 @@ from cozy_runtime.internal.encoding.leaves import (
     SvdqNvfp4NativeLeaf,
     W4a8NativeLeaf,
 )
-
-# `torch: Any` is the torch module, which the check venv does not carry.
 
 # ------------------------------------------------------------------------- the device
 
@@ -116,7 +115,7 @@ class DeviceFacts:
         }
 
 
-def measure_device(torch: Any, index: int = 0, kind: str = "") -> DeviceFacts:
+def measure_device(torch: ModuleType, index: int = 0, kind: str = "") -> DeviceFacts:
     """Read the SELECTED device once, as the facts a plan names it by.
 
     `index` is honoured all the way down (#549.9): torch is asked about that device and NVML
@@ -184,7 +183,7 @@ class RuntimeIdentity:
         return {"release": self.release, "torch_build": self.torch_build}
 
 
-def measure_runtime(torch: Any, release: str) -> RuntimeIdentity:
+def measure_runtime(torch: ModuleType, release: str) -> RuntimeIdentity:
     return RuntimeIdentity(release=release, torch_build=str(getattr(torch, "__version__", "")))
 
 

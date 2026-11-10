@@ -13,7 +13,7 @@ import hashlib
 import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from typing import Any
+from types import ModuleType
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author import _model
@@ -75,7 +75,7 @@ def fingerprint(
 JIT_DSLS = ("triton", "cutedsl", "helion")
 
 
-def apply(torch: Any, kind: str) -> None:
+def apply(torch: ModuleType, kind: str) -> None:
     """The policy, set once per executor before CUDA init and its first op: torch's own
     defaults, pinned so no package moves them (float32 matmuls in full precision, no TF32;
     cuDNN convolutions with TF32, as torch has them); `deterministic=True` scopes' cuDNN mode;
@@ -104,7 +104,7 @@ class _Determinism:
         self._before = (False, False)
 
     @contextmanager
-    def held(self, torch: Any) -> Iterator[None]:
+    def held(self, torch: ModuleType) -> Iterator[None]:
         cudnn = torch.backends.cudnn
         with self._lock:
             if not self._open:

@@ -6,13 +6,13 @@ from __future__ import annotations
 import functools
 import importlib.metadata
 import sys
-from collections.abc import Callable
 
+from cozy_runtime.author._handler import Handler
 from cozy_runtime.internal import installed
 from cozy_runtime.internal.memo_identity import distribution_identity, release_identity
 
 
-def describe(fn: Callable[..., object]) -> dict[str, str]:
+def describe(fn: Handler) -> dict[str, str]:
     """The operation identity of an entrypoint: its name and its distribution's build, as the
     static reader computes it (`static_interface._operation_identity`). An unreadable build (an
     editable install) disables the shortcut; it never refuses an invocation."""
@@ -28,7 +28,7 @@ def describe(fn: Callable[..., object]) -> dict[str, str]:
     return {"operation_identity": identity}
 
 
-def stage(fn: Callable[..., object]) -> str | None:
+def stage(fn: Handler) -> str | None:
     """A memoized Model method's code identity in this process: its name and its distribution's
     installed files by their recorded hashes. None for an editable or unrecorded install."""
     owner = _owner(fn.__module__.split(".")[0])

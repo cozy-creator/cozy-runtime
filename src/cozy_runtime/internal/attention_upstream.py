@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from cozy_runtime.internal.attention_ulysses import PartialOptions
 
 from cozy_runtime.internal import arch, attention_fp8
-from cozy_runtime.internal.attention_ulysses import Local, Options
+from cozy_runtime.internal.attention_ulysses import Implementation, Local, Options
 
 # Optional dependencies are named under TYPE_CHECKING so base imports stay Torch-free.
 
@@ -30,7 +30,7 @@ class FlashAttn3(Protocol):
     """What serves FA3: upstream's `flash_attn_interface` or the wheel's (`prebuilt`)."""
 
     @property
-    def flash_attn_func(self) -> Callable[..., object]: ...
+    def flash_attn_func(self) -> Callable[..., object]: ...  # type: ignore[explicit-any]  # FA3's own
 
 
 #: The loaded FlashAttention-3 and the build it came from.
@@ -537,7 +537,7 @@ def _sage3_fp4(
     return _output(output, q).transpose(1, 2)
 
 
-def _named(name: str) -> Callable[..., str]:
+def _named(name: str) -> Implementation:
     return lambda *_: name
 
 

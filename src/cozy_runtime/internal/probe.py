@@ -32,7 +32,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING
 
 import msgspec
 from tensorfs import UnsupportedError
@@ -68,7 +68,8 @@ from cozy_runtime.internal.encoding.selection import (
 )
 from cozy_runtime.internal.prebuilt import W4a8, unpack
 
-# `torch`, `device`, `dtype` and tensor values are `Any`: the check venv carries no torch.
+if TYPE_CHECKING:
+    import torch
 
 #: The weight every oracle decodes: a realistic attention projection.
 BENCH_SHAPE = (2048, 2048)
@@ -211,11 +212,13 @@ def e4m3_value(bits: int) -> float:
     return sign * (1.0 + mantissa / 8.0) * 2.0 ** (exponent - 7)
 
 
-def _eps(torch: Any, dtype: Any) -> float:
+def _eps(torch: ModuleType, dtype: torch.dtype) -> float:
     return float(torch.finfo(dtype).eps)
 
 
-def _numerics(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
+def _numerics(
+    torch: ModuleType, provider: Provider, device: torch.device, dtype: torch.dtype
+) -> Sweep:
     """All 256 E4M3 patterns under one f32 scale: the decode is `round_L(weight * scale)`, the
     scale entering exactly, so it must equal the f64 product cast once into the dtype."""
     data = torch.frombuffer(bytearray(bytes(range(256))), dtype=torch.uint8)
@@ -226,7 +229,9 @@ def _numerics(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
     return _exact_sweep(torch, destination.cpu(), data.double() * scale.double(), dtype)
 
 
-def _numerics_rowwise(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
+def _numerics_rowwise(
+    torch: ModuleType, provider: Provider, device: torch.device, dtype: torch.dtype
+) -> Sweep:
     """Decode all 256 e4m3 patterns against 256 DIFFERENT row scales — 65,536 pairs.
 
     `fp8.rowwise`'s scale is a CONTINUOUS f32 per output row, not a format with 256 code
@@ -262,7 +267,7 @@ def _numerics_rowwise(torch: Any, provider: Provider, device: Any, dtype: Any) -
 
 
 def _numerics_int8_convrot(
-    torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor
+    torch: ModuleType, provider: Provider, device: torch.device, dtype: torch.dtype
 ) -> Sweep:
     """Every int8 value in every Hadamard position, against 256 power-of-two row scales.
 
@@ -297,7 +302,7 @@ def _numerics_int8_convrot(
     )
 
 
-def _exact_sweep(torch: ModuleType, got: Tensor, truth: Tensor, dtype: Tensor) -> Sweep:
+def _exact_sweep(torch: ModuleType, got: Tensor, truth: Tensor, dtype: torch.dtype) -> Sweep:
     """`got` against the f64 `truth` cast once into `dtype`, bit for bit; NaN as NaN."""
     want = truth.to(dtype)
     nan = torch.isnan(truth)
@@ -316,7 +321,7 @@ def _exact_sweep(torch: ModuleType, got: Tensor, truth: Tensor, dtype: Tensor) -
 
 
 def _numerics_int8_rowwise(
-    torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor
+    torch: ModuleType, provider: Provider, device: torch.device, dtype: torch.dtype
 ) -> Sweep:
     """Every int8 value against 256 power-of-two row scales: row `r` holds -128..127 shifted by
     `r`, so a decoder that mis-strides the scale is wrong on every row but one. The product is
@@ -339,7 +344,7 @@ def _across(provider: Provider, rows: Tensor) -> Tensor:
 
 
 def _numerics_int8_tensorwise(
-    torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor
+    torch: ModuleType, provider: Provider, device: torch.device, dtype: torch.dtype
 ) -> Sweep:
     """Every int8 value under one f32 scale: the decode is `round_L(weight * scale)`, the scale
     entering exactly, so it must equal the f64 product cast once into the dtype."""
@@ -351,7 +356,7 @@ def _numerics_int8_tensorwise(
 
 
 def _comfy_fixture(
-    torch: ModuleType, provider: Provider, device: Tensor, shape: tuple[int, int]
+    torch: ModuleType, provider: Provider, device: torch.device, shape: tuple[int, int]
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """A valid constant-q carrier with an independent exact logical reference.
 
@@ -410,14 +415,18 @@ def _comfy_fixture(
     }
 
 
-def _numerics_comfy(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
+def _numerics_comfy(
+    torch: ModuleType, provider: Provider, device: torch.device, dtype: torch.dtype
+) -> Sweep:
     truth, parts = _comfy_fixture(torch, provider, device, (16, 256))
     destination = torch.empty((16, 256), dtype=dtype, device=device)
     provider.decode(torch, parts, destination)
     return _exact_sweep(torch, destination.cpu(), truth.cpu().double(), dtype)
 
 
-def _numerics_mxfp8(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
+def _numerics_mxfp8(
+    torch: ModuleType, provider: Provider, device: torch.device, dtype: torch.dtype
+) -> Sweep:
     """All 256 E4M3 patterns under all 256 E8M0 bytes (row `r` scales every block by byte `r`):
     65,536 pairs, NaN from either operand included. E4M3 times a power of two is exact in f32,
     so the decode must equal the f64 truth cast once into the dtype."""
@@ -434,7 +443,9 @@ def _numerics_mxfp8(torch: ModuleType, provider: Provider, device: Tensor, dtype
     return _exact_sweep(torch, destination.cpu(), truth, dtype)
 
 
-def _numerics_nvfp4(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
+def _numerics_nvfp4(
+    torch: ModuleType, provider: Provider, device: torch.device, dtype: torch.dtype
+) -> Sweep:
     """Every byte pattern (both nibbles of every E2M1 value) against every finite positive E4M3
     block scale, at a power-of-two second level.
 
@@ -477,7 +488,7 @@ def _numerics_nvfp4(torch: ModuleType, provider: Provider, device: Tensor, dtype
 
 
 def _domain_sweep(
-    torch: Any, dtype: Any, got: Sequence[float], scales: Sequence[tuple[float, str]]
+    torch: ModuleType, dtype: torch.dtype, got: Sequence[float], scales: Sequence[tuple[float, str]]
 ) -> Sweep:
     """Grade a decode of all 256 e4m3 elements under each row's `(scale, label)`. `got` is
     row-major, one row per scale.
@@ -563,7 +574,7 @@ def _domain_sweep(
 
 
 def _native_agreement(
-    torch: Any, provider: LeafProvider, device: Any, dtype: Any
+    torch: ModuleType, provider: LeafProvider, device: torch.device, dtype: torch.dtype
 ) -> NativeAgreement:
     """A NATIVE LEAF is checked by running its kernel and comparing it to arithmetic.
 
@@ -629,7 +640,9 @@ class _StandIn:
         self.bias = None
 
 
-def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dict[str, Any]]:
+def _weight_roles(
+    torch: ModuleType, provider: Provider, device: torch.device
+) -> tuple[Tensor, dict[str, Tensor]]:
     """A deterministic `BENCH_SHAPE` weight and the stored roles of it, per suite.
 
     SEEDED, so two runs on one device check the same tensor; and quantized by the encoding's
@@ -735,7 +748,7 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
     raise AssertionError(f"no operand builder for suite {provider.suite!r}")
 
 
-def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> Any:
+def _exact_weight(torch: ModuleType, provider: Provider, roles: Mapping[str, Tensor]) -> Tensor:
     """The EXACT float64 value of the stored roles. The reference both routes are scored on.
 
     Written here in f64 rather than delegated to the decode provider on purpose: a reference
@@ -791,20 +804,20 @@ def _f64(tensor: Tensor) -> Tensor:
     return (tensor.cpu() if tensor.device.type == "mps" else tensor).double()
 
 
-def _activation(torch: Any, device: Any, dtype: Any) -> Any:
+def _activation(torch: ModuleType, device: torch.device, dtype: torch.dtype) -> Tensor:
     """The same seeded activation for every route, so a deviation is about the route."""
     generator = torch.Generator(device="cpu").manual_seed(0x517E)
     x = torch.randn(FIDELITY_TOKENS, BENCH_SHAPE[1], generator=generator, dtype=torch.float32)
     return (x * 0.5).to(device=device, dtype=dtype)
 
 
-def _reference_gemm(torch: Any, x: Any, weight: Any) -> Any:
+def _reference_gemm(torch: ModuleType, x: Tensor, weight: Tensor) -> Tensor:
     """`x @ W.t()` in f64. f32 would be measured through TF32 on every card that has it,
     which is a ~1e-3 error sitting under numbers this suite reports to 1e-6."""
     return (_f64(x) @ _f64(weight).t()).double()
 
 
-def _relative(torch: Any, got: Any, reference: Any) -> float:
+def _relative(torch: ModuleType, got: Tensor, reference: Tensor) -> float:
     delta = (_f64(got) - reference).norm()
     return float(delta / reference.norm().clamp(min=1e-30))
 
@@ -850,7 +863,7 @@ def vector_cases() -> list[VectorCase]:
     return out
 
 
-def vector_tensor(torch: ModuleType, part: VectorPart, device: Tensor) -> Tensor:
+def vector_tensor(torch: ModuleType, part: VectorPart, device: torch.device) -> Tensor:
     """A vector part's tensor: base64 little-endian bytes, viewed in its dtype. An `F4` part
     is its packed bytes, u8 `[R, C/2]`, as the fill plane hands it to a decoder."""
     flat = torch.frombuffer(bytearray(base64.b64decode(part.bits)), dtype=torch.uint8)
@@ -860,7 +873,9 @@ def vector_tensor(torch: ModuleType, part: VectorPart, device: Tensor) -> Tensor
     return flat.view(getattr(torch, name)).reshape(part.shape).to(device)
 
 
-def decode_case(torch: ModuleType, provider: Provider, case: VectorCase, device: Tensor) -> Tensor:
+def decode_case(
+    torch: ModuleType, provider: Provider, case: VectorCase, device: torch.device
+) -> Tensor:
     """`case` decoded by `provider` bound to its params: the logical tensor, or None when the
     provider refuses the case's shape or params."""
     bound = replace(provider, params=params_of(case.encoding.params))  # type: ignore[type-var]
@@ -886,7 +901,7 @@ def same_bits(torch: ModuleType, got: Tensor, expect: str) -> int:
     return int(differ.sum())
 
 
-def _spec_vectors(torch: ModuleType, provider: Provider, device: Tensor) -> SpecVectors:
+def _spec_vectors(torch: ModuleType, provider: Provider, device: torch.device) -> SpecVectors:
     """The conformance cases of the provider's schemes, decoded bit for bit (NaN as NaN).
 
     The synthetic sweeps prove the arithmetic; these prove the provider reads the layout a real
@@ -937,7 +952,9 @@ def _cores_reference(
     return reference
 
 
-def _numerics_cores(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
+def _numerics_cores(
+    torch: ModuleType, provider: Provider, device: torch.device, dtype: torch.dtype
+) -> Sweep:
     """The row's random parts at its probe params (every byte pattern), decoded on the device
     and by the eager reference: bit for bit after the one cast."""
     assert isinstance(provider, CoreDequant)
@@ -955,7 +972,7 @@ def _numerics_cores(torch: ModuleType, provider: Provider, device: Tensor, dtype
 #: Which self-check a provider gets, keyed by the ORACLE IT DECLARES (`Provider.suite`) and
 #: never by class or role set, so a second implementation of one encoding is measured by the
 #: same oracle as the first. A suite name in neither table passes NOTHING.
-DECODE_SUITES: dict[str, Callable[[Any, Provider, Any, Any], Sweep]] = {
+DECODE_SUITES: dict[str, Callable[[ModuleType, Provider, torch.device, torch.dtype], Sweep]] = {
     "comfy-decode": _numerics_comfy,
     "fp8-tensorwise-decode": _numerics,
     "fp8-rowwise-decode": _numerics_rowwise,
@@ -983,7 +1000,7 @@ NATIVE_SUITES = frozenset(
 
 
 def conform(
-    torch: Any,
+    torch: ModuleType,
     providers: Mapping[str, tuple[Provider, ...]],
     device: DeviceFacts,
     output_dtypes: Sequence[str],
@@ -1039,7 +1056,9 @@ PROBE_PARAMS: dict[str, dict[str, object]] = {
 }
 
 
-def _measured(torch: ModuleType, provider: Provider, target: Tensor, dtype: Tensor) -> Evidence:
+def _measured(
+    torch: ModuleType, provider: Provider, target: torch.device, dtype: torch.dtype
+) -> Evidence:
     """`_evidence`, where a device that lacks a dtype the decode reads (MPS has no float8)
     observes nothing for it."""
     # The suite considers every provider even for a plain F64/FP8 model.
@@ -1063,7 +1082,9 @@ def _measured(torch: ModuleType, provider: Provider, target: Tensor, dtype: Tens
         return UnmeasuredEvidence(note=f"{type(exc).__name__}: {exc}"[:300])
 
 
-def _evidence(torch: Any, provider: Provider, target: Any, dtype: Any) -> Evidence:
+def _evidence(
+    torch: ModuleType, provider: Provider, target: torch.device, dtype: torch.dtype
+) -> Evidence:
     """One (implementation, output dtype)'s evidence."""
     if isinstance(provider, LeafProvider) and provider.suite in NATIVE_SUITES:
         agreement = _native_agreement(torch, provider, target, dtype)
