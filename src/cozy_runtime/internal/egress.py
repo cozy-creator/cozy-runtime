@@ -160,7 +160,11 @@ def fetch_public_wheel(
 ) -> tuple[Path, int]:
     """One public wheel, pinned by URL and sha256, fetched anonymously through this door. A
     transfer that goes silent is asked again from the bytes it holds (`Range`), and fails once
-    `STILL_ATTEMPTS` attempts in a row moved nothing."""
+    `STILL_ATTEMPTS` attempts in a row moved nothing.
+
+    The pinned URL is credential-free: no query. A redirect hop may carry one (a Hub's 302 to
+    its presigned storage URL): it is checked like every hop, used for that request only, and
+    never recorded; each attempt asks the pinned URL again."""
 
     class PublicRedirect(HTTPRedirectHandler):
         def redirect_request(
@@ -170,12 +174,12 @@ def fetch_public_wheel(
             return super().redirect_request(req, fp, code, msg, headers, newurl)  # type: ignore[arg-type]
 
     def check(target: str) -> None:
-        _require_public_wheel_url(target)
         host = urlparse(target).hostname or ""
         _validate(
             target, EgressPolicy(allowed_hosts=(host,), allow_private=host in {"127.0.0.1", "::1"})
         )
 
+    _require_public_wheel_url(url)
     check(url)
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".partial")
     opener = build_opener(PublicRedirect())

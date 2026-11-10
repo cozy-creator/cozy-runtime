@@ -111,8 +111,9 @@ class Wheels:
         try:
             egress.fetch_public_wheel(archive, wheel.url, wheel.sha256, WHEEL_CEILING)
         except EnvironmentRefusal as exc:
+            pinned = urlsplit(wheel.url)._replace(query="").geturl()
             raise LockedSourceRefusal(
-                f"{wheel.distribution}: the wheel its uv.lock pins ({wheel.url}) could not be "
+                f"{wheel.distribution}: the wheel its uv.lock pins ({pinned}) could not be "
                 f"read as pinned: {exc}"
             ) from exc
         with zipfile.ZipFile(archive) as unpacked:
