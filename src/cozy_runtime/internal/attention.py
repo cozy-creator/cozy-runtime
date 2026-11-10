@@ -951,9 +951,7 @@ def _expected(live_tokens: int, module: Any) -> None:
     found = known()
     if not any(_sol_objects(found[n]) for n in observed({"": module}).totals() if n in found):
         return
-    import torch
-
-    attention_sol.expect(live_tokens, torch.device(str(placed_device())))
+    attention_sol.expect(live_tokens, placed_device())
 
 
 _EXPECTED.append(_expected)

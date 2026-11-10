@@ -31,12 +31,25 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NoReturn,
+    Protocol,
+    TypeVar,
+    cast,
+    final,
+    runtime_checkable,
+)
 
 import msgspec
 
-from cozy_runtime.author._context import AdapterRef, Device, device
+from cozy_runtime.author._context import AdapterRef, device
 from cozy_runtime.author._errors import CapabilityError, ConformanceError, InvalidRequest
+
+if TYPE_CHECKING:
+    import torch
 
 T = TypeVar("T")
 S = TypeVar("S", bound=msgspec.Struct)
@@ -820,9 +833,8 @@ class Loader:
         self._caches: list[DerivedCache] = []
 
     @property
-    def device(self) -> Device:
-        """This process's device (`author.device()`). Placement is the runtime's; naming it is
-        not a door."""
+    def device(self) -> torch.device:
+        """This process's device (`author.device()`). Placement is the runtime's."""
         self._require_open("loader.device")
         return device()
 

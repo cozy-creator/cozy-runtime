@@ -24,7 +24,7 @@ class Flow(Model[FlowGraph]):
         self.graph = loader.construct(FlowGraph)  # FlowGraph(config): transformer, vae, ...
 
     def denoise(self, ctx: Context, cond: torch.Tensor, steps: int, seed: int) -> torch.Tensor:
-        device = torch.device(str(self.device))
+        device = self.device
         x = rng.counter_noise((1, 16, 128, 128), seed, 0, dtype=torch.bfloat16, device=device)
         sigmas = torch.linspace(1.0, 0.0, steps + 1).tolist()
         for i in range(steps):

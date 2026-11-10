@@ -1,0 +1,1 @@
+- `self.device`, `loader.device`, `ctx.device` and `author.device()` are a `torch.device`, so `tensor.to(self.device)` and `torch.zeros(..., device=self.device)` take them as they are. `author.Device` is gone.

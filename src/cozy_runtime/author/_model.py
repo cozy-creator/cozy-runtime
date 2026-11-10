@@ -45,7 +45,6 @@ from cozy_runtime.author._context import (
     CURRENT,
     AdapterRef,
     Context,
-    Device,
     RequestView,
     derive_seed,
     device,
@@ -1002,10 +1001,10 @@ class Model[PipelineT]:
         return None
 
     @property
-    def device(self) -> Device:
+    def device(self) -> torch.device:
         """Where this model's calls take and return tensors: the device the runtime runs it on
         (`author.device()`: its GPU, or the CPU where there is none). A package never picks
-        one; placement is the runtime's, and reading it is not a door."""
+        one; placement is the runtime's."""
         return device()
 
     @property
