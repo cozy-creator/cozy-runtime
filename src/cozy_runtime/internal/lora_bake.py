@@ -406,7 +406,7 @@ def _e2m1(
         up = torch.rand(fraction.shape, device=payload.device, generator=generator) < fraction
     else:
         up = (fraction > 0.5) | ((fraction == 0.5) & (low % 2 == 1))
-    return (low + up) | (negative.long() << 3)
+    return cast("Tensor", (low + up) | (negative.long() << 3))
 
 
 def bake_nvfp4(

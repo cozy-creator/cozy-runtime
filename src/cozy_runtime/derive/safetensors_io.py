@@ -269,7 +269,7 @@ class StreamingWriter:
         return start, end, self._handle
 
 
-def row_chunks(rows: int, cols: int, budget_elements: int = 1 << 22) -> Iterator[slice]:
+def row_chunks(rows: int, cols: int, budget_elements: int = 1 << 22) -> Iterator[slice[int]]:
     """Row slices whose working set stays inside `budget_elements`. Every encoder in this
     family is row-independent, so chunking changes no number — it only decides whether a
     [28672, 5376] tensor needs 600 MB of float32 scratch or 16 MB of it."""
