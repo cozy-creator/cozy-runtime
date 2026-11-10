@@ -1093,7 +1093,6 @@ src/cozy_runtime/internal/probe.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/producers.py: [arg-type] Argument 1 to "Processor" has incompatible type "_Processor | Tensor | Module"; expected "_Processor"
 src/cozy_runtime/internal/producers.py: [operator] "Tensor" not callable
 src/cozy_runtime/internal/residency.py: [override] Signature of "__repr__" incompatible with supertype "torch._tensor.Tensor"
-src/cozy_runtime/internal/residency.py: [override] Signature of "__torch_dispatch__" incompatible with supertype "torch._tensor.Tensor"
 src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed
 src/cozy_runtime/internal/seam.py: [explicit-any] Explicit "Any" is not allowed

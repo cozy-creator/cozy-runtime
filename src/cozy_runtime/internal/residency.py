@@ -225,7 +225,7 @@ class Placeholder(Tensor):
             cls, tuple(shape), dtype=dtype, device=device, storage_size=0
         )
 
-    def __repr__(self, *, tensor_contents: object = None) -> str:
+    def __repr__(self) -> str:
         return f"UnboundWeight({tuple(self.shape)}, {self.dtype}, {self.device})"
 
     def _varena_read(self) -> Tensor:  # type: ignore[no-redef]  # the default; a made copy's own reads its source
