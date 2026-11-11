@@ -29,7 +29,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import ModuleType
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 
 import msgspec
 
@@ -61,8 +61,8 @@ NEVER = timedelta(days=36500)
 TOLD = timedelta(seconds=10)
 #: One formation attempt, from the join to every GPU's proof: the same few short steps on every GPU
 #: (reach the store, group init, one barrier, one of each collective, the exchange's check). 0.35 s
-#: on 2x A40 (run 46368), at most 1.1 s in 49 formations there. A GPU still in a step after this
-#: will not leave it: 2x A40 sat in formation until cancelled, both GPUs alive, billing (cr-263).
+#: on 2x A40 (run 46368), under 1 s in 27 more there. A GPU still in a step after this will not
+#: leave it: 2x A40 sat in formation until cancelled, both GPUs alive, billing (cr-263).
 ATTEMPT = timedelta(seconds=60)
 #: Attempts before the group is refused. A stalled attempt is aborted on every GPU and the group
 #: forms again on a new store; NCCL keeps its route for the process (`route`).
@@ -361,6 +361,7 @@ class RankGroup:
         devices: Iterable[str] = (),
         waiting: Callable[[str], None] = lambda what: None,
         stalled: Callable[[str, str], None] = lambda step, why: None,
+        refuse: Callable[[str], None] = lambda why: None,
     ) -> None:
         if degree < 2:
             raise ValueError("a rank group is degree >= 2; degree 1 is a plain executor")
@@ -377,6 +378,8 @@ class RankGroup:
         self.waiting = waiting
         #: told each stalled formation attempt's step and verdict (the route it formed on failed)
         self.on_stall = stalled
+        #: refuses the call this group forms for, before GPU 0's process ends (`_end`)
+        self.refuse = refuse
         #: how a follower's program is started: the trampoline's `inherit` backend under
         #: rank 0's own environment, or the suite's launcher for the gloo arms
         self._launch = launch or self._spawn_follower
@@ -477,9 +480,8 @@ class RankGroup:
             follower.replies.put((head, frame))
             if head.reply in ("join", "form") and head.ok:
                 follower.forming = "joined" if head.reply == "join" else "formed"
-            if (
-                head.reply == "form" and not head.ok and head.code != ENDED
-            ):  # ENDED: GPU 0 aborted it
+            # A follower that could not form breaks the group, unless GPU 0 aborted it (ENDED).
+            if head.reply == "form" and not head.ok and head.code != ENDED:
                 self._break(
                     f"{follower.gpu} could not form the group: {head.code}: {head.detail}"[:600]
                 )
@@ -507,11 +509,17 @@ class RankGroup:
         if self.initializing:
             # GPU 0 waits inside group init for a member that will never arrive, and init has
             # no abort: this process ends, saying why, and TensorD fails the call on its exit.
-            sys.stderr.write(
-                f"group_unformed: {why}; GPU 0 cannot leave group init, so its process ends\n"
-            )
-            sys.stderr.flush()
-            os._exit(int(Exit.failed))
+            self._end(f"{why}; GPU 0 cannot leave group init, so its process ends")
+
+    def _end(self, why: str) -> NoReturn:
+        """GPU 0 cannot leave the step it is in: the call it forms for is refused with `why`
+        (`refuse`), the same line goes to stderr, and this process ends, so TensorD frees its
+        GPUs and the machine's idle rules apply."""
+        with contextlib.suppress(Exception):  # a report: the process ends regardless
+            self.refuse(why)
+        sys.stderr.write(f"group_unformed: {why}\n")
+        sys.stderr.flush()
+        os._exit(int(Exit.failed))
 
     def _abort_collectives(self) -> None:
         """A dead follower must not park rank 0 on a collective that cannot complete:
@@ -762,11 +770,7 @@ class RankGroup:
             return
         self._break(f"the group did not form: {why}")  # GPU 0 in group init ends here
         if self.forming not in _REPLY_STEPS:
-            sys.stderr.write(
-                f"group_unformed: {self.broken}; GPU 0 cannot leave {self.forming}, so it ends\n"
-            )
-            sys.stderr.flush()
-            os._exit(int(Exit.failed))
+            self._end(f"{self.broken}; GPU 0 cannot leave {self.forming}, so its process ends")
 
     def _stacks(self, why: str) -> None:
         """Every GPU's threads to stderr, which the machine keeps with the run: each follower's
