@@ -19,6 +19,7 @@ from copy import copy
 from dataclasses import dataclass, is_dataclass
 from fractions import Fraction
 from pathlib import Path
+from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     ClassVar,
@@ -35,10 +36,12 @@ from typing import (
 import msgspec
 from PIL.Image import Image
 
+from cozy_runtime import canonical_json
 from cozy_runtime.author._errors import (
     CapabilityError,
     ConformanceError,
     InvalidRequest,
+    OutputError,
     PreflightViolation,
     RuntimeFailure,
 )
@@ -60,6 +63,24 @@ if TYPE_CHECKING:
 
 _UNBOUND: Final = ""
 Fidelity = Literal["auto", "low", "medium", "high"]
+#: A file's metadata rides in the result beside its kind, so it stays small.
+MAX_METADATA_BYTES: Final = 4096
+
+
+def metadata_map(given: object) -> dict[str, JsonValue]:
+    """`given` as file metadata: a map of names to JSON values, at most `MAX_METADATA_BYTES`."""
+    if not isinstance(given, Mapping) or not all(isinstance(key, str) for key in given):
+        raise OutputError("file metadata is a map of names to JSON values", code="metadata")
+    try:
+        data = canonical_json.encode(dict(given))
+    except ValueError as exc:
+        raise OutputError(f"file metadata holds JSON values only: {exc}", code="metadata") from exc
+    if len(data) > MAX_METADATA_BYTES:
+        raise OutputError(
+            f"file metadata is {len(data)} bytes, over {MAX_METADATA_BYTES}", code="metadata"
+        )
+    parsed: dict[str, JsonValue] = canonical_json.decode(data)
+    return parsed
 
 
 # Private process-handoff facts, never input identity or wire metadata.
@@ -92,6 +113,7 @@ class File:
         "_local",
         "_max_decoded_bytes",
         "_media",
+        "_metadata",
         "_position",
         "_preparation",
         "_probed",
@@ -127,6 +149,7 @@ class File:
         self._media: MediaReads | None = None
         self._fidelity: Fidelity = "auto"
         self._label = ""
+        self._metadata: dict[str, JsonValue] = {}
         self._position = -1
         self._read_guard: Callable[[], None] | None = None
         self._max_decoded_bytes = 0
@@ -175,6 +198,18 @@ class File:
             raise TypeError("a file label must be a string")
         result = copy(self)
         result._label = label
+        return result
+
+    @property
+    def metadata(self) -> Mapping[str, JsonValue]:
+        """What this file says of itself beyond its type (`{"orbit": {...}}`); empty: nothing."""
+        return MappingProxyType(self._metadata)
+
+    def with_metadata(self, metadata: Mapping[str, JsonValue]) -> Self:
+        """A copy of this handle carrying `metadata`, its keys over any it had. Returned as an
+        output, the map is stored with the file; keys the platform doesn't know are kept."""
+        result = copy(self)
+        result._metadata = metadata_map({**self._metadata, **metadata_map(metadata)})
         return result
 
     @property
@@ -241,6 +276,8 @@ class File:
         if self.digest:
             row["size_bytes"] = self.size_bytes
             row["digest"] = self.digest
+        if self._metadata:
+            row["metadata"] = self._metadata
         return row
 
 
