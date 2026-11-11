@@ -37,23 +37,28 @@ def attention_inventory(ctx: Context) -> Measured:
     return _run(attention.inventory)
 
 
-def attention_speed(ctx: Context, *, kernels: str = "", points: str = "", seed: int = 171) -> Measured:
+def attention_speed(
+    ctx: Context, tel: Telemetry, *, kernels: str = "", points: str = "", seed: int = 171
+) -> Measured:
     """`kernels` (comma-separated; SDPA joins as the anchor) timed over the grid's points (`points`, comma-separated
-    ids; empty is every one), interleaved, three rounds."""
+    ids; empty is every one), interleaved, three rounds. Its progress counts points under the stage "measure", not a
+    sampler's steps."""
     from cozy_runtime.internal.bench import attention
 
     names = [n for n in kernels.split(",") if n]
     wanted = {p for p in points.split(",") if p}
     chosen = [p for p in attention.GRID if not wanted or p.id in wanted]
-    return _run(lambda: attention.speed(names, chosen, seed, ctx))
+    with tel.stage("measure"):
+        return _run(lambda: attention.speed(names, chosen, seed, ctx))
 
 
-def attention_quality(ctx: Context, *, kernel: str, seed: int = 171) -> Measured:
+def attention_quality(ctx: Context, tel: Telemetry, *, kernel: str, seed: int = 171) -> Measured:
     """`kernel`'s worst-head relative L2 against FP32 attention on every site, with the best answer a kernel could give
-    without computing."""
+    without computing. Its progress counts sites under the stage "measure"."""
     from cozy_runtime.internal.bench import attention
 
-    return _run(lambda: attention.quality(kernel, seed, ctx))
+    with tel.stage("measure"):
+        return _run(lambda: attention.quality(kernel, seed, ctx))
 
 
 def kernels_inventory(ctx: Context) -> Measured:
