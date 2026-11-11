@@ -428,6 +428,16 @@ only. An `Image`'s file reads upright and scaled down to 16 MP at most, as `Pict
 `File`, `ImageFile`, `VideoFile` and `AudioFile`; a `Latents` result field stays on the machine
 that made it.
 
+A file can carry metadata beside its type: a small JSON map stored with it. An output declares it
+with `file.with_metadata({...})`, a copy of the handle; a reader gets it as `Image`, `Video` or
+`Audio`'s `metadata`. The platform acts on the keys it knows and keeps the rest. An orbit video
+(a video node turns it instead of playing it) is every frame a keyframe:
+
+```python
+clip = out.save_video(frames, fps=24, keyframe_interval=1)
+return Turned(video=clip.with_metadata({"orbit": {"degrees": 360, "direction": "cw", "loops": True}}))
+```
+
 Image inputs can separately opt into preparation on a field or an `Files` argument:
 
 ```python

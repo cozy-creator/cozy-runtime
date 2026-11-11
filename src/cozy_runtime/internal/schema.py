@@ -60,7 +60,7 @@ _ASSET_KINDS: tuple[tuple[type[File], str], ...] = (
 _INPUTS: dict[object, str] = {AspectRatio: "aspect_ratio", Seed: "seed"}
 _MEDIA = (Image, Video, Audio)
 #: A media value's own members; a subclass's others are extras of the version it holds.
-_MEDIA_MEMBERS = frozenset({"file", "description"})
+_MEDIA_MEMBERS = frozenset({"file", "description", "metadata"})
 
 
 def wire(value: object) -> object:

@@ -18,8 +18,10 @@ from cozy_runtime.author._files import (
     asset_inputs,
     bind,
     file_state,
+    metadata_map,
 )
 from cozy_runtime.author._media import admits, normalize
+from cozy_runtime.canonical_json import JsonValue
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _ASSETS = {kind.kind: kind for kind in (File, ImageFile, AudioFile, VideoFile)}
@@ -65,6 +67,8 @@ def decode(
     if len(grants) > 32:
         raise ValueError("native result grant inventory exceeds its bound")
 
+    said: dict[str, dict[str, JsonValue]] = {}
+
     def handle(cls: type[File] | type[Tree], grant: ByteGrant) -> File | Tree:
         made: File | Tree
         if issubclass(cls, Tree):
@@ -81,6 +85,9 @@ def decode(
             )
         made._read_guard = guard
         made._grant_token = grant_token
+        if isinstance(made, File):
+            # What the child said of its file stays with it: returned on, it's the parent's too.
+            made._metadata = said.get(grant.output_id, {})
         return made
 
     verified: dict[str, ByteGrant] = {}
@@ -117,6 +124,7 @@ def decode(
         ):
             raise ValueError("native result differs from its verified host grant")
         verified[output_id] = grant
+        said[output_id] = metadata_map(node.get("metadata") or {})
         handles[output_id] = handle(Tree if kind == "tree" else _ASSETS[kind], grant)
 
     def replace(node: object, path: str) -> object:

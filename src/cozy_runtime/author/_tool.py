@@ -41,10 +41,12 @@ def spoken(text: str) -> str:
 
 class Image(msgspec.Struct, frozen=True, kw_only=True, tag_field="type", tag="image"):
     """A picture and what it shows: what a mention of a picture box gives, or a slot holds. Read
-    upright and scaled down to 16 MP at most; `file.read(max_pixels=)` reads it smaller."""
+    upright and scaled down to 16 MP at most; `file.read(max_pixels=)` reads it smaller.
+    `metadata` is what its version's file says of itself (`File.with_metadata`)."""
 
     file: Annotated[ImageFile, ImagePreparation(max_pixels=16 << 20)]
     description: str = ""
+    metadata: dict[str, object] = msgspec.field(default_factory=dict)
 
 
 class Video(msgspec.Struct, frozen=True, kw_only=True, tag_field="type", tag="video"):
@@ -53,6 +55,8 @@ class Video(msgspec.Struct, frozen=True, kw_only=True, tag_field="type", tag="vi
 
     file: VideoFile
     description: str = ""
+    #: `{"orbit": {"degrees": 360, "direction": "cw", "loops": True}}` for an orbit.
+    metadata: dict[str, object] = msgspec.field(default_factory=dict)
 
 
 class Audio(msgspec.Struct, frozen=True, kw_only=True, tag_field="type", tag="audio"):
@@ -60,6 +64,7 @@ class Audio(msgspec.Struct, frozen=True, kw_only=True, tag_field="type", tag="au
 
     file: AudioFile
     description: str = ""
+    metadata: dict[str, object] = msgspec.field(default_factory=dict)
 
 
 if TYPE_CHECKING:
