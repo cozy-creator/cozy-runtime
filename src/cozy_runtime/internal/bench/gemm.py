@@ -545,7 +545,6 @@ def tiles(seed: int, ctx: Context) -> Tiles:
             configs = {f"n{bn}-w{w}": partial(gemv, bn, w) for bn in (32, 64, 128) for w in (4, 8)}
             found.append(_tile_set("gemv", n, k, m, f"n{nvfp4_linear.GEMV_N}-w8", configs, flush))
             ctx.progress(at * 3 + 1 + i, total)
-        del weight, blocked, decoded
         torch.cuda.empty_cache()
     return {"inventory": card.inventory, "kernels": found}
 
