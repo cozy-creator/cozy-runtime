@@ -85,7 +85,7 @@ def gemm_speed(ctx: Context, *, lanes: str = "", shapes: str = "", seed: int = 1
     return _run(lambda: gemm.speed(chosen, wanted, seed, ctx))
 
 
-def calibrate(ctx: Context) -> Measured:
+def host_calibrate(ctx: Context) -> Measured:
     """This pod's sustained bf16 GEMM TFLOPS and memory GB/s, which the gate holds against its card's reference: a host
     far below it (an H100 that ran every kernel 3x slow, release gate 43061813774) is refused (xs-177)."""
     from cozy_runtime.internal.bench import gemm

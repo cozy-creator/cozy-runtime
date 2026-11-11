@@ -200,15 +200,20 @@ def _bf16(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
         finally:
             torch.backends.cuda.preferred_blas_library(default)
 
-    rule = f"bf16-gemm:{default.name.lower()}"
+    rule = f"bf16-gemm:{str(getattr(default, 'name', default)).lower()}"
     calls: dict[str, Call] = {rule: partial(torch.nn.functional.linear, x, w)}
-    calls |= {f"bf16-gemm:{name}": partial(under, name) for name in ("cublas", "cublaslt") if f"bf16-gemm:{name}" != rule}
+    for name in ("cublas", "cublaslt"):
+        if f"bf16-gemm:{name}" != rule:
+            calls[f"bf16-gemm:{name}"] = partial(under, name)
     return calls, {"gemm": rule, "linear": rule}
 
 
-def _tiles(name: str, gemm: Callable[..., torch.Tensor], *args: object) -> dict[str, Call]:
-    """`gemm(*args, config)` for every config a family's table could hold: one it does not raises at its first call."""
-    return {f"{name}:c{c}": partial(gemm, *args, c) for c in range(8)}
+def _tiles(name: str, gemm: Callable[[int], torch.Tensor]) -> dict[str, Call]:
+    """`gemm(config)` for every config a family's table could hold: one it does not raises at its first call."""
+    calls: dict[str, Call] = {}
+    for c in range(8):
+        calls[f"{name}:c{c}"] = partial(gemm, c)
+    return calls
 
 
 def _tile(name: str) -> bool:
@@ -226,7 +231,7 @@ def _int8(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
         q, qs = ops.int8_quantize(x)
         calls["quantize:int8"] = partial(ops.int8_quantize, x)
         calls["int8-gemm:prebuilt"] = partial(ops.int8_gemm, q, qs, data, scale, None, BF16, -1)
-        calls |= _tiles("int8-gemm", ops.int8_gemm, q, qs, data, scale, None, BF16)
+        calls |= _tiles("int8-gemm", partial(ops.int8_gemm, q, qs, data, scale, None, BF16))
         calls["int8-gemm:cublaslt"] = partial(int8_linear._product, torch, q, qs, data, scale, BF16)
         calls["int8-linear:prebuilt"] = partial(ops.int8_linear, x, data, scale, None, BF16)
     if card.kitchen is not None:
@@ -260,7 +265,7 @@ def _fp8(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[dic
         calls["quantize:fp8"] = partial(ops.fp8_quantize, x)
     if ops is not None and ops.cutlass_fp8:
         calls["fp8-gemm:prebuilt"] = partial(ops.fp8_gemm, q, qs, data, scale, None, BF16, -1)
-        calls |= _tiles("fp8-gemm", ops.fp8_gemm, q, qs, data, scale, None, BF16)
+        calls |= _tiles("fp8-gemm", partial(ops.fp8_gemm, q, qs, data, scale, None, BF16))
         calls["fp8-linear:prebuilt"] = partial(ops.fp8_linear, x, data, scale, None, BF16)
         return calls, {"gemm": "fp8-gemm:prebuilt", "linear": "fp8-linear:prebuilt"}
     if ops is not None:
@@ -302,7 +307,8 @@ def _nvfp4(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[d
 
         def w4a4() -> torch.Tensor:
             p, b, t = nvfp4_linear._quantized(torch, kitchen, x)
-            return kitchen.scaled_mm_nvfp4(p, weight, t, second, b, blocked, out_dtype=BF16)
+            out: torch.Tensor = kitchen.scaled_mm_nvfp4(p, weight, t, second, b, blocked, out_dtype=BF16)
+            return out
 
         calls["nvfp4-linear:kitchen"] = w4a4
         return calls, {"gemm": "nvfp4-gemm:kitchen", "linear": "nvfp4-linear:kitchen"}
@@ -318,7 +324,7 @@ def _w4a8(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
     w = prebuilt.W4a8(codes, group, _rand(g, s.n, scale=1e-3, add=5e-4), None)
     q, qs = ops.int8_quantize(x)
     calls: dict[str, Call] = {"w4a8-gemm:prebuilt": partial(ops.w4a8_gemm, q, qs, w, None, BF16, -1)}
-    calls |= _tiles("w4a8-gemm", ops.w4a8_gemm, q, qs, w, None, BF16)
+    calls |= _tiles("w4a8-gemm", partial(ops.w4a8_gemm, q, qs, w, None, BF16))
     calls["w4a8-linear:prebuilt"] = partial(ops.w4a8_linear, x, w, None, BF16)
     return calls, {"gemm": "w4a8-gemm:prebuilt", "linear": "w4a8-linear:prebuilt"}
 
@@ -526,7 +532,9 @@ def tiles(seed: int, ctx: Context) -> Tiles:
             )
             return decoded
 
-        configs = {f"n{bn}-k{bk}-w{w}": partial(dequant, bn, bk, w) for bn in (32, 64, 128) for bk in (64, 128, 256) for w in (2, 4, 8)}
+        configs: dict[str, Call] = {}
+        for bn, bk, w in ((bn, bk, w) for bn in (32, 64, 128) for bk in (64, 128, 256) for w in (2, 4, 8)):
+            configs[f"n{bn}-k{bk}-w{w}"] = partial(dequant, bn, bk, w)
         found.append(_tile_set("dequant", n, k, 0, "n64-k128-w4", configs, flush))
         ctx.progress(at * 3, total)
         words = weight.view(torch.int32)
@@ -542,7 +550,9 @@ def tiles(seed: int, ctx: Context) -> Tiles:
                 )  # fmt: skip
                 return out
 
-            configs = {f"n{bn}-w{w}": partial(gemv, bn, w) for bn in (32, 64, 128) for w in (4, 8)}
+            configs = {}
+            for bn, w in ((bn, w) for bn in (32, 64, 128) for w in (4, 8)):
+                configs[f"n{bn}-w{w}"] = partial(gemv, bn, w)
             found.append(_tile_set("gemv", n, k, m, f"n{nvfp4_linear.GEMV_N}-w8", configs, flush))
             ctx.progress(at * 3 + 1 + i, total)
         torch.cuda.empty_cache()
