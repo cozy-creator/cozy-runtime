@@ -364,7 +364,7 @@ class RankGroup:
         devices: Iterable[str] = (),
         waiting: Callable[[str], None] = lambda what: None,
         stalled: Callable[[str, str], None] = lambda step, why: None,
-        refuse: Callable[[str], None] = lambda why: None,
+        refuse: Callable[[str], bool] = lambda why: False,
     ) -> None:
         if degree < 2:
             raise ValueError("a rank group is degree >= 2; degree 1 is a plain executor")
@@ -381,7 +381,7 @@ class RankGroup:
         self.waiting = waiting
         #: told each stalled formation attempt's step and verdict (the route it formed on failed)
         self.on_stall = stalled
-        #: refuses the call this group forms for, before GPU 0's process ends (`_end`)
+        #: refuses the call this group forms for before GPU 0's process ends; True: it was (`_end`)
         self.refuse = refuse
         #: how a follower's program is started: the trampoline's `inherit` backend under
         #: rank 0's own environment, or the suite's launcher for the gloo arms
@@ -515,13 +515,15 @@ class RankGroup:
             self._end(f"{why}; GPU 0 cannot leave group init, so its process ends")
 
     def _end(self, why: str) -> NoReturn:
-        """GPU 0 cannot leave the step it is in: the call it forms for is refused with `why`
-        (`refuse`), the same line goes to stderr, and this process ends, so TensorD frees its
-        GPUs and the machine's idle rules apply."""
-        with contextlib.suppress(Exception):  # a report: the process ends regardless
-            self.refuse(why)
+        """GPU 0 cannot leave the step it is in. The line goes to stderr, the call it forms for is
+        refused with it (`refuse`) and the machine, which ends a refused group, is given `UNWIND`
+        to end this process: one that also ends itself races that and reads as an executor that
+        died. Then it ends anyway, so its GPUs are freed and the idle rules apply."""
         sys.stderr.write(f"group_unformed: {why}\n")
         sys.stderr.flush()
+        with contextlib.suppress(Exception):  # a report: the process ends regardless
+            if self.refuse(why):
+                time.sleep(UNWIND.total_seconds())
         os._exit(int(Exit.failed))
 
     def _abort_collectives(self) -> None:

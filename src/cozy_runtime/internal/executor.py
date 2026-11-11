@@ -1563,12 +1563,14 @@ class Executor:
                 f"a group stalled in {step} over peer memory: {why}",
             )
 
-    def _refuse_start(self, why: str) -> None:
+    def _refuse_start(self, why: str) -> bool:
         """This start's group cannot form and GPU 0's process is about to end: the start is
         refused first, so the call fails `group_unformed`, not as an executor that ended."""
-        if not self.started:
-            refused = {"ok": False, "code": "group_unformed", "detail": why[:900], "reply": "start"}
-            _send_reply(self.channel, refused)
+        if self.started:
+            return False
+        refused = {"ok": False, "code": "group_unformed", "detail": why[:900], "reply": "start"}
+        _send_reply(self.channel, refused)
+        return True
 
     def _watch_abort(self, watcher: socket.socket) -> None:
         """A follower's collectives end when rank 0 says so (`RankGroup.interrupt`): its main
