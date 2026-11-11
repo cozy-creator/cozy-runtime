@@ -12,7 +12,7 @@ on:
         type: string
         default: master
       build:
-        description: "wheels: release files; pure: sdist and pure wheel"
+        description: "wheels: release files; pure: sdist and pure wheel; xs170-candidate: hosted prepromotion SDK integration check"
         type: string
         default: wheels
       runner:
@@ -45,7 +45,7 @@ jobs:
 
   dev:
     needs: modules
-    if: ${{ !cancelled() && needs.modules.result != 'failure' }}
+    if: ${{ inputs.build != 'xs170-candidate' && !cancelled() && needs.modules.result != 'failure' }}
     runs-on: ${{ inputs.billed_runner || inputs.runner }}
     # Hang bound, not a work budget.
     timeout-minutes: 60
@@ -119,4 +119,102 @@ jobs:
           name: cozy-runtime-${{ steps.pin.outputs.sha }}${{ runner.arch == 'ARM64' && '-aarch64' || '' }}
           path: source/dist/
           if-no-files-found: error
+          retention-days: 7
+
+  # Prepromotion source/SDK qualification; never publishes or mutates the registry.
+  candidate:
+    if: inputs.build == 'xs170-candidate'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SDK_RELEASE: https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.24.2
+      SDK_WHEEL: tensorfs-0.24.2-cp311-abi3-manylinux_2_28_x86_64.whl
+      SDK_MANIFEST_SHA: c85b6d4291e06e04c84fa7d714fcd509aeb7f63b7653a2ecc859d44d49ddb664
+      OLD_CANDIDATE_DIR: /home/fidika/cozy/.worktrees/cozy-runtime/xs170-sdk-cohort/.task/qualification/candidate-v0.24.2/assets
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: Record source ownership and protected RC ancestry
+        run: |
+          mkdir -p "$RUNNER_TEMP/proof" "$RUNNER_TEMP/sdk-candidate"
+          git merge-base --is-ancestor 810b2efdcb8e82abb75d979c70939e4a1e4c650a HEAD
+          git merge-base --is-ancestor bf74de170508dc8cacb0c7b2a18c4d958c9c5c93 HEAD
+          git log -1 --format='%H%n%an <%ae>%n%cn <%ce>' > "$RUNNER_TEMP/proof/source.txt"
+          sha256sum .mypy-baseline.txt > "$RUNNER_TEMP/proof/baseline-before.sha256"
+      - name: Download and verify the actual SDK candidate
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 "$SDK_RELEASE/SHA256SUMS" -o "$RUNNER_TEMP/sdk-candidate/SHA256SUMS"
+          printf '%s  %s\n' "$SDK_MANIFEST_SHA" "$RUNNER_TEMP/sdk-candidate/SHA256SUMS" | sha256sum -c -
+          for file in "$SDK_WHEEL" tensorfs-0.24.2.tar.gz; do
+            curl -fLsS --retry 3 "$SDK_RELEASE/$file" -o "$RUNNER_TEMP/sdk-candidate/$file"
+            (cd "$RUNNER_TEMP/sdk-candidate" && grep -F " $file" SHA256SUMS | sha256sum -c -)
+          done
+          echo "UV_FIND_LINKS=$RUNNER_TEMP/sdk-candidate" >> "$GITHUB_ENV"
+      - name: Materialize only the candidate paths in the prepromotion lock
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          import tomllib
+          path = Path('uv.lock')
+          before = path.read_text()
+          old = os.environ['OLD_CANDIDATE_DIR']
+          new = str(Path(os.environ['RUNNER_TEMP']) / 'sdk-candidate')
+          assert before.count(old) == 3
+          after = before.replace(old, new)
+          assert after.replace(new, old) == before
+          assert [p for p in tomllib.loads(before)['package'] if p['name'] == 'tensorfs'][0]['version'] == '0.24.2'
+          path.write_text(after)
+          proof = {'source_lock_sha256': hashlib.sha256(before.encode()).hexdigest(),
+                   'verification_lock_sha256': hashlib.sha256(after.encode()).hexdigest(),
+                   'candidate_path_translation_only': True,
+                   'registry_relock_required_before_merge': True}
+          (Path(os.environ['RUNNER_TEMP']) / 'proof/lock-translation.json').write_text(json.dumps(proof, indent=2) + '\n')
+          PY
+      - name: Normal locked sync, lint, compilation, import and strict typing
+        run: |
+          set -euo pipefail
+          uv sync --locked
+          uv run --locked ruff check --select E9,F63,F7,F82 --output-format github .
+          uv run --locked python -m compileall -q src
+          uv run --locked python -c "import cozy_runtime; print(cozy_runtime.__version__)"
+          scripts/typecheck.sh | tee "$RUNNER_TEMP/proof/typecheck.log"
+          sha256sum -c "$RUNNER_TEMP/proof/baseline-before.sha256"
+      - name: Build the exact integrated source into its candidate wheel
+        run: uv build --wheel --out-dir "$RUNNER_TEMP/runtime-dist"
+      - name: Installed old and integrated Runtime consumers
+        run: |
+          set -euo pipefail
+          cpu_torch=$(sed -n 's/^torch @ /torch @ /p' scripts/typecheck-requirements.txt)
+          test -n "$cpu_torch"
+          for mode in old new; do
+            uv venv --python 3.12 "$RUNNER_TEMP/$mode-runtime"
+            runtime=cozy-runtime==0.45.0
+            if [ "$mode" = new ]; then runtime=$(find "$RUNNER_TEMP/runtime-dist" -name '*.whl' -print -quit); fi
+            uv pip install --python "$RUNNER_TEMP/$mode-runtime/bin/python" "$RUNNER_TEMP/sdk-candidate/$SDK_WHEEL" "$runtime" "$cpu_torch"
+            "$RUNNER_TEMP/$mode-runtime/bin/python" -I checks/sdk_checkpoint_consumer.py --wheel "$RUNNER_TEMP/sdk-candidate/$SDK_WHEEL" --out "$RUNNER_TEMP/proof/$mode-runtime.json"
+          done
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'proof'
+          old = json.loads((root / 'old-runtime.json').read_text())
+          new = json.loads((root / 'new-runtime.json').read_text())
+          fields = ['tensorfs', 'native_extension_sha256', 'checkpoint', 'model_id', 'values', 'replay', 'wire_frame']
+          assert all(old[key] == new[key] for key in fields)
+          (root / 'consumer-comparison.json').write_text(json.dumps({'passed': True, 'equal_fields': fields}, indent=2) + '\n')
+          PY
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xs170-runtime-candidate-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/proof/
+            ${{ runner.temp }}/runtime-dist/
           retention-days: 7
