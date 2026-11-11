@@ -57,12 +57,33 @@ def decode(
     request_id: str,
     guard: Callable[[], None],
     grant_token: object | None = None,
-    python_type: type[msgspec.Struct] | None = None,
     media: MediaReads | None = None,
 ) -> object:
-    """Every native result leaf is replaced from the separately verified host grant."""
+    """Every native result leaf is replaced from the separately verified host grant, a handle of
+    the type its field declares: a `Latents` field's grant is a `Latents`, though on the wire it
+    is a file like any other."""
     if len(grants) > 32:
         raise ValueError("native result grant inventory exceeds its bound")
+
+    def handle(cls: type[File] | type[Tree], grant: ByteGrant) -> File | Tree:
+        made: File | Tree
+        if issubclass(cls, Tree):
+            made = cls(grant.digest, digest=grant.digest, root=grant.local, attempt=request_id)
+            made.size_bytes = grant.content_bytes
+        else:
+            made = cls(
+                grant.digest,
+                digest=grant.digest,
+                media_type=grant.media_type,
+                size_bytes=grant.length,
+                local=grant.local,
+                attempt=request_id,
+            )
+        made._read_guard = guard
+        made._grant_token = grant_token
+        return made
+
+    verified: dict[str, ByteGrant] = {}
     handles: dict[str, File | Tree] = {}
     for grant in grants:
         output_id = grant.output_id
@@ -95,24 +116,8 @@ def decode(
             or not grant.local.is_absolute()
         ):
             raise ValueError("native result differs from its verified host grant")
-        if kind == "tree":
-            tree = Tree(digest, digest=digest, root=grant.local, attempt=request_id)
-            tree.size_bytes = size
-            tree._read_guard = guard
-            handle: File | Tree = tree
-        else:
-            asset: File = _ASSETS[kind](
-                digest,
-                digest=digest,
-                media_type=media_type,
-                size_bytes=size,
-                local=grant.local,
-                attempt=request_id,
-            )
-            asset._read_guard = guard
-            handle = asset
-        handle._grant_token = grant_token
-        handles[output_id] = handle
+        verified[output_id] = grant
+        handles[output_id] = handle(Tree if kind == "tree" else _ASSETS[kind], grant)
 
     def replace(node: object, path: str) -> object:
         if path in handles:
@@ -129,29 +134,18 @@ def decode(
         return node
 
     def granted(target: type[object], item: object) -> File | Tree:
-        if (
-            isinstance(target, type)
-            and issubclass(target, (File, Tree))
-            and isinstance(item, (File, Tree))
-            and getattr(item, "kind", "tree") == getattr(target, "kind", "tree")
-            and any(item is handle for handle in handles.values())
-        ):
-            return item
-        raise TypeError("result file is not a verified grant of this attempt")
+        path = next((path for path, held in handles.items() if held is item), None)
+        if path is None or not isinstance(target, type) or not issubclass(target, (File, Tree)):
+            raise TypeError("result file is not a verified grant of this attempt")
+        held = handles[path]
+        if not issubclass(target, type(held)) or target.kind != held.kind:
+            raise TypeError("result file is not a verified grant of this attempt")
+        if target is not type(held):
+            # A subclass of its wire kind's class (`Latents` of `File`): the field's own type.
+            held = handles[path] = handle(target, verified[path])
+        return held
 
     result = msgspec.convert(replace(value, ""), type=result_type, dec_hook=granted, strict=True)
-    if python_type is not None:
-        # The generated schema above owns wire admission, including unknown
-        # fields and tags. Then return the installed public Python type while
-        # retaining each granted native handle as the same object.
-        result = msgspec.convert(
-            msgspec.to_builtins(
-                result, builtin_types=(File, ImageFile, AudioFile, VideoFile, Tree)
-            ),
-            type=python_type,
-            dec_hook=granted,
-            strict=True,
-        )
     # A received result becomes an input to the rest of the parent's Python
     # composition. Preserve its declared per-field media/decode limits through
     # the same concrete-value traversal used for ordinary input hydration.
