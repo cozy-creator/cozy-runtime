@@ -5,10 +5,21 @@ from __future__ import annotations
 
 from cozy_runtime.author._errors import ConformanceError
 
-#: Each module's operations: quantize, and the attention bench (xs-171).
+#: Each module's operations: quantize, and the release gate's exercisers (`cozy_runtime.bench`, unstable): the attention
+#: bench (xs-171), the kernels suite and the execution suite's Runtime cells (xs-174).
 EXPORTS = {
     "cozy_runtime.derive.operations": ("quantize",),
-    "cozy_runtime.bench": ("attention_inventory", "attention_speed", "attention_quality"),
+    "cozy_runtime.bench": (
+        "attention_inventory",
+        "attention_speed",
+        "attention_quality",
+        "kernels_inventory",
+        "kernel_check",
+        "kernel_ready",
+        "child_wire",
+        "overlay_replay",
+        "lora_overlay_refill",
+    ),
 }
 
 
