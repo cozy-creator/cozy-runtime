@@ -32,16 +32,20 @@ int device_attribute() {
     return value;
 }
 
-// N tiles per band: as many as keep the band's weight slice (tiles x tile N x K bytes) in three
-// quarters of the L2, at most `retained`; a card with under 16 MB of L2 takes the width that leaves
-// one wave the least to read. xs-177: a fixed 32 overflowed an RTX 4060 Ti's 32 MB at H3's shapes
-// (28 x 256 x 5376 = 38.5 MB): the banded 128x256 tile ran 1.5-2x slower than the banded 128x128
-// there (release gate 43066026392), while on a 4090's 72 MB it leads (43063687592).
+// N tiles per band, at most `retained`: as many as keep the band's weight slice (tiles x tile N x K
+// bytes) in three quarters of the L2, but never fewer than a wave spans four rows of (sms / 4); a
+// card with under 16 MB of L2 takes the width that leaves one wave the least to read. xs-177: a wave
+// that spans a row or two of the band reads its weights again for every row once they overflow the
+// L2. A fixed 32 overflowed an RTX 4060 Ti's and 5060 Ti's 32 MB at H3's shapes (28 x 256 x 5376 =
+// 38.5 MB) and the banded 128x256 tile ran 1.3-2x slower than the banded 128x128 there (release gates
+// 43066026392, 43070233631); a wave of a 4090's 128 SMs spans six rows of a 21-tile band and is
+// fastest on it even at 77 MB of a 72 MB L2 (43063687592), so 128 SMs and more keep 32.
 int band_tiles(int retained, int sms, cutlass::gemm::GemmCoord tile, int k) {
     const int64_t l2 = device_attribute<cudaDevAttrL2CacheSize>();
     if (l2 < (16 << 20))
         return std::max(1, int(std::lround(std::sqrt(double(sms) * tile.m() / tile.n()))));
-    return int(std::clamp<int64_t>(l2 * 3 / 4 / (int64_t(tile.n()) * k), 1, retained));
+    const int64_t fits = l2 * 3 / 4 / (int64_t(tile.n()) * k);
+    return int(std::clamp<int64_t>(std::max<int64_t>(fits, sms / 4), 1, retained));
 }
 
 // Stream-K over the partial last wave only, data-parallel elsewhere; tiles walk N in bands so a
