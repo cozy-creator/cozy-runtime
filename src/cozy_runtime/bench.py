@@ -8,6 +8,7 @@ says what each measures."""
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 import msgspec
 
@@ -20,10 +21,10 @@ class Measured(msgspec.Struct, frozen=True):
     detail: str
 
 
-def _run(work: object) -> Measured:
+def _run(work: Callable[[], object]) -> Measured:
     from cozy_runtime.internal.bench import attention
 
-    found = attention.off_request(work)  # type: ignore[arg-type]  # a zero-argument callable
+    found = attention.off_request(work)
     return Measured(json.dumps(found, sort_keys=True))
 
 
