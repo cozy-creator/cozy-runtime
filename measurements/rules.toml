@@ -6,10 +6,15 @@
 provisional = true
 # Worst-head relative L2 against FP32 attention, by the kernel's own precision, on every site at or below its level.
 level = { 16 = 0.01, 8 = 0.04, 4 = 0.10 }
-# A quantized sparse kernel: against FP32, at most this many times the 16-bit sparse kernel's own error at that site
-# (and against that kernel, within its level's bar).
+# Where a kernel was measured on captured sites, those decide; synthetic sites are notes in the report.
+# A sparse kernel is judged against the exact computation of its own route, not dense FP32: its level's bar on that
+# error, and a quantized one at most this many times the 16-bit sparse kernel's error against the same computation.
+# The sparse approximation's own loss against dense FP32 is the model's choice and a note in the report.
 sparse_vs_fp32 = 1.2
-# Every kernel beats the best answer it could give without computing (V, V's mean, zero) by this factor.
+# The ratio applies only past this error: the 16-bit bar, below which both errors are BF16 rounding (BF16 SDPA against
+# FP32 reads 0.002-0.004 on our captures) and their ratio is noise (kitchen-sol 0.0020 against BF16 Sol's 0.0017).
+sparse_floor = 0.01
+# Every dense kernel beats the best answer it could give without computing (V, V's mean, zero) by this factor.
 trivial = 3.0
 
 [noise]

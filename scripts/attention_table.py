@@ -120,6 +120,7 @@ def identities(src: Path) -> dict[str, str]:
 class Rules:
     bars: dict[int, float]
     sparse_vs_fp32: float
+    sparse_floor: float
     trivial: float
     noise_floor: float
     noise_spread: float
@@ -136,6 +137,7 @@ class Rules:
         return Rules(
             bars={int(k): float(v) for k, v in bars["level"].items()},
             sparse_vs_fp32=float(bars["sparse_vs_fp32"]),
+            sparse_floor=float(bars["sparse_floor"]),
             trivial=float(bars["trivial"]),
             noise_floor=float(raw["noise"]["floor"]),
             noise_spread=float(raw["noise"]["spread"]),
@@ -178,27 +180,68 @@ def _classes(src: Path) -> list[str]:
     return list(arch.CLASSES)
 
 
-def _passes(name: str, kernel: Kernel, quality: Json, rules: Rules) -> str:
-    """Empty when KERNEL passes its own level's bar on every site at or below that level, else why not."""
+def _passes(name: str, kernel: Kernel, quality: Json, rules: Rules, notes: list[str]) -> str:
+    """Empty when KERNEL passes its level's bar where the measurements can judge it, else why not; what they cannot
+    judge, or judge only on synthetic operands once captured ones exist, goes to NOTES (the report) instead.
+
+    - Corpus first: where the kernel was measured on captured sites (`kind` "captured"), those decide; synthetic sites
+      are notes.
+    - A dense kernel is held to its level's bar against FP32 attention and must beat a computation-free answer.
+    - A sparse kernel is held against the exact computation of its own route, not dense FP32: the sparse
+      approximation is the model's choice (its layout asks for it), and its loss is a note for the bars' owner. The
+      route's exact computation is a site's `route` error when the bench records it, else FP32 on a `routable` site,
+      where every query's mass sits in one key block, so the route is unambiguous and dense FP32 is that computation.
+      A quantized sparse kernel stays within `sparse_vs_fp32` times the 16-bit sparse kernel's error there, once its
+      own error is past `sparse_floor` (below it, both are BF16 rounding and their ratio is noise)."""
     if quality is None:
         return "no quality measurement"
-    judged = [e for e in quality["errors"] if e["level"] <= kernel.level]
-    if not judged:
+    at = [e for e in quality["errors"] if e["level"] <= kernel.level]
+    if not at:
         return "no site it would serve was measured"
-    for e in judged:
+    if kernel.sparse:  # the sites with an exact computation of the route: recorded, else the routable ones
+        decisive = [e for e in at if "route" in e] or [e for e in at if e.get("kind") == "routable"]
+        if not decisive:
+            return "no site measured against its route's exact computation"
+    else:
+        decisive = [e for e in at if e.get("kind") == "captured"] or at
+    for e in at:
         if not e["finite"]:
             return f"non-finite output on {e['site']}"
-        if e["worst"] * rules.trivial > e["trivial"]:
-            return f"{e['site']}: {e['worst']:.4f} does not beat a computation-free answer ({e['trivial']:.4f}) by {rules.trivial:g}x"
         if kernel.sparse and e.get("sparse_calls", 1) < 1:
             return f"{e['site']}: its sparse path did not run"
-        if kernel.sparse and kernel.level < 16 and "ref16" in e:
-            if e["ref16"] > rules.bars[kernel.level]:
-                return f"{e['site']}: {e['ref16']:.4f} against the 16-bit sparse kernel, over {rules.bars[kernel.level]:g}"
-            if e["worst"] > rules.sparse_vs_fp32 * e["ref16_fp32"]:
-                return f"{e['site']}: {e['worst']:.4f} against FP32, over {rules.sparse_vs_fp32:g}x the 16-bit sparse kernel's {e['ref16_fp32']:.4f}"
-        elif not kernel.sparse and e["worst"] > rules.bars[kernel.level]:
-            return f"{e['site']}: worst head {e['worst']:.4f}, over the {kernel.level}-bit bar {rules.bars[kernel.level]:g}"
+    for e in at:
+        why = _sparse_fault(kernel, e, rules) if kernel.sparse else _dense_fault(kernel, e, rules)
+        if why and e in decisive:
+            return why
+        if why:
+            notes.append(f"note: {name}: {kernel.name} on {e.get('kind', 'synthetic')} {why}")
+        if kernel.sparse and e.get("kind") == "captured":
+            against = f"; the 16-bit route's {e['ref16_fp32']:.4f}, and it against that route {e['ref16']:.4f}" if "ref16" in e else ""
+            notes.append(f"note: {name}: {kernel.name} at {e['site']}: the sparse route's loss against dense FP32 "
+                         f"{e['worst']:.4f}{against}")  # fmt: skip
+    return ""
+
+
+def _dense_fault(kernel: Kernel, e: Json, rules: Rules) -> str:
+    if e["worst"] * rules.trivial > e["trivial"]:
+        return f"{e['site']}: {e['worst']:.4f} does not beat a computation-free answer ({e['trivial']:.4f}) by {rules.trivial:g}x"
+    if e["worst"] > rules.bars[kernel.level]:
+        return f"{e['site']}: worst head {e['worst']:.4f}, over the {kernel.level}-bit bar {rules.bars[kernel.level]:g}"
+    return ""
+
+
+def _sparse_fault(kernel: Kernel, e: Json, rules: Rules) -> str:
+    """A sparse kernel at site E against the exact computation of its route: E's `route` error, else FP32 on a
+    routable site; nothing to judge where E has neither."""
+    route = e.get("route", e["worst"] if e.get("kind") == "routable" else None)
+    if route is None:
+        return ""
+    if route > rules.bars[kernel.level]:
+        return f"{e['site']}: {route:.4f} against its route's exact computation, over the {kernel.level}-bit bar {rules.bars[kernel.level]:g}"
+    exact16 = e.get("route16")  # the 16-bit sparse kernel against the same computation
+    if kernel.level < 16 and exact16 is not None and e.get("kind") != "routable" and route > rules.sparse_floor:
+        if route > rules.sparse_vs_fp32 * exact16:
+            return f"{e['site']}: {route:.4f} against its route, over {rules.sparse_vs_fp32:g}x the 16-bit sparse kernel's {exact16:.4f}"
     return ""
 
 
@@ -282,7 +325,7 @@ def _cells(name: str, record: Json, kernels: Mapping[str, Kernel], rules: Rules,
     for k in sorted(measured | failed.keys()):
         if k not in kernels:
             raise SystemExit(f"{name}: {k} was measured and is no Runtime kernel now")
-        why = rules.excludes(k, name) or failed.get(k, "") or _passes(k, kernels[k], record["quality"].get(k), rules)
+        why = rules.excludes(k, name) or failed.get(k, "") or _passes(name, kernels[k], record["quality"].get(k), rules, report)
         if why:
             report.append(f"{name}: {k} left out: {why}")
         else:
