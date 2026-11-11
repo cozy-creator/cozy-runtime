@@ -116,6 +116,9 @@ _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", defa
 #: TensorFS tallies working memory by the pass and site it was born in (`vt.pass_mark`); an older
 #: one has no tally, and nothing is marked.
 _ESCAPES = hasattr(vt, "pass_mark")
+#: TensorFS keeps a derive's pages on disk for later processes and reads pages ahead of their use
+#: (`varena.Pages.stage`); an older one keeps them for the process and reads on demand.
+_DERIVED = hasattr(varena.Pages, "stage")
 _U64 = (1 << 64) - 1
 #: Escaped bytes a run's warning names.
 _NOTED = 256 << 20
@@ -1040,6 +1043,12 @@ class Memory:
         self.native: varena.Device | None = None
         #: This GPU's host tier: TensorFS keeps weight pages in pinned host RAM.
         self.pages: varena.Pages | None = None
+        #: each raw Region's Source, and those the tier is reading ahead (`_read_ahead`)
+        self._sources: weakref.WeakKeyDictionary[varena.Region, varena.Source] = (
+            weakref.WeakKeyDictionary()
+        )
+        self._staging: list[varena.Source] = []
+        self._coming: set[str] = set()
         self.granularity = 512
         self._phase_plan: varena.Plan | None = None
         self._phase_plan_signature: tuple[tuple[list[str] | _PhaseSignature, ...], ...] | None = (
@@ -1556,6 +1565,10 @@ class Memory:
             else:
                 block.overlay = overlay
         self._activate_phase(model)
+        request = _REQUEST.get()
+        if request is not None:
+            with self.lock:
+                self._read_ahead(request.phase(model.name), current=True)
 
     def _idle(self, block: _Block) -> None:
         """An idle block's views go: a native page stays the core's cache, and a CPU's bytes are
@@ -1737,16 +1750,29 @@ class Memory:
         region: varena.Region | None = getattr(block, field)
         if region is None:
             size = block.final_bytes if final else block.storage_bytes
-            region = self._device_native().region(size, self._source(block, final=final))
+            source = self._source(block, final=final)
+            region = self._device_native().region(size, source)
             setattr(block, field, region)
+            if not final:
+                self._sources[region] = source
         return region
 
-    def _source(self, block: _Block, *, final: bool) -> varena.Source:
+    def _source(
+        self,
+        block: _Block,
+        *,
+        final: bool,
+        identity: object = None,
+        overlay: Hashable = None,
+    ) -> varena.Source:
         """Where a Region of `block` gets its bytes. The tier keeps its stored bytes, or those a
-        bake wrote, or its cast bytes where those are all a use needs (`_host_final`)."""
+        bake wrote, or its cast bytes where those are all a use needs (`_host_final`). Under its
+        model's fill identity and its overlay, or those given (a read ahead of a later use)."""
         model = block.model
-        kept = model.identity is not None and final == _host_final(block)
-        page = repr(_page(block, model.identity, block.overlay, final=final)) if kept else None
+        if identity is None:
+            identity, overlay = model.identity, block.overlay
+        kept = identity is not None and final == _host_final(block)
+        page = _page(block, identity, overlay, final=final) if kept else None
         owner = weakref.ref(block)  # a Region owns its Source: never the block back
         if final:
             return varena.Source(
@@ -1763,9 +1789,13 @@ class Memory:
                 name = f"{model.component}/{key}#{part.role or 'value'}"
                 parts.append((name, offset, part.nbytes))
                 offset += (part.nbytes + 255) // 256 * 256
-        derive = None
+        derive, slot = None, None
         if model.fill is not None:
             derive = functools.partial(_derive, owner, "region", _bake)
+            if _DERIVED and page is not None:
+                slot = _slot(block, identity, overlay)
+        # `slot` is a newer TensorFS's (`_DERIVED`), which the pinned stubs do not know yet.
+        derived: dict[str, Any] = {} if slot is None else {"slot": slot}
         return varena.Source(
             self._tier(),
             model.name,
@@ -1775,6 +1805,7 @@ class Memory:
             parts=parts,
             page=page,
             derive=derive,
+            **derived,
         )
 
     def _use(self, block: _Block, *, final: bool = False) -> varena.Use:
@@ -1902,13 +1933,66 @@ class Memory:
             if self._active_beside(request):
                 self._retire_phase_plan("overlapping_requests")
                 return
-            if names != self._phase_names or request_id != self._phase_request:
+            changed = names != self._phase_names or request_id != self._phase_request
+            if changed:
                 self._phase_names, self._phase_request = names, request_id
                 if request is not None:
                     request.phase_changes.append(
                         {"models": sorted(names), "retention": "native_demand"}
                     )
             self._refresh_phase_plan(names)
+            if changed:
+                self._read_ahead(names)
+
+    def _read_ahead(self, names: frozenset[str], *, current: bool = False) -> None:
+        """TensorFS reads pages into pinned host RAM ahead of their use (`Pages.stage`), within free
+        room, while this phase runs: the models of this phase's packages that the request has not
+        used yet, the largest first (text encoding reads the transformer's). This phase's own go
+        before them when the last read ahead had them coming (its read goes on), or `current`: an
+        overlay armed inside its forward moved its blocks. A page a derive made in an earlier
+        process is read from disk, made again by no one."""
+        request = _REQUEST.get()
+        if not _DERIVED or self.pages is None or request is None or request.idle:
+            return
+        request.entered |= names
+        active = [m for m in self.models.values() if m.name in names and not m.closed]
+        current = current or any(m.name in self._coming for m in active)
+        releases = {m.source.release for m in active}
+        later = sorted(
+            (
+                m
+                for m in self.models.values()
+                if m.source.release in releases and m.name not in request.entered and not m.closed
+            ),
+            key=lambda m: -sum(b.storage_bytes for b in m.groups()),
+        )
+        self._coming = {m.name for m in later}
+        reading = (active if current else []) + later
+        self._staging = [source for model in reading for source in self._staged(model)]
+        # A newer TensorFS's (`_DERIVED`), which the pinned stubs do not know yet.
+        stage: Callable[[list[varena.Source]], None] = getattr(self._tier(), "stage")  # noqa: B009
+        stage(self._staging)
+
+    def _staged(self, model: Model) -> list[varena.Source]:
+        """`model`'s raw pages' Sources in block order, under the fill identity its next use wants:
+        its Regions' where they are current, else made for the read alone."""
+        identity = model.wanted_identity()
+        if identity is None:
+            return []
+        sources = []
+        for block in model.groups():
+            if not block.storage_bytes or _host_final(block):
+                continue
+            region = block.region
+            source = None
+            if region is not None and identity == model.identity:
+                source = self._sources.get(region)
+            if source is None:
+                fill = model.fill
+                overlay = None if fill is None else fill.overlay(block.path, block.parts)
+                source = self._source(block, final=False, identity=identity, overlay=overlay)
+            sources.append(source)
+        return sources
 
     def _final_views(self, block: _Block) -> None:
         if not block.finals:
@@ -2331,6 +2415,7 @@ class Memory:
                 if self.pages is not None and not idle:
                     request.record_fills()
                     self.pages.request_ended()  # the pages it refilled are their worth
+                    self._staging, self._coming = [], set()
                 if _ESCAPES and self.cuda and not idle and torch.cuda.is_initialized():
                     # or a capacity failure raised through here, never a package's own error
                     raised = sys.exc_info()[1]
@@ -2642,6 +2727,8 @@ class Request:
         self.escaped: list[EscapeRecord] = []
         self.forwards: set[Model] = set()
         self.heads: dict[Model, tuple[set[int], int]] = {}
+        #: the models whose phases this request entered: what it has not is read ahead
+        self.entered: set[str] = set()
         #: the attempt failed (its executor says): a refused allocation in its last pass is learned
         self.failed = False
         #: pure ops varena told to run again finer after refusing their leaf: zero in a normal run
@@ -2654,8 +2741,9 @@ class Request:
         #: are not in it, and no sum of it with them ever happened: the driver reads the card.
         self.torch_peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
-        #: origin -> [bytes, fills, ns]: the store, a kept page (`baked`), or another set's stored
-        #: bytes on this GPU (`resident`) or in its kept page (`host`)
+        #: origin -> [bytes, fills, ns]: the store, a kept page (`baked`), another set's stored
+        #: bytes on this GPU (`resident`) or in its kept page (`host`), a derived page on disk
+        #: (`derived`), or a derive's stored bytes the tier read ahead (`staged`)
         self.moved = {origin: [0, 0, 0] for origin in ("store", "baked", "resident", "host")}
         #: each baked fill's trace entry and its bake (`Bake`), resolved when the request ends
         self.bakes: list[tuple[FillEntry | _BakeTimes, Bake]] = []
@@ -3102,13 +3190,37 @@ def _placeholders(model: Model) -> None:
             site.table[site.name] = held
 
 
-def _page(
-    block: _Block, identity: object, overlay: Hashable, *, final: bool = False
-) -> tuple[object, ...]:
-    """A block's host-tier page key: its set, path, fill identity and overlay, and `final` for
-    its cast bytes."""
-    page: tuple[object, ...] = (block.model.name, block.path, identity, overlay)
-    return (*page, "final") if final else page
+def _page(block: _Block, identity: object, overlay: Hashable, *, final: bool = False) -> str:
+    """A block's host-tier page key: a digest of its component by content, path, stored layout,
+    fill identity and overlay, and `final` for its cast bytes. The same bytes have one key in every
+    process, whichever release of a package loaded them."""
+    return _digest((block.model.content, block.path, _layout(block), identity, overlay, final))
+
+
+def _slot(block: _Block, identity: object, overlay: Hashable) -> str | None:
+    """`block` under its fill identity whatever its overlay: what its derived pages are kept on disk
+    by, when all that names them names it in every process. A factor no loaded model holds is
+    named by an object of this process (`Filling.overlay`): its pages never leave it."""
+    if not (_portable(identity) and _portable(overlay)):
+        return None
+    return _digest((block.model.content, block.path, _layout(block), identity))
+
+
+def _layout(block: _Block) -> tuple[tuple[str, str, int], ...]:
+    """Where `block`'s stored parts lie in its page."""
+    parts = block.parts.items()
+    return tuple((key, part.role, part.nbytes) for key, roles in parts for part in roles.values())
+
+
+def _digest(value: object) -> str:
+    return hashlib.sha256(repr(value).encode()).hexdigest()
+
+
+def _portable(value: object) -> bool:
+    """Whether `value`'s repr names it the same in every process: plain values and their tuples."""
+    if isinstance(value, tuple):
+        return all(_portable(item) for item in value)
+    return value is None or isinstance(value, (str, int, float, bool))
 
 
 def _host_final(block: _Block) -> bool:
