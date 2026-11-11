@@ -1,7 +1,9 @@
-"""The Runtime's attention bench (xs-171): built-in calls of the Runtime's own App (`derive.operations`), which every
+"""Unstable: for the release gate only, outside the stable API; it may change or go in any release.
+
+The Runtime's attention bench (xs-171): built-in calls of the Runtime's own App (`derive.operations`), which every
 environment holds, so the release gate measures the Runtime's kernels from inside the Runtime. A gate script calls them
-with `call(bench.attention_speed, ...)`; each returns its measurements as one JSON document. Tooling for the people
-who build the attention table, not an author API: `internal/bench/attention.py` says what each measures."""
+with `call(bench.attention_speed, ...)`; each returns its measurements as one JSON document. `internal/bench/attention.py`
+says what each measures."""
 
 from __future__ import annotations
 
