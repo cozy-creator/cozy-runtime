@@ -68,7 +68,7 @@ from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, S
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, Protocol, TypedDict, cast
 
 import msgspec
 import tensorfs
@@ -270,7 +270,25 @@ if TYPE_CHECKING:
     from cozy_runtime.internal.encoding.selection import DeviceFacts
     from cozy_runtime.internal.residency import Memory
     from cozy_runtime.internal.residency import Request as MemoryRequest
+    from cozy_runtime.internal.triton_kernels import DeviceLike
     from cozy_runtime.internal.weights import Backend, Placement
+
+    class _Reselect(Protocol):
+        """This construction's `attention.select`, bound but for what to pass over."""
+
+        def __call__(self, *, passed: Mapping[str, str] | None = None) -> attention.Applied: ...
+
+    class _Load(Protocol):
+        """`triton_kernels.load`."""
+
+        def __call__(self, kernels: TritonKernels, *, device: DeviceLike) -> Launch: ...
+
+    class _Ready(Protocol):
+        """`triton_kernels.ready`."""
+
+        def __call__(
+            self, kernels: TritonKernels, wait: bool = False, *, device: DeviceLike
+        ) -> Launch | None: ...
 
 #: The native inline-result door: a small typed result rides
 #: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at
@@ -1053,7 +1071,7 @@ class Executor:
         #: HOST ONLY: this process's start, for the execution record (wall ms and its legs)
         self.boot: Reply = {}
         #: HOST ONLY: this rank's pid, host ordinal, GPU uuid and arch, read once after device init
-        self._identity: Reply | None = None
+        self._identity: execution_evidence.Identity | None = None
         #: THIS process's rank in its generation's group and the group's size (cr-068). A
         #: plain executor is rank 0 of a world of 1 and forms nothing; rank 0 of a wider
         #: world spawns and drives the followers; a follower's channel is rank 0's seam.
@@ -1122,7 +1140,7 @@ class Executor:
         self.attention_defaults = attention.Snapshot(())
         #: this construction's selection, made again between requests (`_upgrade_attention`),
         #: passing over what `passed` names
-        self._reselect: Callable[..., attention.Applied] | None = None
+        self._reselect: _Reselect | None = None
         #: kernel installs waiting for their build on every GPU (`Plan.when_ready`), by set name
         self._installs: list[_Install] = []
         #: Device facts for this prepared generation, reused for per-request pin checks.
@@ -1291,11 +1309,11 @@ class Executor:
         host.execution = execution
         host.memory = memory
 
-    def _rank_identity(self) -> Reply:
+    def _rank_identity(self) -> execution_evidence.Identity:
         owner = self.host
         if owner._identity is None:
             owner._identity = execution_evidence.identity(
-                self.torch,
+                cast("ModuleType", self.torch),  # imported before a request reaches here
                 self.device_kind == "cuda" and accel.present(self.torch, self.device_kind),  # type: ignore[arg-type]  # torch is imported before a request reaches here
                 self.rank if self.world > 1 else 0,
                 _sealed_entries(),
@@ -1456,7 +1474,7 @@ class Executor:
             }
         spec, store = forming
         try:
-            self.pg = form_rank(self.torch, spec, store)
+            self.pg = form_rank(cast("ModuleType", self.torch), spec, store)  # opened at start
         except Exception as exc:
             return self._unformed(exc, "form")
         if self.comms is not None:
@@ -2027,7 +2045,7 @@ class Executor:
                 else ""
             )
             if command.import_only:
-                if device and accel.initialized(torch, self.device_kind):
+                if device and accel.initialized(torch, self.device_kind):  # type: ignore[possibly-undefined]  # imported under `if device` above
                     self.poisoned = "the package import initialized a device before its grant"
                     return self._close_after(
                         self._refusal("cuda_initialized_before_runtime", self.poisoned)
@@ -2047,7 +2065,7 @@ class Executor:
                             code="group_unformed",
                         )
                 if not command.import_only and cpu_group:
-                    self.pg = self.group.form(self.torch, _SEALED)
+                    self.pg = self.group.form(cast("ModuleType", self.torch), _SEALED)  # opened above
                     stage("group_form")
                 elif not command.import_only:
                     measured = links.measured(
@@ -2061,7 +2079,7 @@ class Executor:
                     )
                     exchange = self._group_exchange()
                     self.pg = self.group.form(
-                        self.torch,
+                        cast("ModuleType", self.torch),  # opened above
                         _SEALED,
                         nccl=self.transport.nccl,
                         exchange=exchange,
@@ -2253,8 +2271,8 @@ class Executor:
         self,
         model: Model[object],
         torch: ModuleType,
-        load: Callable[..., Launch],
-        ready: Callable[..., Launch | None],
+        load: _Load,
+        ready: _Ready,
         reports: dict[str, Mapping[str, object]],
     ) -> str:
         """The model's own execution plan on its filled components, on this GPU: its
@@ -3368,7 +3386,8 @@ class Executor:
                 for model in cast("Backend", member.backend).models.values():  # filtered above
                     for _, release in graphs.DECODERS:
                         release(model.module)
-                    graphs.retire(self.torch, model.module)
+                    # cast: a backend exists only once torch opened
+                    graphs.retire(cast("ModuleType", self.torch), model.module)
 
     def awaiting_invoke(self) -> bool:
         """A prepared request waits for its invoke, which comes next (TensorD's lookahead or its

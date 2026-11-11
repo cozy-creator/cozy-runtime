@@ -17,7 +17,7 @@ import itertools
 import math
 from collections.abc import Sequence
 from functools import partial
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import Tensor
@@ -71,7 +71,7 @@ def draw(
 
 
 def law(
-    shape: Sequence[int], seed: Any, step: Any, stream: int, kind: int, device: torch.device
+    shape: Sequence[int], seed: int | Tensor, step: int | Tensor, stream: int, kind: int, device: torch.device
 ) -> Tensor:
     """The draw in torch ops, in float32: what the kernel computes, operation for operation."""
     words = _words(shape, seed, step, stream, kind, device)
@@ -85,7 +85,7 @@ def law(
 
 
 def _words(
-    shape: Sequence[int], seed: Any, step: Any, stream: int, kind: int, device: torch.device
+    shape: Sequence[int], seed: int | Tensor, step: int | Tensor, stream: int, kind: int, device: torch.device
 ) -> Tensor:
     """Philox4x32-10 under the key `seed`: the four 32-bit words (int64) of each block of four
     elements of `shape`, one row per block."""
@@ -98,10 +98,10 @@ def _words(
         hi0, lo0 = _mulhilo(c[0], _M0)
         hi1, lo1 = _mulhilo(c[2], _M1)
         c = [hi1 ^ c[1] ^ k0, lo1, hi0 ^ c[3] ^ k1, lo0]
-    return torch.stack(c, -1)
+    return torch.stack(cast("list[Tensor]", c), -1)  # cast: ten rounds leave every word a tensor
 
 
-def _mulhilo(a: Any, m: int) -> tuple[Any, Any]:
+def _mulhilo(a: Tensor | int, m: int) -> tuple[Tensor | int, Tensor | int]:
     """The high and low 32-bit words of `a * m`, a 32-bit word by a 32-bit constant, by 16-bit
     halves of `m` so int64 never overflows."""
     low = a * (m & 0xFFFF)

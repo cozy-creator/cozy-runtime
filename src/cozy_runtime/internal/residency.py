@@ -57,6 +57,8 @@ if TYPE_CHECKING:
     )
     from torch._ops import OpOverload
 
+    from cozy_runtime.internal.execution.phase import WorkingPhase
+
 __all__ = [
     "Binding",
     "BindingLayout",
@@ -225,7 +227,7 @@ class Placeholder(Tensor):
             cls, tuple(shape), dtype=dtype, device=device, storage_size=0
         )
 
-    def __repr__(self) -> str:
+    def __repr__(self) -> str:  # type: ignore[override]  # repr() never passes Tensor's tensor_contents
         return f"UnboundWeight({tuple(self.shape)}, {self.dtype}, {self.device})"
 
     def _varena_read(self) -> Tensor:  # type: ignore[no-redef]  # the default; a made copy's own reads its source
@@ -2437,7 +2439,7 @@ class RequestStats(TypedDict):
     trace: list[FillEntry]
     trace_scope: str
     phases: list[PhaseChange]
-    working_phases: list[dict[str, Any]]  # type: ignore[explicit-any]  # phase.observing's rows (typing-runtime types them)
+    working_phases: list[WorkingPhase]
     working_splits: list[SplitRecord]
     escaped: list[EscapeRecord]
     finer_splits: int
@@ -2631,7 +2633,7 @@ class Request:
         self.steps: list[set[str]] = []
         self.declared_steps: list[set[str]] = []
         self.phase_changes: list[PhaseChange] = []
-        self.working_phases: list[dict[str, Any]] = []  # type: ignore[explicit-any]  # phase.observing's rows (typing-runtime types them)
+        self.working_phases: list[WorkingPhase] = []
         self.working_phase_keys: set[str] = set()
         self.working_splits: dict[str, SplitRecord] = {}
         #: each loop's record of what its passes left live outside any owner (`vt.escapes_take`);

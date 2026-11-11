@@ -58,13 +58,12 @@ if TYPE_CHECKING:
     from av.rational import AVRational
     from av.stream import Stream
     from av.video.frame import VideoFrame
-    from numpy.typing import NDArray
     from torch import Tensor
 
     from cozy_runtime.canonical_json import JsonValue
 
 #: What frames and waveforms save from: a torch tensor (on any device) or a numpy array.
-type Samples = Tensor | NDArray[np.generic]
+type Samples = Tensor | np.ndarray[tuple[int, ...], np.dtype[np.generic[object]]]
 
 #: Raw-snapshot ceiling as a multiple of the attempt's output ceiling. H3's largest launch
 #: product (124 frames of 1344x768 RGB) is ~1.45x the 256 MiB output cap; 16x admits an

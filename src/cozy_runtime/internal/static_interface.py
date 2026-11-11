@@ -1273,11 +1273,11 @@ class Reader:
                 self.refuse(module, value, str(exc), "static_unsupported")
         return None
 
-    def declared(
+    def declared(  # type: ignore[explicit-any]  # factory: any author factory, its own TypeError judging the call
         self,
         module: Module,
         call: ast.Call,
-        factory: Callable[..., object],  # any author factory: its own TypeError judges the call
+        factory: Callable[..., object],
     ) -> None:
         """Refuse a declaration its author factory refuses: the import-time rule, applied to
         the folded arguments."""

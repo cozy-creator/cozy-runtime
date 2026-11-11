@@ -807,7 +807,7 @@ def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
             dtype = (torch.bfloat16, torch.float16, torch.float32)[kind]
             stored = {"value": torch.full((rows, cols), 0.25, dtype=dtype, device=device)}
         fused(torch, launch, stored, down, up, kind)
-        got = stored["value"].float() if "value" in stored else decode_e4m3(torch, data) * 0.5
+        got = stored["value"].float() if "value" in stored else decode_e4m3(torch, data) * 0.5  # type: ignore[possibly-undefined]  # ROWWISE's, the one kind without "value"
         wrong[kind] = int((got != want).sum())
     # nvfp4: 0.25 (E2M1 0.5 under a 0.5 block scale) + 24 * +-1/32 is 1.0 or -0.5, both on that
     # block's kept grid, over a partial column tile.

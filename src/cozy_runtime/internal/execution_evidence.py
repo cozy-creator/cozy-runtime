@@ -29,9 +29,12 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Mapping, Sequence
-from typing import Any, NotRequired, TypedDict
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 from cozy_runtime.internal import accel
+
+if TYPE_CHECKING:
+    from types import ModuleType
 
 
 class RuntimeGPU(TypedDict):
@@ -88,7 +91,16 @@ class GpuEvidence(TypedDict):
     attention: RankAttention
 
 
-def identity(torch: Any, cuda: bool, local: int, sealed: Sequence[str]) -> dict[str, Any]:
+class Identity(TypedDict, total=False):
+    """Who ran a call: its process, and its GPU's number, UUID and architecture."""
+
+    pid: int
+    gpu: int
+    uuid: str
+    arch: str
+
+
+def identity(torch: ModuleType, cuda: bool, local: int, sealed: Sequence[str]) -> Identity:
     """This process's `pid`, `gpu`, `uuid` and `arch` for device `local` of its seal."""
     if not cuda:
         return {"pid": os.getpid(), "gpu": -1, "uuid": "", "arch": ""}
@@ -145,7 +157,7 @@ def now_us() -> int:
 
 
 def record(
-    who: Mapping[str, Any],
+    who: Identity,
     start_us: int,
     end_us: int,
     seen: RankAttention | None = None,
