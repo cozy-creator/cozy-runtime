@@ -2,7 +2,7 @@
 """The attention table (xs-171): measured, generated, checked. Never edited by hand.
 
     attention_table.py generate [--partial]   measurements/attention.json + rules.toml -> internal/attention_table.json
-    attention_table.py check                  the shipped table regenerates byte for byte, every listed kernel's build
+    attention_table.py check [--partial]      the shipped table regenerates byte for byte, every listed kernel's build
                                               is the one measured, and every kernel a class runs was measured
     attention_table.py identities [--src DIR] each kernel's build identity in the tree at DIR (default: this one)
 
@@ -171,12 +171,11 @@ def _kernels(src: Path) -> dict[str, Kernel]:
     return {c.name: Kernel(c.name, c.level, c.sparse, c.dense) for c in attention.KERNELS}
 
 
-def _classes(src: Path) -> list[str] | None:
+def _classes(src: Path) -> list[str]:
     sys.path.insert(0, str(src))
     from cozy_runtime.internal import arch
 
-    named: Sequence[str] | None = getattr(arch, "CLASSES", None)
-    return None if named is None else list(named)
+    return list(arch.CLASSES)
 
 
 def _passes(name: str, kernel: Kernel, quality: Json, rules: Rules) -> str:
@@ -377,13 +376,12 @@ def generate(measurements: Path, rules_path: Path, src: Path, partial: bool = Fa
     classes = _classes(src)
     measured = data["classes"]
     report: list[str] = []
-    if classes is not None:
-        unknown = sorted(set(measured) - set(classes))
-        missing = sorted(set(classes) - set(measured))
-        if unknown:
-            raise SystemExit(f"measured classes the Runtime does not name: {unknown}")
-        if missing and not partial:
-            raise SystemExit(f"classes never measured: {missing} (a round on their reference cards; --partial for one in progress)")
+    unknown = sorted(set(measured) - set(classes))
+    missing = sorted(set(classes) - set(measured))
+    if unknown:
+        raise SystemExit(f"measured classes the Runtime does not name: {unknown}")
+    if missing and not partial:
+        raise SystemExit(f"classes never measured: {missing} (a round on their reference cards; --partial for one in progress)")
     identity: dict[str, str] = {}
     for name, record in sorted(measured.items()):
         for k, ident in record["kernels"].items():
@@ -443,7 +441,7 @@ def _version(v: str) -> tuple[int, ...]:
 # ---------------------------------------------------------------------------- check
 
 
-def check(measurements: Path, rules_path: Path, table_path: Path, src: Path) -> list[str]:
+def check(measurements: Path, rules_path: Path, table_path: Path, src: Path, partial: bool = False) -> list[str]:
     """Why the shipped table cannot ship, or nothing."""
     shipped = table_path.read_text()
     table = json.loads(shipped)
@@ -453,7 +451,7 @@ def check(measurements: Path, rules_path: Path, table_path: Path, src: Path) -> 
         return _validator(src, table_path)
     if not measurements.exists():
         return [f"{table_path.name}: no {measurements.relative_to(ROOT)} to regenerate it from"]
-    wanted, _ = generate(measurements, rules_path, src, partial=_classes(src) is None)
+    wanted, _ = generate(measurements, rules_path, src, partial=partial)
     if wanted != shipped:
         fails.append(f"{table_path.name} does not regenerate byte for byte from {measurements.name} and {rules_path.name}: run generate")
     now = identities(src)
@@ -494,7 +492,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--rules", type=Path, default=RULES)
     parser.add_argument("--table", type=Path, default=TABLE)
     parser.add_argument("--src", type=Path, default=ROOT / "src", help="the source tree whose kernels count")
-    parser.add_argument("--partial", action="store_true", help="generate with some classes unmeasured")
+    parser.add_argument("--partial", action="store_true", help="some classes not measured yet (a round in progress)")
     parser.add_argument("--report", type=Path, help="write the per-cell report here")
     args = parser.parse_args(argv)
     src = args.src.resolve()
@@ -506,7 +504,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.table.write_text(text)
         (args.report.write_text if args.report else lambda s: sys.stderr.write(s))("\n".join(report) + "\n")
         return 0
-    fails = check(args.measurements, args.rules, args.table, src)
+    fails = check(args.measurements, args.rules, args.table, src, args.partial)
     for fail in fails:
         print(f"FAIL {fail}")
     print(f"attention table: {'FAIL' if fails else 'PASS'}")
