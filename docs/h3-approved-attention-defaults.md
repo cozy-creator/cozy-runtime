@@ -6,7 +6,7 @@ partition-stable implementations where they are eligible and ready.
 | Hardware | Dense kernel | Sparse kernel | Preferred hybrid |
 |---|---|---|---|
 | Hopper SM90 | SageAttention2 8-bit, fixed K mean | BF16 CuTe Sparse | `sol-attn-sage2-fixed-kmean` |
-| Consumer Blackwell SM120 | SageAttention3 NVFP4, fixed means | Kitchen INT8 Sparse | `kitchen-sol-producer-fp4-fixed-means-shared-qkv` |
+| Consumer Blackwell SM120 | Kitchen INT8 | Kitchen INT8 Sparse | `kitchen-sol-producer-fast-shared-qkv` |
 | Ada SM89, Ampere | Kitchen INT8 | Kitchen INT8 Sparse | `kitchen-sol-producer-fast-shared-qkv` |
 
 Turbo remains four dense steps followed by four sparse steps; regular generation

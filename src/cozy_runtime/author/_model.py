@@ -194,7 +194,8 @@ class Serving:
       encoding (the code reaches its components through their forward only). False refuses.
     - `min_bits`: the lowest weight precision the lane rules pick by themselves (`MIN_BITS`).
     - `attention_bits`: the lowest attention precision its sites tolerate, whole or per
-      component-qualified module prefix.
+      component-qualified module prefix. 4 serves 8-bit kernels until a measured quality pass
+      and an eye check list 4-bit ones (Paul, 11-11); a 4-bit kernel serves by pin.
     - `phase`: "decode" for an LM's token loop, else "compute" (`PHASES`).
     - `unloaded` / `derived`: component-qualified key patterns a load does not warn about.
     - `loras`: the components that take LoRAs.
