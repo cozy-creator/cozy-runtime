@@ -55,7 +55,7 @@ class Ranks:
         device: torch.device,
         tag: str,
         gpu: Callable[[int], str],
-        told: Callable[[str], None] | None = None,
+        stage: Callable[[str], None] | None = None,
     ) -> None:
         import torch.distributed as dist
         from torch._C._distributed_c10d import PrefixStore
@@ -63,7 +63,7 @@ class Ranks:
 
         self.rank, self.world, self.pg, self.device, self.gpu = rank, world, pg, device, gpu
         #: tells the machine a long meeting's wait as the call's stage (GPU 0's; None elsewhere)
-        self.told = told
+        self.stage = stage
         self.store = PrefixStore(f"cozy.spmd/{tag}/", _get_process_group_store(pg))
         self.sequence = 0
         self.lock = threading.Lock()
@@ -80,8 +80,9 @@ class Ranks:
             keys = [f"{n}/{rank}" for rank in range(self.world)]
             self.store.set(keys[self.rank], json.dumps({"what": what, **value}))
             ended = [f"end/{rank}" for rank in range(self.world)]
+            waiting = self._waiting(what)
             rows: list[Row] = [
-                json.loads(raw) for raw in gather(self.store, keys, what, ended, self._told(what))
+                json.loads(raw) for raw in gather(self.store, keys, what, ended, waiting)
             ]
             if n > 1:
                 self.store.delete_key(f"{n - 1}/{self.rank}")
@@ -93,15 +94,15 @@ class Ranks:
             )
         return rows
 
-    def _told(self, what: str) -> Callable[[list[int]], None] | None:
-        say = self.told
-        if say is None:
+    def _waiting(self, what: str) -> Callable[[list[int]], None] | None:
+        stage = self.stage
+        if stage is None:
             return None
 
-        def told(absent: list[int]) -> None:
-            say(f"waiting for {', '.join(self.gpu(rank) for rank in absent)}: {what}")
+        def waiting(absent: list[int]) -> None:
+            stage(f"waiting for {', '.join(self.gpu(rank) for rank in absent)}: {what}")
 
-        return told
+        return waiting
 
     def end(self, ok: bool) -> None:
         """This GPU's handler returned or raised: a GPU still waiting at a meeting for it learns

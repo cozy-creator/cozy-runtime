@@ -1732,7 +1732,7 @@ class Executor:
             tag=tag,
             gpu=_gpu,
             # its long meeting waits are the run's stage; a follower's attempt tells nothing
-            told=request_path.told,
+            stage=request_path.told,
         )
         group.broadcast(
             {
