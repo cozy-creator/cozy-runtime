@@ -4,7 +4,7 @@ and the Runtime's own sites (`attention_site`), which need no Diffusers.
 Every kernel is a Runtime-local forward (`attention_upstream`, `attention_sol`) that
 `attention_ulysses` makes one call of, so one wrapper serves every degree: a Runtime site calls
 it, and it is registered with Diffusers for a Diffusers site. A site takes
-the first kernel of its GPU family's cell (`DENSE`, `SPARSE`, by `arch` row) at its attention
+the first kernel of its hardware class's cell (`TABLE`, by `arch` row) at its attention
 level that serves it here: 16 for a request at 16 bits (`EXACT`), else the model's
 `attention_bits` for the site (default 16). A kernel that is not part of torch is compiled on
 this machine for this card (`kernel_sources`, `kernel_compile`) and serves once its artifact is
@@ -50,6 +50,7 @@ from cozy_runtime.internal import (
     attention_kitchen_sol,
     attention_sage2_fixed,
     attention_sol,
+    attention_table,
     attention_ulysses,
     execution_evidence,
     kernel_cache,
@@ -148,7 +149,7 @@ class Candidate:
     #: a package's producer, served through its base backend (`known`)
     producer: AttentionProducer | None = None
     #: its precision: 16 keeps the operands' own, 8 or 4 quantizes them (its coarsest operand);
-    #: the one cell level it may be listed at (`DENSE`, `SPARSE`)
+    #: the lowest cell level it may be listed at (`TABLE`)
     level: int = 16
     #: a sparse kernel: the model's layout routes each call's rows (`attention_sol`)
     sparse: bool = False
@@ -380,44 +381,12 @@ def retired(pin: str) -> str:
 
 
 
-#: Each family's kernels per attention level, best first (precision-tiers §2.4; the order is
-#: the release gate's measurements). A site walks its level's cell, each level above, then SDPA.
-#: No cell lists a 4-bit kernel (Paul, 11-11: in H3 it loses small details, the seagulls, and
-#: gains little speed): a site whose model tolerates 4 bits serves 8-bit kernels; 4-bit ones
-#: serve only by pin, until a measured quality pass and an eye check list them (xs-171).
-DENSE: dict[str, dict[int, tuple[str, ...]]] = {
-    arch.MMA_SYNC: {16: ("sdpa",), 8: ("kitchen-int8", "sageattention")},
-    arch.WGMMA: {16: ("flash-attn3",), 8: ("sageattention",)},
-    arch.TCGEN05: {16: ("cudnn",), 8: ("flash-attn4-fp8",)},
-}
-#: A sparse site's kernels (one a package producer serves: its model supplies an
-#: `AttentionLayout`), tried at its level and each above before any DENSE kernel. BF16 Sol's dense
-#: rows take the first 16-bit DENSE kernel after it (`_sol_dense`). tcgen05's 8-bit cell is Sol's
-#: FA4 route with FP8 exact tiles and FA4 FP8 dense rows (`sol-attn-fa4-fp8`; a whole H3 15 s call
-#: 109-113 ms on a B200 against Sol's own 134-146 ms, h3a-093). mma.sync's 8-bit cell is Kitchen's
-#: INT8 Sol: INT8 runs 2x BF16 there, 4x
-#: on GeForce (half-rate FP32 accumulation), and BF16 Sol's exact blocks alone outlast Kitchen's
-#: whole sparse step (H3 15 s, RTX 4090: 23 s at peak).
-SPARSE: dict[str, dict[int, tuple[str, ...]]] = {
-    arch.MMA_SYNC: {16: ("sol-attn",), 8: ("kitchen-sol",)},
-    arch.WGMMA: {16: ("sol-attn",), 8: ("sol-attn-sage2-fixed-kmean",)},
-    arch.TCGEN05: {16: ("sol-attn",), 8: ("sol-attn-fa4-fp8",)},
-}
-LEVELS = (4, 8, 16)
-#: A cell lists only kernels of its own precision: a coarser or finer kernel there could not merge.
-_MISFILED = [
-    f"{family} {'sparse' if table is SPARSE else 'dense'} {level}: {name} is {BY_NAME[name].level}"
-    for table in (DENSE, SPARSE)
-    for family, cells in table.items()
-    for level, names in cells.items()
-    for name in names
-    if BY_NAME[name].level != level or BY_NAME[name].sparse != (table is SPARSE)
-]
-if _MISFILED:
-    raise ValueError(f"attention cells hold kernels of another precision: {_MISFILED}")
-_FOUR_BIT = [f"{f} {at}" for t in (DENSE, SPARSE) for f, c in t.items() for at in c if at < 8]
-if _FOUR_BIT:  # a measured pass and an eye check lift this for a class (xs-171), never by hand
-    raise ValueError(f"4-bit attention serves only by pin: {_FOUR_BIT}")
+#: Each class's kernels per layout, attention level, head dimension and token bucket, fastest
+#: first (`attention_table`): a site walks its level's cell, each level above, then SDPA. A
+#: hand-made table lists no 4-bit kernel (Paul, 11-11: in H3 it loses small details, the
+#: seagulls, for little speed), so a site whose model tolerates 4 bits serves 8-bit kernels;
+#: only a measured table, past the 4-bit quality bar Paul signs, lists them (xs-171).
+TABLE = attention_table.load(BY_NAME)
 #: The pin of a request at 16 bits: every site in its scope at level 16.
 EXACT = "exact"
 #: Package producers' candidates, each derived once from its registration.
@@ -535,14 +504,18 @@ def sparse_site(module: object) -> bool:
     return any(not _invalid(producer, module) for producer in _PRODUCERS.values())
 
 
-def walk(row: arch.Row, at: int, layout: bool = False) -> list[str]:
-    """A site's kernels on ROW, best first: a LAYOUT site's sparse cells at level AT and each
-    level above (its model asked for sparse attention), then the dense cells the same way, then
-    SDPA, each producer standing in before its base; none the row cannot run."""
-    found, names, levels = known(), list[str](), LEVELS[LEVELS.index(at) :]
-    for table in (SPARSE, DENSE) if layout else (DENSE,):
+def walk(
+    row: arch.Row, at: int, layout: bool = False, head_dim: int = 0, bucket: int = -1
+) -> list[str]:
+    """A site's kernels on ROW for one token BUCKET (-1: the last), best first: a LAYOUT site's
+    sparse cells at level AT and each level above (its model asked for sparse attention), then
+    the dense cells the same way, then SDPA, each producer standing in before its base; none the
+    row cannot run."""
+    levels = attention_table.LEVELS[attention_table.LEVELS.index(at) :]
+    found, names, klass = known(), list[str](), arch.klass(row)
+    for cells in ("sparse", "dense") if layout else ("dense",):
         for step in levels:
-            names += table.get(row.family, {}).get(step, ())
+            names += TABLE.ranking(klass, cells, step, head_dim, bucket)
     stand_ins: dict[str, list[str]] = {}
     for name, producer in _PRODUCERS.items():
         stand_ins.setdefault(producer.base, []).append(name)
@@ -1759,7 +1732,9 @@ def install(
 
 def _walk_order(row: arch.Row, at: int, module: object, processor: object) -> list[str]:
     """A site's kernels at level AT: a classic site keeps SDPA, every other one walks."""
-    return ["sdpa"] if isinstance(processor, ClassicSdpa) else walk(row, at, sparse_site(module))
+    if isinstance(processor, ClassicSdpa):
+        return ["sdpa"]
+    return walk(row, at, sparse_site(module), _head_dim(module))
 
 
 def _pin_reason(entry: Ready | None, why: str, record: _Record, degree: int) -> str:

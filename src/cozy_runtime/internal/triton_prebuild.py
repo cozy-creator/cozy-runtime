@@ -23,6 +23,7 @@ import json
 import shutil
 import tempfile
 import time
+from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
 
@@ -52,12 +53,14 @@ def sets(package: str = "") -> list[tuple[TritonKernels, int]]:
         return [(k, sm) for k in sorted(declared, key=lambda k: k.name) for sm in rows]
     found: dict[tuple[str, int], TritonKernels] = {}
     for sm in sorted(arch.ROWS):
-        row = arch.row(sm)
-        extra = [attention_sol_fa4.KERNELS] if row.family == arch.TCGEN05 else []
-        runtime = (*machine_kernels.triton_sets(row), lora_bake.KERNELS, lm.KERNELS, moe.KERNELS)
-        for kernels in (*runtime, *extra):
-            if kernels.entries:
-                found[(kernels.name, sm)] = kernels
+        named = arch.row(sm)
+        for half in (False, True) if named.family == arch.MMA_SYNC else (False,):
+            row = replace(named, half_accumulate=half)  # each hardware class of the cc
+            extra = [attention_sol_fa4.KERNELS] if row.family == arch.TCGEN05 else []
+            sets = (*machine_kernels.triton_sets(row), lora_bake.KERNELS, lm.KERNELS, moe.KERNELS)
+            for kernels in (*sets, *extra):
+                if kernels.entries:
+                    found[(kernels.name, sm)] = kernels
     return [(kernels, sm) for (_, sm), kernels in sorted(found.items())]
 
 
