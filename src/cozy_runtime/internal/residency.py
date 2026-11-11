@@ -1974,11 +1974,11 @@ class Memory:
 
     def _read_ahead(self, names: frozenset[str], *, current: bool = False) -> None:
         """TensorFS reads pages into pinned host RAM ahead of their use (`Pages.read_ahead`),
-        within free room, while this phase runs: the models of this phase's packages that the
-        request has not used yet, the largest first (text encoding reads the transformer's). This
-        phase's own go before them when the last read ahead had them coming (its read goes on),
-        or `current`: an overlay armed inside its forward moved its blocks. A page a derive made
-        in an earlier process is read from disk, made again by no one."""
+        within free room, while this phase runs: the largest model of this phase's packages that
+        the request has not used yet (text encoding reads the transformer's). This phase's own go
+        before it when the last read ahead had them coming (its read goes on), or `current`: an
+        overlay armed inside its forward moved its blocks. A page a derive made in an earlier
+        process is read from disk, made again by no one."""
         request = _REQUEST.get()
         if not _DERIVED or self.pages is None or request is None or request.idle:
             return
@@ -1986,6 +1986,8 @@ class Memory:
         active = [m for m in self.models.values() if m.name in names and not m.closed]
         current = current or any(m.name in self._coming for m in active)
         releases = {m.source.release for m in active}
+        # The largest model it has not used: what reads it ahead pays for the read and its pages'
+        # registration while this phase runs, worth it for the one a cold step waits on most.
         later = sorted(
             (
                 m
@@ -1993,7 +1995,7 @@ class Memory:
                 if m.source.release in releases and m.name not in request.entered and not m.closed
             ),
             key=lambda m: -sum(b.storage_bytes for b in m.groups()),
-        )
+        )[:1]
         self._coming = {m.name for m in later}
         reading = (active if current else []) + later
         self._staging = [source for model in reading for source in self._staged(model)]
