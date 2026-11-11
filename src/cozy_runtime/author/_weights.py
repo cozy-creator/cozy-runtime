@@ -15,12 +15,13 @@ if TYPE_CHECKING:
 
     from cozy_runtime.weights_store import Checkpoint, TensorMetadata
 
-    #: A `Weights`' layout. Bare `Weights` is any layout: the checker reads it as `Weights[Model[object]]`.
-    M = TypeVar("M", bound=Model[object], default=Model[object])
+    #: A `Weights`' layout (covariant: a `Weights[Sdxl]` is a `Weights` of any layout). Bare `Weights` is any
+    #: layout: the checker reads it as `Weights[Model[object]]`.
+    M = TypeVar("M", bound=Model[object], default=Model[object], covariant=True)
 else:
     from typing import TypeVar
 
-    M = TypeVar("M", bound=Model)
+    M = TypeVar("M", bound=Model, covariant=True)
 
 MAX_WEIGHTS_OUTPUTS = 16
 MAX_WEIGHTS_SOURCE_READ = 64 << 20
