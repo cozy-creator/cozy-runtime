@@ -68,6 +68,11 @@ if TYPE_CHECKING:
     class _Call(Protocol):
         """A root's own `__call__`, unbound: the module, then its arguments as written."""
 
+        def __call__(self, module: Module, /, *args: object, **kwargs: object) -> object: ...
+
+    class _Op(Protocol):
+        """A torch function a mode intercepts: any operands."""
+
         def __call__(self, *args: object, **kwargs: object) -> object: ...
 
     #: a placed component's residency and its name (`PLACED`)
@@ -739,7 +744,7 @@ def _yielding(torch: ModuleType) -> Callable[[], AbstractContextManager[object]]
     class Yielding(torch.overrides.TorchFunctionMode):  # type: ignore[misc, name-defined]  # torch is passed in: a module
         def __torch_function__(
             self,
-            func: _Call,
+            func: _Op,
             types: tuple[type, ...],
             args: tuple[object, ...] = (),
             kwargs: dict[str, object] | None = None,
@@ -1126,7 +1131,9 @@ def _dense(layout: AttentionLayout | None) -> tuple[object, ...] | None:
     )
 
 
-def _under(layout: AttentionLayout, call: _Call, *args: object, **kwargs: object) -> object:
+def _under(
+    layout: AttentionLayout, call: _Call, *args: *tuple[Module, *tuple[object, ...]], **kwargs: object
+) -> object:
     with attention_scope(layout):
         return call(*args, **kwargs)
 
