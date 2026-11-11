@@ -535,7 +535,8 @@ def tiles(seed: int, ctx: Context) -> Tiles:
         configs: dict[str, Call] = {}
         for bn, bk, w in ((bn, bk, w) for bn in (32, 64, 128) for bk in (64, 128, 256) for w in (2, 4, 8)):
             configs[f"n{bn}-k{bk}-w{w}"] = partial(dequant, bn, bk, w)
-        found.append(_tile_set("dequant", n, k, 0, "n64-k128-w4", configs, flush))
+        default = f"n{nvfp4_linear.DECODE_N}-k{nvfp4_linear.DECODE_K}-w4"
+        found.append(_tile_set("dequant", n, k, 0, default, configs, flush))
         ctx.progress(at * 3, total)
         words = weight.view(torch.int32)
         for i, m in enumerate((1, 16)):
