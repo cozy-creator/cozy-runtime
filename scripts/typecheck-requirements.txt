@@ -45,7 +45,7 @@ safetensors==0.8.0
 setuptools==84.2.1
 shellingham==1.5.4
 sympy==1.14.0
-tensorfs==0.24.1
+tensorfs==0.24.2
 tokenizers==0.23.3
 torch @ https://download.pytorch.org/whl/cpu/torch-2.15.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl
 tqdm==4.70.1

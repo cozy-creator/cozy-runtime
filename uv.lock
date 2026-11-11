@@ -364,8 +364,8 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "peft", marker = "extra == 'adapters'", specifier = ">=0.20,<0.21" },
     { name = "pillow", specifier = ">=12" },
-    { name = "tensorfs", specifier = ">=0.24.1,<0.25" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.24.1,<0.25" },
+    { name = "tensorfs", specifier = ">=0.24.2,<0.25" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.24.2,<0.25" },
     { name = "tokenizers", marker = "extra == 'adapters'", specifier = ">=0.23.1" },
     { name = "torch", marker = "extra == 'adapters'", specifier = ">=2.15" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.15" },
@@ -1537,11 +1537,11 @@ wheels = [
 
 [[package]]
 name = "tensorfs"
-version = "0.24.1"
-source = { registry = "/home/fidika/cozy/.worktrees/cozy-creator/xs170-sdk-patch/.task/qualification/ci-release-wheels" }
-sdist = { path = "/home/fidika/cozy/.worktrees/cozy-creator/xs170-sdk-patch/.task/qualification/ci-release-wheels/tensorfs-0.24.1.tar.gz" }
+version = "0.24.2"
+source = { registry = "/home/fidika/cozy/.worktrees/cozy-runtime/xs170-sdk-cohort/.task/qualification/candidate-v0.24.2/assets" }
+sdist = { path = "/home/fidika/cozy/.worktrees/cozy-runtime/xs170-sdk-cohort/.task/qualification/candidate-v0.24.2/assets/tensorfs-0.24.2.tar.gz" }
 wheels = [
-    { path = "/home/fidika/cozy/.worktrees/cozy-creator/xs170-sdk-patch/.task/qualification/ci-release-wheels/tensorfs-0.24.1-cp311-abi3-manylinux_2_28_x86_64.whl" },
+    { path = "/home/fidika/cozy/.worktrees/cozy-runtime/xs170-sdk-cohort/.task/qualification/candidate-v0.24.2/assets/tensorfs-0.24.2-cp311-abi3-manylinux_2_28_x86_64.whl" },
 ]
 
 [[package]]
