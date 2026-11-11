@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Annotated, Generic, NewType, TypeVar
+from typing import TYPE_CHECKING, Annotated, Generic, NewType
 
 import msgspec
 
@@ -62,8 +62,15 @@ class Audio(msgspec.Struct, frozen=True, kw_only=True, tag_field="type", tag="au
     description: str = ""
 
 
-#: What a prompt's references may be: `Prompt[Image]` narrows it.
-T = TypeVar("T", bound=Image | Video | Audio)
+if TYPE_CHECKING:
+    from typing_extensions import TypeVar
+
+    #: What a prompt's references may be: `Prompt[Image]` narrows it; bare `Prompt` takes all three.
+    T = TypeVar("T", bound=Image | Video | Audio, default=Image | Video | Audio)
+else:
+    from typing import TypeVar
+
+    T = TypeVar("T", bound=Image | Video | Audio)
 
 
 # msgspec resolves this module's string annotations without a class's type parameters.
