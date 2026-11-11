@@ -5,21 +5,17 @@ still serves. Its modules are `kernels`, `fusion`, `stepcache`, `moe`, `lora`, `
 from cozy_runtime.accel._concurrent import concurrently
 from cozy_runtime.accel._spread import spread
 from cozy_runtime.author._model import (
-    graph_keys,
     hold_dtype,
     placeable,
     plain_forward,
     sequence_parallel,
-    uncaptured,
 )
 
 __all__ = [
     "concurrently",
-    "graph_keys",
     "hold_dtype",
     "placeable",
     "plain_forward",
     "sequence_parallel",
     "spread",
-    "uncaptured",
 ]

@@ -16,9 +16,6 @@ def describe(fn: Handler) -> dict[str, str]:
     """The operation identity of an entrypoint: its name and its distribution's build, as the
     static reader computes it (`static_interface._operation_identity`). An unreadable build (an
     editable install) disables the shortcut; it never refuses an invocation."""
-    export = getattr(fn, "_cozy_export", None)
-    if export is not None:
-        fn = export.implementation
     owner = _owner(fn.__module__.split(".")[0])
     identity = release_identity(
         f"{fn.__module__}.{fn.__qualname__}", owner or "", _build(owner) if owner else None

@@ -179,12 +179,11 @@ class CallableDoc(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True)
     description: str = ""
     request: JsonValue
     result: JsonValue
-    #: A child task (`app.child_task`): cozy and TensorD refuse it as a root request.
+    #: A private function (`private=True`): cozy and TensorD refuse it as a root request.
     internal: bool = False
     models: Annotated[tuple[ModelSlot, ...], msgspec.Meta(max_length=16)] = ()
     assets: AssetsSlot | msgspec.UnsetType = msgspec.UNSET
     invocable: invocable_interface.Invocable | msgspec.UnsetType = msgspec.UNSET
-    publishes: bool = False
     #: written only as false: CPU only. Absent: the machine's GPU when it has one.
     accelerator: bool | msgspec.UnsetType = msgspec.UNSET
     tool: ToolDoc | msgspec.UnsetType = msgspec.UNSET
@@ -213,24 +212,14 @@ def assemble(
     application: str,
     declared: Sequence[Declaration],
     *,
-    installed: bool = False,
     recipes: Sequence[dict[str, Json]] = (),
 ) -> dict[str, Json]:
     """One package interface from the static reader's records of its callables: each passes
-    the one rule set (`validate`), then renders its entry.
-
-    `installed` describes a published wheel, so it holds that release to the rules it was
-    published under."""
+    the one rule set (`validate`), then renders its entry."""
     docs = []
     for row in declared:
         validate(row)
-        doc = entry(row)
-        invocable_interface.check_memo_requires(
-            msgspec.convert(doc["invocable"], invocable_interface.Invocable, strict=True),
-            doc["request"],
-            authoring=not installed,
-        )
-        docs.append(doc)
+        docs.append(entry(row))
     body: dict[str, Json] = {
         "format": SCHEMA,
         "application": application,
@@ -283,8 +272,6 @@ def entry(declared: Declaration) -> dict[str, Json]:
                 row["prepare"] = dict(preparation.descriptor())
             kinds.append(row)
         doc["assets"] = {"parameter": assets.parameter, "kinds": kinds}
-    if declared.publishes:
-        doc["publishes"] = True
     if not declared.accelerator:
         doc["accelerator"] = False
     if declared.tool is not None:
@@ -536,10 +523,8 @@ def _validate(interface: PackageInterface, source: str) -> None:
         outputs = () if item.weights_outputs is msgspec.UNSET else item.weights_outputs
         if item.invocable is not msgspec.UNSET:
             invocable_interface.validate(item.invocable, item.request, item.result)
-            if item.invocable.memoize and (outputs or item.publishes):
-                _invalid(
-                    source, path, "a function that writes weights or publishes is not memoized"
-                )
+            if item.invocable.memoize and outputs:
+                _invalid(source, path, "a function that writes weights is not memoized")
         for model_index, slot in enumerate(item.models):
             _model_slot(slot, item.name, source, f"{path}.models[{model_index}]")
         output_ids = [output.output_id for output in outputs]

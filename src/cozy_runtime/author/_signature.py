@@ -38,14 +38,12 @@ from cozy_runtime.author._files import (
 from cozy_runtime.author._handler import Handler
 from cozy_runtime.author._markers import (
     PREPARATIONS,
-    Bound,
     FileBound,
     FileLimits,
     Preparation,
     _PreflightMarker,
 )
 from cozy_runtime.author._media import KIND_MEDIA, slot_kind
-from cozy_runtime.author._memo import Memoize
 from cozy_runtime.author._model import Model, component_use, undeclared_methods
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._tool import Tool
@@ -360,13 +358,11 @@ class Declaration:
     """`Preflight[T]` parameters."""
     slots: tuple[Slot, ...] = ()
     assets: AssetsBinding | None = None
-    publishes: bool = False
-    emits_media: bool = False
     weights_outputs: tuple[WeightsOutput, ...] = ()
     """The TensorFS model outputs this function writes; grants mint off this declaration."""
-    memoize: Memoize | None = None
+    memoize: bool = False
     child_task: bool = False
-    """Run by its own package's calls only (`app.child_task`), never a root request."""
+    """Run by its own package's calls only (`private=True`), never a root request."""
     accelerator: bool = True
     """False: CPU only, never opens CUDA. True: the machine's GPU when it has one."""
     tool: Tool | None = None
@@ -377,7 +373,8 @@ class Declaration:
     model_on_demand: tuple[str, ...] = ()
     """Model arguments built, and their weights fetched, on first use (`on_demand=`)."""
     parameters: tuple[str, ...] | None = None
-    """An invocable's caller parameters; None: a handler, whose request is its struct."""
+    """Its request's fields, when they are its own parameters; None: its request is its one
+    struct parameter."""
     parameter_defaults: Mapping[str, object] = field(default_factory=dict)
     identity: Mapping[str, str] = field(default_factory=dict)
     """Its operation identity, where the reader can state one."""
@@ -401,12 +398,7 @@ class Surface(Declaration):
     fn: Handler
     is_async: bool
     params: tuple[Param, ...]
-    demand_bound: Bound | None = None
     preflight: PreflightSpec | None = None
-    hidden: bool = False
-    """DECLARED but NOT PUBLISHED (#572d). Hidden callables stay in the local registry but
-    are absent from the package interface, so no binding is staged and no request reaches them."""
-    invocable: bool = False
 
     @property
     def outputs(self) -> frozenset[str]:
@@ -535,48 +527,55 @@ def _classify(name: str, annotation: object, where: str) -> Param:
     )
 
 
+def _injected(annotation: object) -> bool:
+    """What the Runtime passes in by type: Context, a model, a service, preflight facts."""
+    base, markers = strip(annotation)
+    return (
+        any(isinstance(m, _PreflightMarker) for m in markers)
+        or base is Context
+        or weights_class(base) is not None
+        or model_class(base) is not None
+        or any(base is kind or get_origin(base) is kind for kind in _PARAMETERIZED.values())
+        or (isinstance(base, type) and any(issubclass(base, s) for s in SERVICES.values()))
+    )
+
+
 def analyze(
     fn: Handler,
     *,
     name: str,
-    publishes: bool = False,
-    emits_media: bool = False,
     weights_outputs: tuple[WeightsOutput, ...] = (),
-    demand_bound: Bound | None = None,
     preflight: Handler | None = None,
-    hidden: bool = False,
     child_task: bool = False,
     accelerator: bool = True,
     tool: Tool | None = None,
-    invocable: bool = False,
-    memoize: Memoize | None = None,
+    memoize: bool = False,
     model_defaults: Mapping[str, str] | None = None,
     model_components: Mapping[str, tuple[str, ...]] | None = None,
     model_on_demand: tuple[str, ...] = (),
     model_classes: Mapping[str, type[Model[object]]] | None = None,
 ) -> Surface:
     """Derive the whole surface from the signature. Every refusal here is a BUILD refusal.
+
+    The request is the one struct parameter, when that is the function's only parameter the
+    Runtime does not inject; otherwise its plain parameters are the request's fields.
     `model_classes` names a model argument's class in place of its annotation."""
     where = f"{fn.__module__}:{fn.__qualname__}"
     signature = inspect.signature(fn)
     hints = {**_hints(fn), **(model_classes or {})}
-    params: list[Param] = []
-    wire_fields: list[tuple[str, object] | tuple[str, object, object]] = []
-    for parameter in signature.parameters.values():
+    declared = list(signature.parameters.values())
+    for parameter in declared:
         if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
             raise ConformanceError(
                 f"{where}: *{parameter.name} — no **kwargs grab-bags exist on the author "
                 "surface; everything injected is named and typed",
                 fields=[parameter.name],
             )
-        if parameter.default is not parameter.empty and not invocable:
+        if parameter.kind is parameter.POSITIONAL_ONLY:
             raise ConformanceError(
-                f"{where}: parameter {parameter.name} carries a default "
-                f"({parameter.default!r}) — every parameter here is INJECTED by the runtime, "
-                "so a default is a second source of the same fact. A model slot in "
-                "particular is declared by its bare type alone: there is no slot object and "
-                "no artifacts= dict",
-                code="injected_default",
+                f"{where}: parameter {parameter.name} is positional-only; the Runtime passes "
+                "every argument by name",
+                code="request_signature",
                 fields=[parameter.name],
             )
         if parameter.name not in hints:
@@ -585,88 +584,84 @@ def analyze(
                 "the contract",
                 fields=[parameter.name],
             )
+        check_parameter_markers(hints[parameter.name])
+    plain = [
+        p
+        for p in declared
+        if not _injected(hints[p.name])
+        and not (strip(hints[p.name])[0] is Files or get_origin(strip(hints[p.name])[0]) is Files)
+    ]
+    struct = (
+        plain[0]
+        if len(plain) == 1
+        and plain[0].default is plain[0].empty
+        and is_struct(strip(hints[plain[0].name])[0])
+        else None
+    )
+    keyword = struct is None
+    params: list[Param] = []
+    wire_fields: list[tuple[str, object] | tuple[str, object, object]] = []
+    for parameter in declared:
         annotation = hints[parameter.name]
         base, _ = strip(annotation)
-        check_parameter_markers(annotation)
         if base is Files or get_origin(base) is Files:
             if parameter.default is not parameter.empty:
                 raise ConformanceError("Files inputs cannot have defaults", code="assets_default")
-            if invocable and parameter.kind is not parameter.KEYWORD_ONLY:
-                raise ConformanceError(
-                    "invocable Files must be keyword-only", code="invocable_signature"
-                )
             binding = assets_binding(parameter.name, annotation)
             params.append(Param(parameter.name, "assets", annotation))
-            if invocable:
+            if keyword:
                 wire_fields.append((parameter.name, binding.wire_type))
             continue
-        if invocable:
-            base, _ = strip(annotation)
-            injected = (
-                base is Context
-                or model_class(base) is not None
-                or (
-                    isinstance(base, type)
-                    and any(issubclass(base, service) for service in SERVICES.values())
-                )
-                or get_origin(base) in (Settings, Secrets)
-                or weights_class(base) is not None
-            )
-            if not injected:
-                if parameter.kind is not parameter.KEYWORD_ONLY:
-                    raise ConformanceError(
-                        "invocable arguments must be keyword-only", code="invocable_signature"
-                    )
-                try:
-                    _wire_type(annotation)
-                except ConformanceError as exc:
-                    raise ConformanceError(
-                        f"{where}: parameter {parameter.name}: {exc.message}",
-                        code=exc.code,
-                        fields=[parameter.name],
-                    ) from None
-                params.append(Param(parameter.name, "wire", annotation))
-                if parameter.default is parameter.empty:
-                    wire_fields.append((parameter.name, annotation))
-                else:
-                    _wire_default(parameter.default)
-                    try:
-                        msgspec.convert(parameter.default, type=annotation, strict=True)
-                    except (TypeError, ValueError, msgspec.ValidationError) as exc:
-                        raise ConformanceError(
-                            "invocable default differs from its type", code="invocable_default"
-                        ) from exc
-                    wire_fields.append((parameter.name, annotation, parameter.default))
-                continue
-            if parameter.default is not parameter.empty:
+        if parameter is struct:
+            params.append(Param(parameter.name, "payload", base))
+            continue
+        if parameter in plain:
+            try:
+                _wire_type(annotation)
+            except ConformanceError as exc:
                 raise ConformanceError(
-                    "injected invocable parameters cannot have defaults", code="injected_default"
-                )
-            if weights_class(base) is not None or model_class(base) is not None:
-                # It marks the slot in the request schema, which then drops it: a
-                # caller chooses the slot's model with a ModelChoice beside the request.
-                wire_fields.append((parameter.name, ModelArtifact | None, None))
+                    f"{where}: parameter {parameter.name}: {exc.message}",
+                    code=exc.code,
+                    fields=[parameter.name],
+                ) from None
+            params.append(Param(parameter.name, "wire", annotation))
+            if parameter.default is parameter.empty:
+                wire_fields.append((parameter.name, annotation))
+            else:
+                _wire_default(parameter.default)
+                try:
+                    msgspec.convert(parameter.default, type=annotation, strict=True)
+                except (TypeError, ValueError, msgspec.ValidationError) as exc:
+                    raise ConformanceError(
+                        f"{where}: the default of {parameter.name} differs from its type",
+                        code="request_default",
+                        fields=[parameter.name],
+                    ) from exc
+                wire_fields.append((parameter.name, annotation, parameter.default))
+            continue
+        if parameter.default is not parameter.empty:
+            raise ConformanceError(
+                f"{where}: parameter {parameter.name} carries a default "
+                f"({parameter.default!r}) — it is INJECTED by the runtime, so a default is a "
+                "second source of the same fact. A model slot in particular is declared by its "
+                "bare type alone",
+                code="injected_default",
+                fields=[parameter.name],
+            )
+        if keyword and (weights_class(base) is not None or model_class(base) is not None):
+            # It marks the slot in the request schema, which then drops it: a caller
+            # chooses the slot's model with a ModelChoice beside the request.
+            wire_fields.append((parameter.name, ModelArtifact | None, None))
         params.append(_classify(parameter.name, annotation, where))
 
-    payloads = [p for p in params if p.role == "payload"]
     assets_params = [p for p in params if p.role == "assets"]
     if len(assets_params) > 1:
         raise ConformanceError(
             "one Files input slot is supported per callable", code="assets_arity"
         )
-    if invocable:
-        declared = list(signature.parameters.values())
-        if (
-            not inspect.iscoroutinefunction(fn)
-            or not declared
-            or params[0].role != "context"
-            or declared[0].kind
-            not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        ):
-            raise ConformanceError(
-                "an invocable must be async with Context first", code="invocable_signature"
-            )
-        payload_type: object = msgspec.defstruct(
+    payload_type: object
+    if struct is None:
+        payload_type = msgspec.defstruct(
             f"{fn.__name__}Request",
             wire_fields,
             module=fn.__module__,
@@ -674,13 +669,8 @@ def analyze(
             frozen=True,
             forbid_unknown_fields=True,
         )
-    elif len(payloads) != 1:
-        raise ConformanceError(
-            f"{where}: exactly one typed request struct is required, found {len(payloads)}",
-            code="payload_arity",
-        )
     else:
-        payload_type = payloads[0].annotation
+        payload_type = strip(hints[struct.name])[0]
         if assets_params:
             binding = assets_binding(assets_params[0].name, assets_params[0].annotation)
             payload_type = assets_payload(
@@ -693,13 +683,19 @@ def analyze(
             f"(got {result!r}) — the result transaction validates against it exactly",
             code="result_schema",
         )
-    if invocable:
+    if keyword:
         _wire_type(result)
 
     spec: PreflightSpec | None = None
     if preflight is not None:
+        if struct is None:
+            raise ConformanceError(
+                f"{where}: preflight= reads a request struct, and this function's request is "
+                "its own parameters",
+                code="preflight_payload",
+            )
         spec = analyze_preflight(
-            preflight, payloads[0].annotation, assets_params[0] if assets_params else None
+            preflight, strip(hints[struct.name])[0], assets_params[0] if assets_params else None
         )
     callers = [p.name for p in params if p.role in ("wire", "model", "weights", "assets")]
     return Surface(
@@ -725,25 +721,20 @@ def analyze(
             if p.role in ("model", "weights")
         ),
         assets=next((assets_binding(p.name, p.annotation) for p in assets_params), None),
-        publishes=publishes,
-        emits_media=emits_media,
         weights_outputs=weights_outputs,
-        demand_bound=demand_bound,
         preflight=spec,
-        hidden=hidden,
         child_task=child_task,
         accelerator=accelerator,
         tool=tool,
-        invocable=invocable,
         memoize=memoize,
         model_defaults=model_defaults or {},
         model_components=model_components or {},
         model_on_demand=model_on_demand,
-        parameters=tuple(callers) if invocable else None,
+        parameters=tuple(callers) if keyword else None,
         parameter_defaults={
             name: signature.parameters[name].default
             for name in callers
-            if invocable and signature.parameters[name].default is not inspect.Parameter.empty
+            if keyword and signature.parameters[name].default is not inspect.Parameter.empty
         },
     )
 
@@ -776,13 +767,17 @@ def _wire_default(value: object) -> None:
     if type(value) is float and math.isfinite(value):
         return
     raise ConformanceError(
-        "invocable defaults must be immutable canonical scalars", code="invocable_default"
+        "a request parameter's default is an immutable scalar (str, bool, int, float, None)",
+        code="request_default",
     )
 
 
 def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
     """Refuse interpreter-local values before an interface is generated."""
     base, _ = strip(annotation)
+    if isinstance(base, typing.NewType):  # `Seed`
+        _wire_type(base.__supertype__, seen)
+        return
     if base in (str, int, float, bool, type(None)):
         return
     origin = get_origin(base)
@@ -799,7 +794,8 @@ def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
         args = get_args(base)
         if not args:
             raise ConformanceError(
-                "invocable collections must have element types", code="invocable_wire_type"
+                "a request parameter's collection names its element type",
+                code="request_wire_type",
             )
         for arg in args:
             _wire_type(arg, seen)
@@ -815,13 +811,14 @@ def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
             for field in msgspec.structs.fields(typing.cast(type[msgspec.Struct], base)):
                 if field.default_factory is not msgspec.NODEFAULT:
                     raise ConformanceError(
-                        "invocable types cannot have default factories", code="invocable_default"
+                        "a request parameter's struct cannot have default factories",
+                        code="request_default",
                     )
                 _wire_type(field.type, seen | {base})
             return
     raise ConformanceError(
-        f"invocable type {annotation!r} is recursive or has no portable wire representation",
-        code="invocable_wire_type",
+        f"{annotation!r} is recursive or has no portable wire representation",
+        code="request_wire_type",
     )
 
 

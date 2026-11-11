@@ -185,7 +185,7 @@ def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> A
             temperature=payload.temperature,
             top_p=payload.top_p,
             seed=payload.seed,
-            progress=lambda tokens: tel.progress(
+            progress=lambda tokens: tel._progress(
                 min(tokens / payload.max_tokens, 1.0), stage="answering"
             ),
         )

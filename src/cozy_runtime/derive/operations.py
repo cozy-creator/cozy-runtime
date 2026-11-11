@@ -24,7 +24,6 @@ from cozy_runtime.author import (
     UnsupportedInput,
     Weights,
     WeightsOutput,
-    invocable,
 )
 from cozy_runtime.author._recipes import DeclaredRecipe, Plan, canonical, fingerprint
 from cozy_runtime.weights_store import Checkpoint, Derivation
@@ -182,11 +181,10 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
     return selection
 
 
-@invocable
-async def quantize(  # type: ignore[explicit-any,misc]  # static describe's any-layout spelling
+async def quantize(
     ctx: Context,
     *,
-    source: Weights[Any],
+    source: Weights,
     plan: QuantizationPlan,
     tel: Telemetry,
     max_relative_frobenius: float | None = None,

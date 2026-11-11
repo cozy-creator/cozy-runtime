@@ -104,9 +104,8 @@ from cozy_runtime.accel.kernels import Launch, Plan, TritonKernels
 from cozy_runtime.author import _activity, _split
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
-from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelChoice
-from cozy_runtime.author._calls import Exchange, Nudges, _Broker, _CallType, _export
+from cozy_runtime.author._calls import Exchange, Nudges, _Broker, _CallType
 from cozy_runtime.author._context import CURRENT, Device, place
 from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.author._describe import freeze
@@ -147,6 +146,7 @@ from cozy_runtime.author._model import (
 from cozy_runtime.author._observations import DEVICE, PLANS, Attribution, Observation
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
+from cozy_runtime.author._signature import analyze
 from cozy_runtime.author._weights import Weights as RawWeights
 from cozy_runtime.derive import recipes as declared_recipes
 from cozy_runtime.derive.operations import app as builtin_operations_app
@@ -158,7 +158,6 @@ from cozy_runtime.internal import (
     attention_sol,
     attention_ulysses,
     builtin_operations,
-    call_types,
     canonical,
     child_env,
     contract,
@@ -166,7 +165,6 @@ from cozy_runtime.internal import (
     execution_evidence,
     fp8_linear,
     int8_linear,
-    interface_wheel,
     kernel_cache,
     kernel_compile,
     kernel_ready,
@@ -298,8 +296,42 @@ _SEALED: dict[str, str] = {}
 _OPEN_MAX = 10240
 
 
-#: Each callable an attempt may call, by (module, export).
-type CallBindings = dict[tuple[str, str], _CallType]
+class CallBindings(Mapping[tuple[str, str], _CallType]):
+    """Each callable an attempt may call, by (module, export). Another package's function is bound
+    from its own code at its first call, so a dependency nothing calls is never imported."""
+
+    def __init__(
+        self, bound: dict[tuple[str, str], _CallType], installed: Collection[tuple[str, str]]
+    ) -> None:
+        self._bound, self._installed = bound, frozenset(installed) - bound.keys()
+
+    def __getitem__(self, key: tuple[str, str]) -> _CallType:
+        binding = self._bound.get(key)
+        if binding is None:
+            if key not in self._installed:
+                raise KeyError(key)
+            module, export = key
+            try:
+                function = getattr(importlib.import_module(module), export, None)
+            except ImportError as exc:
+                raise CapabilityError(
+                    f"{module}:{export} can't be imported here: {exc}", code="child_interface"
+                ) from exc
+            if not callable(function):
+                raise CapabilityError(
+                    f"{module}:{export} is not installed in this environment",
+                    code="child_interface",
+                )
+            binding = self._bound[key] = _serving(module, export, analyze(function, name=export))
+        return binding
+
+    def __iter__(self) -> Iterator[tuple[str, str]]:
+        return iter((*self._bound, *self._installed))
+
+    def __len__(self) -> int:
+        return len(self._bound) + len(self._installed)
+
+
 #: One reply, event or document on the seam: JSON, readers narrow (`seam.Channel.send`).
 type Reply = dict[str, object]
 
@@ -647,7 +679,7 @@ def _serving(module: str, export: str, surface: Surface) -> _CallType:
     if any(field.name in slots for field in fields):
         request = msgspec.defstruct(
             request.__name__,
-            # An invocable's defaults are immutable scalars (`_wire_default`), never factories.
+            # Request parameters' defaults are immutable scalars (`_wire_default`), never factories.
             [(f.name, f.type, f.default) for f in fields if f.name not in slots],
             module=module,
             kw_only=True,
@@ -665,7 +697,8 @@ def _serving(module: str, export: str, surface: Surface) -> _CallType:
     call = msgspec.defstruct(
         f"{export}Call", [("payload", request), ("models", models)], module=module, frozen=True
     )
-    return _CallType("", module, export, call, result, models=slots)
+    struct = next((p.name for p in surface.params if p.role == "payload"), "")
+    return _CallType("", module, export, call, result, models=slots, request_parameter=struct)
 
 
 # --------------------------------------------------------------------------- state
@@ -1984,7 +2017,6 @@ class Executor:
                         importlib.import_module(name)
                     stage("runtime_imports")
             if self.discovered is None:
-                self._install_call_proxies(command.call_interfaces)
                 self._discover_provisioned(command.application, str(command.package_interface))
                 stage("package_import")
             # A fork's own Start names them again; its import-only parent installed them.
@@ -2547,6 +2579,10 @@ class Executor:
             # counter noise's kernel, which a recorded step's draw needs before its capture.
             leaves.prime(torch, torch.cuda.current_device())
             philox.prime(torch.cuda.current_device())
+            if self.world > 1:  # a group's int8 wire (`ulysses`)
+                from cozy_runtime.internal.parallel import turn
+
+                turn.prime(torch.cuda.current_device())
         if self.world > 1 and self.rank == 0:
             # THE FOLLOWERS RESOLVE BESIDE RANK 0, not after it: the load goes to every rank
             # before this one reads a header, and the plans are compared at the residence
@@ -3332,7 +3368,7 @@ class Executor:
                 for model in cast("Backend", member.backend).models.values():  # filtered above
                     for _, release in graphs.DECODERS:
                         release(model.module)
-                    graphs.retire(self.torch, model.module)  # type: ignore[arg-type]  # torch is imported before a request reaches here
+                    graphs.retire(self.torch, model.module)
 
     def awaiting_invoke(self) -> bool:
         """A prepared request waits for its invoke, which comes next (TensorD's lookahead or its
@@ -4451,42 +4487,6 @@ class Executor:
             "kernel_symbol": ",".join(sorted(choices.totals())) if choices is not None else "",
         }
 
-    def _install_call_proxies(self, rows: Sequence[CallInterface]) -> None:
-        """Expose managed dependency imports before importing a private workflow.
-
-        App registrations keep their original implementations. Only public module
-        exports in this caller process become typed proxies; installed files and
-        the independently executing callee remain ordinary uv installations.
-        """
-        prepared: set[str] = set()
-        for row in rows:
-            document, module = row.interface_document, row.module
-            if not document or module in prepared:
-                continue
-            prepared.add(module)
-            imported = importlib.import_module(module)
-            generated = interface_wheel.generate(package_interface.canonical_bytes(document))  # type: ignore[arg-type]  # an interface document is a JSON object
-            source = generated.get(module.replace(".", "/") + "/__init__.py")
-            if source is None:
-                raise CapabilityError(
-                    "installed dependency export is absent", code="child_interface"
-                )
-            companion_name = module + "._cozy_runtime_callers"
-            companion = ModuleType(companion_name)
-            sys.modules[companion_name] = companion
-            exec(compile(source, "<installed package callers>", "exec"), companion.__dict__)
-            bindings = {
-                export: call_types.public_result(imported, binding)
-                for export, binding in companion.__dict__["__cozy_bindings__"].items()
-            }
-            imported.__dict__["__cozy_bindings__"] = bindings
-            for export in bindings:
-                proxy = companion.__dict__[export]
-                # Callable lookup (including prefetch) uses the admitted public
-                # module. Generated wire types stay private to the companion.
-                proxy.__module__ = module
-                imported.__dict__[export] = proxy
-
     def _call_broker(self, request_id: str, rows: tuple[CallInterface, ...]) -> _Broker | None:
         """This attempt's broker over `rows`, bound once per executor (a served package's
         attempts share its Start's rows)."""
@@ -4508,6 +4508,7 @@ class Executor:
                 "call interface inventory exceeds its bound", code="child_interface"
             )
         bindings: dict[tuple[str, str], _CallType] = {}
+        installed: set[tuple[str, str]] = set()
         own = effect_interfaces.bindings()
         for row in rows:
             module, export = row.module, row.export
@@ -4534,34 +4535,12 @@ class Executor:
                     )
                 bindings[(module, export)] = _serving(module, export, own_surface)
             else:
-                imported = importlib.import_module(module)
-                function = getattr(imported, export, None)
-                declared = _export(function) if callable(function) else None
-                if declared is not None:
-                    registration = Registration(
-                        name=export,
-                        fn=declared.implementation,
-                        invocable=True,
-                        memoize=declared.memoize,
-                        model_defaults=declared.defaults,
-                        model_components=declared.components,
-                    )
-                    binding = _serving(module, export, registration.surface)
-                else:
-                    generated_binding = getattr(imported, "__cozy_bindings__", {}).get(export)
-                    if not isinstance(generated_binding, _CallType):
-                        raise CapabilityError(
-                            "installed export is not invocable", code="child_interface"
-                        )
-                    binding = generated_binding
-                prior = bindings.get((module, export))
-                if prior is not None and prior != binding:
-                    raise CapabilityError("ambiguous managed export", code="child_interface")
-                bindings[(module, export)] = binding
+                # Another package's function, installed beside this one: bound at its first call.
+                installed.add((module, export))
         for export in own:
             key = (effect_interfaces.MODULE, export)
             bindings.setdefault(key, effect_interfaces.unserved(export))
-        return bindings
+        return CallBindings(bindings, installed)
 
     def _store(self) -> Path:
         host = self.host
@@ -4647,7 +4626,6 @@ class Executor:
                             "kind": "progress",
                             "stage": frame.stage,
                             "stage_fraction": frame.stage_fraction,
-                            "overall_fraction": frame.overall_fraction,
                             "position": frame.position,
                             "total": frame.total,
                             "advance": frame.advance,

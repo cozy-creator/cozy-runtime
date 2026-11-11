@@ -1,22 +1,13 @@
 """Input files and reading video and audio. Optional."""
 
 from cozy_runtime.author._decode import (
-    DEFAULT_DECODE_LIMITS,
-    AudioProbe,
     DecodedAudio,
     DecodedAudioChunk,
     DecodedAudioFormat,
     DecodedMediaEvent,
     DecodedMediaHeader,
-    DecodedMediaStream,
-    DecodedVideo,
     DecodedVideoFormat,
     DecodedVideoFrame,
-    DecodeLimits,
-    DecoderUnavailable,
-    ImageProbe,
-    MediaDecodeError,
-    VideoProbe,
 )
 from cozy_runtime.author._files import (
     AudioFile,
@@ -31,29 +22,20 @@ from cozy_runtime.author._files import (
 )
 
 __all__ = [
-    "DEFAULT_DECODE_LIMITS",
     "AudioFile",
-    "AudioProbe",
-    "DecodeLimits",
     "DecodedAudio",
     "DecodedAudioChunk",
     "DecodedAudioFormat",
     "DecodedMediaEvent",
     "DecodedMediaHeader",
-    "DecodedMediaStream",
-    "DecodedVideo",
     "DecodedVideoFormat",
     "DecodedVideoFrame",
-    "DecoderUnavailable",
     "File",
     "FileInfo",
     "Files",
     "ImageFile",
-    "ImageProbe",
     "Latents",
-    "MediaDecodeError",
     "References",
     "Tree",
     "VideoFile",
-    "VideoProbe",
 ]

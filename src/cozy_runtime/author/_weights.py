@@ -5,13 +5,22 @@ from __future__ import annotations
 import re
 from collections.abc import Buffer, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, get_args, get_origin
+from typing import TYPE_CHECKING, Any, Generic, get_args, get_origin
 
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._model import Model
 
 if TYPE_CHECKING:
+    from typing_extensions import TypeVar
+
     from cozy_runtime.weights_store import Checkpoint, TensorMetadata
+
+    #: A `Weights`' layout. Bare `Weights` is any layout: the checker reads it as `Weights[Model[object]]`.
+    M = TypeVar("M", bound=Model[object], default=Model[object])
+else:
+    from typing import TypeVar
+
+    M = TypeVar("M", bound=Model)
 
 MAX_WEIGHTS_OUTPUTS = 16
 MAX_WEIGHTS_SOURCE_READ = 64 << 20
@@ -49,7 +58,7 @@ class WeightsOutput:
             )
 
 
-class Weights[M: Model[object]]:
+class Weights(Generic[M]):
     """The raw checkpoint of `M`'s layout (bare `Weights`: any layout). Never constructed.
 
     Read it here, or pass it to `ctx.tensorfs_source` and `derive.quantize_artifact`.

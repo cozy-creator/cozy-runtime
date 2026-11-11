@@ -13,12 +13,11 @@ no environment or config.
 from cozy_runtime import canonical_json
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import App
-from cozy_runtime.author._artifacts import Lora, ModelArtifact, ModelChoice, ObjectRef
-from cozy_runtime.author._calls import ChildCallError, PendingCall, invocable, prefetch
+from cozy_runtime.author._artifacts import Lora, ModelArtifact, ModelChoice
+from cozy_runtime.author._calls import ChildCallError, call, prefetch
 from cozy_runtime.author._context import Context, Device, device
-from cozy_runtime.author._errors import Cancelled, InvalidRequest, OutputError, UnsupportedInput
+from cozy_runtime.author._errors import InvalidRequest, OutputError, UnsupportedInput
 from cozy_runtime.author._loader import Config, DerivedCache, Loader, ModelAssets
-from cozy_runtime.author._memo import Memoize
 from cozy_runtime.author._model import Model, Serving, memoize, uses_components
 from cozy_runtime.author._recipes import (
     DerivationHook,
@@ -34,10 +33,8 @@ from cozy_runtime.author._services import (
     Adjustments,
     ImageFrame,
     Outputs,
-    SavedAudioFacts,
     SavedVideo,
     Telemetry,
-    VideoJoin,
 )
 from cozy_runtime.author._split import Cut, Windows, split, windows
 from cozy_runtime.author._tool import Seed
@@ -49,7 +46,6 @@ __all__ = [
     "AdjustmentRows",
     "Adjustments",
     "App",
-    "Cancelled",
     "ChildCallError",
     "Config",
     "Context",
@@ -62,18 +58,14 @@ __all__ = [
     "InvalidRequest",
     "Loader",
     "Lora",
-    "Memoize",
     "Model",
     "ModelArtifact",
     "ModelAssets",
     "ModelChoice",
-    "ObjectRef",
     "OutputError",
     "Outputs",
-    "PendingCall",
     "QuantizationPlan",
     "Recipe",
-    "SavedAudioFacts",
     "SavedVideo",
     "Seed",
     "SelectionPlan",
@@ -83,13 +75,12 @@ __all__ = [
     "Telemetry",
     "ThreadPoolExecutor",
     "UnsupportedInput",
-    "VideoJoin",
     "Weights",
     "WeightsOutput",
     "Windows",
+    "call",
     "canonical_json",
     "device",
-    "invocable",
     "memoize",
     "prefetch",
     "retained",

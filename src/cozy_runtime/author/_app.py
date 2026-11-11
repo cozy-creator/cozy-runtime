@@ -16,10 +16,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import ParamSpec, TypedDict, TypeVar, Unpack, overload
 
-from cozy_runtime.author._calls import _export
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._handler import Handler
-from cozy_runtime.author._memo import Memoize, memo_policy, one_memo
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import (
     model_components,
@@ -40,7 +38,7 @@ class RegistrationOptions(TypedDict, total=False):
     name: str | None
     defaults: Mapping[str, str] | None
     components: Mapping[str, Sequence[str]] | None
-    memoize: bool | Memoize
+    memoize: bool
     on_demand: Sequence[str]
     accelerator: bool | None
     weights: tuple[WeightsOutput, ...]
@@ -60,8 +58,7 @@ class Registration:
 
     name: str
     fn: Handler
-    invocable: bool = False
-    memoize: Memoize | None = None
+    memoize: bool = False
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
@@ -91,7 +88,6 @@ class Registration:
                 child_task=self.child_task,
                 accelerator=self.accelerator,
                 tool=self.tool,
-                invocable=self.invocable,
                 memoize=self.memoize,
                 model_defaults=self.model_defaults,
                 model_components=self.model_components,
@@ -129,8 +125,8 @@ class App:
           argument this function fetches. Without it: those its class's `@uses_components`
           hints name when every public method has one, else all of them.
         - `memoize=True`: its results are deterministic, so a repeat is answered from the
-          result cache (never for a function that writes weights);
-          `Memoize(requires=("seed",))` memoizes only requests that name each listed option.
+          result cache (never for a function that writes weights). A request that leaves an
+          optional `Seed` field unset runs without the cache.
         - `on_demand=("upsampler",)`: model arguments a request may leave unused; each is
           built, and its weights fetched, when the function first reads it.
         - `accelerator=False`: CPU only; otherwise it gets the machine's GPU when there is one.
@@ -193,7 +189,7 @@ class App:
         name: str | None = None,
         defaults: Mapping[str, str] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
-        memoize: bool | Memoize = False,
+        memoize: bool = False,
         on_demand: Sequence[str] = (),
         accelerator: bool | None = None,
         weights: tuple[WeightsOutput, ...] = (),
@@ -202,8 +198,11 @@ class App:
         tool: Tool | None = None,
         model_classes: Mapping[str, type[Model[object]]] | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
-        policy = memo_policy(memoize)
-        for option, value in (("accelerator", accelerator), ("private", private)):
+        for option, value in (
+            ("memoize", memoize),
+            ("accelerator", accelerator),
+            ("private", private),
+        ):
             if value is not None and type(value) is not bool:
                 raise RegistrationError(f"{option} is True or False")
         declared_defaults = model_defaults(defaults)
@@ -221,24 +220,12 @@ class App:
                 raise RegistrationError(
                     f"duplicate registration {registered!r}: names are unique per app"
                 )
-            export = _export(target)
-            if declared_defaults and export is not None and export.defaults:
-                raise ConformanceError(
-                    "declare defaults once, on invocable or App registration", code="model_defaults"
-                )
-            if declared_components and export is not None and export.components:
-                raise ConformanceError(
-                    "declare components once, on invocable or App registration",
-                    code="model_components",
-                )
             self._registry[registered] = Registration(
                 name=registered,
-                fn=export.implementation if export is not None else target,
-                invocable=export is not None,
-                memoize=one_memo(export.memoize, policy) if export is not None else policy,
-                model_defaults=declared_defaults or (export.defaults if export is not None else {}),
-                model_components=declared_components
-                or (export.components if export is not None else {}),
+                fn=target,
+                memoize=memoize,
+                model_defaults=declared_defaults,
+                model_components=declared_components,
                 model_on_demand=declared_on_demand,
                 model_classes=dict(model_classes or {}),
                 weights_outputs=weights,

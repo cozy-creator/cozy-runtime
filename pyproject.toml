@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.44.1"
+version = "0.44.2"
 description = "Cozy author surface and device executor"
 # The native wheels carry the kernels (`kernels/`): derived from comfy-kitchen, vLLM and SGLang
 # (Apache-2.0, comfy-kitchen's NOTICE), with CUTLASS and FlashAttention-3 (BSD-3-Clause). The
@@ -112,6 +112,7 @@ module = [
     "cozy_runtime.internal.kernel_sources",
     "cozy_runtime.internal.lora_bake",
     "cozy_runtime.internal.nvfp4_linear",
+    "cozy_runtime.internal.parallel.turn",
     "cozy_runtime.internal.philox",
     "cozy_runtime.internal.sage3",
     "cozy_runtime.internal.svdq_linear",

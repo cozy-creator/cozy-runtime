@@ -60,8 +60,8 @@ class DescribeEnvironment(msgspec.Struct, tag="describe_environment", tag_field=
 
 
 class Callee(msgspec.Struct, frozen=True):
-    """Another package's App this environment holds: a job of the root calls its invocables as
-    child runs here."""
+    """Another package's App this environment holds: a job of the root calls its public
+    functions (`call(fn, ...)`) as child runs here."""
 
     distribution: str
     version: str

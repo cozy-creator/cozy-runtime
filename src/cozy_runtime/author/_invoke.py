@@ -430,7 +430,7 @@ def _preflight(surface: Surface, overlay: Overlay) -> tuple[object, str | None]:
 
 
 def _payload_value(surface: Surface, payload: object) -> object:
-    if surface.assets is None or surface.invocable:
+    if surface.assets is None or surface.parameters is not None:
         return payload
     annotation = next(p.annotation for p in surface.params if p.role == "payload")
     cls = cast("type[msgspec.Struct]", annotation)  # an asset-bearing payload is a Struct
@@ -780,7 +780,8 @@ def _inject(
             kwargs[param.name] = facts
         elif param.role in ("model", "weights"):
             model = _model(param, inv, param.name in surface.model_on_demand)
-            artifact = getattr(overlay.payload, param.name, None) if surface.invocable else None
+            keyword = surface.parameters is not None
+            artifact = getattr(overlay.payload, param.name, None) if keyword else None
             if artifact is not None and (
                 not isinstance(artifact, ModelArtifact)
                 or (

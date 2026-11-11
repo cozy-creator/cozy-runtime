@@ -20,7 +20,7 @@ import stat
 import threading
 import warnings
 from collections.abc import Buffer, Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -112,7 +112,6 @@ class ProgressFrame:
     advance: int
     position: int | None = None
     total: int | None = None
-    overall_fraction: float | None = None
     step_ms: float = 0.0
     call_request: str | None = None
     call_attempt: int | None = None
@@ -142,7 +141,6 @@ class _LoopState(TypedDict):
 class _ProgressScope:
     telemetry: Telemetry
     name: str
-    bounds: tuple[float, float] | None
 
 
 _progress_scope: ContextVar[_ProgressScope | None] = ContextVar("cozy_progress_scope", default=None)
@@ -157,7 +155,7 @@ def stage_progress() -> Callable[[float], None] | None:
     if current is None:
         return None
     telemetry, name = current
-    return lambda fraction: telemetry.progress(fraction, stage=name)
+    return lambda fraction: telemetry._progress(fraction, stage=name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,8 +259,10 @@ class Attempt:
     shown: set[str] = field(default_factory=set)
     #: A composite asset's parts, by its handle: what `publish` sends instead of one file.
     parts: dict[str, tuple[PublishPart, ...]] = field(default_factory=dict)
-    _overall_fraction: float | None = None
     _progress_diagnostics: set[str] = field(default_factory=set)
+    #: Its open `tel.stage`s, innermost last: `ctx.progress` from a thread of its own counts
+    #: under the innermost.
+    _stages: list[str] = field(default_factory=list)
     #: Overlapped calls (`author.concurrently`) record from their own threads.
     _recording: threading.Lock = field(default_factory=threading.Lock)
     #: Whether a model component-use scope is open; media reads refuse while one is.
@@ -1490,13 +1490,9 @@ class Telemetry(_Bound):
         super().__init__(attempt)
         self._ctx = ctx
 
-    def progress(
-        self,
-        stage_fraction: float,
-        *,
-        stage: str | None = None,
-        overall_fraction: float | None = None,
-    ) -> None:
+    def _progress(self, stage_fraction: float, *, stage: str) -> None:
+        """A share of `stage` done: the Runtime's own work that counts no steps (a decode, a
+        quantization). Authors report steps with `ctx.progress`."""
         attempt = self._attempt
         attempt.check_open("Telemetry.progress")
         self._ctx.raise_if_cancelled()
@@ -1504,22 +1500,11 @@ class Telemetry(_Bound):
         if name is None:
             return
         fraction = self._fraction(stage_fraction, "stage_fraction")
-        overall = self._overall(overall_fraction)
-        if fraction is not None or overall is not None:
-            self._progress_frame(
-                name,
-                stage_fraction=fraction,
-                overall_fraction=overall,
-            )
+        if fraction is not None:
+            self._progress_frame(name, stage_fraction=fraction)
 
-    def step_callback(
-        self,
-        total: int,
-        *,
-        stage: str | None = None,
-        overall_range: tuple[float, float] | None = None,
-    ) -> Callable[[int], None]:
-        """Return one counted-work hook carrying stage and optional overall coordinates.
+    def _step_counter(self, total: int, *, stage: str) -> Callable[[int], None]:
+        """One count of `total` steps under `stage`, called with each finished step's index.
 
         It is also the STEP-TIME instrument: the interval between consecutive calls is
         accumulated in place (five floats per stage), so inference step time is attributable
@@ -1527,9 +1512,8 @@ class Telemetry(_Bound):
         handful of float operations.
         """
         attempt = self._attempt
-        attempt.check_open("Telemetry.step_callback")
-        name = self._stage_name(stage or "step")
-        bounds = self._overall_range(overall_range)
+        attempt.check_open("ctx.progress")
+        name = self._stage_name(stage)
         valid_total = (
             isinstance(total, int) and not isinstance(total, bool) and 0 < total <= 1_000_000_000
         )
@@ -1576,17 +1560,11 @@ class Telemetry(_Bound):
                 elif valid_total and isinstance(step, int) and not 0 <= step < total:
                     self._diagnose("step must be within the declared total")
                 return
-            raw_fraction = (step + 1) / total
-            fraction = round(raw_fraction, 6)
-            overall = None
-            if bounds is not None:
-                overall = self._overall(bounds[0] + raw_fraction * (bounds[1] - bounds[0]))
             self._progress_frame(
                 name,
-                stage_fraction=fraction,
+                stage_fraction=round((step + 1) / total, 6),
                 position=step + 1,
                 total=total,
-                overall_fraction=overall,
                 step_ms=step_ms,
             )
 
@@ -1595,9 +1573,10 @@ class Telemetry(_Bound):
     def loop_progress(self) -> tuple[Callable[[int, int], None], Callable[[str], None]]:
         """`ctx.progress(step, total)` and a model method call's activity (`ctx._called`).
 
-        Progress is `step_callback`'s frame under the enclosing stage (else "denoise"); a step 0
-        starts a new count, timed from the first model call after the previous progress. Until
-        the attempt reports progress, model calls show as a count, at most two frames a second.
+        Progress is a step count under the enclosing stage: this thread's, else the attempt's
+        innermost open one, else "denoise". A step 0 starts a new count, timed from the first
+        model call after the previous progress. Until the attempt reports progress, model calls
+        show as a count, at most two frames a second.
         """
         attempt = self._attempt
         counts: dict[tuple[str, int], Callable[[int], None]] = {}
@@ -1605,14 +1584,15 @@ class Telemetry(_Bound):
 
         def stage(otherwise: str) -> str:
             current = _stage.get()
-            ours = current is not None and current[0]._attempt is attempt
-            return current[1] if current is not None and ours else otherwise
+            if current is not None and current[0]._attempt is attempt:
+                return current[1]
+            return attempt._stages[-1] if attempt._stages else otherwise
 
         def progress(step: int, total: int) -> None:
             state["said"] = True
             key = (stage("denoise"), total)
             if step == 0 or key not in counts:
-                counts[key] = self.step_callback(total, stage=key[0])
+                counts[key] = self._step_counter(total, stage=key[0])
                 if state["began"] is not None:
                     attempt._step_mark, attempt._step_device = state["began"]
             state["began"] = None
@@ -1637,41 +1617,24 @@ class Telemetry(_Bound):
         self._attempt.emit("log", message, level, **fields)
 
     @contextmanager
-    def scope(
-        self, name: str, *, overall_range: tuple[float, float] | None = None
-    ) -> Iterator[None]:
-        """Compose local or managed child progress inside a named work range.
-
-        Ranges describe ordered planned work, not elapsed time. Concurrent operations
-        should leave the range unknown. Ordinary timing stages keep their semantics.
-        """
+    def scope(self, name: str) -> Iterator[None]:
+        """Name a part of the work: progress inside it, a managed call's too, shows as
+        `<name> / <stage>`. Ordinary timing stages keep their semantics."""
         self._attempt.check_open("Telemetry.scope")
         self._ctx.raise_if_cancelled()
         stage = self._stage_name(name)
-        bounds = self._overall_range(overall_range)
         if stage is None:
             yield
             return
         parent = _progress_scope.get()
         if parent is not None and parent.telemetry._attempt is self._attempt:
             stage = f"{parent.name} / {stage}"[:120]
-            if bounds is not None and parent.bounds is not None:
-                start, end = parent.bounds
-                bounds = (start + bounds[0] * (end - start), start + bounds[1] * (end - start))
-            elif parent.bounds is None:
-                bounds = None
-        self._progress_frame(
-            stage, overall_fraction=self._overall(bounds[0], scoped=False) if bounds else None
-        )
-        token = _progress_scope.set(_ProgressScope(self, stage, bounds))
-        succeeded = False
+        self._progress_frame(stage)
+        token = _progress_scope.set(_ProgressScope(self, stage))
         try:
             yield
-            succeeded = True
         finally:
             _progress_scope.reset(token)
-            if succeeded and bounds is not None:
-                self._progress_frame(stage, overall_fraction=self._overall(bounds[1], scoped=False))
 
     def _child_progress(self, payload: Mapping[str, object], scope: _ProgressScope) -> None:
         """Relay measured child coordinates without making child completion parent completion."""
@@ -1689,12 +1652,6 @@ class Telemetry(_Bound):
             if "stage_fraction" in payload
             else None
         )
-        overall = None
-        if scope.bounds is not None and "overall_fraction" in payload:
-            child = self._fraction(payload["overall_fraction"], "overall_fraction")
-            if child is not None:
-                start, end = scope.bounds
-                overall = self._overall(start + child * (end - start), scoped=False)
         position, total = payload.get("position"), payload.get("total")
         if not (
             type(position) is int
@@ -1725,7 +1682,6 @@ class Telemetry(_Bound):
             stage_fraction=fraction,
             position=position,
             total=total,
-            overall_fraction=overall,
             step_ms=step_ms,
             call_request=call_request,
             call_attempt=call_attempt,
@@ -1733,39 +1689,34 @@ class Telemetry(_Bound):
         )
 
     @contextmanager
-    def stage(
-        self, name: str, *, overall_range: tuple[float, float] | None = None
-    ) -> Iterator[None]:
+    def stage(self, name: str) -> Iterator[None]:
         """Per-stage timing bracket; `stage_ms` feeds the duration model and benchmarks.
+        `ctx.progress` inside it counts this stage's steps.
 
         Structurally separate from a component-use scope: this records a NUMBER and touches
         no residency, no placement and no ComponentUseContract.
         """
-        self._attempt.check_open("Telemetry.stage")
+        attempt = self._attempt
+        attempt.check_open("Telemetry.stage")
         self._ctx.raise_if_cancelled()
         stage = self._stage_name(name)
-        bounds = self._overall_range(overall_range)
         if stage is not None:
-            self._progress_frame(
-                stage,
-                overall_fraction=self._overall(bounds[0]) if bounds is not None else None,
-            )
+            self._progress_frame(stage)
+            attempt._stages.append(stage)
         start = work_clock()
-        succeeded = False
         token = _stage.set((self, stage)) if stage is not None else None
         try:
             yield
             settle()
-            succeeded = True
         finally:
             if token is not None:
                 _stage.reset(token)
             elapsed = (work_clock() - start) * 1000
             if stage is not None:
-                self._attempt.attribution.stage(stage, elapsed)
-                self._attempt.emit("stage", stage, round(elapsed, 3))
-                if succeeded and bounds is not None:
-                    self._progress_frame(stage, overall_fraction=self._overall(bounds[1]))
+                with suppress(ValueError):
+                    attempt._stages.remove(stage)
+                attempt.attribution.stage(stage, elapsed)
+                attempt.emit("stage", stage, round(elapsed, 3))
 
     def metric(self, name: str, value: float, *, unit: str | None = None) -> None:
         self._attempt.check_open("Telemetry.metric")
@@ -1794,7 +1745,6 @@ class Telemetry(_Bound):
         stage_fraction: float | None = None,
         position: int | None = None,
         total: int | None = None,
-        overall_fraction: float | None = None,
         step_ms: float = 0.0,
         call_request: str | None = None,
         call_attempt: int | None = None,
@@ -1819,7 +1769,6 @@ class Telemetry(_Bound):
                 advance=attempt.position + 1,
                 position=position,
                 total=total,
-                overall_fraction=overall_fraction,
                 step_ms=step_ms,
                 call_request=call_request,
                 call_attempt=call_attempt,
@@ -1845,40 +1794,6 @@ class Telemetry(_Bound):
             self._diagnose(f"{field} must be a finite number in 0..1")
             return None
         return round(number, 6)
-
-    def _overall(self, value: object | None, *, scoped: bool = True) -> float | None:
-        if value is None:
-            return None
-        overall = self._fraction(value, "overall_fraction")
-        if overall is None:
-            return None
-        scope = _progress_scope.get() if scoped else None
-        if scope is not None and scope.telemetry._attempt is self._attempt:
-            if scope.bounds is None:
-                return None
-            start, end = scope.bounds
-            overall = round(start + overall * (end - start), 6)
-        previous = self._attempt._overall_fraction
-        if previous is not None and overall < previous:
-            self._diagnose("overall_fraction must not move backward")
-            return None
-        self._attempt._overall_fraction = overall
-        return overall
-
-    def _overall_range(self, value: object | None) -> tuple[float, float] | None:
-        if value is None:
-            return None
-        if not isinstance(value, tuple) or len(value) != 2:
-            self._diagnose("overall_range must be a (start, end) pair")
-            return None
-        start = self._fraction(value[0], "overall_range start")
-        end = self._fraction(value[1], "overall_range end")
-        if start is None or end is None:
-            return None
-        if end < start:
-            self._diagnose("overall_range end must not precede its start")
-            return None
-        return start, end
 
     def _diagnose(self, reason: str) -> None:
         attempt = self._attempt

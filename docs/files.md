@@ -13,7 +13,7 @@ import msgspec
 
 from cozy_runtime.author import (
     FileBound, FileLimits, Files, AudioFile, Context, ImageFile, ImagePreparation,
-    VideoFile, VideoPreparation, invocable,
+    VideoFile, VideoPreparation,
 )
 
 References = Annotated[
@@ -36,7 +36,7 @@ class Done(msgspec.Struct):
     frames: int
 
 
-@invocable
+@app.entrypoint
 async def render(ctx: Context, *, shot: Shot, refs: References) -> Done:
     video = shot.clip.read(fps=24)  # at most 15 s, on a 24 fps clock
     for item in refs:
@@ -146,7 +146,7 @@ each with one profile: `image-fit/1` `{max_edge, max_pixels}`, `video-trim/1` an
 members with `{max_short_edge, max_long_edge, max_pixels, max_fps, audio}`, written only when
 a video declares a fit. A known profile admits exactly those
 members and must prepare a kind its declaration carries; readers ignore a profile they do
-not know. Preparations annotate inputs (fields, invocable parameters, `Files`); a result
+not know. Preparations annotate inputs (fields, request parameters, `Files`); a result
 declaring one refuses at describe.
 
 ## Tests

@@ -21,7 +21,7 @@ import weakref
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import Any
 
 import tensorfs.varena.torch as vt
 from tensorfs.varena import _runtime as varena
@@ -29,22 +29,12 @@ from tensorfs.varena import _runtime as varena
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.internal import accel, kernel_ready
 
-if TYPE_CHECKING:
-    import torch
-
-    from cozy_runtime.internal.residency import Memory
-else:
-    try:
-        import torch
-    except ImportError:  # pragma: no cover - the base package is torch-free
-        torch = None
-
 
 class Unavailable(RuntimeError):
     """This runtime cannot honor the graph domain's workspace lifetime contract."""
 
 
-def unsupported() -> str:
+def unsupported(torch: Any) -> str:
     return (
         ""
         if torch.__version__.split(".")[:2] in (["2", "14"], ["2", "15"])
@@ -64,32 +54,32 @@ class Pool:
 
 # A failed CUDA destruction does not prove whether its handle remains valid.
 # Keep its events/library/stream owners until the executor exits; never probe it again.
-_UNPROVEN: list[Domain] = []
+_UNPROVEN: list[Any] = []
 
 
 class Domain:
-    def __init__(self, memory: Memory | None) -> None:
-        self.memory = memory
+    def __init__(self, torch: Any, memory: Any) -> None:
+        self.torch, self.memory = torch, memory
         self.device = placed_device().index or 0
         self.lock = threading.RLock()
-        self.stream: torch.cuda.Stream | None = None
-        self.control: torch.cuda.Stream | None = None
+        self.stream: Any = None
+        self.control: Any = None
         self.primed = False
-        self.owner: torch.cuda.CUDAGraph | None = None
-        self.fork: torch.cuda.Event | None = None
-        self.join: torch.cuda.Event | None = None
-        self.done: torch.cuda.Event | None = None
-        self.last_stream: torch.cuda.Stream | None = None
+        self.owner: Any = None
+        self.fork: Any = None
+        self.join: Any = None
+        self.done: Any = None
+        self.last_stream: Any = None
         self.fenced = True
         self.closed = False
         self.closing = False
         self._destruction_error: BaseException | None = None
-        self.config: _Configuration | None = None
-        self.graphs: weakref.WeakSet[torch.cuda.CUDAGraph] = weakref.WeakSet()
+        self.config: Any = None
+        self.graphs: weakref.WeakSet[Any] = weakref.WeakSet()
         self.local = threading.local()
 
-    def configuration(self) -> _Configuration:
-        cuda = torch.backends.cuda
+    def configuration(self) -> tuple[Any, ...]:
+        cuda = self.torch.backends.cuda
         return (
             cuda.cublas_workspace_size(),
             cuda.cublaslt_workspace_size(),
@@ -103,19 +93,9 @@ class Domain:
             return "graph domain is closing"
         if self.config is not None and self.configuration() != self.config:
             return "library workspace configuration changed while graphs retain its pointers"
-        return unsupported()
+        return unsupported(self.torch)
 
-    def capturing(
-        self,
-    ) -> tuple[torch.cuda.Stream, torch.cuda.Stream, torch.cuda.Event, torch.cuda.Event]:
-        """Its control and library streams and fork/join events, for a capture."""
-        # `initialize` made them, and every capture follows it.
-        return cast(
-            "tuple[torch.cuda.Stream, torch.cuda.Stream, torch.cuda.Event, torch.cuda.Event]",
-            (self.control, self.stream, self.fork, self.join),
-        )
-
-    def recovery_blocked(self, *, replay: bool = False) -> AbstractContextManager[object]:
+    def recovery_blocked(self, *, replay: bool = False) -> AbstractContextManager[Any]:
         """Block reclaim; actual capture also excludes native producers."""
         guard = varena.replay if replay else varena.capture
         return guard(self.device)
@@ -130,21 +110,17 @@ class Domain:
         # kernel probes must not invalidate this small lifetime-owner capture either.
         with kernel_ready.recording():
             try:
-                self.stream = stream = accel.owned_stream(torch, self.device)
-                self.control = control = accel.owned_stream(torch, self.device)
-                fork, join, done = (
-                    torch.cuda.Event()
-                    for _ in range(3)
-                )
-                self.fork, self.join, self.done = fork, join, done
-                fork.record(control)
-                join.record(stream)
-                done.record(stream)
-                self.owner = owner = torch.cuda.CUDAGraph()
+                self.stream = accel.owned_stream(self.torch, self.device)
+                self.control = accel.owned_stream(self.torch, self.device)
+                self.fork, self.join, self.done = (self.torch.cuda.Event() for _ in range(3))
+                self.fork.record(self.control)
+                self.join.record(self.stream)
+                self.done.record(self.stream)
+                self.owner = self.torch.cuda.CUDAGraph()
                 # No library work or allocation inside this owner graph. Recording an event makes
                 # its capture stream explicit; reset later clears only this stream.
-                with vt.graph(owner, stream=stream, reserve_bytes=0):
-                    join.record(stream)
+                with vt.graph(self.owner, stream=self.stream, reserve_bytes=0):
+                    self.join.record(self.stream)
                 self.config = self.configuration()
             except BaseException:
                 self.finish()
@@ -156,7 +132,7 @@ class Domain:
         with self.lock:
             if self.closed or self.closing:
                 raise Unavailable("graph domain is closing or closed")
-            current = torch.cuda.current_stream(self.device)
+            current = self.torch.cuda.current_stream(self.device)
             depth = getattr(self.local, "depth", 0)
             if not depth and self.done is not None:
                 current.wait_event(self.done)
@@ -178,8 +154,8 @@ class Domain:
         if why := self.refusal():
             raise Unavailable(why)
         if not self.primed:
-            with torch.cuda.stream(self.stream):
-                accel.first_launches(torch, "cuda")
+            with self.torch.cuda.stream(self.stream):
+                accel.first_launches(self.torch, "cuda")
             self.primed = True
 
     def finish(self) -> None:
@@ -225,7 +201,7 @@ class Domain:
                 stream = getattr(self, name)
                 if stream is not None:
                     try:
-                        accel.destroy_stream(torch, stream)
+                        accel.destroy_stream(self.torch, stream)
                         setattr(self, name, None)
                     except BaseException as error:
                         self._unproven_destruction(error)
@@ -236,47 +212,48 @@ class Domain:
         if self._destruction_error is None:
             self._destruction_error = cause
             _UNPROVEN.append(self)
-        error = torch.AcceleratorError(
+        error = self.torch.AcceleratorError(
             f"graph stream destruction is unproven; retire executor: {cause}"
         )
         raise error from cause
 
 
 _LOCK = threading.RLock()
-_OWNERS: weakref.WeakKeyDictionary[torch.nn.Module, Domain] = weakref.WeakKeyDictionary()
+_OWNERS: weakref.WeakKeyDictionary[Any, Domain] = weakref.WeakKeyDictionary()
 #: per device memory, the one domain its placed models' graphs share
-_DEVICES: weakref.WeakKeyDictionary[Memory, Domain] = weakref.WeakKeyDictionary()
-type _Configuration = tuple[int, int, torch._C._BlasBackend]
+_DEVICES: weakref.WeakKeyDictionary[Any, Domain] = weakref.WeakKeyDictionary()
 
 
-def device(memory: Memory) -> Domain:
+def device(torch: Any, memory: Any) -> Domain:
     """The device's domain: every placed component's graphs, serialized."""
     with _LOCK:
         found = _DEVICES.get(memory)
         if found is None:
-            found = _DEVICES[memory] = Domain(memory)
-            weakref.finalize(memory, found.finish).atexit = False
+            found = _DEVICES[memory] = Domain(torch, memory)
+            finalizer: Any = weakref.finalize(memory, found.finish)
+            finalizer.atexit = False
         return found
 
 
-def acquire(root: torch.nn.Module, memory: Memory | None = None) -> Domain:
+def acquire(torch: Any, root: Any, memory: Any = None) -> Domain:
     with _LOCK:
         found = _OWNERS.get(root)
         if found is None:
-            found = Domain(memory)
+            found = Domain(torch, memory)
             _OWNERS[root] = found
-            weakref.finalize(root, found.finish).atexit = False
+            finalizer: Any = weakref.finalize(root, found.finish)
+            finalizer.atexit = False
         return found
 
 
-def release(root: torch.nn.Module) -> None:
+def release(root: Any) -> None:
     with _LOCK:
         found = _OWNERS.pop(root, None)
     if found is not None:
         found.finish()
 
 
-def existing(root: torch.nn.Module) -> Domain | None:
+def existing(root: Any) -> Domain | None:
     """Observe an existing owner without creating a domain or touching CUDA."""
     with _LOCK:
         return _OWNERS.get(root)

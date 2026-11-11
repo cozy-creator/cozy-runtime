@@ -28,7 +28,6 @@ from cozy_runtime.author._tool import (
     Prompt,
     Video,
     name_key,
-    spoken,
 )
 
 __all__ = [
@@ -57,5 +56,4 @@ __all__ = [
     "Video",
     "VideoPreparation",
     "name_key",
-    "spoken",
 ]

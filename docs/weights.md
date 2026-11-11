@@ -6,7 +6,7 @@ never constructed. It binds like any model slot (`<fn>.models.<param>`, `default
 exact manifest; the attempt reads it through TensorFS and creates no Python model or GPU tensor.
 
 ```python
-@invocable
+@app.entrypoint
 async def compare(ctx: Context, *, original: Weights[SdxlModel], changed: Weights[SdxlModel]) -> Report:
     for component in original.components():
         for key in original.keys(component):

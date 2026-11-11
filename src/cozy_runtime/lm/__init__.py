@@ -91,7 +91,6 @@ if TYPE_CHECKING:
     from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
 
     from cozy_runtime.author._model import Residency, WarningRow
-    from cozy_runtime.graphs import DecodeReceipt
     from cozy_runtime.graphs.domain import Domain
     from cozy_runtime.internal.residency import Binding, Region
 
@@ -343,12 +342,12 @@ def release(model: torch.nn.Module) -> None:
 
 def _graph_snapshot(
     model: torch.nn.Module,
-) -> tuple[DecodeReceipt | None, list[Pool], Domain | None]:
+) -> tuple[dict[str, object], list[Pool], Domain | None]:
     """Final-reply facts and live pool owners; no device work or per-token aggregation."""
     with _ENGINES_LOCK:
         engine = _ENGINES.get(model)
     if engine is None:
-        return None, [], None
+        return {}, [], None
     return (
         {
             "active_graphs": len(engine.graphs),
@@ -3166,17 +3165,11 @@ def _never(need: int, card: int) -> bool:
 
 
 __all__ = [
-    "BUCKETS",
-    "DEPTH",
     "KERNELS",
-    "MIN_WINDOW",
-    "Constraint",
     "Draft",
     "drafting",
     "generate",
     "install",
-    "release",
-    "window",
 ]
 
 

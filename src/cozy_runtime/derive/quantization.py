@@ -494,7 +494,7 @@ def quantize_component_into(
             saturated += result.saturated
             tel.log("quantized tensor", level="info", encoding=name, component=component,
                     key=tensor.key, done=done, total=total)  # fmt: skip
-            tel.progress(done / total, stage=f"{encoding}-{component}")
+            tel._progress(done / total, stage=f"{encoding}-{component}")
     return QuantizationStats(
         encoded_keys=len(pending),
         reused_keys=reused,

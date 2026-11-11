@@ -55,6 +55,8 @@ NEVER = timedelta(days=36500)
 #: How long a GPU waits at a store meeting for the others (`gather`). They run the same call, so one
 #: arrives within its peers' work on that call; past this the GPUs no longer run the same calls.
 GATHER = timedelta(minutes=5)
+#: How long a meeting waits for a GPU that said it computes what the meeting crosses (`gather`)
+WORKING = timedelta(minutes=30)
 #: How long the GPUs may take to form the group, from the join to every GPU's proof. Each runs the
 #: same few steps (reach the store, group init, one barrier, one of each collective), so a GPU still
 #: forming past what a store meeting allows (`GATHER`) never will: 2x A40 sat in formation until
@@ -259,16 +261,25 @@ def warm(torch: ModuleType, backend: str, rank: int, world: int) -> None:
     torch.cuda.synchronize()
 
 
-def gather(store: Store, keys: Sequence[str], what: str, ended: Sequence[str] = ()) -> list[bytes]:
+def gather(
+    store: Store,
+    keys: Sequence[str],
+    what: str,
+    ended: Sequence[str] = (),
+    working: Sequence[str] = (),
+) -> list[bytes]:
     """Every key's value, once every GPU has set its own. The store's own read waits for a missing
     key for as long as the store lives; this ends (code `ENDED`) when the formation ends
     (`abort_process_group`: an interrupt, or a GPU that failed) or a missing GPU's `ended` key says
     it failed; a missing GPU that returned is a divergence, named; and after `GATHER` it names the
-    GPUs that never arrived (`keys` and `ended` are in GPU order)."""
+    GPUs that never arrived, unless each still missing set its `working` key (it computes what
+    this meeting crosses, a hosted call's result): those are waited for up to `WORKING` (`keys`,
+    `ended` and `working` are in GPU order)."""
     import torch.distributed as dist
 
     keys = list(keys)
-    deadline = time.monotonic() + GATHER.total_seconds()
+    began = time.monotonic()
+    deadline = began + GATHER.total_seconds()
     while True:
         if _ENDED.is_set():
             raise GroupRefusal(f"{what}: another GPU ended this call", code=ENDED)
@@ -284,12 +295,17 @@ def gather(store: Store, keys: Sequence[str], what: str, ended: Sequence[str] = 
                         "same calls",
                         code="group_diverged",
                     ) from None
-            if time.monotonic() < deadline:
+            now = time.monotonic()
+            if now < deadline:
                 continue
-            missing = [f"GPU {rank}" for rank, key in enumerate(keys) if not store.check([key])]
+            absent = [rank for rank, key in enumerate(keys) if not store.check([key])]
+            busy = working and all(store.check([working[rank]]) for rank in absent)
+            if busy and now < began + WORKING.total_seconds():
+                continue
+            waited = int(now - began)
             raise GroupRefusal(
-                f"{what}: {', '.join(missing)} did not arrive in "
-                f"{int(GATHER.total_seconds())} s; the GPUs no longer run the same calls",
+                f"{what}: {', '.join(f'GPU {rank}' for rank in absent)} did not arrive in "
+                f"{waited} s; the GPUs no longer run the same calls",
                 code="group_diverged",
             ) from None
         return list(store.multi_get(keys))
