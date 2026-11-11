@@ -389,10 +389,12 @@ class Captured:
         return Point(q[0], q[1], k[1], kept, q[3], layout="sparse" if self.layout is not None else "dense")
 
     def operands(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        from safetensors.torch import load_file
-
-        held = load_file(str(self.file), device="cuda:0")
-        return held["query"], held["key"], held["value"]
+        header, start = _header(self.file)
+        with self.file.open("rb") as held:
+            held.seek(start)
+            data = bytearray(held.read())
+        q, k, v = (_tensor(header, name, data) for name in ("query", "key", "value"))
+        return q, k, v
 
 
 def _shape(value: object) -> tuple[int, int, int, int]:
@@ -401,17 +403,46 @@ def _shape(value: object) -> tuple[int, int, int, int]:
     return value[0], value[1], value[2], value[3]
 
 
+#: A capture's dtype names (`attention_capture._save` writes BF16) and their torch names.
+_DTYPES = {"BF16": "bfloat16", "F16": "float16", "F32": "float32"}
+
+
+def _header(file: Path) -> tuple[dict[str, object], int]:
+    """A safetensors file's JSON header and the offset its data starts at: an 8-byte little-endian header length, the
+    header, then the raw bytes. Read here rather than by the `safetensors` package, which the Runtime's built-in App
+    environment does not hold (it comes with Diffusers)."""
+    with file.open("rb") as held:
+        size = int.from_bytes(held.read(8), "little")
+        header = json.loads(held.read(size))
+    if not isinstance(header, dict):
+        raise ValueError(f"{file}: its header is not a JSON object")
+    return header, 8 + size
+
+
+def _tensor(header: Mapping[str, object], name: str, data: bytearray) -> torch.Tensor:
+    """Tensor NAME of a safetensors file whose data (after the header) is DATA, on the GPU."""
+    import torch
+
+    spec = header.get(name)
+    if not isinstance(spec, dict) or spec.get("dtype") not in _DTYPES:
+        raise ValueError(f"a capture's {name} is not a BF16, F16 or F32 tensor: {spec!r}")
+    dtype = getattr(torch, _DTYPES[spec["dtype"]])
+    lo, hi = (int(n) for n in spec["data_offsets"])
+    count = (hi - lo) // torch.empty((), dtype=dtype).element_size()
+    flat = torch.frombuffer(data, dtype=dtype, count=count, offset=lo)
+    return flat.view(tuple(int(n) for n in spec["shape"])).to("cuda:0")
+
+
 def corpus(directory: str) -> list[Captured]:
     """Every capture under DIRECTORY (`<model>/<request id>/*.safetensors`), by path."""
-    from safetensors import safe_open
 
     root = Path(directory)
     if not root.is_dir():
         raise ValueError(f"no corpus directory {directory}")
     found: list[Captured] = []
     for file in sorted(root.rglob("*.safetensors")):
-        with safe_open(str(file), "pt") as held:
-            facts = json.loads((held.metadata() or {}).get("facts", "{}"))
+        meta = _header(file)[0].get("__metadata__")
+        facts = json.loads(meta.get("facts", "{}")) if isinstance(meta, dict) else {}
         found.append(Captured(file, str(file.relative_to(root)), facts))
     return found
 
