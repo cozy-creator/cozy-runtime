@@ -450,8 +450,9 @@ def prefetch_rule() -> Row:
 
 @case
 def fill_paths_agree() -> Row:
-    """One fill path: a store read, its page and its derive land the same bytes; the tier pins a
-    page only once its Region has left the card; alternating Regions refill nothing."""
+    """One fill path: a store read, a copy from a resident Region holding the same stored bytes, its
+    page and its derive land the same bytes; the tier pins a page only once its Region has left the
+    card; alternating Regions refill nothing."""
     with tempfile.TemporaryDirectory() as directory:
         writer = tensorfs.Writer(Path(directory) / "raw.cozytensors")
         source = torch.arange(4 * MIB, dtype=torch.uint8)
@@ -489,8 +490,10 @@ def fill_paths_agree() -> Row:
         same(stored, source)
         assert origins() == ["store"]
         assert not tier.pending(), "a resident page is not pinned"
+        # Its stored bytes are on the card already, in `stored`: copied from there, not read again (TensorFS 506874c07).
         same(baked, source + 1)
-        assert len(calls) == 1 and origins() == ["store"]
+        seen = origins()
+        assert len(calls) == 1 and seen == ["resident"], (calls, seen)
         # Both off the card: the stored page pins at idle, the baked one was kept at its bake.
         give_back()
         assert not stored.resident and not baked.resident
@@ -499,7 +502,8 @@ def fill_paths_agree() -> Row:
         assert not tier.pending() and tier.stats()["pages"] == 2, tier.stats()
         same(stored, source)
         same(baked, source + 1)
-        assert origins() == ["baked", "baked"] and len(calls) == 1, "a kept page bakes nothing"
+        seen = origins()
+        assert seen == ["baked", "baked"] and len(calls) == 1, ("a kept page bakes nothing", calls, seen)
         # Resident, both Regions serve with no fill at all.
         same(stored, source)
         same(baked, source + 1)
