@@ -117,8 +117,8 @@ _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", defa
 #: one has no tally, and nothing is marked.
 _ESCAPES = hasattr(vt, "pass_mark")
 #: TensorFS keeps a derive's pages on disk for later processes and reads pages ahead of their use
-#: (`varena.Pages.stage`); an older one keeps them for the process and reads on demand.
-_DERIVED = hasattr(varena.Pages, "stage")
+#: (`varena.Pages.read_ahead`); an older one keeps them for the process and reads on demand.
+_DERIVED = hasattr(varena.Pages, "read_ahead")
 _U64 = (1 << 64) - 1
 #: Escaped bytes a run's warning names.
 _NOTED = 256 << 20
@@ -1945,12 +1945,12 @@ class Memory:
                 self._read_ahead(names)
 
     def _read_ahead(self, names: frozenset[str], *, current: bool = False) -> None:
-        """TensorFS reads pages into pinned host RAM ahead of their use (`Pages.stage`), within free
-        room, while this phase runs: the models of this phase's packages that the request has not
-        used yet, the largest first (text encoding reads the transformer's). This phase's own go
-        before them when the last read ahead had them coming (its read goes on), or `current`: an
-        overlay armed inside its forward moved its blocks. A page a derive made in an earlier
-        process is read from disk, made again by no one."""
+        """TensorFS reads pages into pinned host RAM ahead of their use (`Pages.read_ahead`),
+        within free room, while this phase runs: the models of this phase's packages that the
+        request has not used yet, the largest first (text encoding reads the transformer's). This
+        phase's own go before them when the last read ahead had them coming (its read goes on),
+        or `current`: an overlay armed inside its forward moved its blocks. A page a derive made
+        in an earlier process is read from disk, made again by no one."""
         request = _REQUEST.get()
         if not _DERIVED or self.pages is None or request is None or request.idle:
             return
@@ -1970,8 +1970,9 @@ class Memory:
         reading = (active if current else []) + later
         self._staging = [source for model in reading for source in self._staged(model)]
         # A newer TensorFS's (`_DERIVED`), which the pinned stubs do not know yet.
-        stage: Callable[[list[varena.Source]], None] = getattr(self._tier(), "stage")  # noqa: B009
-        stage(self._staging)
+        tier = self._tier()
+        read: Callable[[list[varena.Source]], None] = getattr(tier, "read_ahead")  # noqa: B009
+        read(self._staging)
 
     def _staged(self, model: Model) -> list[varena.Source]:
         """`model`'s raw pages' Sources in block order, under the fill identity its next use wants:
@@ -2742,8 +2743,8 @@ class Request:
         self.torch_peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
         #: origin -> [bytes, fills, ns]: the store, a kept page (`baked`), another set's stored
-        #: bytes on this GPU (`resident`) or in its kept page (`host`), a derived page on disk
-        #: (`derived`), or a derive's stored bytes the tier read ahead (`staged`)
+        #: bytes on this GPU (`resident`) or in a kept page (`host`, a derive's own read ahead too),
+        #: or a derived page on disk (`derived`)
         self.moved = {origin: [0, 0, 0] for origin in ("store", "baked", "resident", "host")}
         #: each baked fill's trace entry and its bake (`Bake`), resolved when the request ends
         self.bakes: list[tuple[FillEntry | _BakeTimes, Bake]] = []
