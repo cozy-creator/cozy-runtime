@@ -76,7 +76,7 @@ def attention_quality(
 
 def gemm_speed(ctx: Context, *, lanes: str = "", shapes: str = "", seed: int = 177) -> Measured:
     """Every GEMM candidate of each lane (`lanes`, comma-separated; empty is every one) at our packages' shapes
-    (`shapes`: shape ids or model names, comma-separated; empty is every one), interleaved, three rounds, beside the
+    (`shapes`: shape ids or model names, comma-separated; empty is every one), interleaved a sample at a time, beside the
     pick the Runtime's rule makes (xs-177)."""
     from cozy_runtime.internal.bench import gemm
 

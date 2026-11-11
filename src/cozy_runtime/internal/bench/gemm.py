@@ -2,7 +2,7 @@
 linear with, timed at our packages' real shapes beside the pick the Runtime's rule makes today (`int8_linear`,
 `fp8_linear`, `nvfp4_linear`, `prebuilt`). Nothing here ranks: the release gate's `suites/gemm` reads the JSON.
 
-- `speed`: per shape, every candidate of every lane in one interleaved set, three rounds. A `gemm:` candidate multiplies
+- `speed`: per shape, every candidate of every lane in one interleaved set, a sample of each a round. A `gemm:` candidate multiplies
   an operand already quantized (as a block's shared quantize hands it); a `linear:` one starts from the bf16 rows.
   Each tile's output is held to the rule's, bit for bit, on its first and last rows (`same_bits`).
 - `tiles`: two of the Runtime's Triton kernels (nvfp4's weight decode and its GEMV) over tile settings that leave every
@@ -11,6 +11,8 @@ Operands are random and seeded; the pod's clocks are TensorD's NVML reads of the
 
 from __future__ import annotations
 
+import math
+import random
 import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -29,7 +31,12 @@ from cozy_runtime.internal.bench.attention import _device, _quantiles, _timed, _
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP
 
 BF16 = torch.bfloat16
-_ROUNDS, _MIN_SAMPLES, _MAX_SAMPLES, _MIN_MS = 3, 3, 100, 60.0
+#: One sample of each call a round, in turns, so every call sees the clocks the others see: a power-limited card
+#: (H100: config -1 and its own explicit tile 19% apart under bursts of one call) drifts within a burst.
+_ROUNDS = 15
+#: A sample's calls between two events: at least this long, so short GEMMs are not launch-bound.
+_SAMPLE_MS = 2.0
+_MAX_REPS = 64
 _FLUSH_BYTES = 256 << 20
 #: Rows held bit for bit at each end of an output: a tile's sums are its own, whatever the row.
 _EDGE = 2048
@@ -80,7 +87,7 @@ Call = Callable[[], object]
 
 
 class Timed(TypedDict):
-    """ms per call (median, p10, p90 over every call) and the spread of the three round medians over their median."""
+    """ms per call (median, p10, p90 over the samples) and the clocks' drift over the rounds (`_interleaved`)."""
 
     ms: list[float]
     spread: float
@@ -334,24 +341,41 @@ def _edges(out: object) -> tuple[torch.Tensor, torch.Tensor] | None:
     return out[:_EDGE].clone(), out[-_EDGE:].clone()
 
 
+def _sample(call: Call, reps: int, flush: torch.Tensor | None) -> float:
+    """ms per call over `reps` calls between two events; one call after an L2 flush when one is given."""
+    if flush is not None:
+        return _timed(call, flush)
+    begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    begin.record()
+    for _ in range(reps):
+        call()
+    end.record()
+    end.synchronize()
+    return float(begin.elapsed_time(end)) / reps
+
+
 def _interleaved(calls: dict[str, Call], flush: torch.Tensor | None) -> dict[str, Timed]:
-    """Each call warmed, then three rounds, each starting one call later, at least `_MIN_MS` per call a round."""
-    for call in calls.values():
+    """Each call warmed, then `_ROUNDS` rounds of one sample each, every round in its own seeded order, so no call
+    always follows the same neighbour. `spread` is the gap between the medians of the first and last thirds of the
+    rounds over the median: the clocks' drift."""
+    reps: dict[str, int] = {}
+    for name, call in calls.items():
         _warm(call)
+        reps[name] = max(1, min(_MAX_REPS, math.ceil(_SAMPLE_MS / max(_timed(call, None), 1e-3))))
     names = list(calls)
-    samples: dict[str, list[list[float]]] = {name: [] for name in names}
-    for turn in range(_ROUNDS):
-        for name in names[turn % len(names) :] + names[: turn % len(names)]:
-            got: list[float] = []
-            while len(got) < _MAX_SAMPLES and (len(got) < _MIN_SAMPLES or sum(got) < _MIN_MS):
-                got.append(_timed(calls[name], flush))
-            samples[name].append(got)
+    samples: dict[str, list[float]] = {name: [] for name in names}
+    for turn in range(_ROUNDS if names else 0):
+        order = names[:]
+        random.Random(turn).shuffle(order)
+        for name in order:
+            samples[name].append(_sample(calls[name], reps[name], flush))
     times: dict[str, Timed] = {}
-    for name, rounds in samples.items():
-        medians = [statistics.median(r) for r in rounds]
-        middle = statistics.median(medians)
-        spread = round((max(medians) - min(medians)) / middle, 5) if middle > 0 else 0.0
-        times[name] = {"ms": _quantiles([v for r in rounds for v in r]), "spread": spread}
+    third = max(1, _ROUNDS // 3)
+    for name, got in samples.items():
+        middle = statistics.median(got)
+        first, last = statistics.median(got[:third]), statistics.median(got[-third:])
+        spread = round(abs(last - first) / middle, 5) if middle > 0 else 0.0
+        times[name] = {"ms": _quantiles(got), "spread": spread}
     return times
 
 
