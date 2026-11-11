@@ -38,10 +38,17 @@ def attention_inventory(ctx: Context) -> Measured:
 
 
 def attention_speed(
-    ctx: Context, tel: Telemetry, *, kernels: str = "", points: str = "", seed: int = 171
+    ctx: Context,
+    tel: Telemetry,
+    *,
+    kernels: str = "",
+    points: str = "",
+    seed: int = 171,
+    corpus: str = "",
 ) -> Measured:
     """`kernels` (comma-separated; SDPA joins as the anchor) timed over the grid's points (`points`, comma-separated
-    ids; empty is every one), interleaved, three rounds. Its progress counts points under the stage "measure", not a
+    ids; empty is every one), interleaved, three rounds; with `corpus` (a capture directory on this machine) the sparse
+    points take its H3 sparse steps' Q/K/V and layouts. Its progress counts points under the stage "measure", not a
     sampler's steps."""
     from cozy_runtime.internal.bench import attention
 
@@ -49,16 +56,19 @@ def attention_speed(
     wanted = {p for p in points.split(",") if p}
     chosen = [p for p in attention.GRID if not wanted or p.id in wanted]
     with tel.stage("measure"):
-        return _run(lambda: attention.speed(names, chosen, seed, ctx))
+        return _run(lambda: attention.speed(names, chosen, seed, ctx, corpus))
 
 
-def attention_quality(ctx: Context, tel: Telemetry, *, kernel: str, seed: int = 171) -> Measured:
+def attention_quality(
+    ctx: Context, tel: Telemetry, *, kernel: str, seed: int = 171, corpus: str = ""
+) -> Measured:
     """`kernel`'s worst-head relative L2 against FP32 attention on every site, with the best answer a kernel could give
-    without computing. Its progress counts sites under the stage "measure"."""
+    without computing; with `corpus` (a capture directory on this machine) every capture at the kernel's layout and at
+    or below its level is a site too (`kind` "captured"). Its progress counts sites under the stage "measure"."""
     from cozy_runtime.internal.bench import attention
 
     with tel.stage("measure"):
-        return _run(lambda: attention.quality(kernel, seed, ctx))
+        return _run(lambda: attention.quality(kernel, seed, ctx, corpus))
 
 
 def kernels_inventory(ctx: Context) -> Measured:

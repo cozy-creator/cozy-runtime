@@ -1149,6 +1149,8 @@ class Executor:
         self.device_facts: DeviceFacts | None = None
         #: The hardware class attention selected for (`arch.klass`): the group's, in a group.
         self.attention_class = ""
+        #: the model's `attention_bits`: each site's level (`attention.level`)
+        self.attention_bits: int | Mapping[str, int] = 16
         #: a follower's hold of rank 0's attention selection for the current attempt
         self._attention_hold = contextlib.ExitStack()
         self._producer_hold: tuple[str, dict[str, object]] | None = None
@@ -2910,6 +2912,7 @@ class Executor:
             applied = self._reselect()
             self.device_facts = device_facts
             self.attention_class = arch.klass(group_row or attention.device_row(device_facts))
+            self.attention_bits = type(model).__attention_bits__
             stage("attention_pin")
         except (attention.AttentionRefusal, _PlanRefusal) as exc:
             backend.poison(())
@@ -3447,14 +3450,18 @@ class Executor:
                 return target._unadmitted(command) or {}
             # Dev-only (`cozy run --attention-capture`): TensorFS carries it from 0.25.
             capture = str(getattr(command, "attention_capture", "") or "")
-            sites: Sequence[tuple[str, str, object]] = ()
+            sites: Sequence[tuple[str, str, object, int]] = ()
             if capture:
                 try:
                     attention_capture.parse(capture)
                 except ValueError as exc:
                     return {"ok": False, "code": "attention_capture_invalid", "detail": str(exc)}
-                roots = target._attention_roots()
-                sites = [(c, path, m) for c, path, m, _ in attention._attention_records(roots)]
+                sites = [
+                    (c, path, m, attention.level(member.attention_bits, c, path))
+                    for member in target.model_executors or [target]
+                    if member.backend is not None
+                    for c, path, m, _ in attention._attention_records(member._attention_roots())
+                ]
             with attention_capture.capturing(capture, command.request_id, sites):
                 reply = target.invoke(command, prepared, slot)
         self.attempts += 1

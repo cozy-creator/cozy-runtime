@@ -5,10 +5,12 @@ the machine for the attention suite's corpus (xs-171).
 SPEC is JSON: `{"dir": "/abs/path", "sites": ["fl2va_dit/transformer_blocks.0.attn", ...],
 "calls": [0, 3], "heads": 4, "seed": 0}`. `sites` are fnmatch patterns on `component/path`
 (none: the census alone); `calls` the per-site call ordinals within the request (none: every
-call); `heads` how many heads a capture keeps: the two whose keys have the largest max/RMS, the
+call); `heads` how many heads a capture keeps: the one whose keys have the largest max/RMS, the
 rest seeded at random. Each process writes under `dir/<request id>/`: `census.jsonl`, one row
 per call, and one safetensors file per captured call, BF16 `query`/`key`/`value` of the kept
-heads over the whole sequence, its facts in the header. The record is taken in
+heads over the whole sequence, its facts in the header (with `heads`, the kept heads, and
+`crest`). Each row names the site's `level` (16/8/4, as it runs) and `exact` (an exact path's
+rows or keys with outlier channels: what a kernel is held to at 16). The record is taken in
 `attention_ulysses._call` after the band pick, so it is what the kernel receives: after norms
 and RoPE, after Ulysses' exchange (the full sequence of this rank's heads). Rank 0 only.
 
@@ -37,7 +39,7 @@ import msgspec
 
 from cozy_runtime.accel.attention import _ACTIVE_LAYOUT
 from cozy_runtime.author._services import STEP_NOW
-from cozy_runtime.internal import attention_ulysses
+from cozy_runtime.internal import attention_sol, attention_ulysses
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -68,8 +70,11 @@ _SITE: ContextVar[str] = ContextVar("cozy_capture_site", default="")
 
 
 class _Capture:
-    def __init__(self, spec: Spec, out: Path, names: dict[int, str]) -> None:
-        self.spec, self.out, self.names = spec, out, names
+    def __init__(
+        self, spec: Spec, out: Path, names: dict[int, str], sites: dict[str, tuple[object, int]]
+    ) -> None:
+        #: module id -> site name; site name -> (module, the level the site runs at)
+        self.spec, self.out, self.names, self.sites = spec, out, names, sites
         self.calls: dict[str, int] = {}
         self.census = (out / "census.jsonl").open("a")
 
@@ -105,12 +110,22 @@ class _Capture:
         progress = STEP_NOW.get()
         if progress is not None:  # the Runtime's count: a model may declare one layout per phase
             facts["stage"], facts["step"] = progress
+        held = self.sites.get(site)
+        if held is not None:
+            module, facts["level"] = held
+            path = site.partition("/")[2]
+            on = layout is not None and any(
+                path == p or path.startswith(p + ".") for p in layout.exact_paths
+            )
+            # An exact path's rows, or keys whose gain has outlier channels: judged at 16.
+            facts["exact"] = on or attention_sol.outlier_keys(getattr(module, "norm_k", None))
         if layout is not None:
             facts["layout"] = {
                 "step": layout.step,
                 "live_tokens": layout.live_tokens,
                 "protected_prefix": layout.protected_prefix,
                 "dense_until_step": layout.dense_until_step,
+                "tau": layout.tau,
                 "sparse": layout.sparse,
             }
         wanted = bool(site) and any(fnmatch.fnmatchcase(site, p) for p in self.spec.sites)
@@ -138,7 +153,7 @@ class _Capture:
         alike = int(key.shape[2]) == heads  # else fewer K/V heads (GQA): kept whole
         k = (key if alike else query).float()
         crest = k.abs().amax(dim=(0, 1, 3)) / k.square().mean(dim=(0, 1, 3)).sqrt().clamp_min(1e-12)
-        top = [int(h) for h in torch.argsort(crest, descending=True)[: min(2, kept)].tolist()]
+        top = [int(h) for h in torch.argsort(crest, descending=True)[: min(1, kept)].tolist()]
         rest = [h for h in range(heads) if h not in top]
         seeded = random.Random(f"{self.spec.seed}:{site}:{ordinal}")
         chosen = sorted(top + seeded.sample(rest, kept - len(top)))
@@ -191,21 +206,21 @@ def _wrapped(module: Module, site: str) -> Any:  # type: ignore[explicit-any]  #
 
 @contextmanager
 def capturing(
-    text: str, request_id: str, sites: Sequence[tuple[str, str, object]]
+    text: str, request_id: str, sites: Sequence[tuple[str, str, object, int]]
 ) -> Iterator[None]:
     """Within it, this process's attention calls are captured per SPEC (TEXT); SITES are every
-    attention module of this construction (component, module path, module)."""
+    attention module of this construction (component, module path, module, its level)."""
     if not text:
         yield
         return
     spec = parse(text)
     out = Path(spec.dir) / request_id
     out.mkdir(parents=True, exist_ok=True)
-    names = {id(m): f"{component.rsplit('/', 1)[-1]}/{path}" for component, path, m in sites}
-    capture = _Capture(spec, out, names)
+    names = {id(m): f"{component.rsplit('/', 1)[-1]}/{path}" for component, path, m, _ in sites}
+    capture = _Capture(spec, out, names, {names[id(m)]: (m, at) for _, _, m, at in sites})
     handles = [
         handle
-        for _, _, module in sites
+        for _, _, module, _ in sites
         for handle in _wrapped(cast("Module", module), names[id(module)])
     ]
     token = attention_ulysses.CAPTURE.set(capture)
