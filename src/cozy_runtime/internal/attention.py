@@ -366,12 +366,11 @@ def retired(pin: str) -> str:
 
 #: Each family's kernels per attention level, best first (precision-tiers §2.4; the order is
 #: the release gate's measurements). A site walks its level's cell, each level above, then SDPA.
+#: No cell lists a 4-bit kernel (Paul, 11-11: in H3 it loses small details, the seagulls, and
+#: gains little speed): a site whose model tolerates 4 bits serves 8-bit kernels; 4-bit ones
+#: serve only by pin, until a measured quality pass and an eye check list them (xs-171).
 DENSE: dict[str, dict[int, tuple[str, ...]]] = {
-    arch.MMA_SYNC: {
-        16: ("sdpa",),
-        8: ("kitchen-int8", "sageattention"),
-        4: ("sageattention3-fp4", "kitchen-int4qk"),
-    },
+    arch.MMA_SYNC: {16: ("sdpa",), 8: ("kitchen-int8", "sageattention")},
     arch.WGMMA: {16: ("flash-attn3",), 8: ("sageattention",)},
     arch.TCGEN05: {16: ("cudnn",), 8: ("flash-attn4-fp8",)},
 }
@@ -381,15 +380,9 @@ DENSE: dict[str, dict[int, tuple[str, ...]]] = {
 #: tiles take its dense rows' precision (`attention_sol_fa4`), so its 8-bit cell is empty and a
 #: site steps up to it. mma.sync's 8-bit cell is Kitchen's INT8 Sol: INT8 runs 2x BF16 there, 4x
 #: on GeForce (half-rate FP32 accumulation), and BF16 Sol's exact blocks alone outlast Kitchen's
-#: whole sparse step (H3 15 s, RTX 4090: 23 s at peak). Its 4-bit cell is FP4 on FP4 rows, else INT4
-#: Q·Kᵀ on int4 rows (owner, 10-31: no difference he can see from 8-bit; H3 Turbo 15 s on an RTX
-#: 4090 1.10x end to end).
+#: whole sparse step (H3 15 s, RTX 4090: 23 s at peak).
 SPARSE: dict[str, dict[int, tuple[str, ...]]] = {
-    arch.MMA_SYNC: {
-        16: ("sol-attn",),
-        8: ("kitchen-sol",),
-        4: ("kitchen-sol-fp4-fixed-means", "kitchen-sol-fp4-lowmem", "kitchen-sol-int4qk"),
-    },
+    arch.MMA_SYNC: {16: ("sol-attn",), 8: ("kitchen-sol",)},
     arch.WGMMA: {16: ("sol-attn",), 8: ("sol-attn-sage2-fixed-kmean",)},
     arch.TCGEN05: {16: ("sol-attn",)},
 }
@@ -405,6 +398,9 @@ _MISFILED = [
 ]
 if _MISFILED:
     raise ValueError(f"attention cells hold kernels of another precision: {_MISFILED}")
+_FOUR_BIT = [f"{f} {at}" for t in (DENSE, SPARSE) for f, c in t.items() for at in c if at < 8]
+if _FOUR_BIT:  # a measured pass and an eye check lift this for a class (xs-171), never by hand
+    raise ValueError(f"4-bit attention serves only by pin: {_FOUR_BIT}")
 #: The pin of a request at 16 bits: every site in its scope at level 16.
 EXACT = "exact"
 #: Package producers' candidates, each derived once from its registration.
@@ -501,7 +497,8 @@ def _off_row(candidate: Candidate, row: arch.Row) -> str:
 
 def level(bits: int | Mapping[str, int], component: str, path: str) -> int:
     """A site's attention level from the model's `attention_bits`: the integer, or the longest
-    component-qualified prefix that names the site; unlisted sites 16."""
+    component-qualified prefix that names the site; unlisted sites 16. A level of 4 walks the
+    8-bit cells, since no cell lists a 4-bit kernel (`DENSE`)."""
     if isinstance(bits, int):
         return bits
     site = f"{component.rsplit('/', 1)[-1]}.{path}"
