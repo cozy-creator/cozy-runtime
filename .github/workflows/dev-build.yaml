@@ -129,7 +129,7 @@ jobs:
     env:
       SDK_RELEASE: https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.24.3
       SDK_WHEEL: tensorfs-0.24.3-cp311-abi3-manylinux_2_28_x86_64.whl
-      SDK_MANIFEST_SHA: c85b6d4291e06e04c84fa7d714fcd509aeb7f63b7653a2ecc859d44d49ddb664
+      SDK_MANIFEST_SHA: PENDING_FINAL_0243_CANDIDATE_MANIFEST
       OLD_CANDIDATE_DIR: /home/fidika/cozy/.worktrees/cozy-runtime/xs170-sdk-cohort/.task/qualification/candidate-v0.24.2/assets
       COORDINATOR_CANDIDATE_DIR: /home/fidika/cozy/.worktrees/cozy-runtime/xs170-sdk-0243/.task/qualification/candidate-v0.24.3/assets
       SDK_SOURCE: 3e1691a6558be86a356aa06e2be00b6f0c27dbba
@@ -151,6 +151,7 @@ jobs:
       - name: Download and verify the actual SDK candidate
         run: |
           set -euo pipefail
+          [[ "$SDK_MANIFEST_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::The final SDK0.24.3 manifest is not available; do not run candidate qualification yet.'; exit 1; }
           curl -fLsS --retry 3 "$SDK_RELEASE/SHA256SUMS" -o "$RUNNER_TEMP/sdk-candidate/SHA256SUMS"
           printf '%s  %s\n' "$SDK_MANIFEST_SHA" "$RUNNER_TEMP/sdk-candidate/SHA256SUMS" | sha256sum -c -
           for file in "$SDK_WHEEL" tensorfs-0.24.3.tar.gz; do
