@@ -365,6 +365,32 @@ def measured(
         return Links(reason=f"the links could not be measured: {exc}")
 
 
+def demote(directory: Path | None, devices: Sequence[str], detail: str) -> None:
+    """A group of `devices` stalled forming over NCCL's peer memory: this boot's measurements
+    holding them all keep NCCL to NVLink from now on (`Links.nccl`), saying why. One probe group
+    that formed proves the route works once, not that it always does (cr-263)."""
+    if directory is None:
+        return
+    boot = _boot()
+    with (
+        contextlib.suppress(OSError, ValueError, KeyError),
+        open(directory / f"{boot}.lock", "a+") as lock,
+    ):
+        filelock.lock(lock)
+        for path in sorted(directory.glob(f"{boot}-*.json")):
+            document = json.loads(path.read_text())
+            if not set(devices) <= set(document["devices"]):
+                continue
+            document["processes"] = {
+                **document["processes"],
+                "nccl_peer": False,
+                "detail": detail[:300],
+            }
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(document))
+            temporary.replace(path)
+
+
 def _probe(devices: Sequence[str]) -> Links:
     """Run the probe child, reading its lines until its exit or its group's row: that result is
     kept, and whatever of the probe is still tearing down is ended. Its pairs end by the child's
