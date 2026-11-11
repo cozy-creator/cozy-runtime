@@ -1,0 +1,1 @@
+A package that imports a cozy package its uv.lock does not lock is refused `unlocked_dependency` with what is actually wrong: when [project].dependencies names it, the lock is missing or older than them (`cozy run` locks it); when it does not, add it there.
