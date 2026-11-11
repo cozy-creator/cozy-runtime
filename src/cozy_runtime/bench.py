@@ -101,8 +101,27 @@ def kernel_ready(ctx: Context, *, mode: str, seed: int = 202610270201) -> Measur
 def varena_core(ctx: Context, *, case: str) -> Measured:
     """`case`, one of varena's rules that only the Runtime's own adapter reaches (`internal/bench/varena_cases.py`), in a
     fresh process: varena's allocator installs there before CUDA starts. Raises when it fails."""
+    from tensorfs.varena import _runtime as varena
+
     command = [sys.executable, "-I", "-B", "-m", "cozy_runtime.internal.bench.varena_cases", case]
     lines: list[str] = []
+    device = ctx.device.index or 0
+    # The child is this call's only GPU work, and its cases model a process beside no request: an idle tier pins nothing
+    # while a peer is in one (TensorFS a563efcd6). So this executor steps out of its request until the child ends.
+    varena.request_boundary(device, begin=False)
+    try:
+        code = _child(command, lines, ctx)
+    finally:
+        varena.request_boundary(device, begin=True)
+    rows = [json.loads(line) for line in lines if line.startswith("{")]
+    found = {"case": case, "exit": code, "rows": rows, "tail": lines[-40:] if code else []}
+    if code:
+        raise RuntimeError(f"varena case {case} failed: {json.dumps(found)[-4000:]}")
+    return Measured(json.dumps(found, sort_keys=True))
+
+
+def _child(command: list[str], lines: list[str], ctx: Context) -> int:
+    """`command`'s exit code, its output lines into `lines`; killed when the call is canceled."""
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as child:
         assert child.stdout is not None
         try:
@@ -112,11 +131,7 @@ def varena_core(ctx: Context, *, case: str) -> Measured:
         except BaseException:
             child.kill()
             raise
-    rows = [json.loads(line) for line in lines if line.startswith("{")]
-    found = {"case": case, "exit": child.returncode, "rows": rows, "tail": lines[-40:] if child.returncode else []}
-    if child.returncode:
-        raise RuntimeError(f"varena case {case} failed: {json.dumps(found)[-4000:]}")
-    return Measured(json.dumps(found, sort_keys=True))
+    return child.returncode
 
 
 def offload_in_executor(ctx: Context) -> Measured:
