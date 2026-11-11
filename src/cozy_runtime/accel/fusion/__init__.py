@@ -701,14 +701,17 @@ def _attend(
             )
             for norm, t in zip(site.qk, (q, k), strict=True)
         )
+    from cozy_runtime.internal import attention_capture
+
     processor = site.attention.processor
-    attended = dispatch_attention_fn(
-        q,
-        k,
-        v,
-        backend=processor._attention_backend,
-        parallel_config=processor._parallel_config,
-    )
+    with attention_capture.at(site.attention):  # the module is not called: name its site
+        attended = dispatch_attention_fn(
+            q,
+            k,
+            v,
+            backend=processor._attention_backend,
+            parallel_config=processor._parallel_config,
+        )
     return cast("_Linear", site.out)(attended.flatten(2))  # a composed site has its `to_out`
 
 

@@ -8,17 +8,20 @@ release gate's `suites/attention/collect.py` gathers.
 - `quality`: one kernel's error per head against FP32 attention on every site.
 
 The pod's clock, temperature and throttling are TensorD's NVML reads of the call, in its record. Q/K/V are synthetic
-(`rng.counter_noise`: seeded random, outlier rows, and block-routable for sparse kernels) until the corpus of captured
-activations exists."""
+(`rng.counter_noise`: seeded random, outlier rows, and block-routable for sparse kernels), and, given a `corpus` (a
+directory of `cozy run --attention-capture` captures on the machine), also real: each capture is a quality site, and
+the sparse speed points take an H3 sparse step's Q/K/V with its layout."""
 
 from __future__ import annotations
 
 import contextlib
+import json
 import statistics
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 from cozy_runtime import _build_provenance, rng
@@ -301,13 +304,14 @@ class Opened:
         return self.ready.candidate.refusal(q, k, _OPTIONS)
 
     @contextlib.contextmanager
-    def step(self, point: Point) -> Iterator[Callable[[], int]]:
-        """A sparse kernel's call at a sparse point is a sparse step of a Sol site, whose sparse calls are counted."""
+    def step(self, point: Point, layout: AttentionLayout | None = None) -> Iterator[Callable[[], int]]:
+        """A sparse kernel's call at a sparse point is a sparse step of a Sol site, whose sparse calls are counted:
+        under LAYOUT (a capture's), else H3's at POINT's length."""
         if not (self.sparse and point.layout == "sparse"):
             yield lambda: 0
             return
-        layout = AttentionLayout(live_tokens=point.lq, protected_prefix=_PREFIX, step=_SPARSE_STEP,
-                                 dense_until_step=_SPARSE_STEP)  # fmt: skip
+        layout = layout or AttentionLayout(live_tokens=point.lq, protected_prefix=_PREFIX, step=_SPARSE_STEP,
+                                           dense_until_step=_SPARSE_STEP)  # fmt: skip
         site = attention_sol._SITE.set(attention_sol.Site("attention-bench", "attn"))
         try:
             with attention_scope(layout), attention_sol.observing() as counts:
@@ -351,6 +355,79 @@ def _alive() -> bool:
     return True
 
 
+# ---- the captured corpus
+
+
+@dataclass(frozen=True, slots=True)
+class Captured:
+    """One capture (`attention_capture`): its file under the corpus directory and its facts header."""
+
+    file: Path
+    name: str
+    facts: Mapping[str, object]
+
+    @property
+    def layout(self) -> AttentionLayout | None:
+        held = self.facts.get("layout")
+        if not isinstance(held, dict) or not held.get("sparse"):
+            return None
+        return AttentionLayout(
+            live_tokens=int(held["live_tokens"]), protected_prefix=int(held["protected_prefix"]),
+            step=int(held["step"]), dense_until_step=int(held["dense_until_step"]), tau=float(held.get("tau", 1.0)),
+        )  # fmt: skip
+
+    @property
+    def level(self) -> int:
+        """The level its site runs at; an exact path's rows (or outlier keys) are held to 16."""
+        held = self.facts.get("level", 16)
+        return 16 if self.facts.get("exact") else int(held) if isinstance(held, int) else 16
+
+    def point(self) -> Point:
+        q, k = (_shape(self.facts[n]) for n in ("query", "key"))
+        heads = self.facts.get("heads")
+        kept = len(heads) if isinstance(heads, list) else q[2]
+        return Point(q[0], q[1], k[1], kept, q[3], layout="sparse" if self.layout is not None else "dense")
+
+    def operands(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from safetensors.torch import load_file
+
+        held = load_file(str(self.file), device="cuda:0")
+        return held["query"], held["key"], held["value"]
+
+
+def _shape(value: object) -> tuple[int, int, int, int]:
+    if not (isinstance(value, list) and len(value) == 4 and all(isinstance(n, int) for n in value)):
+        raise ValueError(f"a capture's shape is four ints, not {value!r}")
+    return value[0], value[1], value[2], value[3]
+
+
+def corpus(directory: str) -> list[Captured]:
+    """Every capture under DIRECTORY (`<model>/<request id>/*.safetensors`), by path."""
+    from safetensors import safe_open
+
+    root = Path(directory)
+    if not root.is_dir():
+        raise ValueError(f"no corpus directory {directory}")
+    found: list[Captured] = []
+    for file in sorted(root.rglob("*.safetensors")):
+        with safe_open(str(file), "pt") as held:
+            facts = json.loads((held.metadata() or {}).get("facts", "{}"))
+        found.append(Captured(file, str(file.relative_to(root)), facts))
+    return found
+
+
+def _tiled(t: torch.Tensor, heads: int) -> torch.Tensor:
+    """T's heads repeated to HEADS: a captured head subset at a point's head count."""
+    return t.repeat(1, 1, -(-heads // t.shape[2]), 1)[:, :, :heads].contiguous()
+
+
+def _sparse_capture(captures: list[Captured], tokens: int) -> Captured | None:
+    """The sparse-step capture nearest TOKENS in length, within 10%."""
+    held = [c for c in captures if c.layout is not None]
+    best = min(held, key=lambda c: abs(c.point().lq - tokens), default=None)
+    return best if best is not None and abs(best.point().lq - tokens) <= tokens // 10 else None
+
+
 # ---- speed
 
 
@@ -387,7 +464,7 @@ def _quantiles(values: list[float]) -> list[float]:
     return [round(statistics.median(ordered), 5), round(at(0.1), 5), round(at(0.9), 5)]
 
 
-def speed(names: list[str], points: list[Point], seed: int, ctx: Context) -> Speed:
+def speed(names: list[str], points: list[Point], seed: int, ctx: Context, directory: str = "") -> Speed:
     import torch
 
     device = _device()
@@ -401,9 +478,18 @@ def speed(names: list[str], points: list[Point], seed: int, ctx: Context) -> Spe
     flush = torch.empty(_FLUSH_BYTES, dtype=torch.uint8, device="cuda:0")
     l2 = int(torch.cuda.get_device_properties(0).L2_cache_size)
     results: list[PointResult] = []
+    captures = corpus(directory) if directory else []
     for at, point in enumerate(points):
         kind = "routable" if point.layout == "sparse" else "random"
-        q, k, v = _operands(point, kind, seed + at)
+        held = _sparse_capture(captures, point.lq) if point.layout == "sparse" else None
+        grid, data = point.id, f"synthetic:{kind}"
+        layout: AttentionLayout | None = None
+        if held is None:
+            q, k, v = _operands(point, kind, seed + at)
+        else:  # an H3 sparse step's own Q/K/V and layout, its heads repeated to the point's count
+            q, k, v = (_tiled(t, point.heads) for t in held.operands())
+            layout, data = held.layout, f"captured:{held.name}"
+            point = Point(point.batch, int(q.shape[1]), int(k.shape[1]), point.heads, point.dim, layout="sparse")
         fits = sum(t.numel() * t.element_size() for t in (q, k, v)) <= l2
         refused: dict[str, str] = {}
         failed: dict[str, str] = {}
@@ -419,7 +505,7 @@ def speed(names: list[str], points: list[Point], seed: int, ctx: Context) -> Spe
                 continue
             try:
                 kernel.prepare(q)
-                with kernel.step(point) as sparse_calls:
+                with kernel.step(point, layout) as sparse_calls:
                     _warm(partial(kernel, q, k, v))
                     if kernel.sparse and not sparse_calls():
                         failed[name] = "its sparse path did not run: a dense reference served"
@@ -436,7 +522,7 @@ def speed(names: list[str], points: list[Point], seed: int, ctx: Context) -> Spe
             for name in live[turn % len(live) :] + live[: turn % len(live)]:
                 kernel = opened[name]
                 got: list[float] = []
-                with kernel.step(point):
+                with kernel.step(point, layout):
                     while len(got) < _MAX_SAMPLES and (len(got) < _MIN_SAMPLES or sum(got) < _MIN_MS):
                         got.append(_timed(partial(kernel, q, k, v), flush if fits else None))
                 samples[name].append(got)
@@ -449,8 +535,8 @@ def speed(names: list[str], points: list[Point], seed: int, ctx: Context) -> Spe
                 "spread": round((max(medians) - min(medians)) / middle, 5) if middle > 0 else 0.0,
             }
         results.append({
-            "id": point.id, "batch": point.batch, "lq": point.lq, "lk": point.lk, "heads": point.heads,
-            "dim": point.dim, "dtype": point.dtype, "layout": point.layout, "data": f"synthetic:{kind}",
+            "id": grid, "batch": point.batch, "lq": point.lq, "lk": point.lk, "heads": point.heads,
+            "dim": point.dim, "dtype": point.dtype, "layout": point.layout, "data": data,
             "times": times, "refused": refused, "failed": failed,
         })  # fmt: skip
         del q, k, v
@@ -501,7 +587,34 @@ def _sparse_reference(device: DeviceFacts) -> str:
     return found[0] if found else ""
 
 
-def quality(name: str, seed: int, ctx: Context) -> Quality:
+@dataclass(frozen=True, slots=True)
+class _Case:
+    """One quality site: synthetic (`SITES`) or a capture's, with its operands and, for a sparse step, its layout."""
+
+    name: str
+    point: Point
+    kind: str
+    level: int
+    operands: Callable[[], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    layout: AttentionLayout | None = None
+
+
+def _cases(sparse: bool, level: int, seed: int, directory: str) -> tuple[list[_Case], int]:
+    """The synthetic sites of a kernel's layout, and the corpus's captures at its layout and at or below its LEVEL;
+    with how many captures the corpus holds."""
+    found = [
+        _Case(s.name, s.point, s.kind, s.level, partial(_operands, s.point, s.kind, seed + at))
+        for at, s in enumerate(SITES) if (s.point.layout == "sparse") == sparse
+    ]  # fmt: skip
+    captures = corpus(directory) if directory else []
+    found += [
+        _Case(c.name, c.point(), "captured", c.level, c.operands, c.layout)
+        for c in captures if (c.layout is not None) == sparse and c.level <= level
+    ]  # fmt: skip
+    return found, len(captures)
+
+
+def quality(name: str, seed: int, ctx: Context, directory: str = "") -> Quality:
     import torch
 
     device = _device()
@@ -510,21 +623,21 @@ def quality(name: str, seed: int, ctx: Context) -> Quality:
     ref16 = _open(reference, device) if reference else None
     errors: list[Error] = []
     skipped: dict[str, str] = {}
-    sites = [s for s in SITES if (s.point.layout == "sparse") == kernel.sparse]
-    for at, site in enumerate(sites):
-        q, k, v = _operands(site.point, site.kind, seed + at)
+    cases, captured = _cases(kernel.sparse, kernel.ready.candidate.level, seed, directory)
+    for at, case in enumerate(cases):
+        q, k, v = case.operands()
         why = kernel.refusal(q, k)
         if why:
-            skipped[site.name] = why
+            skipped[case.name] = why
             continue
         want = _reference(q, k, v)
         kernel.prepare(q)
-        with kernel.step(site.point) as sparse_calls:
+        with kernel.step(case.point, case.layout) as sparse_calls:
             got = kernel(q, k, v)
             calls = sparse_calls()
         heads = _per_head(got, want)
         error: Error = {
-            "site": site.name, "level": site.level, "kind": site.kind, "finite": bool(torch.isfinite(got).all()),
+            "site": case.name, "level": case.level, "kind": case.kind, "finite": bool(torch.isfinite(got).all()),
             "worst": round(max(heads), 6), "mean": round(sum(heads) / len(heads), 6),
             "cosine": round(_cosine(got, want), 6), "trivial": round(_trivial(v, want), 6),
         }  # fmt: skip
@@ -532,16 +645,16 @@ def quality(name: str, seed: int, ctx: Context) -> Quality:
             error["sparse_calls"] = calls
         if ref16 is not None:
             ref16.prepare(q)
-            with ref16.step(site.point):
+            with ref16.step(case.point, case.layout):
                 base = ref16(q, k, v)
             error["ref16"] = round(max(_per_head(got, base)), 6)
             error["ref16_fp32"] = round(max(_per_head(base, want)), 6)
         errors.append(error)
         del q, k, v, want, got
-        ctx.progress(at, len(sites))
+        ctx.progress(at, len(cases))
     return {
-        "inventory": inventory(), "kernel": name, "level": kernel.ready.candidate.level,
-        "reference": reference, "corpus": "synthetic", "errors": errors, "skipped": skipped,
+        "inventory": inventory(), "kernel": name, "level": kernel.ready.candidate.level, "reference": reference,
+        "corpus": f"captured:{captured}" if directory else "synthetic", "errors": errors, "skipped": skipped,
     }  # fmt: skip
 
 

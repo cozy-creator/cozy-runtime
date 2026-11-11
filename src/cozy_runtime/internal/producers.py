@@ -93,7 +93,10 @@ class Processor:
         return self.producer if self.backend in attention_ulysses.serves(self._site) else None
 
     def __call__(self, attn: Module, *args: object, **kwargs: object) -> Tensor:
-        if self.serving is None:
+        if self.serving is None or attention_ulysses.CAPTURE.get() is not None:
+            # Under a dev-only attention capture the site's own dispatch serves, its base Sol
+            # kernel with the layout, so `_call` counts and captures every call, sparse steps
+            # included: the attention table measures bases, never producers.
             return self.original(attn, *args, **kwargs)
         layout, state = _ACTIVE_LAYOUT.get(), self.producer.request_state()
         if layout is None or state is None:
