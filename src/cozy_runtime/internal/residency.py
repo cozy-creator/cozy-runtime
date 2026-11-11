@@ -1980,7 +1980,7 @@ class Memory:
         identity = model.wanted_identity()
         if identity is None:
             return []
-        sources = []
+        sources: list[varena.Source] = []
         for block in model.groups():
             if not block.storage_bytes or _host_final(block):
                 continue
