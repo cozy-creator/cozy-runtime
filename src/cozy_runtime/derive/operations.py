@@ -11,7 +11,17 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
-from cozy_runtime.bench import attention_inventory, attention_quality, attention_speed
+from cozy_runtime.bench import (
+    attention_inventory,
+    attention_quality,
+    attention_speed,
+    child_wire,
+    kernel_check,
+    kernel_ready,
+    kernels_inventory,
+    lora_overlay_refill,
+    overlay_replay,
+)
 from cozy_runtime.author import (
     MAX_WEIGHTS_NEW_BYTES,
     App,
@@ -279,10 +289,33 @@ app.entrypoint(
     weights=(WeightsOutput("model", max_new_bytes=MAX_QUANTIZED_BYTES),),
     accelerator=False,
 )
-# The attention bench (xs-171): the release gate's measurements of the Runtime's own kernels.
+# The release gate's exercisers (`cozy_runtime.bench`, unstable): the attention bench (xs-171) and the kernels suite
+# (xs-174), the Runtime's kernels from inside the Runtime.
 app.entrypoint(attention_inventory, accelerator=True)
 app.entrypoint(attention_speed, accelerator=True)
 app.entrypoint(attention_quality, accelerator=True)
+app.entrypoint(kernels_inventory, accelerator=True)
+app.entrypoint(kernel_check, accelerator=True)
+app.entrypoint(kernel_ready, accelerator=False)
+app.entrypoint(child_wire, accelerator=False)
+app.entrypoint(
+    overlay_replay,
+    defaults={
+        "model": "qwen/qwen-image-edit-2511@0.1.0",
+        "turbo_lora": "lightx2v/qwen-image-edit-2511-lightning-lora@0.1.0",
+    },
+    components={"model": ("transformer",)},
+    accelerator=True,
+)
+app.entrypoint(
+    lora_overlay_refill,
+    defaults={
+        "model": "qwen/qwen-image-edit-2511@0.1.0",
+        "turbo_lora": "lightx2v/qwen-image-edit-2511-lightning-lora@0.1.0",
+    },
+    components={"model": ("transformer",)},
+    accelerator=True,
+)
 
 
 def calibrate(
