@@ -155,6 +155,9 @@ class Candidate:
     #: the dense kernels a sparse one computes rows with, opened beside it: its dense steps',
     #: then its protected prefix's; none: the one its site's walk binds (`_sol_dense`)
     dense: tuple[str, ...] = ()
+    #: the dense kernel a declaring sparse row's exact paths take (H3: the token refiner, block 1
+    #: and the blocks whose key gain has outlier channels); empty: SDPA
+    exact_rows: str = ""
     #: the Runtime module whose `KERNELS` (a `TritonKernels` set) it launches: it serves once
     #: they are built here (`triton_kernels`)
     kernels: str = ""
@@ -229,6 +232,8 @@ class Candidate:
 _GPU = frozenset({arch.MMA_SYNC, arch.WGMMA, arch.TCGEN05})
 _MMA, _WGMMA, _TCGEN05 = (frozenset({f}) for f in (arch.MMA_SYNC, arch.WGMMA, arch.TCGEN05))
 _FP8, _FP4, _INT4 = frozenset({"fp8"}), frozenset({"fp4"}), frozenset({"int4"})
+#: Kitchen's INT8 MMA: every row but Blackwell Ultra's (sm103 has no int8 tensor cores).
+_INT8 = frozenset({"int8"})
 _HALF, _BF16, _D128 = frozenset({"bfloat16", "float16"}), frozenset({"bfloat16"}), frozenset({128})
 _D64_128 = frozenset({64, 128})
 #: What the wheel's FA3 serves (`prebuilt.FlashAttention3`); `flash-attn3-full` serves more.
@@ -257,6 +262,9 @@ class _Admission(TypedDict):
     batches: bool
 
 
+#: Kitchen Sol's exact paths: Kitchen INT8, whose per-block scales carry those keys (H3 on an
+#: RTX 5090: 0.008-0.030 rel L2, FP4 0.10-0.28).
+_KITCHEN_EXACT = "kitchen-int8"
 #: Every sparse kernel's admission: one BF16 document at head dimension 128, equal Q/K/V.
 _SOL = _Admission(
     sparse=True, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False, gqa=False,
@@ -287,7 +295,7 @@ KERNELS: tuple[Candidate, ...] = (
         dtypes=_HALF, max_head_dim=128, artifact="sageattention", import_name="sageattention",
     ),
     Candidate(
-        "kitchen-int8", "_cozy_kitchen_int8", upstream.KITCHEN, _GPU, level=8, dtypes=_HALF,
+        "kitchen-int8", "_cozy_kitchen_int8", upstream.KITCHEN, _GPU, _INT8, level=8, dtypes=_HALF,
         max_head_dim=256, masks=True, causal=False, artifact=_KITCHEN,
         import_name="comfy_kitchen",
     ),
@@ -325,29 +333,37 @@ KERNELS: tuple[Candidate, ...] = (
         import_name="sol_attn", **_SOL,
     ),
     Candidate(
+        "sol-attn-fa4-fp8", "_cozy_sol_fa4_fp8", attention_sol.SOL_FP8, _TCGEN05, level=8,
+        artifact=_PY, import_name="sol_attn", dense=("flash-attn4-fp8",), exact_rows="cudnn",
+        **_SOL,
+    ),
+    Candidate(
         attention_sage2_fixed.SOL_NAME, "_cozy_sol_sage2_fixed_kmean", attention_sage2_fixed.SOL,
         _WGMMA, level=8, artifact=_PY, import_name="sol_attn",
         dense=(attention_sage2_fixed.DENSE_NAME,), **_SOL,
     ),
     Candidate(
-        "kitchen-sol", "_cozy_kitchen_sol_int8", attention_kitchen_sol.KITCHEN_SOL, _GPU, level=8,
-        artifact=_KITCHEN, import_name="comfy_kitchen", dense=("kitchen-int8",), **_SOL,
+        "kitchen-sol", "_cozy_kitchen_sol_int8", attention_kitchen_sol.KITCHEN_SOL, _GPU, _INT8,
+        level=8, artifact=_KITCHEN, import_name="comfy_kitchen", dense=("kitchen-int8",),
+        exact_rows=_KITCHEN_EXACT, **_SOL,
     ),
     Candidate(
         "kitchen-sol-fp4-lowmem", "_cozy_kitchen_sol_fp4_lowmem",
-        attention_kitchen_sol.KITCHEN_SOL_FP4_LOWMEM, _MMA, _FP4, level=4, artifact=_KITCHEN,
-        import_name="comfy_kitchen", dense=("sageattention3-fp4-global-lowmem", "kitchen-int8"),
+        attention_kitchen_sol.KITCHEN_SOL_FP4_LOWMEM, _MMA, _FP4 | _INT8, level=4,
+        artifact=_KITCHEN, import_name="comfy_kitchen",
+        dense=("sageattention3-fp4-global-lowmem", "kitchen-int8"), exact_rows=_KITCHEN_EXACT,
         **_SOL,
     ),
     Candidate(
         "kitchen-sol-int4qk", "_cozy_kitchen_sol_int4qk", attention_kitchen_sol.KITCHEN_SOL_INT4QK,
-        _MMA, _INT4, level=4, artifact=_KITCHEN, import_name="comfy_kitchen",
-        dense=("kitchen-int4qk", "kitchen-int8"), **_SOL,
+        _MMA, _INT4 | _INT8, level=4, artifact=_KITCHEN, import_name="comfy_kitchen",
+        dense=("kitchen-int4qk", "kitchen-int8"), exact_rows=_KITCHEN_EXACT, **_SOL,
     ),
     Candidate(
         "kitchen-sol-fp4-fixed-means", "_cozy_kitchen_sol_fp4_fixed_means",
-        attention_kitchen_sol.KITCHEN_SOL_FP4_FIXED_MEANS, _MMA, _FP4, level=4, artifact=_KITCHEN,
-        import_name="comfy_kitchen", dense=("sageattention3-fp4-fixed-means", "kitchen-int8"),
+        attention_kitchen_sol.KITCHEN_SOL_FP4_FIXED_MEANS, _MMA, _FP4 | _INT8, level=4,
+        artifact=_KITCHEN, import_name="comfy_kitchen",
+        dense=("sageattention3-fp4-fixed-means", "kitchen-int8"), exact_rows=_KITCHEN_EXACT,
         **_SOL,
     ),
 )  # fmt: skip
@@ -375,16 +391,17 @@ DENSE: dict[str, dict[int, tuple[str, ...]]] = {
     arch.TCGEN05: {16: ("cudnn",), 8: ("flash-attn4-fp8",)},
 }
 #: A sparse site's kernels (one a package producer serves: its model supplies an
-#: `AttentionLayout`), tried at its level and each above before any DENSE kernel. Sol's dense rows
-#: take DENSE at the site's level, its exact paths level 16 (`_sol_dense`); on tcgen05 its exact
-#: tiles take its dense rows' precision (`attention_sol_fa4`), so its 8-bit cell is empty and a
-#: site steps up to it. mma.sync's 8-bit cell is Kitchen's INT8 Sol: INT8 runs 2x BF16 there, 4x
+#: `AttentionLayout`), tried at its level and each above before any DENSE kernel. BF16 Sol's dense
+#: rows take the first 16-bit DENSE kernel after it (`_sol_dense`). tcgen05's 8-bit cell is Sol's
+#: FA4 route with FP8 exact tiles and FA4 FP8 dense rows (`sol-attn-fa4-fp8`; a whole H3 15 s call
+#: 109-113 ms on a B200 against Sol's own 134-146 ms, h3a-093). mma.sync's 8-bit cell is Kitchen's
+#: INT8 Sol: INT8 runs 2x BF16 there, 4x
 #: on GeForce (half-rate FP32 accumulation), and BF16 Sol's exact blocks alone outlast Kitchen's
 #: whole sparse step (H3 15 s, RTX 4090: 23 s at peak).
 SPARSE: dict[str, dict[int, tuple[str, ...]]] = {
     arch.MMA_SYNC: {16: ("sol-attn",), 8: ("kitchen-sol",)},
     arch.WGMMA: {16: ("sol-attn",), 8: ("sol-attn-sage2-fixed-kmean",)},
-    arch.TCGEN05: {16: ("sol-attn",)},
+    arch.TCGEN05: {16: ("sol-attn",), 8: ("sol-attn-fa4-fp8",)},
 }
 LEVELS = (4, 8, 16)
 #: A cell lists only kernels of its own precision: a coarser or finer kernel there could not merge.
@@ -457,15 +474,9 @@ def _sol_objects(candidate: Candidate) -> bool:
     return candidate.sparse and candidate.import_name == "sol_attn"
 
 
-#: The kernel a declaring sparse row's exact paths take (H3: the token refiner, block 1 and the
-#: blocks whose key gain has outlier channels): Kitchen INT8 where the row declares it, whose
-#: per-block scales carry those keys (H3 on an RTX 5090: 0.008-0.030 rel L2, FP4 0.10-0.28),
-#: else BF16 SDPA.
-EXACT_INT8, EXACT_DENSE = "kitchen-int8", "sdpa"
-
-
 def _exact_name(candidate: Candidate) -> str:
-    return EXACT_INT8 if EXACT_INT8 in candidate.dense else EXACT_DENSE
+    """The kernel a declaring sparse row's exact paths take: its own, else BF16 SDPA."""
+    return candidate.exact_rows or _SDPA
 
 
 def dense_identity(name: str) -> str:
@@ -907,6 +918,8 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready:
         for role, beside in zip(("dense", "prefix"), dense, strict=False):
             opened = (_waited if wait else _opened)(beside, device).artifact or {}
             artifact.update({f"{role}_{key}": value for key, value in opened.items()})
+        if candidate.exact_rows not in ("", *candidate.dense):
+            (_waited if wait else _opened)(BY_NAME[candidate.exact_rows], device)
     else:
         artifact = _compiled(candidate, device, wait) if candidate.artifact else None
     wheel = (artifact or {}).get("artifact") == "prebuilt"
@@ -1063,24 +1076,21 @@ def _sol_dense(
     resolved: dict[str, Ready],
     refused: dict[str, str],
 ) -> tuple[Ready, Ready | None]:
-    """The kernel Sol recomputes dense rows with (its dense steps, protected prefix and dense
-    paths): the first one after Sol in the site's walk that serves BF16 at head dimension 128
-    on this rank, else SDPA; and when that one quantizes, the next exact one, which the
-    model's exact paths take (level 16). It runs locally after the Ulysses exchange, so it
-    needs no context parallelism. One still compiling is passed over (run 1565: SDPA served
-    Sol's dense steps at 35 s where SageAttention takes about 24 s, the price of not waiting)
-    and selected again once ready."""
+    """The kernel BF16 Sol recomputes dense rows with (its dense steps, protected prefix and
+    dense paths): the first 16-bit one after Sol in the site's walk that serves BF16 at head
+    dimension 128 on this rank, else SDPA. Sol is filed at 16, so its rows are too. It runs
+    locally after the Ulysses exchange, so it needs no context parallelism. One still compiling
+    is passed over and selected again once ready."""
     found, row = known(), device_row(device)
-    dense: Ready | None = None
     for name in (*order, "sdpa"):
         candidate = found.get(name)
         if (
             candidate is None
             or candidate.sparse
+            or not candidate.exact
             or _off_row(candidate, row)
             or not candidate.admits("bfloat16", 128)
             or not candidate.cross
-            or (dense is not None and not candidate.exact)
             or name in refused
         ):
             continue
@@ -1090,13 +1100,7 @@ def _sol_dense(
             except Exception as exc:
                 refused.setdefault(name, f"{type(exc).__name__}: {exc}"[:300])
                 continue
-        if dense is not None:
-            return dense, resolved[name]
-        if candidate.exact:
-            return resolved[name], None
-        dense = resolved[name]
-    if dense is not None:
-        return dense, None
+        return resolved[name], None
     raise AttentionRefusal("attention_kernel_absent", "Sol has no ready dense reference")
 
 
