@@ -162,6 +162,7 @@ from cozy_runtime.internal import (
     canonical,
     child_env,
     contract,
+    crash,
     effect_interfaces,
     execution_evidence,
     fp8_linear,
@@ -5023,6 +5024,7 @@ def _remember_distributions() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     faulthandler.enable(all_threads=True)
+    crash.install()  # ahead of faulthandler: native stacks beside its Python ones (cr-275)
     if hasattr(signal, "SIGUSR1"):  # every thread's Python stack to stderr, the process lives on
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
     parser = argparse.ArgumentParser(description="cozy-runtime device executor")
@@ -5137,6 +5139,13 @@ class _Order:
         self._arrived: dict[int, tuple[float, str]] = {}
         #: ticket -> ms it waited for the idle holder, and on what
         self._waited: dict[int, tuple[float, str]] = {}
+        self._noted()
+
+    def _noted(self) -> None:
+        """What this process answers now, for a fatal signal's record (`crash.note`). The lock is
+        held."""
+        tickets = self._open.items()
+        crash.note(", ".join(self._stage if t == self._idle else what for t, (_, what) in tickets))
 
     def ticket(self, alone: bool, what: str) -> int:
         with self._changed:
@@ -5144,12 +5153,14 @@ class _Order:
             self._open[self._next] = (alone, what)
             if self._idle is not None:
                 self._arrived[self._next] = (time.perf_counter(), self._stage)
+            self._noted()
             return self._next
 
     def stage(self, what: str) -> None:
         """The idle holder moves on to `what`: a command arriving now waits on it."""
         with self._changed:
             self._stage = what
+            self._noted()
 
     def first(self, ticket: int) -> bool:
         with self._changed:
@@ -5183,6 +5194,7 @@ class _Order:
             with self._changed:
                 del self._open[ticket]
                 self.answered += 1
+                self._noted()
                 self._changed.notify_all()
 
     @contextlib.contextmanager
@@ -5196,12 +5208,14 @@ class _Order:
             ticket, answered = self._next, self.answered
             self._open[ticket] = (True, _IDLE_WORK)
             self._idle = ticket
+            self._noted()
         try:
             yield answered
         finally:
             with self._changed:
                 del self._open[ticket]
                 self._idle = None
+                self._noted()
                 now = time.perf_counter()
                 for came, (at, on) in self._arrived.items():
                     self._waited[came] = ((now - at) * 1e3, on)
@@ -5277,7 +5291,7 @@ def serve(executor: Executor, channel: Channel) -> int:
     kernel_compile.waiting = functools.partial(_compiling, channel)
     request_path.told = functools.partial(_waiting, channel)
     # Runtime-owned workers, none before the first is needed.
-    pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call")
+    pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=crash.arm)
     order = executor.order = _Order()
     idle = False
     while True:

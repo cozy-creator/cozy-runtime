@@ -1,5 +1,6 @@
 """Cozy's prebuilt CUDA kernels (`kernels/`), carried by cozy-runtime's native wheels: one per OS
-and CPU, every GPU target inside. The pure wheel carries none (`ABSENT` says why).
+and CPU, every GPU target inside. The pure wheel carries none (`ABSENT` says why). Linux's also
+carry `_crash`, the executor's record of a fatal signal (`internal.crash`).
 
 Kernel modules use nanobind, the static CUDA runtime and Python's stable ABI. A module
 carries a cubin for each target in `ARCHS` and PTX that the driver compiles for a card none names.
@@ -91,6 +92,8 @@ ARCHS: dict[str, dict[str, tuple[str, ...]]] = {
         "cubin": ("sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_103", "sm_120", "sm_121"),
         "ptx": ("compute_80",),
     },
+    # The executor's record of a fatal signal (cr-275, `internal.crash`): no GPU code, Linux only.
+    "_crash": {"cubin": (), "ptx": ()},
 }
 
 #: The GEMMs that are CUTLASS's TMA kernels, by format and family: a Windows wheel lacks them

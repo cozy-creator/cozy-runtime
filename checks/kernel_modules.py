@@ -8,7 +8,10 @@ Each loads on every Python given, and a call on a machine without a GPU returns 
 rather than crashing. The driver floor equals the `platform` crate's (`--platform-floor`, the
 Rust source TensorD checks at startup). Each exports `PyInit_*` alone (nm, dumpbin): an exported
 libstdc++ symbol binds process-wide and crashed torch imported after it. With `--torch-python`,
-each module loads before torch in a fresh interpreter. Any failure is named, and the run exits 1.
+each module loads before torch in a fresh interpreter. `_crash` (Linux) is held to real faults on
+every Python given: a SIGSEGV and an abort on a second thread, each recorded (the crash line,
+faulthandler's Python stacks, the crashed thread's native frames) and ending the process by its
+signal. Any failure is named, and the run exits 1.
 """
 
 from __future__ import annotations
@@ -64,6 +67,48 @@ _attn4 = load("_attn4")
 assert _attn4.attention(0, *(0,) * 11, 1, 2, 2, 128, 128, 128, True, 1.0, *((0, 0, 0),) * 4, 0) != 0
 print(f"{sys.version.split()[0]}: gemv without a GPU -> {code} {_gemm.error_name(code)}")
 """
+
+
+#: `_crash` loaded by path and installed after faulthandler, then a real fault on a second thread
+#: (cr-275).
+CRASH = """
+import ctypes, faulthandler, importlib.util, os, pathlib, sys, threading
+[path] = [p for p in pathlib.Path(sys.argv[1]).iterdir() if p.name.split(".")[0] == "_crash"]
+spec = importlib.util.spec_from_file_location("_crash", path)
+crash = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(crash)
+faulthandler.enable(all_threads=True)
+crash.install()
+crash.note("the formation check")
+fault = {"SIGSEGV": lambda: ctypes.string_at(1), "SIGABRT": os.abort}[sys.argv[2]]
+def call():
+    crash.arm()
+    fault()
+thread = threading.Thread(target=call)
+thread.start()
+thread.join()
+"""
+
+
+def crashes(python: str, package: Path) -> list[str]:
+    """`_crash`'s record of a real SIGSEGV and abort on `python`: what is wrong with each."""
+    failed = []
+    for signame, number in (("SIGSEGV", 11), ("SIGABRT", 6)):
+        call = [python, "-I", "-c", CRASH, str(package), signame]
+        run = subprocess.run(call, capture_output=True, text=True)
+        said = [line for line in run.stderr.splitlines() if line.startswith("executor crashed: ")]
+        print(f"{python} {signame}: exit {run.returncode}; {said[-1] if said else 'no crash line'}")
+        wanted = (
+            run.returncode == -number,
+            bool(said) and said[-1].startswith(f"executor crashed: {signame} in "),
+            "Fatal Python error" in run.stderr,
+            "crashed, most recent call last:" in run.stderr,
+            "answering: the formation check" in run.stderr,
+        )
+        if not all(wanted):
+            tail = run.stderr.strip()[-800:]
+            failed.append(f"{python} _crash {signame}: exit {run.returncode}: {tail}")
+    return failed
 
 
 #: The catalog the modules are held to: `cozy_runtime._kernels`.
@@ -204,6 +249,8 @@ def main() -> int:
         print(run.stdout.strip())
         if run.returncode != 0:
             failed.append(f"{python}: {run.stderr.strip()[-600:]}")
+        if "_crash" not in options.without:
+            failed += crashes(python, package)
     for line in failed:
         print(f"FAILED {line}", flush=True)
         print(f"::error title=kernel modules::{line}", flush=True)
