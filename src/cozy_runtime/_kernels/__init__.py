@@ -11,17 +11,23 @@ authors reach `_norm` through `accel.kernels`.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 try:
     import cozy_runtime._kernels._gemm as _gemm
     import cozy_runtime._kernels._norm as _norm
 
     ABSENT = ""
+    _TMA = _gemm.TMA
 except ModuleNotFoundError:  # the pure wheel: an OS or CPU no native wheel serves
     ABSENT = "this cozy-runtime wheel carries no kernels (the pure wheel)"
+    _TMA = False
 except ImportError as broken:
     ABSENT = f"this cozy-runtime wheel's kernels do not load ({broken})"
+    _TMA = False
 try:
     import cozy_runtime._kernels._fa3 as _fa3
 
@@ -93,7 +99,6 @@ TMA_GEMM: dict[str, dict[str, tuple[int, ...]]] = {
     "int8": {"wgmma": (90,), "tcgen05": (100,)},
     "fp8": {"mma.sync": (120, 121), "wgmma": (90,), "tcgen05": (100, 103)},
 }
-_TMA = not ABSENT and _gemm.TMA
 #: The cards `_gemm.gemm` has a cubin for, by format and family; quantize and gemv run on every
 #: target above.
 GEMM: dict[str, dict[str, tuple[int, ...]]] = {
@@ -103,14 +108,14 @@ GEMM: dict[str, dict[str, tuple[int, ...]]] = {
 
 
 def rms_rope_split_half(
-    q: Any,
-    k: Any,
-    freqs: Any,
-    q_scale: Any,
-    k_scale: Any,
+    q: Tensor,
+    k: Tensor,
+    freqs: Tensor,
+    q_scale: Tensor,
+    k_scale: Tensor,
     epsilon: float = 1e-6,
     rot_dim: int = 0,
-) -> tuple[Any, Any]:
+) -> tuple[Tensor, Tensor]:
     """Return paired out-of-place RMS-normalized split-half RoPE tensors."""
     import torch
 

@@ -56,6 +56,7 @@ from cozy_runtime.author._errors import (
     InvalidRequest,
     OutputError,
 )
+from cozy_runtime.author._handler import Handler
 from cozy_runtime.author._loader import (
     Artifact,
     Backend,
@@ -80,7 +81,7 @@ _LOG = logging.getLogger(__name__)
 PipelineT = TypeVar("PipelineT", covariant=True)
 P = ParamSpec("P")
 R = TypeVar("R")
-ModelT = TypeVar("ModelT", bound="Model[Any]")
+ModelT = TypeVar("ModelT", bound="Model[object]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +289,9 @@ class _ScopedModel(Protocol):
 
     def _cozy_scope(self, method: str, components: tuple[str, ...]) -> _Scope: ...
 
+    @property
+    def _cozy_memo(self) -> StageMemo | None: ...
+
 
 M = TypeVar("M", bound=_ScopedModel)
 
@@ -319,6 +323,10 @@ class Residency(Protocol):
 
     def note(self, key: str, value: str) -> None:
         """A fact about how this attempt executed, reported with its memory facts."""
+        ...
+
+    def open_attempt(self) -> None:
+        """An attempt begins on this placement."""
         ...
 
     def retain(self, component: str, paths: tuple[str, ...]) -> Any:
@@ -605,12 +613,14 @@ class Placement(Protocol):
 #: The remote scopes open in this context, innermost last: (model, method, components).
 #: Per context rather than per model, so a remote scope on a helper thread is visible to that
 #: thread's hosted calls and to nothing else.
-_REMOTE_SCOPES: contextvars.ContextVar[tuple[tuple[Model[Any], str, tuple[str, ...]], ...]] = (
-    contextvars.ContextVar("cozy_remote_scopes", default=())
+#: Open scopes, innermost last: (model, method, components).
+type _OpenScopes = tuple[tuple[Model[object], str, tuple[str, ...]], ...]
+_REMOTE_SCOPES: contextvars.ContextVar[_OpenScopes] = contextvars.ContextVar(
+    "cozy_remote_scopes", default=()
 )
 #: The local scopes open in this context, innermost last: (model, method, components).
-_LOCAL_SCOPES: contextvars.ContextVar[tuple[tuple[Model[Any], str, tuple[str, ...]], ...]] = (
-    contextvars.ContextVar("cozy_local_scopes", default=())
+_LOCAL_SCOPES: contextvars.ContextVar[_OpenScopes] = contextvars.ContextVar(
+    "cozy_local_scopes", default=()
 )
 #: Whether a `deterministic=True` scope is open in this context.
 _DETERMINISTIC_SCOPE: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -622,9 +632,14 @@ _DETERMINISTIC_SCOPE: contextvars.ContextVar[bool] = contextvars.ContextVar(
 DETERMINISTIC: list[Callable[[], AbstractContextManager[None]]] = [nullcontext]
 
 
+#: What a seal's `enter` hands its `leave`: the refusal count, finer splits and shared-scope count
+#: at entry, or None when nothing reads refusals (`internal/contract._Scopes`).
+type Sealing = tuple[int, int, int] | None
+
+
 class Sealed(Protocol):
-    def enter(self) -> Any: ...
-    def leave(self, entered: Any, method: str, ok: bool) -> None: ...
+    def enter(self) -> Sealing: ...
+    def leave(self, entered: Sealing, method: str, ok: bool) -> None: ...
 
 
 #: The package contract's checks at each local scope (`internal/contract._Scopes`: the flags a
@@ -701,7 +716,7 @@ def memoize[M: _ScopedModel, **P, R](
         declared: _Declared = cast("_Declared", wrapper)
         declared.__uses_components__ = components
         declared.__deterministic__ = bool(getattr(fn, "__deterministic__", False))
-    return cast("Callable[Concatenate[M, P], R]", wrapper)
+    return wrapper
 
 
 def sequence_parallel(*, degrees: Sequence[int]) -> Callable[[type[ModelT]], type[ModelT]]:
@@ -774,7 +789,7 @@ def placeable(*names: str) -> Callable[[type[ModelT]], type[ModelT]]:
     return decorate
 
 
-def _is_async(fn: Callable[..., object]) -> bool:
+def _is_async(fn: Handler) -> bool:
     return inspect.iscoroutinefunction(inspect.unwrap(fn))
 
 
@@ -1148,17 +1163,17 @@ class _ComponentScope:
         "_using",
     )
 
-    def __init__(self, model: Model[Any], method: str, components: tuple[str, ...]) -> None:
+    def __init__(self, model: Model[object], method: str, components: tuple[str, ...]) -> None:
         self._model = model
         self._method = method
         self._components = components
-        self._remote: contextvars.Token[Any] | None = None
-        self._local: contextvars.Token[Any] | None = None
+        self._remote: contextvars.Token[_OpenScopes] | None = None
+        self._local: contextvars.Token[_OpenScopes] | None = None
         self._call: Context | None = None
         self._using: AbstractContextManager[None] | None = None
         self._numerics: AbstractContextManager[None] | None = None
         self._caches: list[DerivedCache] = []
-        self._contract: tuple[Sealed, object] | None = None
+        self._contract: tuple[Sealed, Sealing] | None = None
 
     def __enter__(self) -> None:
         model = self._model
@@ -1293,7 +1308,7 @@ class Generation:
     """One constructed, Ready model generation and the binding paths sharing it."""
 
     identity: ConstructionIdentity
-    model: Model[Any]
+    model: Model[object]
     record: ConstructionRecord
     paths: list[str] = field(default_factory=list)
 
@@ -1309,7 +1324,7 @@ def component_use(cls: type) -> Mapping[str, tuple[str, ...]]:
     return contract
 
 
-def _public_methods(cls: type) -> Iterator[tuple[str, Callable[..., object]]]:
+def _public_methods(cls: type) -> Iterator[tuple[str, Handler]]:
     """Author-defined public methods only — runtime-owned base members do not open scopes."""
     for name in dir(cls):
         if name.startswith("_") or name in _RUNTIME_MEMBERS or hasattr(Model, name):
@@ -1394,7 +1409,7 @@ class ModelRegistry:
             self._by_path[binding_path] = generation
             return cast("ModelT", generation.model)
 
-    def models(self, callable_name: str) -> Mapping[str, Model[Any]]:
+    def models(self, callable_name: str) -> Mapping[str, Model[object]]:
         """What `Invocation.models` needs for ONE callable, keyed by parameter name.
 
         Resolution is per binding PATH, never per parameter name: two entrypoints both
@@ -1432,7 +1447,7 @@ class ModelRegistry:
     def _construct(
         self,
         identity: ConstructionIdentity,
-        cls: type[Model[Any]],
+        cls: type[Model[object]],
         artifact: Artifact,
         mode: Mode,
         adapters: Sequence[AdapterRef] = (),
@@ -1534,7 +1549,7 @@ class ModelRegistry:
             object.__setattr__(model, "_cozy_loading", False)
         return Generation(identity, model, record)
 
-    def _loader(self, model: Model[Any], artifact: Artifact, mode: Mode) -> Loader:
+    def _loader(self, model: Model[object], artifact: Artifact, mode: Mode) -> Loader:
         return Loader(artifact, owner=model, backend=self._backend, mode=mode)
 
 

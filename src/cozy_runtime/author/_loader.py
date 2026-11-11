@@ -31,13 +31,26 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NoReturn,
+    Protocol,
+    TypeVar,
+    cast,
+    final,
+    runtime_checkable,
+)
 
 import msgspec
 
 from cozy_runtime.author import _group
 from cozy_runtime.author._context import AdapterRef, Device, device
 from cozy_runtime.author._errors import CapabilityError, ConformanceError, InvalidRequest
+
+if TYPE_CHECKING:
+    from cozy_runtime.internal.fill import FitVerdict
 
 T = TypeVar("T")
 S = TypeVar("S", bound=msgspec.Struct)
@@ -324,7 +337,7 @@ class Config:
     def as_bool(self, name: str, default: bool | None = None) -> bool:
         return self._scalar(name, bool, default)
 
-    def mapping(self) -> dict[str, Any]:
+    def mapping(self) -> dict[str, Any]:  # type: ignore[explicit-any]  # **config for libraries
         """The whole section as a plain, canonically ordered COPY.
 
         The typed accessors are the door for the author's own code; this one is the door
@@ -407,10 +420,9 @@ class Artifact:
     """The originally admitted base when a prepared view becomes the serving snapshot."""
 
 
-#: The `Fit` document `tensorfs.fit` returns, verbatim: `code` (one of the eight),
-#: `detail` (the §3 text), `component`, `key`, `encoding`, `device`, `custody`, `ignored`,
-#: `routes` and `ok`. The runtime never authors one and never rephrases one.
-Fit = Mapping[str, object]
+#: The `Fit` document `tensorfs.fit` returns, verbatim (`fill.FitVerdict`). The runtime never
+#: authors one and never rephrases one.
+type Fit = FitVerdict
 
 
 UNNORMALIZED = "checkpoint_unnormalized"
@@ -429,7 +441,7 @@ class ModelFitRefused(ConformanceError):
 
     default_code = "model_fit_refused"
 
-    def __init__(self, fit: Fit, unnormalized: str = "") -> None:
+    def __init__(self, fit: Mapping[str, object], unnormalized: str = "") -> None:
         verdict = f"{fit.get('code')} — {fit.get('detail')}"
         super().__init__(
             f"{unnormalized}; {verdict}" if unnormalized else verdict,
@@ -893,9 +905,9 @@ class Loader:
         fit = self._backend.fit(walked, encoded_leaves=self._consent())
         if fit is not None and not fit.get("ok"):
             raise ModelFitRefused(fit, self._artifact.unnormalized)
-        ignored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("ignored", ())))
-        warned = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("warnings", ())))
-        unstored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("unstored", ())))
+        ignored = tuple(str(k) for k in fit.get("ignored", ())) if fit else ()
+        warned = tuple(str(k) for k in fit.get("warnings", ())) if fit else ()
+        unstored = tuple(str(k) for k in fit.get("unstored", ())) if fit else ()
         walked = walked.without(frozenset(k.replace("/", ".", 1) for k in unstored))
         _legs.append(("fit", round((time.perf_counter() - _t0) * 1000, 1)))
         _t0 = time.perf_counter()

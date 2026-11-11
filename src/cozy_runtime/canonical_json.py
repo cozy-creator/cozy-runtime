@@ -7,14 +7,20 @@ Blob and artifact integrity must continue to hash their exact bytes instead.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Mapping, Sequence
 
 import msgspec
 
 from cozy_runtime.internal import canonical
 
+#: A JSON scalar as plain Python.
+type JsonScalar = str | int | float | bool | None
 
-def encode(value: Any) -> bytes:
+#: A JSON value as plain Python, as written: a mapping, sequence, string, number, bool or None.
+type JsonValue = Mapping[str, JsonValue] | Sequence[JsonValue] | str | int | float | bool | None
+
+
+def encode(value: object) -> bytes:
     """Return the canonical JSON bytes of a JSON value."""
     try:
         return canonical.write(value)
@@ -22,7 +28,7 @@ def encode(value: Any) -> bytes:
         raise ValueError(str(exc)) from exc
 
 
-def decode(data: bytes) -> Any:
+def decode(data: bytes) -> canonical.Json:
     """Parse bounded UTF-8 JSON, refusing duplicate keys and invalid numbers."""
     try:
         return canonical.parse(data)
@@ -41,7 +47,7 @@ def normalize(data: bytes) -> bytes:
     return encode(decode(data))
 
 
-def digest(value: Any) -> str:
+def digest(value: object) -> str:
     """Return ``sha256:<hex>`` over a JSON value's canonical semantic bytes."""
     try:
         return canonical.digest(value)

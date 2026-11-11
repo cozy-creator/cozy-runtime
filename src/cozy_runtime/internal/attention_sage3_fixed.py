@@ -160,7 +160,7 @@ def forward(
     qlist = api.scale_and_quant_fp4(prepared.pop("q"))
     klist = api.scale_and_quant_fp4_permute(prepared.pop("k"))
     vlist = api.scale_and_quant_fp4_transpose(prepared.pop("v"))
-    output = api.blockscaled_fp4_attn(
+    output: Tensor = api.blockscaled_fp4_attn(
         qlist, klist, vlist, prepared["delta"], tokens, False, False, True
     )[0]
     return output[:, :, :tokens, :].transpose(1, 2).contiguous()

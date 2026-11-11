@@ -32,12 +32,12 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from functools import wraps
+from functools import update_wrapper
 from importlib import import_module
 from inspect import Parameter, Signature, signature
 from pathlib import Path
 from types import MethodType
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict, cast
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -53,12 +53,35 @@ from cozy_runtime.internal.attention_ulysses import Local
 # Tensor and module imports remain type-only, preserving the Torch-free base surface.
 
 
+class DenseRows(Protocol):
+    """A sparse kernel's dense rows: `(query=, key=, value=, scale=)`."""
+
+    def __call__(
+        self, *, query: Tensor, key: Tensor, value: Tensor, scale: float | None
+    ) -> Tensor: ...
+
+
+class SparseRows(Protocol):
+    """A sparse kernel's own rows: `(q, k, v, scale, protected prefix, tau)`."""
+
+    def __call__(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        scale: float | None,
+        sink_tokens: int,
+        tau: float,
+        /,
+    ) -> Tensor: ...
+
+
 @dataclass(frozen=True, slots=True)
 class Site:
     component: str
     path: str
     #: The module's key RMSNorm (`norm_k`), when it has one (`outlier_keys`).
-    keys: Any = field(default=None, compare=False, repr=False)
+    keys: object = field(default=None, compare=False, repr=False)
 
 
 #: A key RMSNorm gain that peaks at this multiple of its RMS or more puts outlier channels in
@@ -68,23 +91,27 @@ class Site:
 KEY_GAIN_CREST = 3.0
 
 
-def outlier_keys(norm: Any) -> bool:
+def outlier_keys(norm: object) -> bool:
     """Whether a key RMSNorm's gain has an outlier channel (`KEY_GAIN_CREST`). Read on its
     module's first call, where its weight is resident, and kept on it: weights alone decide,
     so every rank and every step agree."""
-    if getattr(norm, "weight", None) is None:
+    weight: Tensor | None = getattr(norm, "weight", None)
+    if weight is None:
         return False
     if not hasattr(norm, "_cozy_outlier_keys"):
-        gain = norm.weight.detach().float().abs()
-        norm._cozy_outlier_keys = bool(gain.amax() >= KEY_GAIN_CREST * gain.square().mean().sqrt())
-    return bool(norm._cozy_outlier_keys)
+        gain = weight.detach().float().abs()
+        # In its __dict__, as Module.__setattr__ keeps a plain value.
+        vars(norm)["_cozy_outlier_keys"] = bool(
+            gain.amax() >= KEY_GAIN_CREST * gain.square().mean().sqrt()
+        )
+    return bool(vars(norm)["_cozy_outlier_keys"])
 
 
 _SITE: ContextVar[Site | None] = ContextVar("cozy_sol_site", default=None)
-_DENSE: Callable[..., Tensor] | None = None
+_DENSE: DenseRows | None = None
 _DENSE_IDENTITY = ""
 #: The BF16 kernel the model's exact paths take when the dense one quantizes; else `_DENSE`.
-_EXACT: Callable[..., Tensor] | None = None
+_EXACT: DenseRows | None = None
 _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", default=None)
 _RANK_COUNTS: ContextVar[dict[int, dict[str, int]] | None] = ContextVar(
     "cozy_sol_rank_counts", default=None
@@ -161,9 +188,7 @@ def record_rank(rank: int, counts: dict[str, int]) -> None:
         total[name] += value
 
 
-def bind_dense(
-    call: Callable[..., Tensor], identity: str, exact: Callable[..., Tensor] | None = None
-) -> None:
+def bind_dense(call: DenseRows, identity: str, exact: DenseRows | None = None) -> None:
     """Install the dense reference a selection resolved, and the BF16 kernel the model's exact
     paths take when that one quantizes. Selection runs at preparation and at a run's step and
     stage boundaries, so a rebind never changes a running step."""
@@ -174,7 +199,7 @@ def bind_dense(
 
 
 #: A bound dense reference: (dense, its identity, exact).
-type Binding = tuple[Callable[..., Tensor] | None, str, Callable[..., Tensor] | None]
+type Binding = tuple[DenseRows | None, str, DenseRows | None]
 
 
 def binding() -> Binding:
@@ -192,11 +217,17 @@ def dense_identity() -> str:
     return _DENSE_IDENTITY
 
 
+class _Forward(Protocol):
+    """An attention module's forward: whatever its call was given."""
+
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
+
+
 @dataclass(frozen=True, slots=True)
 class _InstalledSite:
     site: Site
-    forward: Callable[..., Tensor]
-    original: Callable[..., Tensor]
+    forward: MethodType
+    original: _Forward
     bind_original: bool
     had_instance_forward: bool
     prior_instance_forward: object
@@ -219,7 +250,7 @@ def install_site(module: Module, component: str, path: str) -> None:
         return
     original = module.forward
     bound = isinstance(original, MethodType) and original.__self__ is module
-    call = original.__func__ if bound else original
+    call: _Forward = original.__func__ if isinstance(original, MethodType) and bound else original
     had_forward = "forward" in vars(module)
     prior = vars(module).get("forward")
     original_signature = signature(original)
@@ -227,11 +258,10 @@ def install_site(module: Module, component: str, path: str) -> None:
     while self_name in original_signature.parameters:
         self_name += "_"
 
-    @wraps(call, updated=())
-    def scoped_forward(self: Any, /, *args: Any, **kwargs: Any) -> Any:
+    def scoped_forward(self: Module, /, *args: object, **kwargs: object) -> object:
         # Read the copied module's record rather than closing over a bound method
         # on the original module. deepcopy must execute the copied weights.
-        installed = self._cozy_sol_site
+        installed: _InstalledSite = vars(self)["_cozy_sol_site"]
         token = _SITE.set(installed.site)
         try:
             if installed.bind_original:
@@ -240,10 +270,11 @@ def install_site(module: Module, component: str, path: str) -> None:
         finally:
             _SITE.reset(token)
 
+    update_wrapper(scoped_forward, call, updated=())  # as `@wraps(call, updated=())` would
     if not bound:
         # A callable object's metadata must not retain its original mutable state.
         # Its explicit signature below still preserves the public call contract.
-        del scoped_forward.__wrapped__
+        del scoped_forward.__dict__["__wrapped__"]
     scoped_forward.__dict__["__signature__"] = Signature(
         [Parameter(self_name, Parameter.POSITIONAL_ONLY), *original_signature.parameters.values()],
         return_annotation=original_signature.return_annotation,
@@ -251,10 +282,13 @@ def install_site(module: Module, component: str, path: str) -> None:
     wrapper = MethodType(scoped_forward, module)
     module.forward = wrapper
     try:
-        module._cozy_sol_site = _InstalledSite(site, wrapper, call, bound, had_forward, prior)
+        # Our records live in the module's __dict__, as Module.__setattr__ keeps a plain value.
+        vars(module)["_cozy_sol_site"] = _InstalledSite(
+            site, wrapper, call, bound, had_forward, prior
+        )
     except BaseException:
         if had_forward:
-            module.forward = prior
+            vars(module)["forward"] = prior
         else:
             del module.forward
         raise
@@ -270,10 +304,10 @@ def remove_site(module: Module, component: str, path: str) -> None:
     if module.forward is not existing.forward:
         raise ValueError("attention forward was replaced after installing its Sol site")
     if existing.had_instance_forward:
-        module.forward = existing.prior_instance_forward
+        vars(module)["forward"] = existing.prior_instance_forward
     else:
         del module.forward
-    del module._cozy_sol_site
+    del vars(module)["_cozy_sol_site"]
 
 
 def _dense(query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Tensor:
@@ -337,7 +371,15 @@ def route(capability: tuple[int, int]) -> str:
     return ""
 
 
-def variant(tokens: int, capability: tuple[int, int]) -> dict[str, Any]:
+class Variant(TypedDict, total=False):
+    """What of a length an sm90 object is compiled for: its 64-token blocks, and whether the
+    last one is full. Every other route's is empty."""
+
+    blocks: int
+    full: bool
+
+
+def variant(tokens: int, capability: tuple[int, int]) -> Variant:
     """What of this length the card's kernel is compiled for: nothing, except on sm90's."""
     if type(tokens) is not int or tokens < 1:
         raise ValueError("a Sol variant needs a positive token count")
@@ -369,8 +411,19 @@ def target(capability: tuple[int, int]) -> str:
     return f"sm_{major}{minor}{'a' if major >= 9 else ''}"
 
 
+class Library(TypedDict):
+    """Every library input to a Sol object (`sol_library`)."""
+
+    sol_attn_sources: str
+    cutlass_dsl: str
+    cuda_toolkit: str
+    tvm_ffi: str
+    python: str
+    cute_dsl_env: dict[str, str]
+
+
 @functools.cache
-def sol_library() -> dict[str, Any]:
+def sol_library() -> Library:
     """Every library input to the object: sources, DSL and toolkit, FFI ABI, Python tag."""
     cutlass = import_module("cutlass")
     tvm_ffi = import_module("tvm_ffi")
@@ -426,7 +479,7 @@ class _Placeholder:
     def __dlpack_device__(self) -> tuple[int, int]:
         return (_DLPACK_CUDA, 0)
 
-    def __dlpack__(self, *args: Any, **kwargs: Any) -> Any:
+    def __dlpack__(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[explicit-any]  # DLPack's call, passed to torch's as made
         capsule = self.tensor.__dlpack__(*args, **kwargs)
         name_of = ctypes.pythonapi.PyCapsule_GetName
         name_of.restype, name_of.argtypes = ctypes.c_char_p, [ctypes.py_object]
@@ -471,12 +524,26 @@ def compile_variant(route: str, blocks: int = 0, full: bool = False) -> bytes:
         return path.read_bytes()
 
 
+class Spec(TypedDict):
+    """A Sol `job`'s spec, which its builder (`build`) reads: the route and its `variant`."""
+
+    route: str
+    blocks: NotRequired[int]
+    full: NotRequired[bool]
+
+
 @request_path.forbid("kernel build: sol")
-def build(spec: dict[str, Any], staging: Path, report: Callable[..., None]) -> dict[str, object]:
+def build(spec: Spec, staging: Path, report: Callable[[float], None]) -> dict[str, object]:
     """The compile manager's builder for one object (`kernel_compile.BUILDERS["sol"]`)."""
     data = compile_variant(spec["route"], int(spec.get("blocks", 0)), bool(spec.get("full")))
     (staging / "object").write_bytes(data)
     return {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+
+
+class _Function(Protocol):
+    """A loaded object's TVM-FFI function: its operands, then the stream."""
+
+    def __call__(self, *arguments: object) -> object: ...
 
 
 class Loaded:
@@ -484,10 +551,10 @@ class Loaded:
 
     __slots__ = ("function",)
 
-    def __init__(self, function: Any) -> None:
+    def __init__(self, function: _Function) -> None:
         self.function = function
 
-    def __call__(self, *arguments: Any, stream: Any = None) -> Any:
+    def __call__(self, *arguments: object, stream: object = None) -> object:
         return self.function(*arguments, stream)
 
 
@@ -718,7 +785,7 @@ def _native(
     named = ROUTES[route(_arch(query.device))]  # the calling convention upstream branches on
     interface = import_module("sol_attn.interface")
     interface._compiled[(query.device.index, named, batch, tokens, heads, 1)] = loaded
-    return interface._sol_attn_cute(
+    out: Tensor = interface._sol_attn_cute(
         query.contiguous(),
         key.contiguous(),
         value.contiguous(),
@@ -730,6 +797,7 @@ def _native(
         sink_tokens=sink_tokens,
         sink_start=0,
     )
+    return out
 
 
 def sol_attention(
@@ -774,10 +842,10 @@ def _attention(
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-    sparse: Callable[..., Tensor] | None = None,
-    dense: Callable[..., Tensor] = _dense,
-    prefix_dense: Callable[..., Tensor] | None = None,
-    exact: Callable[..., Tensor] | None = None,
+    sparse: SparseRows | None = None,
+    dense: DenseRows = _dense,
+    prefix_dense: DenseRows | None = None,
+    exact: DenseRows | None = None,
 ) -> Tensor:
     """Shared input and model-policy boundary for the opt-in sparse implementations. What a
     sparse kernel admits (one BF16 document, head dimension 128, equal Q/K/V, no mask or
@@ -848,11 +916,11 @@ def _execute(
     layout: AttentionLayout,
     site: Site,
     *,
-    sparse: Callable[..., Tensor] | None = None,
-    dense: Callable[..., Tensor] = _dense,
-    prefix_dense: Callable[..., Tensor] | None = None,
-    exact: Callable[..., Tensor] | None = None,
-) -> Any:
+    sparse: SparseRows | None = None,
+    dense: DenseRows = _dense,
+    prefix_dense: DenseRows | None = None,
+    exact: DenseRows | None = None,
+) -> Tensor:
     """Apply the model's explicit policy after hardware/operand validation. An exact path's
     dense rows (its dense steps, its protected prefix, a dense path) take the exact kernel on
     every route: the walked reference's (`_exact`), or the one a declaring row gives; on a

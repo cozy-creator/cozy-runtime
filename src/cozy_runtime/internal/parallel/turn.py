@@ -15,7 +15,7 @@ from __future__ import annotations
 import itertools
 from contextlib import AbstractContextManager, nullcontext
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import Tensor
@@ -29,7 +29,7 @@ try:
 except ImportError as _absent:  # pragma: no cover - a CPU-only or non-Linux environment
     if TYPE_CHECKING:
         raise
-    TRITON_ABSENT = f"triton does not import ({_absent})"
+    TRITON_ABSENT = f"triton does not import ({_absent})"  # type: ignore[unreachable]  # checkers import triton
 else:
     TRITON_ABSENT = ""
 
@@ -60,7 +60,7 @@ def signs(order: int, device: torch.device) -> Tensor:
 def turned(rows: Tensor) -> Tensor:
     """`rows` (any float, last dimension a power of two) turned, in fp32: a shift `narrow` takes."""
     order = rows.shape[-1]
-    return (rows.float() @ signs(order, rows.device).float()) * order**-0.5
+    return cast(Tensor, (rows.float() @ signs(order, rows.device).float()) * order**-0.5)
 
 
 def law(x: Tensor, shift: Tensor | None = None) -> tuple[Tensor, Tensor]:
@@ -79,7 +79,7 @@ def law_back(values: Tensor, scale: Tensor) -> Tensor:
     """`law`'s rows back, in `scale`'s dtype."""
     order = values.shape[-1]
     summed = values.float() @ signs(order, values.device).float()
-    return (summed * (scale.float() * order**-0.5)).to(scale.dtype)
+    return cast(Tensor, (summed * (scale.float() * order**-0.5)).to(scale.dtype))
 
 
 def narrow(

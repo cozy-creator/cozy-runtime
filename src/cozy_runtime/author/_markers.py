@@ -423,7 +423,9 @@ class FileBound:
 
 def _meta(extra: Mapping[str, object] | None = None, **constraints: object) -> msgspec.Meta:
     said = {key: value for key, value in (extra or {}).items() if value not in (None, "")}
-    return msgspec.Meta(**constraints, **({"extra": said} if said else {}))  # type: ignore[arg-type]
+    # The caller's keywords are `Meta`'s own, which its overloads can't see through `**`.
+    meta: msgspec.Meta = msgspec.Meta(**constraints, **({"extra": said} if said else {}))  # type: ignore[call-overload]
+    return meta
 
 
 def _number(value: object, what: str) -> float:

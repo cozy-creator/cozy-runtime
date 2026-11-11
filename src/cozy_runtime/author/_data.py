@@ -14,13 +14,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.canonical_json import JsonScalar
 
 
-def data_values(anchor: str, asset: str, *path: str) -> tuple[Any, ...]:
+def data_values(anchor: str, asset: str, *path: str) -> tuple[JsonScalar, ...]:
     """The values a committed JSON file lists at `path`, as a tuple.
 
     `anchor` is the calling module's `__file__`; `asset` is a relative path under that
@@ -48,7 +48,7 @@ def data_values(anchor: str, asset: str, *path: str) -> tuple[Any, ...]:
     return tuple(_scalar(row, asset, path) for row in value)
 
 
-def _read(anchor: str, asset: str) -> Any:
+def _read(anchor: str, asset: str) -> object:
     base = Path(anchor).resolve().parent
     target = (base / asset).resolve()
     if Path(asset).is_absolute() or not target.is_relative_to(base):
@@ -69,7 +69,7 @@ def _read(anchor: str, asset: str) -> Any:
         ) from exc
 
 
-def _dig(value: Any, keys: Sequence[str], asset: str, path: Sequence[str]) -> Any:
+def _dig(value: object, keys: Sequence[str], asset: str, path: Sequence[str]) -> object:
     for key in keys:
         if not isinstance(value, dict) or key not in value:
             raise ConformanceError(
@@ -79,7 +79,7 @@ def _dig(value: Any, keys: Sequence[str], asset: str, path: Sequence[str]) -> An
     return value
 
 
-def _scalar(value: Any, asset: str, path: Sequence[str]) -> Any:
+def _scalar(value: object, asset: str, path: Sequence[str]) -> JsonScalar:
     if isinstance(value, (bool, int, float, str)) or value is None:
         return value
     raise ConformanceError(

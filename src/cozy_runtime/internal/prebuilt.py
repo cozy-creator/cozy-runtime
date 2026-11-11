@@ -21,12 +21,22 @@ from dataclasses import dataclass, field
 from functools import partial
 from importlib import metadata
 from types import ModuleType
+from typing import TYPE_CHECKING
 
 from cozy_runtime import _kernels
 from cozy_runtime._kernels import ABSENT as ABSENT
 from cozy_runtime._kernels import ARCHS, FAMILIES, GEMM, NO_FA3, TMA_GEMM
 from cozy_runtime.internal import arch, verify
-from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, E4M3_MAX, Tensor, hadamard256
+from cozy_runtime.internal.encoding.formats import (
+    CONVROT_GROUP,
+    E4M3_MAX,
+    Dtype,
+    Tensor,
+    hadamard256,
+)
+
+if TYPE_CHECKING:
+    from torch import device as Device
 
 #: The verdicts' kernel names, one per format: each verifies on its own.
 KERNELS = {"int8": "prebuilt-int8", "fp8": "prebuilt-fp8"}
@@ -81,14 +91,14 @@ class Prebuilt:
         self._scratch = lambda size: self.torch.empty(size, dtype=self.torch.uint8, device=device)
 
     def int8_linear(
-        self, x: Tensor, data: Tensor, scale: Tensor, bias: Tensor | None, out_dtype: object
+        self, x: Tensor, data: Tensor, scale: Tensor, bias: Tensor | None, out_dtype: Dtype
     ) -> Tensor:
         flat = self._rows(INT8, x)
         rows, width = flat.shape
         bias = self._weight(INT8, data, scale, bias, width, out_dtype)
         shape = (*x.shape[:-1], data.shape[0])
         if rows <= _kernels._gemm.GEMV_ROWS:
-            out = self.torch.empty(shape, dtype=out_dtype, device=x.device)
+            out: Tensor = self.torch.empty(shape, dtype=out_dtype, device=x.device)
             code = 0 if rows == 0 else _kernels._gemm.gemv(
                 self.index, flat.data_ptr(), self._half(flat.dtype), data.data_ptr(),
                 scale.data_ptr(), _ptr(bias), out.data_ptr(), self._half(out_dtype), rows,
@@ -101,7 +111,7 @@ class Prebuilt:
         return self.int8_gemm(q, scales, data, scale, bias, out_dtype).view(shape)
 
     def fp8_linear(
-        self, x: Tensor, data: Tensor, scale: Tensor, bias: Tensor | None, out_dtype: object
+        self, x: Tensor, data: Tensor, scale: Tensor, bias: Tensor | None, out_dtype: Dtype
     ) -> Tensor:
         q, scales = self.fp8_quantize(x)
         shape = (*x.shape[:-1], data.shape[0])
@@ -138,7 +148,7 @@ class Prebuilt:
         data: Tensor,
         scale: Tensor,
         bias: Tensor | None,
-        out_dtype: object,
+        out_dtype: Dtype,
         config: int = -1,
         out: Tensor | None = None,
     ) -> Tensor:
@@ -151,13 +161,13 @@ class Prebuilt:
         data: Tensor,
         scale: Tensor,
         bias: Tensor | None,
-        out_dtype: object,
+        out_dtype: Dtype,
         config: int = -1,
         out: Tensor | None = None,
     ) -> Tensor:
         return self._gemm(FP8, q, scales, data, scale, bias, out_dtype, config, out)
 
-    def w4a8_linear(self, x: Tensor, w: W4a8, bias: Tensor | None, out_dtype: object) -> Tensor:
+    def w4a8_linear(self, x: Tensor, w: W4a8, bias: Tensor | None, out_dtype: Dtype) -> Tensor:
         q, scales = self.int8_quantize(x)
         return self.w4a8_gemm(q, scales, w, bias, out_dtype).view(*x.shape[:-1], w.codes.shape[0])
 
@@ -167,7 +177,7 @@ class Prebuilt:
         scales: Tensor,
         w: W4a8,
         bias: Tensor | None,
-        out_dtype: object,
+        out_dtype: Dtype,
         config: int = -1,
     ) -> Tensor:
         """`q @ unpack(w).T`, both scales and the bias. From `UNPACK_ROWS` rows the codes unpack
@@ -190,7 +200,7 @@ class Prebuilt:
             )  # fmt: skip
             self._check(code, "the w4a8 unpack")
             return self.int8_gemm(q, scales, levels, w.scale, bias, out_dtype)
-        out = torch.empty(rows, n, dtype=out_dtype, device=q.device)
+        out: Tensor = torch.empty(rows, n, dtype=out_dtype, device=q.device)
         if rows == 0:
             return out
         code = _kernels._gemm.w4a8_gemm(
@@ -205,7 +215,7 @@ class Prebuilt:
         return out
 
     def _w4a8_weight(
-        self, w: W4a8, bias: Tensor | None, width: int, out_dtype: object
+        self, w: W4a8, bias: Tensor | None, width: int, out_dtype: Dtype
     ) -> Tensor | None:
         torch = self.torch
         n = w.codes.shape[0]
@@ -282,7 +292,7 @@ class Prebuilt:
         data: Tensor,
         scale: Tensor,
         bias: Tensor | None,
-        out_dtype: object,
+        out_dtype: Dtype,
         config: int,
         out: Tensor | None = None,
     ) -> Tensor:
@@ -298,7 +308,11 @@ class Prebuilt:
         bias = self._weight(f, data, scale, bias, width, out_dtype)
         n = data.shape[0]
         direct = out is not None and _writable(out, rows, n, out_dtype, q.device)
-        result = out if direct else torch.empty(rows, n, dtype=out_dtype, device=q.device)
+        result: Tensor = (
+            out
+            if direct and out is not None
+            else torch.empty(rows, n, dtype=out_dtype, device=q.device)
+        )
         if rows == 0:
             return _landed(result, out)
         code = _kernels._gemm.NOT_SUPPORTED
@@ -351,7 +365,7 @@ class Prebuilt:
         scale: Tensor,
         bias: Tensor | None,
         width: int,
-        out_dtype: object,
+        out_dtype: Dtype,
     ) -> Tensor | None:
         key = (data.dtype, scale.dtype, data.data_ptr(), scale.data_ptr(), *data.shape, width,
                out_dtype)  # fmt: skip
@@ -391,7 +405,7 @@ class Prebuilt:
             found = found.contiguous()
         return found if found.data_ptr() % 16 == 0 else found.clone()
 
-    def _half(self, dtype: object) -> bool:
+    def _half(self, dtype: Dtype) -> bool:
         if dtype not in (self.torch.bfloat16, self.torch.float16):
             raise ValueError(f"8-bit linear: activations and outputs are bf16 or fp16, not {dtype}")
         return bool(dtype == self.torch.float16)
@@ -421,7 +435,7 @@ class W4a8:
     codebook: Tensor | None
 
 
-def _writable(out: Tensor, rows: int, n: int, dtype: object, device: object) -> bool:
+def _writable(out: Tensor, rows: int, n: int, dtype: Dtype, device: Device) -> bool:
     """Whether the GEMM writes `out` in place: `[rows, n]` of its dtype on its device, the last
     axis dense and the rows 16 bytes apart in whole multiples, as its stores are."""
     return (
@@ -453,7 +467,7 @@ def unpack(torch: ModuleType, w: W4a8) -> Tensor:
         levels = torch.arange(-8, 8, dtype=torch.float32, device=codes.device)
     else:
         levels = w.codebook.reshape(16).float()
-    out = torch.empty(rows, 2 * half, dtype=torch.int8, device=codes.device)
+    out: Tensor = torch.empty(rows, 2 * half, dtype=torch.int8, device=codes.device)
     step = max(1, (1 << 22) // max(half, 1))
     for at in range(0, rows, step):
         part = codes[at : at + step]
@@ -582,7 +596,8 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
     generator = torch.Generator(device=device).manual_seed(20261017)
 
     def randn(*shape: int, scale: float = 1.0) -> Tensor:
-        return torch.randn(*shape, generator=generator, device=device, dtype=torch.float32) * scale
+        drawn: Tensor = torch.randn(*shape, generator=generator, device=device, dtype=torch.float32)
+        return drawn * scale
 
     rows, out_features, width = 300, 512, 1024
     if f.fp8:
@@ -596,11 +611,14 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
     for dtype in (torch.bfloat16, torch.float16):
         bias = randn(out_features).to(dtype)
         name = "bf16" if dtype == torch.bfloat16 else "fp16"
+        x: Tensor | None = None
+        want: Tensor | None = None
         for m in (3, rows):
             x = randn(m, width).to(dtype)
             want = law(torch, f, x.double(), data, scale, bias)
             got = (ops.fp8_linear if f.fp8 else ops.int8_linear)(x, data, scale, bias, dtype)
             errors[f"{name} linear M={m}"] = verify.error(torch, got, want)
+        assert x is not None and want is not None  # the rows' last pass: M=rows
         q, scales = (ops.fp8_quantize if f.fp8 else ops.int8_quantize)(x)
         first: tuple[int, Tensor] | None = None
         for config in range(8):
@@ -661,7 +679,8 @@ def probe_w4a8(torch: ModuleType, ops: Prebuilt) -> verify.Verdict:
     generator = torch.Generator(device=device).manual_seed(20261022)
 
     def randn(*shape: int, scale: float = 1.0) -> Tensor:
-        return torch.randn(*shape, generator=generator, device=device, dtype=torch.float32) * scale
+        drawn: Tensor = torch.randn(*shape, generator=generator, device=device, dtype=torch.float32)
+        return drawn * scale
 
     rows, out_features, width = 300, 520, 1024  # N not a multiple of a tile
     codes = torch.randint(0, 256, (out_features, width // 2), generator=generator,
@@ -680,12 +699,15 @@ def probe_w4a8(torch: ModuleType, ops: Prebuilt) -> verify.Verdict:
         for dtype in (torch.bfloat16, torch.float16):
             bias = randn(out_features).to(dtype)
             label = f"{name} {'bf16' if dtype == torch.bfloat16 else 'fp16'}"
+            x: Tensor | None = None
+            want: Tensor | None = None
             for m in (3, rows):
                 x = randn(m, width).to(dtype)
                 want = law(torch, INT8, x.double(), data, grid.scale, bias)
                 errors[f"{label} linear M={m}"] = verify.error(
                     torch, ops.w4a8_linear(x, grid, bias, dtype), want
                 )
+            assert x is not None and want is not None  # the rows' last pass: M=rows
             q, scales = ops.int8_quantize(x)
             first: tuple[int, Tensor] | None = None
             for config in range(8):
@@ -734,22 +756,26 @@ def _prologue(
     torch: ModuleType, x: Tensor, modulation: Tensor, shift: Tensor, eps: float
 ) -> Tensor:
     """`gelu_tanh(rms_norm(x) * (1 + modulation) + shift)`, a table row per half of the rows."""
-    entry = torch.arange(x.shape[0], device=x.device) // (x.shape[0] // modulation.shape[0])
-    y = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+    entry: Tensor = torch.arange(x.shape[0], device=x.device)
+    entry = entry // (x.shape[0] // modulation.shape[0])
+    root: Tensor = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+    y = x * root
     y = y * (1 + modulation[entry]) + shift[entry]
-    return 0.5 * y * (1 + torch.tanh(0.79788456 * (y + 0.044715 * y**3)))
+    tanh: Tensor = torch.tanh(0.79788456 * (y + 0.044715 * y**3))
+    return 0.5 * y * (1 + tanh)
 
 
 def _swiglu(torch: ModuleType, gate: Tensor, up: Tensor) -> Tensor:
     """The rows an eager SwiGLU writes: torch's silu, then the product, each in the rows' dtype."""
-    silu = torch.nn.functional.silu(gate.float()).to(gate.dtype)
+    silu: Tensor = torch.nn.functional.silu(gate.float()).to(gate.dtype)
     return (silu.float() * up.float()).to(gate.dtype).double()
 
 
 def _situ(torch: ModuleType, x: Tensor) -> Tensor:
     """The gated SiTU of [hidden | gate] rows: `4 tanh(g / 4) sigmoid(g) * 25 tanh(h / 25)`."""
     hidden, gate = x.chunk(2, -1)
-    return 4 * torch.tanh(gate / 4) * torch.sigmoid(gate) * 25 * torch.tanh(hidden / 25)
+    situ: Tensor = 4 * torch.tanh(gate / 4) * torch.sigmoid(gate) * 25 * torch.tanh(hidden / 25)
+    return situ
 
 
 @dataclass(frozen=True, slots=True)

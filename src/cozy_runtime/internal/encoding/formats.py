@@ -13,13 +13,14 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
 from cozy_runtime.author._loader import TORCH_DTYPES as _TORCH_DTYPES
 from cozy_runtime.internal.decode_schemes import BY_SCHEME as _CORE_SCHEMES
 from cozy_runtime.internal.decode_schemes import parts_rule as _core_parts_rule
 
-# `Any` below is a torch module, tensor, dtype or nn.Module: torch is absent from the check venv.
+if TYPE_CHECKING:
+    import torch
 
 REFUSALS = frozenset(
     {
@@ -151,7 +152,7 @@ def to_blocked(torch: ModuleType, scales: Tensor) -> Tensor:
     rows, cols = int(scales.shape[0]), int(scales.shape[1])
     padded_rows, padded_cols = _blocked_shape(rows, cols)
     row_blocks, col_blocks = padded_rows // 128, padded_cols // 4
-    padded = torch.zeros(padded_rows, padded_cols, dtype=scales.dtype, device=scales.device)
+    padded: Tensor = torch.zeros(padded_rows, padded_cols, dtype=scales.dtype, device=scales.device)
     padded[:rows, :cols] = scales
     tiles = padded.view(row_blocks, 128, col_blocks, 4).permute(0, 2, 1, 3)
     return tiles.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1).contiguous()
@@ -227,8 +228,9 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
 
 # ------------------------------------------------------------------------ the providers
 
-#: A torch tensor, spelled once: torch is absent from the check venv.
-type Tensor = Any
+#: A torch tensor and dtype, spelled once for the modules that import no torch at run time.
+type Tensor = torch.Tensor
+type Dtype = torch.dtype
 
 
 class Provider(Protocol):
@@ -288,6 +290,24 @@ class Provider(Protocol):
     ) -> None: ...
 
 
+class Leaf(Protocol):
+    """An installed encoded leaf (`leaves`): an `nn.Module` whose weight is its role buffers."""
+
+    #: a role's buffer where it is not the role's own name
+    BUFFERS: ClassVar[dict[str, str]]
+    _cozy_roles: tuple[str, ...]
+    _buffers: dict[str, torch.Tensor | None]
+    _non_persistent_buffers_set: set[str]
+
+    def __call__(self, x: Tensor, /) -> Tensor:
+        """The linear op it replaced, on its encoded weight."""
+        ...
+
+    def roles(self) -> dict[str, Tensor]:
+        """Each role's tensor as the leaf keeps it (cast or swizzled from the stored part)."""
+        ...
+
+
 @runtime_checkable
 class LeafProvider(Provider, Protocol):
     """A module-replacing provider: the stored parts stay resident as the weight and the
@@ -309,7 +329,15 @@ class LeafProvider(Provider, Protocol):
         """The destination dtypes its kernels write; a tensor of another decodes."""
         ...
 
-    def leaf(self, torch: Any, parts: Mapping[str, Any], replaced: Any, out_dtype: Any) -> Any: ...
+    def leaf(
+        self,
+        torch: ModuleType,
+        parts: Mapping[str, Tensor],
+        replaced: object,
+        out_dtype: torch.dtype,
+    ) -> Leaf:
+        """The leaf replacing `replaced` (a linear op), multiplying by `parts` into `out_dtype`."""
+        ...
 
     def resident_bytes(self, parts: Mapping[str, RolePart]) -> int: ...
 
@@ -538,7 +566,8 @@ def e8m0_multipliers(torch: ModuleType, scale: Tensor) -> Tensor:
     bits = raw.to(torch.int32) << 23
     bits = torch.where(raw == 0, torch.full_like(bits, 1 << 22), bits)
     mult = bits.view(torch.float32)
-    return torch.where(raw == E8M0_NAN, torch.full_like(mult, float("nan")), mult)
+    out: Tensor = torch.where(raw == E8M0_NAN, torch.full_like(mult, float("nan")), mult)
+    return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -721,7 +750,7 @@ def nvfp4_values(
     rows, cols = int(weight.shape[0]), int(weight.shape[1]) * 2
     pair = (weight >> 4, weight & 0x0F) if high_first else (weight & 0x0F, weight >> 4)
     codes = torch.stack(pair, dim=-1).reshape(rows, cols)
-    lut = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=weight.device)
+    lut: Tensor = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=weight.device)
     blocks = lut[codes.long()].view(rows, cols // NVFP4_BLOCK, NVFP4_BLOCK)
     second = scale_2.to(torch.float32).reshape(())
     block_scale = scale.to(torch.float32).view(rows, cols // NVFP4_BLOCK, 1)

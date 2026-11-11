@@ -152,7 +152,7 @@ def _fields(
     it can). A group with a required member the box can't draw is one it can't draw: it stays
     off the box when it has a default, as any such field does (a model's `regions`)."""
     shapes: list[str] = []
-    for f in msgspec.structs.fields(struct):  # type: ignore[arg-type]
+    for f in msgspec.structs.fields(struct):  # type: ignore[arg-type]  # a payload or group: a Struct type
         path = prefix + f.name
         base, markers = strip(f.type)
         inner, _ = unwrap_optional(base)
@@ -197,7 +197,9 @@ def _undrawable(tp: object, markers: Sequence[object], listed: bool) -> str:
     slot = (
         isinstance(tp, type) and issubclass(tp, (*_FILES, *_MEDIA)) and not issubclass(tp, Latents)
     )
-    struct = is_struct(tp) and not slot and not issubclass(tp, (Pickup, Prompt))  # type: ignore[arg-type]
+    struct = (
+        isinstance(tp, type) and is_struct(tp) and not slot and not issubclass(tp, (Pickup, Prompt))
+    )
     if listed:
         return "" if slot else "group" if struct else "a list of anything but slots or groups"
     if tp is AspectRatio:

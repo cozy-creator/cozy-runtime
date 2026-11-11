@@ -11,9 +11,9 @@ routing's own tiles exits. `GROUP` row tiles take each weight block in turn whil
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from cozy_runtime.accel.kernels import TritonEntry
+from cozy_runtime.accel.kernels import JitKernel, TritonEntry, jit
 
 try:
     import triton
@@ -21,7 +21,7 @@ try:
 except ImportError as _absent:  # pragma: no cover - a CPU-only or non-Linux environment
     if TYPE_CHECKING:
         raise
-    TRITON_ABSENT = f"triton does not import ({_absent})"
+    TRITON_ABSENT = f"triton does not import ({_absent})"  # type: ignore[unreachable]  # TYPE_CHECKING re-raises
 else:
     TRITON_ABSENT = ""
 
@@ -33,7 +33,7 @@ GEMM_K = {"bf16": 64, "int8": 128}
 
 if not TRITON_ABSENT:
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @jit
     def experts_bf16_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         weights_ptr,
@@ -61,7 +61,7 @@ if not TRITON_ABSENT:
             acc += tl.sum(wv.to(tl.float32) * xv[None, :], axis=1)
         tl.store(out_ptr + p * n + rows, acc.to(tl.bfloat16), mask=rows < n)
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @jit
     def experts_int8_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         x_scale_ptr,
@@ -95,7 +95,7 @@ if not TRITON_ABSENT:
         y = y * tl.load(s + rows, mask=rows < n, other=0.0)
         tl.store(out_ptr + p * n + rows, y.to(tl.bfloat16), mask=rows < n)
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton ships no types
     def _tile(  # type: ignore[no-untyped-def]
         order_ptr,
         spans_ptr,
@@ -130,7 +130,7 @@ if not TRITON_ABSENT:
             target = pair
         return expert, live, cols, source, target
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @jit
     def grouped_bf16_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         weights_ptr,
@@ -166,7 +166,7 @@ if not TRITON_ABSENT:
         ok = live[:, None] & (cols[None, :] < n)
         tl.store(out_ptr + target[:, None] * n + cols[None, :], acc.to(tl.bfloat16), mask=ok)
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @jit
     def grouped_int8_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         x_scale_ptr,
@@ -209,7 +209,7 @@ if not TRITON_ABSENT:
         tl.store(out_ptr + target[:, None] * n + cols[None, :], y.to(tl.bfloat16), mask=ok)
 
 
-def _signature(kernel: Any, **types: str) -> dict[str, str]:
+def _signature(kernel: JitKernel, **types: str) -> dict[str, str]:
     return {
         name: types.get(name)
         or ("constexpr" if name.isupper() else "*i64" if name.endswith("s_ptr") else "i32")

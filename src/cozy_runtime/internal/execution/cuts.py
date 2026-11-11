@@ -16,7 +16,7 @@ import math
 import sys
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
-from typing import cast
+from typing import Protocol, cast
 
 import torch
 from torch import Tensor, nn
@@ -27,6 +27,14 @@ from cozy_runtime.internal.encoding.leaves import NVFP4
 from cozy_runtime.internal.execution.sizing import levelled, levels, pieces
 
 type Band = Callable[[int, int], Tensor]
+
+
+class Forward(Protocol):
+    """A module's forward as a cut calls it: its input first, then whatever else it takes."""
+
+    def __call__(self, x: object, *args: object, **kwargs: object) -> object: ...
+
+
 type Attention = Callable[[Tensor, Tensor, Tensor, Tensor | None], Tensor]
 #: diffusers' token-wise feed-forwards and the activation projections inside them
 _FFN = frozenset({"FeedForward", "GELU", "GEGLU", "SwiGLU", "ApproximateGELU", "LinearActivation"})
@@ -50,7 +58,8 @@ def install(module: nn.Module) -> int:
             and "_conv_forward" not in vars(sub)
             and type(sub)._conv_forward in (nn.Conv2d._conv_forward, nn.Conv3d._conv_forward)
         ):
-            sub._conv_forward = _conv_bands(f"{path}:bands", sub, _conv_of(sub))
+            # The instance's own conv shadows its class's, with positional parameters.
+            sub._conv_forward = _conv_bands(f"{path}:bands", sub, _conv_of(sub))  # type: ignore[method-assign,assignment]
             vars(sub)["_cozy_cut"] = True
             count += 1
         # torch's RMS norm reduces each row alone: token pieces are the whole (v7 H3 13826 ran
@@ -80,12 +89,16 @@ def install(module: nn.Module) -> int:
 type Conv = Callable[[Tensor, Tensor, Tensor | None], Tensor]
 
 
-def _conv_of(module: nn.Module) -> Conv:
+type Convolution = nn.Conv2d | nn.Conv3d
+
+
+def _conv_of(module: Convolution) -> Conv:
     """`module`'s class `_conv_forward` as it is at each call."""
-    return lambda x, w, b: type(module)._conv_forward(module, x, w, b)
+    # Each conv class's `_conv_forward` takes its own instance, which `module` is.
+    return lambda x, w, b: type(module)._conv_forward(module, x, w, b)  # type: ignore[arg-type]
 
 
-def _conv_bands(site: str, module: nn.Module, conv: Conv) -> Conv:
+def _conv_bands(site: str, module: Convolution, conv: Conv) -> Conv:
     """A conv at the level the process keeps for `site`: whole at 0, else in bands of images, else
     (one image, ungrouped) of output channels, each band copied into its slice of the result.
     Measured on a GPU (tests/test_band_live_bytes.py): the band's workspace is what shrinks."""
@@ -110,7 +123,7 @@ def _conv_bands(site: str, module: nn.Module, conv: Conv) -> Conv:
     return cut
 
 
-def _conv_need(module: nn.Module, x: Tensor, units: int, by_images: bool) -> sizing.Per:
+def _conv_need(module: Convolution, x: Tensor, units: int, by_images: bool) -> sizing.Per:
     """A band's bytes: the whole output, held throughout; the band's output; and, where the conv
     pads by copying (a padding mode other than zeros), the band's padded input (an image band's
     images, or the whole input again for a channel band). cuDNN's workspace is left to allocator
@@ -120,7 +133,8 @@ def _conv_need(module: nn.Module, x: Tensor, units: int, by_images: bool) -> siz
     if module.padding == "same":
         sizes = spatial
     else:
-        pad = (0,) * dims if module.padding == "valid" else module.padding
+        # Neither "same" nor "valid": torch keeps a padding tuple.
+        pad = (0,) * dims if module.padding == "valid" else cast("tuple[int, ...]", module.padding)
         sizes = [
             (n + 2 * p - d * (k - 1) - 1) // s + 1
             for n, p, d, k, s in zip(
@@ -168,12 +182,12 @@ def _bands(
     return out
 
 
-def _forward(module: nn.Module) -> Callable[..., object]:
+def _forward(module: nn.Module) -> Forward:
     """A forward set on the instance as it is now, else its class's at each call."""
     return vars(module).get("forward") or catch.current(module)
 
 
-def _ffn(site: str, module: nn.Module, forward: Callable[..., object]) -> Callable[..., object]:
+def _ffn(site: str, module: nn.Module, forward: Forward) -> Forward:
     whole: list[bool] = []  # a piece returned no tensor: it runs whole from then on
 
     def cut(x: object, *args: object, **kwargs: object) -> object:
@@ -268,7 +282,7 @@ class _Whole(Exception):
     """A cut's pieces do not join (a call returned no tensor): it runs whole."""
 
 
-def _tokens(forward: Callable[..., object], x: Tensor, tokens: int, level: int) -> object:
+def _tokens(forward: Forward, x: Tensor, tokens: int, level: int) -> object:
     if not level:
         return forward(x)
     size, flat, out = pieces(tokens, level), x.reshape(tokens, x.shape[-1]), None
@@ -284,7 +298,7 @@ def _tokens(forward: Callable[..., object], x: Tensor, tokens: int, level: int) 
     return out.view(*x.shape[:-1], *out.shape[1:])
 
 
-def _norm(site: str, module: nn.Module, forward: Callable[..., object]) -> Callable[..., object]:
+def _norm(site: str, module: nn.Module, forward: Forward) -> Forward:
     """A norm over its trailing `normalized_shape` in pieces of whole rows (tokens)."""
     dims = len(cast("tuple[int, ...]", module.normalized_shape))
 
@@ -311,7 +325,7 @@ def _norm(site: str, module: nn.Module, forward: Callable[..., object]) -> Calla
     return cut
 
 
-def _rows(forward: Callable[..., object], flat: Tensor, tokens: int, level: int) -> object:
+def _rows(forward: Forward, flat: Tensor, tokens: int, level: int) -> object:
     if not level:
         return forward(flat)
     size, out = pieces(tokens, level), None
@@ -351,8 +365,8 @@ def _rms(
     first: bool,
     channels: int,
     affine_dims: int,
-    forward: Callable[..., object],
-) -> Callable[..., object]:
+    forward: Forward,
+) -> Forward:
     def cut(x: object, *args: object, **kwargs: object) -> object:
         if (
             args
@@ -383,7 +397,7 @@ def _rms(
     return cut
 
 
-def _rms_bands(forward: Callable[..., object], x: Tensor, axis: int, level: int) -> object:
+def _rms_bands(forward: Forward, x: Tensor, axis: int, level: int) -> object:
     height = int(x.shape[axis])
     if not level:
         return forward(x)

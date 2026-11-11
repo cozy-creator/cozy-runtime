@@ -16,7 +16,7 @@ from types import ModuleType
 
 from cozy_runtime.accel.kernels import INT8_CONVROT, PreQuantized
 from cozy_runtime.internal import arch, int8_linear, kernel_ready, prebuilt
-from cozy_runtime.internal.encoding.formats import Tensor
+from cozy_runtime.internal.encoding.formats import Dtype, Tensor
 
 OP = "cozy-w4a8"
 #: The activation operand it takes: int8.convrot's.
@@ -71,7 +71,7 @@ def serving(index: int) -> str:
 
 
 def linear(
-    torch: ModuleType, x: Tensor, w: prebuilt.W4a8, bias: Tensor | None, out_dtype: object
+    torch: ModuleType, x: Tensor, w: prebuilt.W4a8, bias: Tensor | None, out_dtype: Dtype
 ) -> Tensor:
     """`x @ W.T + bias` for one w4a8 weight."""
     index = x.get_device()
@@ -89,7 +89,7 @@ def gemm(
     operand: PreQuantized,
     w: prebuilt.W4a8,
     bias: Tensor | None,
-    out_dtype: object,
+    out_dtype: Dtype,
     out: Tensor | None = None,
 ) -> Tensor:
     """The linear of an int8.convrot operand (`int8_linear.quantize`, a producer's prologue);

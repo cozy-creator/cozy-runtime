@@ -64,7 +64,7 @@ def record(
     return GpuMemory(
         gpu=gpu,
         ceiling=_ceiling(device, store),
-        stats=request.stats(),
+        stats=request.stats(),  # type: ignore[arg-type]  # a RequestStats is a str-keyed dict on the wire
         torch_peak=torch_peak if device is not None else None,
     )
 

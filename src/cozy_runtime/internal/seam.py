@@ -38,7 +38,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, NoReturn
+from typing import NoReturn
 
 from cozy_runtime.internal.canonical import DOC_MAX_BYTES
 
@@ -85,7 +85,7 @@ class SeamError(Exception):
 SUPPLYING = frozenset({"load", "invoke"})
 
 
-def _scan(value: Any, path: str = "", *, supplied: bool = False) -> None:
+def _scan(value: object, path: str = "", *, supplied: bool = False) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
             at = f"{path}{key}"
@@ -121,7 +121,7 @@ class Channel:
     #: by `Mux.ask`): attempts, follower readers and overlapped calls all send.
     sending: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
-    def send(self, message: dict[str, Any]) -> None:
+    def send(self, message: dict[str, object]) -> None:
         _scan(message, supplied=message.get("cmd") in SUPPLYING)
         data = json.dumps(message, separators=(",", ":"), sort_keys=True).encode()
         if len(data) > MAX_FRAME:
@@ -241,7 +241,7 @@ class Channel:
 
     def recv(
         self, timeout: float | None = None, *, total_timeout: float | None = None
-    ) -> dict[str, Any] | None:
+    ) -> Frame | None:
         """One frame, or None when the peer is gone (a disposable executor's normal end)."""
         deadline = time.monotonic() + total_timeout if total_timeout is not None else None
         head = self._read_exact(

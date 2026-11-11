@@ -87,16 +87,16 @@ class ChildCallError(CapabilityError):
 
 
 @overload
-def call[R](
-    fn: Callable[..., Coroutine[Any, Any, R]], /, **arguments: object
+def call[R](  # type: ignore[explicit-any]  # any package function: call() names its arguments
+    fn: Callable[..., Coroutine[object, object, R]], /, **arguments: object
 ) -> PendingCall[R]: ...
 
 
 @overload
-def call[R](fn: Callable[..., R], /, **arguments: object) -> PendingCall[R]: ...
+def call[R](fn: Callable[..., R], /, **arguments: object) -> PendingCall[R]: ...  # type: ignore[explicit-any]  # any package function: call() names its arguments
 
 
-def call(fn: Callable[..., object], /, **arguments: object) -> PendingCall[Any]:
+def call(fn: Callable[..., object], /, **arguments: object) -> PendingCall[object]:  # type: ignore[explicit-any]  # any package function: call() names its arguments
     """Run `fn` as a managed call: its own job on the machine, with its own models, memo and
     progress. Awaiting it returns `fn`'s result.
 
@@ -112,8 +112,8 @@ def call(fn: Callable[..., object], /, **arguments: object) -> PendingCall[Any]:
     return broker.reserve(module, name, arguments)
 
 
-def prefetch(
-    callee: Callable[..., object],
+def prefetch[**P, R](
+    callee: Callable[P, R],
     *,
     models: Mapping[str, ModelChoice | None] | None = None,
 ) -> None:
@@ -186,7 +186,7 @@ class PendingCall[R](Awaitable[R]):
         self.progress_scope = _progress_scope.get()
         self.progress_sequence = 0
 
-    def __await__(self) -> Generator[Any, None, R]:
+    def __await__(self) -> Generator[object, None, R]:
         if self.task is None:
             self.task = asyncio.create_task(self.broker.run(self))
         return self.task.__await__()
@@ -229,7 +229,7 @@ class _Broker:
         self.nudges: Nudges | None = None
         self.nudged = 0
         self.nudge = asyncio.Event()
-        self.calls: dict[int, PendingCall[Any]] = {}
+        self.calls: dict[int, PendingCall[object]] = {}
         self.next_index = 0
         self.closed = False
         self.activated: set[int] = set()
@@ -295,7 +295,7 @@ class _Broker:
         module: str,
         export: str,
         arguments: Mapping[str, object],
-    ) -> PendingCall[Any]:
+    ) -> PendingCall[object]:
         ctx = self.context
         if self.closed or ctx is None or ctx.request_id != self.request_id:
             raise CapabilityError("package call escaped its attempt", code="escaped_handle")
@@ -393,7 +393,8 @@ class _Broker:
         payload = application_json.encode(encoded)
         if len(payload) > MAX_CALL_BYTES:
             raise CapabilityError("package call exceeds inline bound", code="child_payload_bound")
-        call = PendingCall[Any](self, self.next_index, binding, payload, ctx, tuple(saved.values()))
+        saved_files = tuple(saved.values())
+        call = PendingCall[object](self, self.next_index, binding, payload, ctx, saved_files)
         self.next_index += 1
         self.calls[call.index] = call
         return call
@@ -509,7 +510,7 @@ class _Broker:
             nudges.close()
 
     @staticmethod
-    def _observe(call: PendingCall[Any], answer: Answer) -> None:
+    def _observe[T](call: PendingCall[T], answer: Answer) -> None:
         child_id = answer.child_request_id
         if child_id:
             if len(child_id) > 256 or call.request_id not in ("", child_id):
@@ -524,10 +525,10 @@ class _Broker:
             if scope is None and call.broker.telemetry is not None:
                 scope = _ProgressScope(call.broker.telemetry, call.binding.export)
             if scope is not None:
-                scope.telemetry._child_progress(progress.payload, scope)
+                scope.telemetry._child_progress(progress.payload, scope)  # type: ignore[arg-type]  # a child's progress is a JSON object
 
     @staticmethod
-    def _intent(call: PendingCall[Any]) -> ChildCall:
+    def _intent[T](call: PendingCall[T]) -> ChildCall:
         return ChildCall(
             call_index=call.index,
             module=call.binding.module,

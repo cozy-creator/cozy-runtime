@@ -24,7 +24,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 from cozy_runtime.accel.kernels import (
     INT8_CONVROT,
@@ -48,7 +48,9 @@ from cozy_runtime.internal.encoding.formats import (
     E4M3_MAX,
     MX_BLOCK,
     NVFP4_BLOCK,
+    Dtype,
     Int8ConvRotDequant,
+    Leaf,
     MicroScaledDequant,
     Nvfp4Dequant,
     Params,
@@ -71,7 +73,85 @@ SVDQ = "cozy.svdq-nvfp4.native-leaf/1"
 
 class _Serving(Protocol):
     def serving(self, index: int) -> str: ...
-    def prime(self, torch: Any, index: int) -> None: ...
+    def prime(self, torch: ModuleType, index: int) -> None: ...
+
+
+class EncodedLeaf(Protocol):
+    """An encoded leaf (`_leaf_class`) as its forward reads it: its geometry, and each role
+    buffer by its buffer's name."""
+
+    in_features: int
+    out_features: int
+
+    def __getattr__(self, name: str) -> Tensor: ...
+
+
+class _Forward(Protocol):
+    """An `EncodedLinear`'s linear: `(leaf, x, out_dtype) -> out`."""
+
+    def __call__(self, leaf: EncodedLeaf, x: Tensor, out_dtype: Dtype, /) -> Tensor: ...
+
+
+class _LeafClass(Protocol):
+    """An `EncodedLinear` class: its constructor."""
+
+    def __call__(
+        self,
+        forward_fn: _Forward | None,
+        roles: Mapping[str, Tensor],
+        bias: Tensor | None,
+        out_dtype: Dtype,
+        provider: str,
+        encoding: str,
+        in_features: int,
+        out_features: int,
+    ) -> Leaf: ...
+
+
+class _SvdqLeaf(Leaf, Protocol):
+    #: Whether the weight is in the prebuilt GEMM's tiles (`svdq_linear.tiled`).
+    tiled: bool
+
+
+class _SvdqLeafClass(Protocol):
+    def __call__(
+        self,
+        forward_fn: _Forward | None,
+        roles: Mapping[str, Tensor],
+        bias: Tensor | None,
+        out_dtype: Dtype,
+        provider: str,
+        encoding: str,
+        in_features: int,
+        out_features: int,
+    ) -> _SvdqLeaf: ...
+
+
+class _NativeOps(Protocol):
+    """An 8-bit leaf's op module (`int8_linear`, `fp8_linear`)."""
+
+    def quantize(self, torch: ModuleType, x: Tensor) -> PreQuantized | None: ...
+
+    def gemm(
+        self,
+        torch: ModuleType,
+        operand: PreQuantized,
+        data: Tensor,
+        scale: Tensor,
+        bias: Tensor | None,
+        out_dtype: Dtype,
+        out: Tensor | None = None,
+    ) -> Tensor: ...
+
+    def linear(
+        self,
+        torch: ModuleType,
+        x: Tensor,
+        data: Tensor,
+        scale: Tensor,
+        bias: Tensor | None,
+        out_dtype: Dtype,
+    ) -> Tensor: ...
 
 
 class _ScaledMm:
@@ -82,7 +162,7 @@ class _ScaledMm:
         return "torch._scaled_mm"
 
     @staticmethod
-    def prime(torch: Any, index: int) -> None:
+    def prime(torch: ModuleType, index: int) -> None:
         return None
 
 
@@ -113,7 +193,7 @@ def serving(provider: str, index: int) -> str:
     return str(_MODULES[provider].serving(index))
 
 
-def prime(torch: Any, index: int) -> None:
+def prime(torch: ModuleType, index: int) -> None:
     """Opens every kernel the encoded leaves serve on cuda:`index`, each on its own thread, at
     device init beside the weight fill (`kernel_ready.prime`): a first ask waits for its kernel
     rather than serve a fallback through a request's first step (cr-241: H3's nvfp4 step 1 on an
@@ -122,12 +202,17 @@ def prime(torch: Any, index: int) -> None:
         module.prime(torch, index)
 
 
-def sites(leaves: Mapping[str, tuple[Any, ...]]) -> Counter[tuple[str, str]]:
+class _Installed(Protocol):
+    @property
+    def provider(self) -> str: ...
+
+
+def sites(leaves: Mapping[str, tuple[_Installed, *tuple[object, ...]]]) -> Counter[tuple[str, str]]:
     """`(component, provider)` -> how many installed leaves: counted once, when they install."""
     return Counter((key.partition(".")[0], entry[0].provider) for key, entry in leaves.items())
 
 
-def _leaf_class(torch: Any) -> Any:
+def _leaf_class(torch: ModuleType) -> _LeafClass:
     """The `nn.Module` subclass every encoded leaf is an instance of, built ONCE, lazily.
 
     Built inside a function because this module imports no torch — the whole runtime's
@@ -141,12 +226,12 @@ def _leaf_class(torch: Any) -> Any:
     its eviction already walk — so the resident bytes stay ledgered by the machinery that
     was already counting them.
     """
-    cached = getattr(_leaf_class, "_cached", None)
+    cached: _LeafClass | None = getattr(_leaf_class, "_cached", None)
     if cached is not None:
         return cached
     from torch import nn
 
-    class EncodedLinear(nn.Module):  # type: ignore[misc]
+    class EncodedLinear(nn.Module):
         """One linear op whose WEIGHT IS THE ENCODED ROLE SET, computed by an encoded GEMM.
 
         It stands exactly where the module it replaced stood, takes exactly that module's
@@ -158,12 +243,18 @@ def _leaf_class(torch: Any) -> Any:
         #: A role's buffer where it is not the role's own name.
         BUFFERS: ClassVar[dict[str, str]] = {}
 
+        if TYPE_CHECKING:
+            # Its only dynamic attributes are its buffers: each role, and `bias` (None for none).
+            def __getattr__(self, name: str) -> Tensor: ...
+
+            bias: Tensor | None
+
         def __init__(
             self,
-            forward_fn: Any,
-            roles: Mapping[str, Any],
-            bias: Any,
-            out_dtype: Any,
+            forward_fn: _Forward | None,
+            roles: Mapping[str, Tensor],
+            bias: Tensor | None,
+            out_dtype: Dtype,
             provider: str,
             encoding: str,
             in_features: int,
@@ -190,7 +281,7 @@ def _leaf_class(torch: Any) -> Any:
             self.in_features = in_features
             self.out_features = out_features
 
-        def roles(self) -> dict[str, Any]:
+        def roles(self) -> dict[str, Tensor]:
             return {role: getattr(self, self.BUFFERS.get(role, role)) for role in self._cozy_roles}
 
         #: Whether `linear` takes `out` and its GEMM writes there (`forward`'s `out`).
@@ -199,8 +290,8 @@ def _leaf_class(torch: Any) -> Any:
         PURE_WINDOWS: ClassVar[bool] = True
 
         def forward(
-            self, x: Any, *, prequantized: PreQuantized | None = None, out: Any = None
-        ) -> Any:
+            self, x: Tensor, *, prequantized: PreQuantized | None = None, out: Tensor | None = None
+        ) -> Tensor:
             """The linear; with `out` (a view, e.g. this linear's column range of a sibling
             group's packed output) its result lands there, which it also returns."""
             # Semantic hooks still see the original positional float operand.
@@ -211,18 +302,24 @@ def _leaf_class(torch: Any) -> Any:
             out.copy_(self.linear(x, prequantized))
             return out
 
-        def linear(self, x: Tensor, prequantized: PreQuantized | None) -> Tensor:
+        def linear(
+            self, x: Tensor, prequantized: PreQuantized | None, out: Tensor | None = None
+        ) -> Tensor:
+            """`out` is a subclass's (`WRITES_INTO`): this linear never gets one."""
+            forward = self._cozy_forward
+            assert forward is not None  # a leaf built without one overrides `linear`
             if prequantized is None and torch.is_autocast_enabled(x.device.type):
                 # As the replaced `nn.Linear` does under autocast: compute from, and return,
                 # the autocast dtype, whatever the stored weight's logical dtype is.
                 dtype = torch.get_autocast_dtype(x.device.type)
-                out = self._cozy_forward(self, x.to(dtype), dtype)
+                result = forward(self, x.to(dtype), dtype)
             else:
                 operand = x if prequantized is None else prequantized
-                out = self._cozy_forward(self, operand, self.out_dtype)
+                # Only an 8-bit leaf is handed a shared operand, and it overrides `linear`.
+                result = forward(self, operand, self.out_dtype)  # type: ignore[arg-type]
             if self.bias is not None:
-                out = out + self.bias.to(out.dtype)
-            return out
+                result = result + self.bias.to(result.dtype)
+            return result
 
         def extra_repr(self) -> str:
             return (
@@ -236,13 +333,13 @@ def _leaf_class(torch: Any) -> Any:
 
 
 #: The 8-bit leaves' ops, by provider: each module's `quantize`, `gemm` and `linear`.
-_NATIVE_OPS: dict[str, ModuleType] = {INT8_CONVROT: int8_linear, ROWWISE_FP8: fp8_linear}
+_NATIVE_OPS: dict[str, _NativeOps] = {INT8_CONVROT: int8_linear, ROWWISE_FP8: fp8_linear}
 
 
-def _native_leaf_class(torch: ModuleType) -> type:
+def _native_leaf_class(torch: ModuleType) -> _LeafClass:
     """`EncodedLinear` whose forward is one call of its provider's op (`int8_linear`,
     `fp8_linear`), the bias in the GEMM's epilogue."""
-    cached: type | None = getattr(_native_leaf_class, "_cached", None)
+    cached: _LeafClass | None = getattr(_native_leaf_class, "_cached", None)
     if cached is not None:
         return cached
 
@@ -318,7 +415,7 @@ def _native_leaf_class(torch: ModuleType) -> type:
     return NativeLinear
 
 
-def _leaf_geometry(replaced: Any, data: Any) -> tuple[int, int, Any]:
+def _leaf_geometry(replaced: object, data: Tensor) -> tuple[int, int, Tensor | None]:
     """`(in_features, out_features, bias)` of the module being stood in for.
 
     Read off the REPLACED module rather than inferred from the payload, because the payload
@@ -327,7 +424,7 @@ def _leaf_geometry(replaced: Any, data: Any) -> tuple[int, int, Any]:
     refusal in `fill.py`, not a reshape here.
     """
     out_features, in_features = int(data.shape[0]), int(data.shape[1])
-    bias = getattr(replaced, "bias", None)
+    bias: Tensor | None = getattr(replaced, "bias", None)
     return in_features, out_features, bias
 
 
@@ -402,7 +499,7 @@ class RowwiseNativeLeaf:
             return why
         return f"the fp8 GEMM needs K and N divisible by 16; this tensor is {list(shape)}"
 
-    def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None:
+    def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
         raise AssertionError(
             "an encoded_gemm provider REPLACES the leaf; it never writes a float "
             "destination — see LeafProvider.leaf"
@@ -417,7 +514,9 @@ class RowwiseNativeLeaf:
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
         return 0
 
-    def leaf(self, torch: Any, parts: Mapping[str, Any], replaced: Any, out_dtype: Any) -> Any:
+    def leaf(
+        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: object, out_dtype: Dtype
+    ) -> Leaf:
         data = parts["weight"]
         in_features, out_features, bias = _leaf_geometry(replaced, data)
         return _native_leaf_class(torch)(
@@ -517,8 +616,8 @@ class Int8ConvRotNativeLeaf:
         return 0
 
     def leaf(
-        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
-    ) -> Tensor:
+        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: object, out_dtype: Dtype
+    ) -> Leaf:
         placed = placed_device()
         if placed.type == "cuda" and int8_linear.native(torch, placed.index or 0) is None:
             # The op is built at boot; until it lands the reviewed comfy-kitchen binary serves
@@ -538,9 +637,9 @@ class Int8ConvRotNativeLeaf:
         )
 
 
-def _w4a8_leaf_class(torch: ModuleType) -> type:
+def _w4a8_leaf_class(torch: ModuleType) -> _LeafClass:
     """`NativeLinear` over w4a8's roles: its GEMM (`w4a8_linear`) on int8.convrot's operand."""
-    cached: type | None = getattr(_w4a8_leaf_class, "_cached", None)
+    cached: _LeafClass | None = getattr(_w4a8_leaf_class, "_cached", None)
     if cached is not None:
         return cached
 
@@ -669,8 +768,8 @@ class W4a8NativeLeaf:
         return 0
 
     def leaf(
-        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
-    ) -> Tensor:
+        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: object, out_dtype: Dtype
+    ) -> Leaf:
         if (placed := placed_device()).type == "cuda":
             # The 8-bit op is built at boot; asking starts its load beside the weight fill.
             int8_linear.native(torch, placed.index or 0)
@@ -694,9 +793,9 @@ class W4a8NativeLeaf:
         )
 
 
-def _nvfp4_leaf_class(torch: ModuleType) -> type:
+def _nvfp4_leaf_class(torch: ModuleType) -> _LeafClass:
     """`EncodedLinear` keyed by nvfp4's stored roles, held in the buffers its kernels read."""
-    cached: type | None = getattr(_nvfp4_leaf_class, "_cached", None)
+    cached: _LeafClass | None = getattr(_nvfp4_leaf_class, "_cached", None)
     if cached is not None:
         return cached
 
@@ -796,7 +895,7 @@ class Nvfp4NativeLeaf:
         return 3 * rows * cols
 
     @staticmethod
-    def _forward(leaf: Tensor, x: Tensor, out_dtype: Tensor) -> Tensor:
+    def _forward(leaf: EncodedLeaf, x: Tensor, out_dtype: Dtype) -> Tensor:
         import torch
 
         rows, cols = leaf.out_features, leaf.in_features // NVFP4_BLOCK
@@ -811,8 +910,8 @@ class Nvfp4NativeLeaf:
         )
 
     def leaf(
-        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
-    ) -> Tensor:
+        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: object, out_dtype: Dtype
+    ) -> Leaf:
         if (placed := placed_device()).type == "cuda":
             # Starts the kernel's build beside the weight fill; the first calls run eager.
             int8_linear.kitchen(torch, placed.index or 0)
@@ -843,10 +942,10 @@ class Nvfp4NativeLeaf:
         )
 
 
-def _svdq_leaf_class(torch: ModuleType) -> type:
+def _svdq_leaf_class(torch: ModuleType) -> _SvdqLeafClass:
     """`EncodedLinear` over svdq.nvfp4's roles: both kernels (`svdq_linear`), the bias in the
     GEMM's epilogue."""
-    cached: type | None = getattr(_svdq_leaf_class, "_cached", None)
+    cached: _SvdqLeafClass | None = getattr(_svdq_leaf_class, "_cached", None)
     if cached is not None:
         return cached
 
@@ -986,8 +1085,8 @@ class SvdqNvfp4NativeLeaf:
         return 0
 
     def leaf(
-        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
-    ) -> Tensor:
+        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: object, out_dtype: Dtype
+    ) -> Leaf:
         """The roles as stored where the kernels read them so (every role of a canonical tensor);
         a high-first nibble order, the cuBLAS scale tiles, a divided second level, a rank no
         kernel is built for and 16-bit factors other than bf16 are made once, at the bind."""
@@ -1148,9 +1247,9 @@ class MicroScaledNativeLeaf:
         return 3 * rows * cols  # to_blocked's padded grid, its reshape copy and the result
 
     @staticmethod
-    def _forward(torch: ModuleType, leaf: Tensor, x: Tensor, out_dtype: Tensor) -> Tensor:
+    def _forward(torch: ModuleType, leaf: EncodedLeaf, x: Tensor, out_dtype: Dtype) -> Tensor:
         payload, scales = quantize_activation_mx(torch, x)
-        out = torch._scaled_mm(
+        out: Tensor = torch._scaled_mm(
             payload,
             leaf.weight.t(),
             scale_a=to_blocked(torch, scales).view(torch.float8_e8m0fnu),
@@ -1160,8 +1259,8 @@ class MicroScaledNativeLeaf:
         return out.reshape(*x.shape[:-1], -1)
 
     def leaf(
-        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
-    ) -> Tensor:
+        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: object, out_dtype: Dtype
+    ) -> Leaf:
         weight = parts["weight"]
         if weight.dtype != torch.float8_e4m3fn:
             raise refuse(

@@ -25,7 +25,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
 
 #: WHICH KERNEL each route computes with. The two float routes compute in the destination's
 #: own dtype through the ordinary library GEMM — that is what "kernel-neutral" means, and it
@@ -153,7 +152,7 @@ class DeliveryRefusal(Exception):
     """A typed refusal about the delivery axis. Kept because the wire and the worker's
     refusal matrix both name it; plan-level refusals are `resolution.PlanRefusal`."""
 
-    def __init__(self, code: str, detail: str, walk: Sequence[Mapping[str, Any]] = ()) -> None:
+    def __init__(self, code: str, detail: str, walk: Sequence[Mapping[str, object]] = ()) -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail

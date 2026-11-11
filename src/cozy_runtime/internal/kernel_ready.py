@@ -34,7 +34,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._errors import is_capacity
@@ -42,7 +42,9 @@ from cozy_runtime.author._model import LANDED, Building, Yielded
 from cozy_runtime.internal import kernel_compile, verify
 
 if TYPE_CHECKING:
-    from cozy_runtime.accel.kernels import Launch
+    import torch
+
+    from cozy_runtime.accel.kernels import Launch, TritonKernels
 
 #: `opener(wait)`: the kernel ready to dispatch. With `wait` it may wait for its build; without,
 #: None while the build runs. It raises when the kernel cannot serve here.
@@ -73,10 +75,24 @@ _AGREED: set[str] = set()
 _REPORTS: dict[int, dict[str, str]] = {}
 #: A background opener's thread name, before its kernel's.
 THREAD = "kernel-ready: "
-#: `triton_kernels.opened(kernels, probe, wait, *, device)`: a Runtime Triton set's opener,
-#: bound by `triton_kernels` when the executor imports it past its device boundary (the
-#: families that open one import no torch).
-TRITON: list[Callable[..., Launch | None]] = []
+
+
+class TritonOpener(Protocol):
+    """`triton_kernels.opened`: a Runtime Triton set's opener."""
+
+    def __call__(
+        self,
+        kernels: TritonKernels,
+        probe: Callable[[Launch], verify.Verdict],
+        wait: bool = False,
+        *,
+        device: torch.device | str | int,
+    ) -> Launch | None: ...
+
+
+#: `triton_kernels.opened`, bound by `triton_kernels` when the executor imports it past its
+#: device boundary (the families that open one import no torch).
+TRITON: list[TritonOpener] = []
 #: The executor's actual device AND execution stream for every opener on any thread.
 #: CUDA current-stream state is thread-local; selecting a device alone leaves probes on
 #: that thread's default stream. Bound after allocator/device/stream initialization.

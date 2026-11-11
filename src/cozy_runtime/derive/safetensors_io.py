@@ -27,12 +27,23 @@ import json
 import os
 import struct
 from collections.abc import Iterator
+from io import BufferedWriter
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 import numpy as np
+import numpy.typing as npt
 
 from cozy_runtime.author import UnsupportedInput
+
+
+class HeaderRow(TypedDict):
+    """One tensor's safetensors header entry."""
+
+    dtype: str
+    shape: list[int]
+    data_offsets: list[int]
+
 
 #: Bytes per element, by header dtype name. A name absent here is not refused by this
 #: module — it is carried verbatim as opaque bytes, because a passthrough tensor's dtype
@@ -64,7 +75,9 @@ def numel(shape: list[int]) -> int:
     return total
 
 
-def to_f32(raw: bytes | bytearray | memoryview, dtype: str, shape: list[int]) -> np.ndarray:
+def to_f32(
+    raw: bytes | bytearray | memoryview, dtype: str, shape: list[int]
+) -> npt.NDArray[np.float32]:
     """Decode a FLOAT tensor's stored bytes to float32. Refuses anything else, loudly:
     a quantizer that silently reinterprets an int tensor as floats produces plausible
     numbers from bytes that never were numbers."""
@@ -87,7 +100,7 @@ def to_f32(raw: bytes | bytearray | memoryview, dtype: str, shape: list[int]) ->
     return np.ascontiguousarray(out, dtype=np.float32).reshape(shape)
 
 
-def from_f32(values: np.ndarray, dtype: str) -> bytes:
+def from_f32(values: npt.ArrayLike, dtype: str) -> bytes:
     """Encode float32 back to a stored float carrier, round-to-nearest-EVEN throughout."""
     flat = np.ascontiguousarray(values, dtype=np.float32).reshape(-1)
     if dtype == "F32":
@@ -120,10 +133,10 @@ class Writer:
             )
         self._rows.append((key, dtype, list(shape), raw))
 
-    def header(self) -> dict[str, Any]:
+    def header(self) -> dict[str, HeaderRow]:
         """The header these tensors WILL produce — available before any byte is written,
         which is what makes a header prediction checkable against the real thing."""
-        out: dict[str, Any] = {}
+        out: dict[str, HeaderRow] = {}
         offset = 0
         for key, dtype, shape, raw in sorted(self._rows, key=lambda r: r[0]):
             out[key] = {"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + len(raw)]}
@@ -165,7 +178,7 @@ class StreamingWriter:
         self._declared: dict[str, tuple[str, list[int], int]] = {}
         self._offsets: dict[str, tuple[int, int]] = {}
         self._written: set[str] = set()
-        self._handle: Any = None
+        self._handle: BufferedWriter | None = None
         self._path: Path | None = None
         self._data_base = 0
 
@@ -177,8 +190,8 @@ class StreamingWriter:
             raise UnsupportedInput(f"{key!r}: no itemsize for dtype {dtype!r}")
         self._declared[key] = (dtype, list(shape), numel(shape) * want)
 
-    def header(self) -> dict[str, Any]:
-        out: dict[str, Any] = {}
+    def header(self) -> dict[str, HeaderRow]:
+        out: dict[str, HeaderRow] = {}
         offset = 0
         for key in sorted(self._declared):
             dtype, shape, length = self._declared[key]
@@ -202,15 +215,15 @@ class StreamingWriter:
         self._handle.truncate(total)
 
     def put(self, key: str, raw: bytes) -> None:
-        start, _end = self._require(key, len(raw))
-        self._handle.seek(self._data_base + start)
-        self._handle.write(raw)
+        start, _end, handle = self._require(key, len(raw))
+        handle.seek(self._data_base + start)
+        handle.write(raw)
         self._written.add(key)
 
     def put_from_file(self, key: str, src: Path, src_offset: int, length: int) -> None:
         """Range-copy a tensor from its source without materializing it (#553d)."""
-        start, _ = self._require(key, length)
-        self._handle.seek(self._data_base + start)
+        start, _, handle = self._require(key, length)
+        handle.seek(self._data_base + start)
         with src.open("rb") as reader:
             reader.seek(src_offset)
             left = length
@@ -218,11 +231,12 @@ class StreamingWriter:
                 chunk = reader.read(min(self._CHUNK, left))
                 if not chunk:
                     raise UnsupportedInput(f"{key!r}: source truncated mid range-copy")
-                self._handle.write(chunk)
+                handle.write(chunk)
                 left -= len(chunk)
         self._written.add(key)
 
     def close(self) -> int:
+        assert self._handle is not None  # opened: `put` refuses before `open`
         missing = sorted(set(self._declared) - self._written)
         if missing:
             self._handle.close()
@@ -238,7 +252,8 @@ class StreamingWriter:
         os.replace(tmp, self._path)
         return self._data_base + sum(length for _, _, length in self._declared.values())
 
-    def _require(self, key: str, length: int) -> tuple[int, int]:
+    def _require(self, key: str, length: int) -> tuple[int, int, BufferedWriter]:
+        """`key`'s byte range, checked against `length`, and the open file."""
         if self._handle is None:
             raise UnsupportedInput("put before open")
         if key not in self._declared:
@@ -251,10 +266,10 @@ class StreamingWriter:
             )
         if key in self._written:
             raise UnsupportedInput(f"{key!r} written twice")
-        return start, end
+        return start, end, self._handle
 
 
-def row_chunks(rows: int, cols: int, budget_elements: int = 1 << 22) -> Iterator[slice]:
+def row_chunks(rows: int, cols: int, budget_elements: int = 1 << 22) -> Iterator[slice[int]]:
     """Row slices whose working set stays inside `budget_elements`. Every encoder in this
     family is row-independent, so chunking changes no number — it only decides whether a
     [28672, 5376] tensor needs 600 MB of float32 scratch or 16 MB of it."""

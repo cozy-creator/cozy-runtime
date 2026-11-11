@@ -15,12 +15,12 @@ from __future__ import annotations
 
 import site
 import sys
-from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from importlib import import_module, util
 from pathlib import Path
 from types import ModuleType
+from typing import Protocol
 
 from cozy_runtime.accel.kernels import INT8_CONVROT, PreQuantized
 from cozy_runtime.author._errors import Fault, fault
@@ -35,7 +35,7 @@ from cozy_runtime.internal import (
     tools,
     verify,
 )
-from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, Tensor, hadamard256
+from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, Dtype, Tensor, hadamard256
 
 ARTIFACT = "comfy-kitchen"
 OP = "cozy-int8"
@@ -46,8 +46,14 @@ GEMV_ROWS = 4
 #: What each card opens, by its `kernel_ready` name's head: the verified op, comfy-kitchen.
 NATIVE, KITCHEN = "cozy int8 op", "comfy-kitchen CUTLASS int8 GEMM"
 
-#: The loaded op: `(x, data, scale, bias, out_dtype) -> out`.
-type Op = Callable[..., Tensor]
+
+class Op(Protocol):
+    """The loaded op: `(x, data, scale, bias, out_dtype) -> out`."""
+
+    def __call__(
+        self, x: Tensor, data: Tensor, scale: Tensor, bias: Tensor | None, out_dtype: Dtype, /
+    ) -> Tensor: ...
+
 
 #: Device index -> the verified library serving its 8-bit ops.
 _LIBS: dict[int, prebuilt.Prebuilt] = {}
@@ -246,7 +252,7 @@ def linear(
     data: Tensor,
     scale: Tensor,
     bias: Tensor | None,
-    out_dtype: object,
+    out_dtype: Dtype,
 ) -> Tensor:
     """`x @ W.T + bias` for one `int8-convrot256/1` weight: `data` int8 `[N, K]`, `scale` f32."""
     index = x.get_device()
@@ -263,9 +269,10 @@ def linear(
                 return op(x, data, scale, bias, out_dtype)
             module = kitchen(torch, index)
             if module is not None:
-                return module.int8_linear(
+                served: Tensor = module.int8_linear(
                     x, data, scale, bias, out_dtype, convrot=True, convrot_groupsize=CONVROT_GROUP
                 )
+                return served
     except (Building, Yielded):
         raise
     except Exception as exc:  # eager serves this call
@@ -362,7 +369,7 @@ def gemm(
     data: Tensor,
     scale: Tensor,
     bias: Tensor | None,
-    out_dtype: object,
+    out_dtype: Dtype,
     out: Tensor | None = None,
 ) -> Tensor:
     """The linear of a `quantize`d operand: the op's GEMM, both scales and the bias in its
@@ -399,7 +406,7 @@ def landed(result: Tensor, out: Tensor | None) -> Tensor:
     return out
 
 
-def eager(torch: ModuleType, x: Tensor, data: Tensor, scale: Tensor, out_dtype: Tensor) -> Tensor:
+def eager(torch: ModuleType, x: Tensor, data: Tensor, scale: Tensor, out_dtype: Dtype) -> Tensor:
     """The same W8A8 arithmetic in torch ops: rotate, per-token int8, int8 GEMM, both scales."""
     quantized, row_scale = quantize_rows(torch, x)
     out = _product(torch, quantized, row_scale, data, scale, out_dtype)
@@ -421,14 +428,14 @@ def _product(
     row_scale: Tensor,
     data: Tensor,
     scale: Tensor,
-    out_dtype: Tensor,
+    out_dtype: Dtype,
 ) -> Tensor:
     """`[M, K]` int8 rows times the weight in torch's int8 GEMM, both scales applied."""
     rows = int(quantized.shape[0])
     if quantized.is_cuda:
         # cuBLASLt's int8 GEMM takes more than 16 rows; the padding rows are zeros.
         padded = torch.nn.functional.pad(quantized, (0, 0, 0, max(0, 17 - rows)))
-        acc = torch._int_mm(padded, data.t())[:rows]
+        acc: Tensor = torch._int_mm(padded, data.t())[:rows]
     else:
         acc = quantized.to(torch.int32) @ data.to(torch.int32).t()
     out = acc.float().mul_(row_scale.reshape(-1, 1)).mul_(scale.float().reshape(1, -1))

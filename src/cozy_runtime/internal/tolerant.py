@@ -12,7 +12,6 @@ from __future__ import annotations
 import copy
 import re
 from collections.abc import Collection
-from typing import Any
 
 import msgspec
 
@@ -25,7 +24,7 @@ def read[T](doc: object, into: type[T], advisory: Collection[str] = ()) -> tuple
         return msgspec.convert(doc, into), []
     except msgspec.ValidationError as first:
         error = first
-    work: Any = copy.deepcopy(doc)
+    work = copy.deepcopy(doc)
     dropped: list[str] = []
     while True:
         message, _, where = str(error).rpartition(" - at `$")
@@ -43,7 +42,7 @@ def read[T](doc: object, into: type[T], advisory: Collection[str] = ()) -> tuple
         absent = node is None and isinstance(path[-1], str) if path else False
         if not path or not (absent or any(_within(dotted, member) for member in advisory)):
             raise error
-        del parent[path[-1]]
+        _drop(parent, path[-1])
         dropped.append(f"{dotted}: {message or error}")
         try:
             return msgspec.convert(work, into), dropped
@@ -58,7 +57,15 @@ def _within(dotted: str, member: str) -> bool:
     return dotted == member or dotted.startswith(member + ".")
 
 
-def _child(node: Any, step: str | int) -> Any:
+def _child(node: object, step: str | int) -> object:
     if isinstance(step, int):
         return node[step] if isinstance(node, list) and step < len(node) else _MISSING
     return node.get(step, _MISSING) if isinstance(node, dict) else _MISSING
+
+
+def _drop(parent: object, step: str | int) -> None:
+    """Delete what `_child` found: a step into a list is an index, into a dict a key."""
+    if isinstance(parent, dict):  # noqa: SIM114 (mypy narrows each branch apart)
+        del parent[step]
+    elif isinstance(parent, list) and isinstance(step, int):
+        del parent[step]

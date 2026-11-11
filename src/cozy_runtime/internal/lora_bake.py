@@ -42,9 +42,9 @@ try:
     import triton
     import triton.language as tl
 except ImportError:  # a host without Triton bakes eagerly
+    triton = None
     if TYPE_CHECKING:
         raise
-    triton = None
 
 Strategy = Literal["bake", "per_step"]
 #: How a bake runs on a GPU: its fused kernels, or the eager reference.
@@ -131,14 +131,14 @@ def _magnitudes(torch: ModuleType, device: Device) -> Tensor:
     code = torch.arange(127, device=device)
     exponent, mantissa = code >> 3, (code & 7).to(torch.float32)
     normal = torch.ldexp(1 + mantissa / 8, exponent - 7)
-    return torch.where(exponent == 0, mantissa * 2.0**-9, normal)
+    return cast("Tensor", torch.where(exponent == 0, mantissa * 2.0**-9, normal))
 
 
 def decode_e4m3(torch: ModuleType, data: Tensor) -> Tensor:
     decoded = data.view(torch.uint8).view(torch.float8_e4m3fn).float()
     # This codec saturates the two reserved NaN codes to their signed maxima.
     # Keep their original signs (and signed zero) after the native conversion.
-    fixed = torch.nan_to_num(decoded, nan=E4M3_MAX)
+    fixed: Tensor = torch.nan_to_num(decoded, nan=E4M3_MAX)
     return fixed.copysign_(decoded)
 
 
@@ -177,13 +177,13 @@ def encode_e4m3(
         return _nearest(torch, mags, values)
     if rounding == "stochastic":
         low, fraction = _floor_code(torch, mags, values.abs().clamp(max=E4M3_MAX))
-        draw = torch.rand(fraction.shape, device=values.device, generator=generator)
+        draw: Tensor = torch.rand(fraction.shape, device=values.device, generator=generator)
         return ((low + (draw < fraction)) | ((values < 0) << 7)).to(torch.uint8)
     rows, cols = values.shape
     pad = -cols % FEEDBACK_RUN
     work = torch.nn.functional.pad(values, (0, pad)) if pad else values
     runs = work.reshape(rows, -1, FEEDBACK_RUN)
-    out = torch.empty(runs.shape, dtype=torch.uint8, device=values.device)
+    out: Tensor = torch.empty(runs.shape, dtype=torch.uint8, device=values.device)
     carry = torch.zeros(runs.shape[:2], dtype=values.dtype, device=values.device)
     for k in range(FEEDBACK_RUN):
         want = runs[..., k] + carry
@@ -208,7 +208,7 @@ def _account(
     base: Tensor,
     delta: Tensor,
     stored: Tensor,
-    saturated: Tensor,
+    saturated: Tensor | int,
     down: Tensor,
 ) -> None:
     if stats is None:
@@ -269,7 +269,7 @@ def _bf16_either(torch: ModuleType, values: Tensor, generator: Generator | None)
     gap = high - low
     fraction = torch.where(torch.isfinite(gap) & (gap != 0), (values - low) / gap, 0.0)
     draw = torch.rand(fraction.shape, device=values.device, generator=generator)
-    return torch.where(draw < fraction, high, low)
+    return cast("Tensor", torch.where(draw < fraction, high, low))
 
 
 def bake_rowwise(
@@ -381,7 +381,7 @@ def _nvfp4_decode(torch: ModuleType, raw: Tensor, blocks: Tensor, second: float)
     """Packed u8 `[rows, cols/2]` and E4M3 block bytes `[rows, cols/16]` -> f32 `[rows, cols]`."""
     rows = raw.shape[0]
     codes = torch.stack((raw & 0x0F, raw >> 4), dim=-1).reshape(rows, -1).long()
-    values = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=raw.device)[codes]
+    values: Tensor = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=raw.device)[codes]
     scale = decode_e4m3(torch, blocks) * second
     return (values.view(rows, -1, NVFP4_BLOCK) * scale.unsqueeze(-1)).view(rows, -1)
 
@@ -398,7 +398,7 @@ def _e2m1(
     even code."""
     grid = torch.tensor(E2M1_VALUES[:8], dtype=torch.float32, device=payload.device)
     magnitude = payload.abs().clamp(max=6.0)
-    low = (torch.searchsorted(grid, magnitude, right=True) - 1).clamp(0, 7)
+    low: Tensor = (torch.searchsorted(grid, magnitude, right=True) - 1).clamp(0, 7)
     high = (low + 1).clamp(max=7)
     gap = grid[high] - grid[low]
     fraction = torch.where(gap > 0, (magnitude - grid[low]) / gap, torch.zeros_like(gap))
@@ -406,7 +406,7 @@ def _e2m1(
         up = torch.rand(fraction.shape, device=payload.device, generator=generator) < fraction
     else:
         up = (fraction > 0.5) | ((fraction == 0.5) & (low % 2 == 1))
-    return (low + up) | (negative.long() << 3)
+    return cast("Tensor", (low + up) | (negative.long() << 3))
 
 
 def bake_nvfp4(
@@ -623,7 +623,7 @@ def norms(torch: ModuleType, stored: Mapping[str, Tensor], down: Tensor, up: Ten
             return values.mul_(scales[start:stop].float())
 
     down_fp32 = down.float()
-    out = torch.empty(rows, dtype=torch.float32, device=down.device)
+    out: Tensor = torch.empty(rows, dtype=torch.float32, device=down.device)
     for start, stop in _chunks(rows, cols):
         target = rows_of(start, stop).add_(_delta(up, down_fp32, 1.0, start, stop))
         out[start:stop] = torch.linalg.vector_norm(target, dim=1)
@@ -633,7 +633,7 @@ def norms(torch: ModuleType, stored: Mapping[str, Tensor], down: Tensor, up: Ten
 def dora_ratio(torch: ModuleType, magnitude: Tensor, norm: Tensor) -> Tensor:
     """`m / ||V||` per output row, f32; 0 where `V`'s row is 0 (`D`'s row is then 0 too)."""
     tiny = torch.finfo(torch.float32).tiny
-    return torch.where(norm > 0, magnitude.float() / norm.clamp_min(tiny), 0.0)
+    return cast("Tensor", torch.where(norm > 0, magnitude.float() / norm.clamp_min(tiny), 0.0))
 
 
 def dora_weight(
@@ -778,10 +778,10 @@ def serving(torch: ModuleType, device: int) -> How | None:
 
 def _launch(device: int) -> Launch:
     """GPU `device`'s bake launcher: the attempt chose `fused` once it served."""
-    launch = kernel_ready.ready(f"{KERNELS.name} cuda:{device}")
+    launch: Launch | None = kernel_ready.ready(f"{KERNELS.name} cuda:{device}")
     if launch is None:
         raise RuntimeError("a fused bake was chosen before its kernels served")
-    return cast("Launch", launch)
+    return launch
 
 
 def recipe(fused: bool) -> str:

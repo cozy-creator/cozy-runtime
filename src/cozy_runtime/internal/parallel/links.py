@@ -35,10 +35,12 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import TypedDict
 
 from cozy_runtime.graphs import streams
 from cozy_runtime.internal import filelock, kernel_cache, spawn
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.config import inherited_environment
 from cozy_runtime.internal.parallel import copy_engine, group
 
@@ -73,6 +75,17 @@ class Pair:
         return self.peer and self.verified and self.direct_gbps > self.staged_gbps
 
 
+class Processes(TypedDict, total=False):
+    """What a group of probe processes managed (`_group`): NCCL over peer memory, the copy
+    engines through symmetric memory, the level it formed at, why not, and NCCL's time."""
+
+    nccl_peer: bool
+    copy_engines: bool
+    level: str
+    detail: str
+    nccl_ms: float
+
+
 @dataclass(frozen=True, slots=True)
 class Links:
     """Every ordered pair of a group's GPUs, what a group of processes over them managed, and
@@ -80,7 +93,7 @@ class Links:
 
     pairs: tuple[Pair, ...] = ()
     #: the process probe: `nccl_peer`, `copy_engines` (bools), `detail` and timings
-    processes: Mapping[str, Any] = field(default_factory=dict)
+    processes: Processes = field(default_factory=lambda: Processes())
     reason: str = ""
 
     @property
@@ -151,7 +164,7 @@ class Links:
             f"GPU {number.get(pair.src, pair.src)} to GPU {number.get(pair.dst, pair.dst)} {cause}"
         )
 
-    def document(self, devices: Sequence[str]) -> dict[str, Any]:
+    def document(self, devices: Sequence[str]) -> dict[str, object]:
         return {
             "devices": list(devices),
             "pairs": [asdict(pair) for pair in self.pairs],
@@ -160,7 +173,7 @@ class Links:
         }
 
     @classmethod
-    def among(cls, document: Mapping[str, Any], devices: Sequence[str]) -> Links | None:
+    def among(cls, document: Json, devices: Sequence[str]) -> Links | None:
         """The pairs of `devices`, in their order, from a measurement of a set holding them all.
         None where that measurement's process group did not try the route these would take."""
         position = {entry: index for index, entry in enumerate(document["devices"])}
@@ -172,7 +185,8 @@ class Links:
             for row in document["pairs"]
             if (pair := Pair(**row)).src in at and pair.dst in at
         )
-        links = cls(pairs, dict(document["processes"]), document["reason"])
+        processes: Processes = document["processes"]
+        links = cls(pairs, processes.copy(), document["reason"])
         if links.reason or not links.all_peers:
             return links
         return links if links.processes.get("level") == links.level else None
@@ -187,7 +201,7 @@ def _gbps(nbytes: int, seconds: float) -> float:
     return round(nbytes / seconds / 1e9, 2) if seconds > 0 else 0.0
 
 
-def _measure(torch: Any, count: int, emit: Any) -> None:
+def _measure(torch: ModuleType, count: int, emit: Callable[[Pair], None]) -> None:
     """In the probe process: every ordered pair, staged first (it bounds how long a direct
     copy may take before it can no longer win), then direct, each checked by a byte sum."""
     devices = [torch.device("cuda", index) for index in range(count)]
@@ -222,7 +236,7 @@ def _measure(torch: Any, count: int, emit: Any) -> None:
                 drained[slot].record(in_stream)
         in_stream.synchronize()
 
-    def timed(copy: Any, *devices_used: int) -> float:
+    def timed(copy: Callable[[], object], *devices_used: int) -> float:
         began = time.perf_counter()
         for _ in range(_REPEATS):
             copy()
@@ -376,8 +390,9 @@ def _probe(devices: Sequence[str]) -> Links:
     )
     assert child.stdout is not None
     pairs: list[Pair] = []
-    processes: dict[str, Any] = {}
+    processes: Processes = {}
     window: float | None = None
+    started = 0.0  # set at the first pair, read once every pair is in
     watch = selectors.DefaultSelector()
     watch.register(child.stdout, selectors.EVENT_READ)
     while True:
@@ -421,11 +436,11 @@ def _probe(devices: Sequence[str]) -> Links:
     return Links(tuple(pairs), processes)
 
 
-def _unformed(level: str, detail: str) -> dict[str, Any]:
+def _unformed(level: str, detail: str) -> Processes:
     return {"nccl_peer": False, "copy_engines": False, "level": level, "detail": detail}
 
 
-def _group(torch: Any, rank: int, world: int, port: int, level: str) -> dict[str, Any]:
+def _group(torch: ModuleType, rank: int, world: int, port: int, level: str) -> Processes:
     """One process of the probe's own group: NCCL over peer memory, then the copy engines
     through symmetric memory, each checked against the other's bytes."""
     from torch.distributed import _symmetric_memory as symm
@@ -477,7 +492,7 @@ class Transport:
     #: the formation check of `route` (`copy_engine.form`): mapped, exact
     check: dict[str, bool] = field(default_factory=dict)
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, object]:
         """GPUs by their nvidia-smi numbers; each pair's route is direct or through host memory."""
         number = dict(enumerate(self.gpus))
         return {

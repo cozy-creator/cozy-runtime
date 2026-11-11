@@ -16,7 +16,7 @@ import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
-from typing import Any
+from typing import TYPE_CHECKING, Protocol, cast
 
 import tensorfs.varena.torch as vt
 import torch
@@ -27,10 +27,23 @@ from cozy_runtime.author._context import CURRENT as ATTEMPT
 from cozy_runtime.author._errors import DoesNotFit, is_capacity
 from cozy_runtime.author._model import TRANSPARENT
 from cozy_runtime.internal.execution import phase, sizing
-from cozy_runtime.internal.residency import Request
+from cozy_runtime.internal.residency import Model, Request
+
+if TYPE_CHECKING:
+    from tensorfs.varena._facts import SplitSelection
+
+#: varena's split choice (`split_select`, `split_refused`).
+type Selection = SplitSelection
 
 type Args = Sequence[object]
 type Kwargs = Mapping[str, object]
+
+
+class Forward(Protocol):
+    """A module's forward: any arguments, as torch types `nn.Module.forward`."""
+
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
+
 
 #: the request being served: a site's weights and the phase it runs in
 CURRENT: ContextVar[Request | None] = ContextVar("cozy_execution_request", default=None)
@@ -83,7 +96,8 @@ def checkpoint() -> None:
 
 
 def _capturing() -> bool:
-    return bool(torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing())
+    initialized = torch.cuda.is_initialized()
+    return bool(initialized and torch.cuda.is_current_stream_capturing())
 
 
 def useful(sizes: Sequence[Sequence[int]]) -> list[Sequence[int]]:
@@ -94,7 +108,7 @@ def useful(sizes: Sequence[Sequence[int]]) -> list[Sequence[int]]:
     return list(sizes[: next(n for n, row in enumerate(sizes) if sum(row) <= floor) + 1])
 
 
-def owners(request: Request) -> tuple[Any, ...]:
+def owners(request: Request) -> tuple[Model | Request, ...]:
     """What a site's samples live and die with: the running models, or a componentless request."""
     with request.memory.lock:
         models = tuple(m for m in request.memory.models.values() if m.name in request.current)
@@ -118,10 +132,10 @@ def refuse(device: int, name: str, level: str, need: int, exc: BaseException) ->
 
 def select(
     device: int, key: str, name: str, menu: Sequence[tuple[str, Sequence[int]]], stream: int
-) -> dict[str, Any]:
+) -> Selection:
     """The level native selection takes, its room made; `DoesNotFit` where none can have it."""
     try:
-        selection: dict[str, Any] = vt.split_select(device, key, menu, stream=stream)
+        selection: Selection = vt.split_select(device, key, menu, stream=stream)
         return selection
     except varena.Exhausted as exc:  # a decision, not a failure: nothing has run
         raise refuse(device, name, "its finest split", sum(menu[-1][1]), exc) from exc
@@ -133,7 +147,7 @@ def begin(
     name: str,
     menu: Sequence[tuple[str, Sequence[int]]],
     level: int,
-    selection: dict[str, Any],
+    selection: Selection,
     stream: int,
 ) -> int:
     """Open `level`'s native observation; `DoesNotFit` where its room is gone since selection
@@ -146,7 +160,7 @@ def begin(
 
 
 def note(
-    request: Request, key: str, name: str, level: int, selection: dict[str, Any] | None = None
+    request: Request, key: str, name: str, level: int, selection: Selection | None = None
 ) -> None:
     """A site's calls per level and what each was last chosen against, for the run record."""
     record = request.working_splits.setdefault(key, {"site": name, "levels": {}, "chosen": {}})
@@ -220,7 +234,7 @@ def retry(
     stream: int,
     exc: BaseException,
     pure: bool,
-) -> dict[str, Any] | None:
+) -> Selection | None:
     """Close the failed leaf. For a pure op whose leaf varena refused memory, varena's answer: the
     finer level to run again at, its room made (`stats.finer_splits`; a short estimate), or None,
     and the failure stands. The refused attempt's frames and tensors go before it counts room."""
@@ -229,7 +243,7 @@ def retry(
         return None
     _unwind(exc)
     try:
-        again: dict[str, Any] | None = vt.split_refused(device, key, str(level), stream=stream)
+        again: Selection | None = vt.split_refused(device, key, str(level), stream=stream)
     except varena.Exhausted as refused:
         raise refuse(device, name, "every finer split", sum(menu[-1][1]), refused) from exc
     if again is not None:
@@ -346,10 +360,16 @@ def passing(module: nn.Module, args: Args, kwargs: Kwargs) -> Iterator[None]:
     key = phase.execution_key(f"{type(module).__qualname__}:{shapes}", "runtime.pass/1")
     assert key is not None
     request.memory.remember_working_phase(key, owners(request))
-    with phase.observing(device, "eager", request.working_phases, key=key) as observation:
+    with phase.observing(
+        device,
+        "eager",
+        request.working_phases,  # type: ignore[arg-type]  # residency's rows: WorkingPhase on the boundary branch
+        key=key,
+    ) as observation:
         yield
         if observation is not None:
-            observation.completion_stream.synchronize()
+            # An eager observation holds the stream it ran on (`phase.observing`).
+            cast("torch.cuda.Stream", observation.completion_stream).synchronize()
             observation.complete()
 
 
@@ -359,9 +379,8 @@ def wrap(
     around: Callable[[nn.Module, Args, Kwargs], AbstractContextManager[None]] | None = None,
 ) -> None:
     """Name a block's execution sites and invoke its forward exactly once."""
-    forward = vars(module).get("forward") or current(module)
+    forward: Forward = vars(module).get("forward") or current(module)
 
-    @functools.wraps(module.forward)
     def named(*args: object, **kwargs: object) -> object:
         outer = _local.named, _local.ordinals
         _local.named, _local.ordinals = name, {}
@@ -372,17 +391,18 @@ def wrap(
         finally:
             _local.named, _local.ordinals = outer
 
+    functools.update_wrapper(named, module.forward)  # as `@functools.wraps` would
     module.forward = transparent(named)
     vars(module)["_cozy_execution_forward"] = named
 
 
-def transparent[F: Callable[..., object]](forward: F) -> F:
+def transparent[F](forward: F) -> F:
     """`forward` stands in for its module's own (the class's at each call) with its results,
     which `author.plain_forward` reads as plain."""
     vars(forward)[TRANSPARENT] = True
     return forward
 
 
-def current(module: nn.Module) -> Callable[..., object]:
+def current(module: nn.Module) -> Forward:
     """`module`'s class forward as it is at each call."""
     return lambda *args, **kwargs: type(module).forward(module, *args, **kwargs)

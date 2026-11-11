@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
-from typing import Any
 
 import msgspec
 from tensorfs.executor import ByteGrant
@@ -60,7 +59,7 @@ def decode(
     grant_token: object | None = None,
     python_type: type[msgspec.Struct] | None = None,
     media: MediaReads | None = None,
-) -> Any:
+) -> object:
     """Every native result leaf is replaced from the separately verified host grant."""
     if len(grants) > 32:
         raise ValueError("native result grant inventory exceeds its bound")

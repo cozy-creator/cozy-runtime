@@ -3,7 +3,6 @@ and its row's declared dense kernels for the dense ones (`attention.Candidate.de
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from importlib import import_module
 from typing import TYPE_CHECKING, Unpack
 
@@ -13,7 +12,8 @@ if TYPE_CHECKING:
     from cozy_runtime.internal.attention_ulysses import PartialOptions
 
 from cozy_runtime.internal import attention_sol
-from cozy_runtime.internal.attention_ulysses import Local
+from cozy_runtime.internal.attention_sol import DenseRows
+from cozy_runtime.internal.attention_ulysses import Implementation, Local
 
 
 def sparse(
@@ -21,7 +21,7 @@ def sparse(
 ) -> Tensor:
     kitchen = import_module("comfy_kitchen")
     tensors = (x if x.stride(-1) == 1 else x.contiguous() for x in (query, key, value))
-    return kitchen.sol_attn(
+    out: Tensor = kitchen.sol_attn(
         *tensors,
         tau=tau,
         scale=scale,
@@ -29,6 +29,7 @@ def sparse(
         sink_q=[0, 0],
         token_aug=0,
     )
+    return out
 
 
 def forward(
@@ -36,9 +37,9 @@ def forward(
     key: Tensor,
     value: Tensor,
     *,
-    dense: Callable[..., Tensor],
-    prefix_dense: Callable[..., Tensor],
-    exact: Callable[..., Tensor] | None = None,
+    dense: DenseRows,
+    prefix_dense: DenseRows,
+    exact: DenseRows | None = None,
     **options: Unpack[PartialOptions],
 ) -> Tensor:
     return attention_sol._attention(
@@ -53,7 +54,7 @@ def forward(
     )
 
 
-def _named(implementation: str) -> Callable[..., str]:
+def _named(implementation: str) -> Implementation:
     return lambda *_: implementation
 
 

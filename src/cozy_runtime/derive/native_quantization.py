@@ -11,7 +11,7 @@ from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, Timeo
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import msgspec
 import tensorfs
@@ -19,15 +19,21 @@ import tensorfs
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import Context, Telemetry, UnsupportedInput
 from cozy_runtime.author._loader import TENSORFS_NAMES
-from cozy_runtime.weights_store import Checkpoint, Output
+from cozy_runtime.weights_store import Checkpoint, Output, ReusedQuantization
 
 from .microscale import CONVROT_GROUP, NVFP4_BLOCK, W4A8_GROUP
 
 if TYPE_CHECKING:
-    from tensorfs.api import QuantizeTensor
+    from tensorfs._ext import MetadataInput
+    from tensorfs.api import QuantizationResult, QuantizedTensor, QuantizeTensor
 
     from .quantization import ArtifactQuantizationPlan, QuantizationTensor
     from .svdq import Calibration
+
+    #: msgspec reads these annotations at run time, where TensorFS's TypedDicts are stub-only
+    QuantizedTensors = list[QuantizedTensor]
+else:
+    QuantizedTensors = list[dict[str, object]]
 
 SVDQ_STRATEGY = "svdq-nvfp4-r32-faer/1"
 #: The host bytes one calibrated (svdq.nvfp4) fit may hold: an allowance, not an allocation. Its
@@ -41,14 +47,14 @@ _STRATEGIES = {
     "fp8.rowwise": "fp8-rowwise-rne/1",
     "w4a8.convrot": "w4a8-convrot256-fixed/1",
 }
-_NVFP4 = {
+_NVFP4: dict[str, MetadataInput] = {
     "block_size": NVFP4_BLOCK,
     "global_scale": "multiply",
     "nibble_order": "low_first",
     "scale_layout": "row_major",
 }
 #: Each lane scheme's stored params, written alike by the Writer and the Python encoders.
-PARAMS: dict[str, dict[str, object]] = {
+PARAMS: dict[str, dict[str, MetadataInput]] = {
     "fp8.rowwise": {},
     "int8.convrot": {"rotation": "kron_regular_h4", "rotation_size": CONVROT_GROUP},
     "nvfp4": _NVFP4,
@@ -71,7 +77,7 @@ class QuantizationStats(msgspec.Struct):
     new_bytes_written: int
     saturated_elements: int
     worst_relative_frobenius: float | None
-    tensors: list[dict[str, Any]] = msgspec.field(default_factory=list)
+    tensors: QuantizedTensors = msgspec.field(default_factory=list)
 
 
 @functools.cache
@@ -129,13 +135,15 @@ def resolved(
 
 def provenance(
     source: Checkpoint, rows: list[QuantizeTensor], calibration: Checkpoint | None
-) -> dict[str, Any]:
+) -> dict[str, MetadataInput]:
     """Bind the completed calibration and native producer before Output replay lookup."""
     return {
         "native_quantization": {
             "source": source.id,
             **({"calibration": calibration.id} if calibration is not None else {}),
-            "selection": rows,
+            "selection": cast(
+                "list[MetadataInput]", rows
+            ),  # TypedDict rows are JSON; typing can't say so
             "implementation": tensorfs.raw.quantization_implementation(),
         }
     }
@@ -214,10 +222,10 @@ class Progress:
     done: bool
 
 
-class _Execution:
+class _Execution[R]:
     def __init__(
         self,
-        future: Future[dict[str, object]],
+        future: Future[R],
         control: tensorfs.ConversionControl,
         context: Context | None,
     ) -> None:
@@ -231,7 +239,7 @@ class _Execution:
         self.control.cancel()
         self.future.cancel()  # A queued operation has not touched its Writer yet.
 
-    def _join(self) -> tuple[object, ...]:
+    def _join(self) -> tuple[R, ...]:
         try:
             return (self.future.result(),)
         except CancelledError:
@@ -252,7 +260,7 @@ class _Execution:
                 raise UnsupportedInput(error.detail, code="quantization_tripwire") from error
             raise
 
-    def wait(self) -> tuple[object, ...]:
+    def wait(self) -> tuple[R, ...]:
         while not self.future.done():
             if self.context is not None and self.context.cancelled:
                 self.cancel()
@@ -290,10 +298,10 @@ class _Execution:
 
 
 @dataclass(frozen=True)
-class _Work:
-    convert: Callable[[tensorfs.ConversionControl], dict[str, object]]
+class _Work[R]:
+    convert: Callable[[tensorfs.ConversionControl], R]
 
-    def submit(self, context: Context | None = None) -> _Execution:
+    def submit(self, context: Context | None = None) -> _Execution[R]:
         if context is not None:
             context.raise_if_cancelled()
         control = tensorfs.ConversionControl()
@@ -344,7 +352,7 @@ def quantize(
 
 
 def _run(
-    convert: Callable[[tensorfs.ConversionControl], dict[str, object]],
+    convert: Callable[[tensorfs.ConversionControl], QuantizationResult | ReusedQuantization],
     pending: int,
     ctx: Context,
     tel: Telemetry,
@@ -356,20 +364,23 @@ def _run(
     for row in stats.tensors:
         if row.get("fit") is not None:
             tel.log(
-                "native fitted tensor", component=row["component"], key=row["key"], **row["fit"]
+                "native fitted tensor",
+                component=row["component"],
+                key=row["key"],
+                **row["fit"],  # type: ignore[arg-type]  # its residual (a dict) logs as text
             )
     tel.metric("native_quantized_tensors", float(stats.encoded_keys))
     return stats
 
 
-def _run_native(
-    convert: Callable[[tensorfs.ConversionControl], dict[str, object]],
+def _run_native[R](
+    convert: Callable[[tensorfs.ConversionControl], R],
     pending: int,
     ctx: Context,
     tel: Telemetry,
     *,
     stage: str,
-) -> dict[str, object]:
+) -> R:
     # This helper joins before returning, like the existing bounded encoding loop.
     # It must not consume Context.plan's one whole GPU program slot: an author may
     # convert several outputs and then submit that program in the same request.
@@ -388,7 +399,7 @@ def _run_native(
             time.sleep(0.05)  # Observation never advances native reads/encoding/publication.
         (result,) = execution.wait()
         tel._progress(1.0, stage=stage)
-        return cast("dict[str, object]", result)
+        return result
     except BaseException as error:
         failure = error
         raise

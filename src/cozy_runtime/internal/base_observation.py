@@ -18,7 +18,6 @@ import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
 from packaging.version import InvalidVersion, Version
 
@@ -370,7 +369,7 @@ def _normalize(value: str) -> str:
     return _NAME_RUNS.sub("-", value.strip().lower())
 
 
-def _body(observation: Observation) -> dict[str, Any]:
+def _body(observation: Observation) -> dict[str, object]:
     return {
         "accelerator_backend": observation.accelerator_backend,
         "accelerator_build": observation.accelerator_build,

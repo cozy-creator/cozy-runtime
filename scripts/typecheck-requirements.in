@@ -1,7 +1,8 @@
-# The type check's environment (scripts/typecheck.sh): the libraries the Runtime's source imports, CPU-only.
+# The type check's environment (scripts/typecheck.sh): mypy and the libraries the Runtime's source imports, CPU-only.
 # `scripts/typecheck.sh lock` pins them into typecheck-requirements.txt.
-basedpyright
-tensorfs>=0.22.1,<0.23
+mypy
+# TensorFS by git rev until a release carries its typed stubs (the boundary types read tensorfs.varena._facts).
+tensorfs @ git+https://github.com/cozy-creator/cozy-creator@edb8b0c6fff0b1cf51e00fb82b808873023b27be#subdirectory=crates/tensorfs-py
 msgspec
 numpy
 packaging

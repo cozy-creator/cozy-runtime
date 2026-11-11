@@ -32,9 +32,9 @@ try:
     import triton
     import triton.language as tl
 except ImportError:  # a host without Triton decodes eagerly
+    triton = None
     if TYPE_CHECKING:
         raise
-    triton = None
 
 #: The kernels run here (CUDA, or Triton's interpreter on CPU).
 HAS_TRITON = triton is not None

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from typing import cast
 
 import msgspec
 
@@ -83,7 +84,7 @@ def composer(graph: Graph, magnitudes: Mapping[str, str]) -> Callable[[object], 
             super().__init__()
             self.weight = nn.Parameter(torch.empty(out, dtype=dtype), requires_grad=False)
 
-    class _Linear(PeftLinear):  # type: ignore[misc]
+    class _Linear(PeftLinear):
         #: the weight plane baked the update into the base weight's resident bytes
         _cozy_baked = False
         #: each DoRA adapter's (s, t): its factors' scale alpha / r and its strength
@@ -91,25 +92,27 @@ def composer(graph: Graph, magnitudes: Mapping[str, str]) -> Callable[[object], 
 
         def forward(self, x: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
             # Base hooks (Turbo's overlay) run inside `base_layer`.
-            result = self.base_layer(x, *args, **kwargs).contiguous()
+            result: torch.Tensor = self.base_layer(x, *args, **kwargs).contiguous()
             if not self._cozy_baked:
                 for name in self.active_adapters:
-                    lora.accumulate(
-                        x, result, self.lora_A[name].weight, self.lora_B[name].weight,
-                        self.scaling[name],
-                    )
+                    # peft keeps each factor of a linear as an nn.Linear in an nn.ModuleDict.
+                    down = cast("nn.Linear", self.lora_A[name])
+                    up = cast("nn.Linear", self.lora_B[name])
+                    lora.accumulate(x, result, down.weight, up.weight, self.scaling[name])
             return result
 
-    class _Conv2d(PeftConv2d):  # type: ignore[misc]
+    class _Conv2d(PeftConv2d):
         _cozy_baked = False
 
         def forward(self, x: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
             # Extra memory: a rank-channel activation and one update.
-            result = self.base_layer(x, *args, **kwargs)
+            result: torch.Tensor = self.base_layer(x, *args, **kwargs)
             if self._cozy_baked:
                 return result
             for name in self.active_adapters:
-                down, up = self.lora_A[name], self.lora_B[name]
+                # peft keeps each factor of a convolution as an nn.Conv2d in an nn.ModuleDict.
+                down = cast("nn.Conv2d", self.lora_A[name])
+                up = cast("nn.Conv2d", self.lora_B[name])
                 low = up(down(x.to(down.weight.dtype)))
                 result.add_(low.to(result.dtype), alpha=self.scaling[name])
             return result
@@ -149,10 +152,12 @@ def composer(graph: Graph, magnitudes: Mapping[str, str]) -> Callable[[object], 
                 raise _refuse(
                     "target_type", f"{component}.{path}: a DoRA adapts a linear, not a convolution"
                 )
-            layer = kind(base, first.adapter, config=config, r=first.rank, lora_alpha=first.alpha)
+            # peft annotates `lora_alpha` int; it scales by alpha / r, and a float alpha is ours.
+            alpha = first.alpha
+            layer = kind(base, first.adapter, config=config, r=first.rank, lora_alpha=alpha)  # type: ignore[arg-type]
             layer._cozy_dora = {}
             for row in others:
-                layer.update_layer(row.adapter, row.rank, lora_alpha=row.alpha, config=config)
+                layer.update_layer(row.adapter, row.rank, lora_alpha=row.alpha, config=config)  # type: ignore[arg-type]
             for row in rows:
                 dtype = {"F16": torch.float16, "BF16": torch.bfloat16, "F32": torch.float32}[
                     row.dtype
@@ -163,7 +168,9 @@ def composer(graph: Graph, magnitudes: Mapping[str, str]) -> Callable[[object], 
                 if row.dora:
                     key = f"{component}.{path}.lora_magnitude_vector.{row.adapter}.weight"
                     width = getattr(torch, TORCH_DTYPES[magnitudes[key]])
-                    layer.lora_magnitude_vector[row.adapter] = _Magnitude(base.out_features, width)
+                    # A DoRA adapts a linear: a convolution's was refused above.
+                    out = cast("nn.Linear", base).out_features
+                    layer.lora_magnitude_vector[row.adapter] = _Magnitude(out, width)
                     layer._cozy_dora[row.adapter] = (row.alpha / row.rank, row.strength)
                     layer.scaling[row.adapter] = 1.0
             layer.set_adapter([row.adapter for row in rows], inference_mode=True)

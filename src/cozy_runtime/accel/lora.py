@@ -11,7 +11,7 @@ and the hook adds nothing then."""
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Protocol
 
 import torch
 from torch.nn import functional as F
@@ -72,13 +72,15 @@ class Hook:
     def __init__(self, armed: Callable[[], Factors | None]) -> None:
         self.armed, self._cozy_baked = armed, False
 
-    def __call__(self, module: Any, args: tuple[Any, ...], out: torch.Tensor) -> None:
+    def __call__(
+        self, module: torch.nn.Module, args: tuple[torch.Tensor, ...], out: torch.Tensor
+    ) -> None:
         factors = self.armed()
         if self._cozy_baked or factors is None:
             return  # Bound weights already contain the delta; the fill owns factor reads.
         factors(args[0], out)
 
-    def lora_factors(self) -> tuple[object, torch.Tensor, torch.Tensor, float] | None:
+    def lora_factors(self) -> tuple[Factors, torch.Tensor, torch.Tensor, float] | None:
         """The Runtime's bake reads these (`weights.LoRASource`)."""
         factors = self.armed()
         return None if factors is None else (factors, *factors.factors())

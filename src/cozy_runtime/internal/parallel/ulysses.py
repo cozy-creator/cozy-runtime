@@ -27,12 +27,13 @@ import threading
 import weakref
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
-from typing import Any, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
 import tensorfs.varena.torch as vt
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import _get_process_group_store
 
@@ -44,6 +45,9 @@ from cozy_runtime.internal.execution import catch, sizing
 from cozy_runtime.internal.parallel import copy_engine, turn
 from cozy_runtime.internal.parallel.group import abort_process_group, gather
 
+if TYPE_CHECKING:
+    from torch._C._distributed_c10d import Work
+
 type Compute = Callable[[Tensor, Tensor, Tensor], Tensor]
 type Wait = Callable[[], None]
 
@@ -51,8 +55,19 @@ type Wait = Callable[[], None]
 _ROUNDS = 4
 #: Each group's Q/K/V to one peer, at least, for a group's crossing to outlast its launches.
 _ROUND_BYTES = 16 << 20
+class _Proposal(TypedDict, total=False):
+    """One rank's word at an exchange's meeting (`_Rendezvous.gather`): its rows, the level it
+    asks for and its call's site, or why it refused (`error`, of `kind` fit, oom or other)."""
+
+    rows: int
+    at: int
+    site: str
+    error: str
+    kind: str
+
+
 #: Each GPU's packing stream (`_Packer`)
-_PACKING: dict[int, tuple[Any, ...]] = {}
+_PACKING: dict[int, tuple[torch.cuda.Stream, ...]] = {}
 
 
 def group(config: object) -> ProcessGroup:
@@ -75,7 +90,7 @@ class _Rendezvous:
     """Metadata rounds over the group's store; no tensor crosses here."""
 
     def __init__(self, handle: ProcessGroup) -> None:
-        self.store = dist.PrefixStore(
+        self.store = PrefixStore(
             f"cozy.ulysses/{handle.group_name}/", _get_process_group_store(handle)
         )
         self.rank, self.world = dist.get_rank(handle), dist.get_world_size(handle)
@@ -85,7 +100,7 @@ class _Rendezvous:
         #: same on every rank, so every rank's menu starts there
         self.floors: dict[tuple[int, ...], int] = {}
 
-    def gather(self, value: dict[str, Any]) -> list[dict[str, Any]]:
+    def gather(self, value: _Proposal) -> list[_Proposal]:
         """Every rank's `value` for this sequence: four store calls a rank. Each rank has read
         the last sequence's values before it proposes this one, so its own of them goes. A rank
         that never proposes ends the wait (`group.gather`); ranks whose values name different
@@ -171,7 +186,7 @@ def _groups(padded: int, step: int, world: int) -> list[tuple[int, int]]:
     return [*groups, (end, 1)]
 
 
-def _refusal(rows: Sequence[dict[str, Any]]) -> None:
+def _refusal(rows: Sequence[_Proposal]) -> None:
     """Raise a refusal some rank reported, as what it was."""
     failed = [row for row in rows if row.get("error")]
     if failed:
@@ -184,7 +199,7 @@ def _refusal(rows: Sequence[dict[str, Any]]) -> None:
         raise kind(f"Ulysses refused before its first crossing: {[r['error'] for r in failed]}")
 
 
-def _failure(exc: BaseException) -> dict[str, Any]:
+def _failure(exc: BaseException) -> _Proposal:
     kind = "fit" if isinstance(exc, DoesNotFit) else "oom" if fault(exc) is Fault.OOM else ""
     return {"error": f"{type(exc).__name__}: {exc}", "kind": kind}
 
@@ -208,14 +223,18 @@ def _start(
             torch.cuda.current_stream(held[0][0].device).wait_event(done)
 
         return landed
+    # Each is its Work: `async_op=True` returns one.
     works = [
-        dist.all_to_all_single(
-            out,
-            value,
-            output_split_sizes=[row[rank] for row in matrix],
-            input_split_sizes=matrix[rank],
-            group=handle,
-            async_op=True,
+        cast(
+            "Work",
+            dist.all_to_all_single(
+                out,
+                value,
+                output_split_sizes=[row[rank] for row in matrix],
+                input_split_sizes=matrix[rank],
+                group=handle,
+                async_op=True,
+            ),
         )
         for value, out in zip(sends, receives, strict=True)
     ]
@@ -239,9 +258,9 @@ class _Packer:
 
     def __init__(self, like: Tensor, narrow: bool) -> None:
         self.launch: Launch | None = turn.launcher(like) if narrow else None
-        self.out: Any = None
-        self.back: Any = None
-        self.inbound: Any = None
+        self.out: torch.cuda.Stream | None = None
+        self.back: torch.cuda.Stream | None = None
+        self.inbound: torch.cuda.Stream | None = None
         if like.is_cuda and (self.launch is not None or not narrow):
             device = like.device.index or 0
             found = _PACKING.get(device)
@@ -252,9 +271,9 @@ class _Packer:
         #: what an unpacking or landing on `inbound` read, kept until the calling stream waits
         self.held: list[object] = []
         #: the attended rows `back` packs, each with the event after its packing (`read`)
-        self.reading: list[tuple[Tensor, Any]] = []
+        self.reading: list[tuple[Tensor, torch.cuda.Event | None]] = []
 
-    def mark(self) -> Any:
+    def mark(self) -> torch.cuda.Event | None:
         """An event on the calling stream: what it allocated so far is free for a side stream."""
         if self.out is None:
             return None
@@ -262,7 +281,9 @@ class _Packer:
         event.record()
         return event
 
-    def on(self, stream: Any, after: Any = None) -> AbstractContextManager[object]:
+    def on(
+        self, stream: torch.cuda.Stream | None, after: torch.cuda.Event | None = None
+    ) -> AbstractContextManager[object]:
         """`stream` current (the calling stream's own where there is none), after `after`."""
         if stream is None:
             return nullcontext()
@@ -270,7 +291,7 @@ class _Packer:
             stream.wait_event(after)
         return torch.cuda.stream(stream)
 
-    def mark_on(self, stream: Any) -> Any:
+    def mark_on(self, stream: torch.cuda.Stream | None) -> torch.cuda.Event | None:
         """An event on `stream` after its work so far (None without one)."""
         if stream is None:
             return None
@@ -346,7 +367,12 @@ class _Arriving:
     one tensor), and the operands its unpacking writes (stacked too: one launch unpacks all)."""
 
     def __init__(
-        self, wait: Wait, values: Tensor, scales: Tensor | None, operands: Tensor, mark: Any
+        self,
+        wait: Wait,
+        values: Tensor,
+        scales: Tensor | None,
+        operands: Tensor,
+        mark: torch.cuda.Event | None,
     ) -> None:
         self.wait, self.values, self.scales, self.operands = wait, values, scales, operands
         self.mark = mark
@@ -464,7 +490,14 @@ def _returned(
     return wait, returned
 
 
-def _waited(on: Tensor, wait: Wait, waits: list[Any]) -> None:
+type _Event = torch.cuda.Event
+#: Two marks around a span of the calling stream (none where nothing is timed).
+type _Span = tuple[_Event | None, _Event | None]
+#: The attention, the waits for Q/K/V and the waits for output.
+type _Spans = tuple[list[_Span], list[_Span], list[_Span]]
+
+
+def _waited(on: Tensor, wait: Wait, waits: list[_Span]) -> None:
     """`wait`, between two marks: what the calling stream idled for a crossing."""
     before = _Clock.mark(on)
     wait()
@@ -480,11 +513,11 @@ class _Clock:
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.pending: list[tuple[Any, Any, tuple[list[Any], list[Any], list[Any]], int]] = []
+        self.pending: list[tuple[_Event, _Event, _Spans, int]] = []
         self.totals = dict.fromkeys(self._SUMS, 0.0)
 
     @staticmethod
-    def mark(on: Tensor) -> Any:
+    def mark(on: Tensor) -> _Event | None:
         if not on.is_cuda or torch.cuda.is_current_stream_capturing():
             return None
         event = torch.cuda.Event(enable_timing=True)
@@ -493,9 +526,9 @@ class _Clock:
 
     def add(
         self,
-        began: Any,
-        ended: Any,
-        spans: tuple[list[Any], list[Any], list[Any]],
+        began: _Event | None,
+        ended: _Event | None,
+        spans: _Spans,
         crossed: int,
     ) -> None:
         """`spans`: the attention, the waits for Q/K/V and the waits for output, as mark pairs."""
@@ -638,12 +671,12 @@ def _exchange(
         assert request is not None
         stream = int(torch.cuda.current_stream(device).cuda_stream)
         request.memory.remember_working_phase(site, catch.owners(request))
-    proposal: dict[str, Any] = {
+    proposal: _Proposal = {
         "rows": mine,
         "at": max(catch.LEVELS.get(site, floor), floor),
         "site": f"{called or 'attention'} [{batch} x {padded} heads x {dim}, {b} B]",
     }
-    selection: dict[str, Any] = {}
+    selection = cast("catch.Selection", {})  # chosen where native, the only path that reads it
     try:
         if native:
             selection = catch.select(device, site, "ulysses", levels, stream)
@@ -672,9 +705,9 @@ def _exchange(
     groups = _groups(padded, step, world)
     crossed = submitted = False
     began = _Clock.mark(query)
-    inner: list[Any] = []
-    arrived: list[Any] = []
-    landed: list[Any] = []
+    inner: list[_Span] = []
+    arrived: list[_Span] = []
+    landed: list[_Span] = []
     try:
         out = query.new_empty((batch, mine, padded, dim))
         sources = (query, key, value)

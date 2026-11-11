@@ -17,6 +17,7 @@ import typing
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import ModuleType
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import tensorfs
 from tensorfs import raw
@@ -31,6 +32,31 @@ from cozy_runtime.internal.encoding.formats import (
     part_rule,
 )
 from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan
+
+if TYPE_CHECKING:
+    from tensorfs._ext import ConfigValue, MetadataValue
+
+
+class FitVerdict(TypedDict):
+    """`fit`'s census verdict: `ok` False names the first disagreement; True adds the coverage gaps."""
+
+    ok: bool
+    code: str
+    component: str
+    key: str
+    detail: str
+    encoding: str
+    custody: str
+    device: str
+    ignored: NotRequired[list[str]]
+    ignored_bytes: NotRequired[int]
+    unstored: NotRequired[list[str]]
+    routes: NotRequired[dict[str, int]]
+    warning: NotRequired[str]
+    order: NotRequired[str]
+    #: added by `weights.Binding.fit` over every checkpoint
+    warnings: NotRequired[list[str]]
+
 
 #: The component of a model without a pipeline, whose folder is the root (a Transformers model).
 ROOT_COMPONENT = "model"
@@ -281,10 +307,10 @@ class Checkpoint:
         return found
 
     @property
-    def metadata(self) -> dict[str, object]:
+    def metadata(self) -> dict[str, MetadataValue]:
         return dict(self.ck.metadata)
 
-    def configs(self) -> dict[str, dict[str, object]]:
+    def configs(self) -> dict[str, dict[str, ConfigValue]]:
         """Construction configs by component: each component's that has one."""
         return {name: dict(c.config) for name, c in self.ck.components.items() if c.config}
 
@@ -383,7 +409,7 @@ def fit(
     encoded_leaves: bool,
     custody: str = "",
     device: str = "",
-) -> dict[str, object]:
+) -> FitVerdict:
     """The construction census against the header: every built tensor is stored with its shape
     and dtype, except a persistent buffer, which keeps its
     constructed value when the checkpoint does not store it (`unstored`); stored tensors nothing
@@ -402,7 +428,7 @@ def fit(
 
     def refused(
         code: str, detail: str, component: str = "", key: str = "", encoding: str = ""
-    ) -> dict[str, object]:
+    ) -> FitVerdict:
         return {"ok": False, "code": code, "component": component, "key": key,
                 "detail": detail, "encoding": encoding, "custody": custody,
                 "device": device}  # fmt: skip

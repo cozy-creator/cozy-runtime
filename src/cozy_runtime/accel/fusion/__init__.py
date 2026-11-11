@@ -47,31 +47,42 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from types import FrameType
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from cozy_runtime.accel.fusion import _kernels
 from cozy_runtime.accel.kernels import (
     KernelsUnavailable,
     Launch,
     Plan,
+    PreQuantized,
+    TritonEntry,
     TritonKernels,
     int8_rows,
     quantize_once,
 )
 
-try:
+if TYPE_CHECKING:
     import torch
-except ImportError:  # pragma: no cover - the base package is torch-free
-    if TYPE_CHECKING:
-        raise
-    torch = None
-
-try:
-    from diffusers.models.attention_dispatch import _AttentionBackendRegistry, dispatch_attention_fn
-except ImportError:  # pragma: no cover - only a parallel block composes Diffusers' attention
-    if TYPE_CHECKING:
-        raise
-    _AttentionBackendRegistry = dispatch_attention_fn = None
+    from diffusers.models._modeling_parallel import ParallelConfig
+    from diffusers.models.attention_dispatch import (
+        AttentionBackendName,
+        _AttentionBackendRegistry,
+        dispatch_attention_fn,
+    )
+    from torch import Tensor, nn
+else:
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - the base package is torch-free
+        torch = None
+    try:
+        from diffusers.models.attention_dispatch import (
+            _AttentionBackendRegistry,
+            dispatch_attention_fn,
+        )
+    except ImportError:  # pragma: no cover - only a parallel block composes Diffusers' attention
+        _AttentionBackendRegistry = dispatch_attention_fn = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,13 +91,13 @@ class Modulation:
     row, `index` (int64 over `tokens` or `batch * tokens` rows; it wraps). A parallel block
     reads only the `_msa` tables; a block without `scale` only the gates."""
 
-    index: Any
-    scale_msa: Any = None
-    gate_msa: Any = None
-    scale_mlp: Any = None
-    gate_mlp: Any = None
-    shift_msa: Any = None
-    shift_mlp: Any = None
+    index: Tensor
+    scale_msa: Tensor | None = None
+    gate_msa: Tensor | None = None
+    scale_mlp: Tensor | None = None
+    gate_mlp: Tensor | None = None
+    shift_msa: Tensor | None = None
+    shift_mlp: Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,10 +153,10 @@ class DiTBlock:
     gates; the residual's `x + branch * gate` in fp32; a norm rounds once to fp16).
     """
 
-    block: type[Any]
+    block: type[nn.Module]
     width: int
     head_dim: int
-    modulation: Callable[[Any, Mapping[str, Any]], Modulation]
+    modulation: Callable[[nn.Module, Mapping[str, object]], Modulation]
     norms: tuple[str, ...]
     norm: Literal["layer", "rms"]
     attention: str
@@ -225,17 +236,17 @@ class DiTBlock:
         return self.rope.rotary or self.head_dim if self.rope else 0
 
     @property
-    def dtype(self) -> Any:
+    def dtype(self) -> torch.dtype:
         """The rows' dtype."""
         return torch.float16 if self.rows == "fp16" else torch.bfloat16
 
     @property
-    def wide(self) -> Any:
+    def wide(self) -> torch.dtype:
         """The residual stream's and the tables' dtype."""
         return torch.float32 if self.rows == "fp16" else torch.bfloat16
 
     @property
-    def weight_dtype(self) -> Any:
+    def weight_dtype(self) -> torch.dtype:
         """The norm and q/k norm weights' dtype."""
         return torch.float32 if self.weights == "fp32" else self.wide
 
@@ -267,9 +278,9 @@ class DiTBlock:
 
 
 def _declaring_module() -> str:
-    frame = sys._getframe(1)
+    frame: FrameType | None = sys._getframe(1)
     while frame is not None and frame.f_globals.get("__name__") == __name__:
-        frame = frame.f_back  # type: ignore[assignment]
+        frame = frame.f_back
     return str(frame.f_globals.get("__name__", "")) if frame is not None else ""
 
 
@@ -288,6 +299,70 @@ class _Switch:
         self.launch: Launch | None = None
 
 
+type _RopeCall = tuple[Launch, TritonEntry, _kernels.RopeTables, DiTBlock]
+
+
+class _Eager(Protocol):
+    """A fused module's own class's forward: whatever its call is given, it returns."""
+
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
+
+
+class _Processor(Protocol):
+    """A Diffusers attention processor's backend and parallel config."""
+
+    _attention_backend: AttentionBackendName | None
+    _parallel_config: ParallelConfig | None
+
+
+if TYPE_CHECKING:
+    # What the fused forwards read of the modules they stand in: torch types a Module's other
+    # attributes as `Tensor | Module` (`__getattr__`).
+
+    class _Linear(nn.Module):
+        """A linear, or the encoded leaf in its place."""
+
+        def __call__(self, x: Tensor | PreQuantized, /) -> Tensor: ...
+
+    class _Norm(nn.Module):
+        weight: Tensor | None
+
+    class _HeadNorm(nn.Module):
+        """An attention's q/k RMSNorm; fused (`_head_norm_forward`) under a sequential block."""
+
+        weight: Tensor | None
+        eps: float
+        _cozy_rope: _RopeCall | None
+        _cozy_eager: Callable[[Tensor], Tensor]
+
+        def __call__(self, x: Tensor, /) -> Tensor: ...
+
+    class _Attention(nn.Module):
+        heads: int
+        processor: _Processor
+
+        def __call__(self, hidden_states: Tensor, /, **kwargs: object) -> Tensor: ...
+
+    class _FusedBlock(nn.Module):
+        _cozy_dit: _Site
+        _cozy_eager: _Eager
+
+    class _FusedChannelNorm(nn.Module):
+        gamma: Tensor
+        bias: Tensor | float
+        _cozy_norm: _NormSite
+        _cozy_eager: Callable[[Tensor], Tensor]
+
+    class _FusedConv(nn.Module):
+        weight: Tensor
+        bias: Tensor | None
+        stride: tuple[int, ...]
+        dilation: tuple[int, ...]
+        groups: int
+        _cozy_lone: tuple[int, int]
+        _cozy_eager: Callable[[Tensor, Tensor | None], Tensor]
+
+
 @dataclass(frozen=True, slots=True)
 class _Site:
     """One installed block: its declaration, launcher and the modules it calls. `qkv` and `out`:
@@ -297,14 +372,14 @@ class _Site:
     layout: DiTBlock
     switch: _Switch
     signature: inspect.Signature
-    norms: tuple[Any, ...]
+    norms: tuple[_Norm, ...]
     eps: tuple[float, ...]
-    attention: Any
-    qk: tuple[Any, ...]
-    qkv: tuple[Any, ...]
-    inputs: tuple[Any, ...]
-    down: Any
-    out: Any = None
+    attention: _Attention
+    qk: tuple[_HeadNorm, ...]
+    qkv: tuple[_Linear, ...]
+    inputs: tuple[_Linear, ...]
+    down: _Linear
+    out: _Linear | None = None
 
 
 def _identity(layout: DiTBlock) -> str:
@@ -313,23 +388,24 @@ def _identity(layout: DiTBlock) -> str:
     return "sha256:" + hashlib.sha256(b"cozy.fusion.dit-block\0" + encoded).hexdigest()
 
 
-def _hooked(module: Any) -> bool:
+def _hooked(module: nn.Module) -> bool:
     return bool(module._forward_hooks or module._forward_pre_hooks)
 
 
-def _eps(module: Any, path: str) -> float:
+def _eps(module: nn.Module, path: str) -> float:
     eps = getattr(module, "eps", None)
     if not isinstance(eps, (int, float)):
         raise _Mismatch(f"{path}: no numeric eps")
     return float(eps)
 
 
-def _norm(module: Any, layout: DiTBlock, path: str) -> tuple[Any, float]:
+def _norm(module: nn.Module, layout: DiTBlock, path: str) -> tuple[Tensor | None, float]:
     if layout.norm == "layer":
+        # torch types a LayerNorm's weight and bias Tensor; without affine they are None.
         if not (
             isinstance(module, torch.nn.LayerNorm)
-            and module.weight is None
-            and module.bias is None
+            and cast("Tensor | None", module.weight) is None
+            and cast("Tensor | None", module.bias) is None
             and tuple(module.normalized_shape) == (layout.width,)
         ):
             raise _Mismatch(f"{path}: not a {layout.width}-wide LayerNorm without affine")
@@ -347,7 +423,7 @@ def _norm(module: Any, layout: DiTBlock, path: str) -> tuple[Any, float]:
     return weight, _eps(module, path)
 
 
-def _projections(attention: Any, layout: DiTBlock, path: str) -> tuple[Any, ...]:
+def _projections(attention: nn.Module, layout: DiTBlock, path: str) -> tuple[_Linear, ...]:
     """A parallel block's `(to_q, to_k, to_v, to_out)`, from a Diffusers attention module."""
     out = getattr(attention, "to_out", None)
     out = out[0] if isinstance(out, torch.nn.ModuleList) else out
@@ -362,17 +438,17 @@ def _projections(attention: Any, layout: DiTBlock, path: str) -> tuple[Any, ...]
         or not hasattr(getattr(attention, "processor", None), "_attention_backend")
     ):
         raise _Mismatch(f"{path}: not a Diffusers attention with to_q, to_k, to_v and to_out")
-    return found
+    return cast("tuple[_Linear, ...]", found)  # each an nn.Module, checked above
 
 
-def _site(block: Any, layout: DiTBlock, switch: _Switch, path: str) -> _Site:
+def _site(block: nn.Module, layout: DiTBlock, switch: _Switch, path: str) -> _Site:
     if type(block) is not layout.block or "forward" in vars(block):
         raise _Mismatch(f"{path}: not a {layout.block.__qualname__}")
     names = (layout.mlp.gate, *((layout.mlp.up,) if layout.mlp.up else ()), layout.mlp.down)
     try:
         norms = tuple(block.get_submodule(name) for name in layout.norms)
-        attention: Any = block.get_submodule(layout.attention)
-        mlp: Any = block.get_submodule(layout.mlp.module)
+        attention = block.get_submodule(layout.attention)
+        mlp = block.get_submodule(layout.mlp.module)
         *inputs, down = (mlp.get_submodule(n) for n in names)
         fused_qk = layout.rope or layout.composed
         qk = tuple(attention.get_submodule(n) for n in layout.qk_norms) if fused_qk else ()
@@ -381,7 +457,7 @@ def _site(block: Any, layout: DiTBlock, switch: _Switch, path: str) -> _Site:
     # The fused forward calls neither the norms nor the MLP container: their hooks would not
     # run. Nor, composed, the attention module and its q/k norms.
     bypassed = [*norms, mlp, *(m for m in mlp.children() if m not in (*inputs, down))]
-    projections: tuple[Any, ...] = ()
+    projections: tuple[_Linear, ...] = ()
     if layout.composed:
         projections = _projections(attention, layout, f"{path}.{layout.attention}")
         called = (*projections, *qk)
@@ -404,26 +480,27 @@ def _site(block: Any, layout: DiTBlock, switch: _Switch, path: str) -> _Site:
     passed = signature.parameters if layout.parallel else layout.arguments
     if missing or (layout.rope and layout.rope.argument not in passed):
         raise _Mismatch(f"{path}: the forward lacks {sorted(missing) or [layout.rope]}")
+    # Checked above: the declared norms, attention, q/k norms and MLP linears.
     return _Site(
         layout,
         switch,
         signature,
-        norms,
+        cast("tuple[_Norm, ...]", norms),
         tuple(e for _, e in found),
-        attention,
-        qk,
+        cast("_Attention", attention),
+        cast("tuple[_HeadNorm, ...]", qk),
         projections[:3],
-        tuple(inputs),
-        down,
+        cast("tuple[_Linear, ...]", tuple(inputs)),
+        cast("_Linear", down),
         projections[3] if projections else None,
     )
 
 
-def _cuda(dtype: Any, *tensors: Any) -> bool:
+def _cuda(dtype: torch.dtype, *tensors: Tensor | None) -> bool:
     return all(t is None or (t.dtype is dtype and t.is_cuda) for t in tensors)
 
 
-def _fusable(layout: DiTBlock, x: Any) -> bool:
+def _fusable(layout: DiTBlock, x: Tensor) -> bool:
     """The residual stream the kernels take: bf16, or under fp16 autocast fp16 or fp32."""
     if layout.rows == "bf16":
         return _cuda(torch.bfloat16, x)
@@ -435,7 +512,7 @@ def _fusable(layout: DiTBlock, x: Any) -> bool:
     )
 
 
-def _block_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+def _block_forward(self: _FusedBlock, *args: object, **kwargs: object) -> object:
     site: _Site = self._cozy_dit
     layout, launch = site.layout, site.switch.launch
     if launch is None:
@@ -443,7 +520,7 @@ def _block_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
     bound = site.signature.bind(self, *args, **kwargs)
     bound.apply_defaults()
     arguments = bound.arguments
-    x = arguments[layout.hidden_states]
+    x: Tensor = arguments[layout.hidden_states]
     if not _fusable(layout, x):
         return self._cozy_eager(*args, **kwargs)
     rows = layout.modulation(self, arguments)
@@ -461,17 +538,17 @@ def _block_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
         site.eps[0],
     )
     run = _parallel if layout.parallel else _sequential
-    return run(site, launch, x, normed, rows, arguments)
+    return run(site, launch, x, cast("Tensor", normed), rows, arguments)  # a norm's entry
 
 
-def _inputs(linears: Sequence[Any], normed: Any) -> list[Any]:
+def _inputs(linears: Sequence[_Linear], normed: Tensor) -> list[Tensor]:
     """Every linear that reads the block's normed rows, on those rows: an encoded one quantizes
     them once between them."""
     with quantize_once(normed):
         return [linear(normed) for linear in linears]
 
 
-def _mlp(launch: Launch, site: _Site, hidden: Sequence[Any]) -> Any:
+def _mlp(launch: Launch, site: _Site, hidden: Sequence[Tensor]) -> Tensor:
     """`down(silu(gate) * up)`. An int8 `down` gets the product from its own quantization pass
     when gate and up are two linears' rows: the same rows, never written in bf16."""
     mlp = site.layout.mlp
@@ -487,17 +564,22 @@ def _mlp(launch: Launch, site: _Site, hidden: Sequence[Any]) -> Any:
     return site.down(_kernels.swiglu(launch, site.layout.entries.swiglu, *hidden))
 
 
-def _call_attention(launch: Launch, site: _Site, normed: Any, arguments: Any) -> Any:
+def _call_attention(
+    launch: Launch, site: _Site, normed: Tensor, arguments: Mapping[str, object]
+) -> Tensor:
     """The block's attention module on the normed rows, its q/k norms applying RoPE."""
     layout = site.layout
     call = {name: arguments[name] for name in layout.arguments}
     if layout.rope is not None and call[layout.rope.argument] is not None:
         tables = _kernels.rope_tables(
-            call[layout.rope.argument], interleaved=layout.rope.interleaved, rotary=layout.rotary
+            cast("_Rotary", call[layout.rope.argument]),
+            interleaved=layout.rope.interleaved,
+            rotary=layout.rotary,
         )
         call[layout.rope.argument] = None
+        entry = cast("TritonEntry", layout.entries.rope)  # a layout with a rope has its entry
         for norm in site.qk:
-            norm._cozy_rope = (launch, layout.entries.rope, tables, layout)
+            norm._cozy_rope = (launch, entry, tables, layout)
     try:
         with quantize_once(normed), _selected(site.attention):
             return site.attention(normed, **call)
@@ -507,7 +589,7 @@ def _call_attention(launch: Launch, site: _Site, normed: Any, arguments: Any) ->
 
 
 @contextmanager
-def _selected(attention: Any) -> Iterator[None]:
+def _selected(attention: nn.Module) -> Iterator[None]:
     """The attention's own dispatches that name no backend run the kernel Runtime selected for it,
     not Diffusers' process default: Qwen-Image 2.1's prefill attends each prefix segment and the
     target image that way (`backend=None`), so its first step attended in bf16 (xs-134)."""
@@ -524,15 +606,21 @@ def _selected(attention: Any) -> Iterator[None]:
 
 
 def _sequential(
-    site: _Site, launch: Launch, x: Any, normed: Any, rows: Modulation, arguments: Any
-) -> Any:
+    site: _Site,
+    launch: Launch,
+    x: Tensor,
+    normed: Tensor,
+    rows: Modulation,
+    arguments: Mapping[str, object],
+) -> Tensor:
     layout, entries = site.layout, site.layout.entries
     if layout.composed:
-        attended = _attend(launch, site, *_inputs(site.qkv, normed), arguments)
+        # qkv holds exactly to_q, to_k and to_v.
+        attended = _attend(launch, site, *_inputs(site.qkv, normed), arguments)  # type: ignore[arg-type, call-arg]
     else:
         attended = _call_attention(launch, site, normed, arguments)
     assert entries.second is not None
-    x, normed = _kernels.norm_modulate(
+    x, second = _kernels.norm_modulate(
         launch,
         entries.second,
         x,
@@ -544,7 +632,7 @@ def _sequential(
         branch=attended,
         gate=rows.gate_msa,
     )
-    mlp = _mlp(launch, site, _inputs(site.inputs, normed))
+    mlp = _mlp(launch, site, _inputs(site.inputs, cast("Tensor", second)))  # a norm's entry
     x, _ = _kernels.norm_modulate(
         launch,
         entries.residual,
@@ -561,8 +649,13 @@ def _sequential(
 
 
 def _parallel(
-    site: _Site, launch: Launch, x: Any, normed: Any, rows: Modulation, arguments: Any
-) -> Any:
+    site: _Site,
+    launch: Launch,
+    x: Tensor,
+    normed: Tensor,
+    rows: Modulation,
+    arguments: Mapping[str, object],
+) -> Tensor:
     q, k, v, *hidden = _inputs((*site.qkv, *site.inputs), normed)
     x, _ = _kernels.norm_modulate(
         launch,
@@ -580,17 +673,25 @@ def _parallel(
     return x
 
 
-def _attend(launch: Launch, site: _Site, q: Any, k: Any, v: Any, arguments: Any) -> Any:
+def _attend(
+    launch: Launch,
+    site: _Site,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    arguments: Mapping[str, object],
+) -> Tensor:
     """A composed attention: q/k norms and RoPE fused, the kernel Runtime selected, `to_out`."""
     layout, entries = site.layout, site.layout.entries
     heads = (site.attention.heads, layout.head_dim)
+    # torch leaves `Tensor.unflatten` unannotated.
     q, k, v = (t.unflatten(-1, heads) for t in (q, k, v))
     if layout.rope is None or arguments[layout.rope.argument] is None:
         q, k = (norm(t) for norm, t in zip(site.qk, (q, k), strict=True))
     else:
         assert entries.rope is not None
         tables = _kernels.rope_tables(
-            arguments[layout.rope.argument],
+            cast("_Rotary", arguments[layout.rope.argument]),
             interleaved=layout.rope.interleaved,
             rotary=layout.rotary,
         )
@@ -608,10 +709,14 @@ def _attend(launch: Launch, site: _Site, q: Any, k: Any, v: Any, arguments: Any)
         backend=processor._attention_backend,
         parallel_config=processor._parallel_config,
     )
-    return site.out(attended.flatten(2))
+    return cast("_Linear", site.out)(attended.flatten(2))  # a composed site has its `to_out`
 
 
-def _head_norm_forward(self: Any, hidden_states: Any) -> Any:
+#: A block's rotary argument (`Rope`): a complex table or a `(cos, sin)` pair.
+type _Rotary = Tensor | tuple[Tensor, Tensor]
+
+
+def _head_norm_forward(self: _HeadNorm, hidden_states: Tensor) -> Tensor:
     rope = self._cozy_rope
     # fp16 rows: the fp16 projection, or a processor's fp32 upcast of it.
     if rope is None or hidden_states.dim() != 4 or not _fusable(rope[3], hidden_states):
@@ -622,10 +727,10 @@ def _head_norm_forward(self: Any, hidden_states: Any) -> Any:
     )
 
 
-_FUSED: dict[tuple[type, str], type] = {}
+_FUSED: dict[tuple[type[nn.Module], str], type] = {}
 
 
-def _fused(cls: type, kind: str) -> type:
+def _fused[M: nn.Module](cls: type[M], kind: str) -> type[M]:
     """The installed subclass of `cls`: same parameters, buffers and state-dict keys. Its eager
     forward is `cls.forward`, taken here, so a subclass made after it (graphs' region class) still
     reaches it; `super(type(self), self)` there resolves to the fused forward again and recurses.
@@ -633,7 +738,7 @@ def _fused(cls: type, kind: str) -> type:
     if getattr(cls, "_cozy_fused", None) == kind:
         return cls
     if (cls, kind) not in _FUSED:
-        body: dict[str, Any] = {
+        body: dict[str, object] = {
             "__module__": __name__,
             "_cozy_fused": kind,
             "_cozy_eager": cls.forward,
@@ -651,10 +756,10 @@ def _fused(cls: type, kind: str) -> type:
         else:
             body |= {"forward": _head_norm_forward, "_cozy_rope": None}
         _FUSED[(cls, kind)] = type(f"Fused{cls.__name__}", (cls,), body)
-    return _FUSED[(cls, kind)]
+    return cast("type[M]", _FUSED[(cls, kind)])  # a subclass of `cls`
 
 
-def _census(module: Any) -> tuple[object, ...]:
+def _census(module: nn.Module) -> tuple[object, ...]:
     return tuple(
         (name, tuple(value.shape), str(value.dtype), id(value))
         for name, value in (
@@ -672,7 +777,7 @@ def _report(plan: Plan, layout: DiTBlock, reason: str = "", blocks: int = 0) -> 
     print(f"[cozy] {layout.name}: {json.dumps(document, sort_keys=True)}", file=sys.stderr)
 
 
-def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
+def install(plan: Plan, layout: DiTBlock, *roots: nn.Module) -> str:
     """Fuse every `layout.block` under `roots` on `plan.device`: the plan's identity, or ""
     when the eager blocks serve (no CUDA sm80+, kernels absent or failed, or a block that is
     not the declared layout; reported). Never waits for the kernels' compile."""
@@ -683,7 +788,7 @@ def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
     if _kernels.TRITON_ABSENT:
         _report(plan, layout, f"kernels_absent: {_kernels.TRITON_ABSENT}")
         return ""
-    blocks: list[tuple[str, Any]] = [
+    blocks: list[tuple[str, nn.Module]] = [
         (f"{index}.{path}", module)
         for index, root in enumerate(roots)
         for path, module in root.named_modules()
@@ -708,13 +813,15 @@ def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
         return ""
     before = [_census(root) for root in roots]
     # An attention module calls its q/k norms; a composed one launches them.
-    heads = [norm for _, site in sites for norm in site.qk] if not layout.composed else []
+    heads: list[nn.Module] = (
+        [norm for _, site in sites for norm in site.qk] if not layout.composed else []
+    )
     eager = [(m, type(m)) for m in (*(block for block, _ in sites), *heads)]
     for norm in heads:
         norm.__class__ = _fused(type(norm), "head")
     for block, site in sites:
         block.__class__ = _fused(type(block), "block")
-        block._cozy_dit = site
+        cast("_FusedBlock", block)._cozy_dit = site  # its class is the fused one now
     if [_census(root) for root in roots] != before:
         raise RuntimeError("the fused substitution moved a parameter or buffer")
 
@@ -744,12 +851,12 @@ class ChannelNorm:
     follows; every call of that nonlinearity must follow one of them. Those norms apply the SiLU
     in the same kernel and the nonlinearity becomes the identity. Activations are `dtype`."""
 
-    norm: type
-    silu: tuple[tuple[type, tuple[str, ...]], ...] = ()
+    norm: type[nn.Module]
+    silu: tuple[tuple[type[nn.Module], tuple[str, ...]], ...] = ()
     nonlinearity: str = "nonlinearity"
     dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
     bias: bool = False
-    entries: tuple[Any, ...] = field(init=False, repr=False, compare=False)
+    entries: tuple[TritonEntry, ...] = field(init=False, repr=False, compare=False)
     """Built, as `kernels`, only where Triton imports; elsewhere the norms serve eager."""
     kernels: TritonKernels = field(init=False, repr=False, compare=False)
 
@@ -766,7 +873,7 @@ class ChannelNorm:
         return f"fused.{self.norm.__name__.lower()[:44]}.{self.dtype}"
 
     @property
-    def torch_dtype(self) -> Any:
+    def torch_dtype(self) -> torch.dtype:
         return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[self.dtype]
 
 
@@ -779,7 +886,7 @@ class _NormSite:
     eps: float
 
 
-def _channel_norm_forward(self: Any, x: Any) -> Any:
+def _channel_norm_forward(self: _FusedChannelNorm, x: Tensor) -> Tensor:
     site: _NormSite = vars(self)["_cozy_norm"]
     launch, layout = site.switch.launch, site.layout
     bias = self.bias if isinstance(self.bias, torch.Tensor) else None
@@ -796,11 +903,13 @@ def _channel_norm_forward(self: Any, x: Any) -> Any:
     return _kernels.channel_norm(launch, entry, x, self.gamma, bias, site.scale, site.eps)
 
 
-def _identity_forward(self: Any, x: Any) -> Any:
+def _identity_forward(self: nn.Module, x: Tensor) -> Tensor:
     return x
 
 
-def _norm_site(norm: Any, layout: ChannelNorm, switch: _Switch, silu: bool, path: str) -> _NormSite:
+def _norm_site(
+    norm: _FusedChannelNorm, layout: ChannelNorm, switch: _Switch, silu: bool, path: str
+) -> _NormSite:
     channels = int(norm.gamma.shape[0])
     if not getattr(norm, "channel_first", False) or int(norm.gamma.numel()) != channels:
         raise _Mismatch(f"{path}: not a channel-first norm with one weight per channel")
@@ -813,7 +922,7 @@ def _norm_site(norm: Any, layout: ChannelNorm, switch: _Switch, silu: bool, path
     return _NormSite(layout, switch, silu, channels**0.5, 1e-12)
 
 
-def install_norms(plan: Plan, layout: ChannelNorm, *roots: Any) -> str:
+def install_norms(plan: Plan, layout: ChannelNorm, *roots: nn.Module) -> str:
     """Fuse every `layout.norm` under `roots` on `plan.device` [with the SiLU after it]: the
     plan's identity, or "" when the eager norms serve (no CUDA sm80+, kernels absent or failed,
     or a module that is not the declaration; reported). Never waits for the kernels' compile."""
@@ -839,7 +948,7 @@ def install_norms(plan: Plan, layout: ChannelNorm, *roots: Any) -> str:
     if not norms:
         return report(f"no {layout.norm.__qualname__}")
     fused_silu: set[int] = set()
-    activations: dict[int, Any] = {}
+    activations: dict[int, nn.Module] = {}
     for index, root in enumerate(roots):
         for path, block in root.named_modules():
             names = next((n for cls, n in layout.silu if type(block) is cls), None)
@@ -862,7 +971,13 @@ def install_norms(plan: Plan, layout: ChannelNorm, *roots: Any) -> str:
     switch = _Switch()
     try:
         sites = [
-            (norm, _norm_site(norm, layout, switch, id(norm) in fused_silu, path))
+            # `_norm_site` checks each is a channel-first norm.
+            (
+                norm,
+                _norm_site(
+                    cast("_FusedChannelNorm", norm), layout, switch, id(norm) in fused_silu, path
+                ),
+            )
             for path, norm in norms
         ]
     except _Mismatch as exc:
@@ -871,7 +986,7 @@ def install_norms(plan: Plan, layout: ChannelNorm, *roots: Any) -> str:
     eager = [(m, type(m)) for m in (*(n for n, _ in sites), *activations.values())]
     for norm, site in sites:
         norm.__class__ = _fused(type(norm), "channel")
-        norm._cozy_norm = site
+        cast("_FusedChannelNorm", norm)._cozy_norm = site  # its class is the fused one now
     for activation in activations.values():
         activation.__class__ = _fused(type(activation), "identity")
     if [_census(root) for root in roots] != before:
@@ -880,7 +995,7 @@ def install_norms(plan: Plan, layout: ChannelNorm, *roots: Any) -> str:
 
     def activate(launch: Launch) -> None:
         switch.launch = launch
-        report(**counts)
+        report("", **counts)
 
     try:
         if plan.when_ready is None:
@@ -910,11 +1025,11 @@ class LoneFrame:
     padded copy is made. `upsample`, its nearest upsampler, runs in the activations' dtype:
     Diffusers' goes through fp32, and nearest only copies values, so the bits are the same."""
 
-    conv: type
-    upsample: type | None = None
+    conv: type[nn.Module]
+    upsample: type[nn.Module] | None = None
 
 
-def _lone_conv_forward(self: Any, x: Any, cache_x: Any = None) -> Any:
+def _lone_conv_forward(self: _FusedConv, x: Tensor, cache_x: Tensor | None = None) -> Tensor:
     if cache_x is not None or x.dim() != 5 or x.shape[2] != 1:
         return self._cozy_eager(x, cache_x)
     weight = self.weight if self.weight.dim() == 4 else self.weight[:, :, -1]
@@ -930,7 +1045,7 @@ def _lone_conv_forward(self: Any, x: Any, cache_x: Any = None) -> Any:
     return y.unsqueeze(2)
 
 
-def _lone_padding(conv: Any, path: str) -> tuple[int, int]:
+def _lone_padding(conv: nn.Module, path: str) -> tuple[int, int]:
     """`conv`'s spatial zero padding (rows, columns) when a lone frame meets its last tap only."""
     pad = tuple(getattr(conv, "_padding", ()))
     if getattr(conv, "padding_mode", None) != "zeros":
@@ -951,7 +1066,7 @@ def _lone_padding(conv: Any, path: str) -> tuple[int, int]:
     return (int(pad[2]), int(pad[0]))
 
 
-def install_lone_frame(plan: Plan, layout: LoneFrame, *roots: Any) -> str:
+def install_lone_frame(plan: Plan, layout: LoneFrame, *roots: nn.Module) -> str:
     """`layout` on every `conv` and `upsample` under `roots`: the plan's identity, or "" when the
     eager modules serve (a module that is not the declaration; reported). No kernels, so CPU
     and GPU alike."""
@@ -989,15 +1104,15 @@ def install_lone_frame(plan: Plan, layout: LoneFrame, *roots: Any) -> str:
     before = [_census(root) for root in roots]
     for (_, conv), pad in zip(convs, padding, strict=True):
         conv.__class__ = _fused(type(conv), "lone-conv")
-        conv._cozy_lone = pad
+        cast("_FusedConv", conv)._cozy_lone = pad  # its class is the fused one now
     for _, upsample in upsamples:
         upsample.__class__ = _fused(type(upsample), "nearest")
     if [_census(root) for root in roots] != before:
         raise RuntimeError("the lone-frame substitution moved a parameter or buffer")
     report(convs=len(convs), upsamples=len(upsamples))
-    upsample = getattr(layout.upsample, "__qualname__", None)
+    upsampler = getattr(layout.upsample, "__qualname__", None)
     encoded = json.dumps(
-        {"conv": layout.conv.__qualname__, "upsample": upsample},
+        {"conv": layout.conv.__qualname__, "upsample": upsampler},
         sort_keys=True,
         separators=(",", ":"),
     ).encode()

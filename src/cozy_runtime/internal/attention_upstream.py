@@ -10,7 +10,6 @@ dependencies, and the executor imports torch only after its environment seal.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
 from importlib import import_module
 from types import ModuleType
 from typing import TYPE_CHECKING, Protocol, Unpack
@@ -21,7 +20,7 @@ if TYPE_CHECKING:
     from cozy_runtime.internal.attention_ulysses import PartialOptions
 
 from cozy_runtime.internal import arch, attention_fp8
-from cozy_runtime.internal.attention_ulysses import Local, Options
+from cozy_runtime.internal.attention_ulysses import Implementation, Local, Options
 
 # Optional dependencies are named under TYPE_CHECKING so base imports stay Torch-free.
 
@@ -29,8 +28,17 @@ from cozy_runtime.internal.attention_ulysses import Local, Options
 class FlashAttn3(Protocol):
     """What serves FA3: upstream's `flash_attn_interface` or the wheel's (`prebuilt`)."""
 
-    @property
-    def flash_attn_func(self) -> Callable[..., object]: ...
+    def flash_attn_func(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        softmax_scale: float | None = None,
+        causal: bool = False,
+        num_splits: int = 1,
+    ) -> Tensor | tuple[Tensor, ...]:
+        """Upstream's returns its output alone or with its LSE, by version."""
+        ...
 
 
 #: The loaded FlashAttention-3 and the build it came from.
@@ -343,7 +351,7 @@ def _sage(modes: dict[str, tuple[str, str, str]]) -> Local:
         _options("sageattention", dropout_p, scale)
         _heads(query, key, enable_gqa)
         entry, granularity, accumulation = mode(query)
-        return getattr(import_module("sageattention"), entry)(
+        out: Tensor = getattr(import_module("sageattention"), entry)(
             query,
             key,
             value,
@@ -354,6 +362,7 @@ def _sage(modes: dict[str, tuple[str, str, str]]) -> Local:
             pv_accum_dtype=accumulation,
             smooth_k=True,
         )
+        return out
 
     def impl(query: Tensor, *_: object) -> str:
         entry, granularity, accumulation = mode(query)
@@ -497,9 +506,9 @@ def _sage3_global_owned(q: Tensor, k: Tensor, v: Tensor, *, is_causal: bool) -> 
     del v
     # These official quantizers and attention launch on PyTorch's current stream,
     # so the allocator can recycle the owned inputs without a synchronization.
-    output = api.blockscaled_fp4_attn(qlist, klist, vlist, delta_s, kl, is_causal, False, is_bf16)[
-        0
-    ]
+    output: Tensor = api.blockscaled_fp4_attn(
+        qlist, klist, vlist, delta_s, kl, is_causal, False, is_bf16
+    )[0]
     # Directly form Runtime's BTHD result. The public upstream API first copies
     # the cropped HND tensor, which its caller then copies again to flatten H/D.
     return output[:, :, :ql, :].transpose(1, 2).contiguous()
@@ -537,7 +546,7 @@ def _sage3_fp4(
     return _output(output, q).transpose(1, 2)
 
 
-def _named(name: str) -> Callable[..., str]:
+def _named(name: str) -> Implementation:
     return lambda *_: name
 
 

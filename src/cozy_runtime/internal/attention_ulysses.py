@@ -59,13 +59,49 @@ class Local:
     narrower itself, so under Ulysses they cross as int8 (`internal.parallel.ulysses.exchange`).
     """
 
-    forward: Callable[..., Tensor]
-    impl: Callable[..., str]
+    #: `Options`' keywords, and a sparse kernel's `dense=` rows until `attention` binds them
+    forward: Callable[..., Tensor]  # type: ignore[explicit-any]  # signatures vary until bound
+    impl: Implementation
     head_local: bool = True
     rows: int = 0
-    refusal: Callable[..., str] | None = None
+    refusal: Callable[[Tensor, Tensor, Options], str] | None = None
     instead: tuple[str, Local] | None = None
     narrow: bool = False
+
+
+#: `impl(query, key, value, options)`: the concrete implementation serving those operands.
+type Implementation = Callable[[Tensor, Tensor, Tensor, Options], str]
+#: Ulysses' exchange around a computation (`internal.parallel.ulysses.exchange`).
+type Exchange = Callable[
+    [
+        Tensor,
+        Tensor,
+        Tensor,
+        ProcessGroup,
+        Callable[[Tensor, Tensor, Tensor], Tensor],
+        str,
+        bool | Callable[[int], bool],
+    ],
+    Tensor,
+]
+
+
+class BackendCall(Protocol):
+    """A backend's call, as Diffusers' dispatch and a Runtime site make it (`function`)."""
+
+    def __call__(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attn_mask: Tensor | None = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+        return_lse: bool = False,
+        _parallel_config: object = None,
+    ) -> Tensor: ...
 
 
 class Seen(dict[str, set[str]]):
@@ -80,7 +116,7 @@ class Seen(dict[str, set[str]]):
 #: what served in the observed scope on this rank, and the operand signatures already named
 #: there (an implementation is named once per signature, not per call)
 _SEEN: ContextVar[tuple[Seen, set[object]] | None] = ContextVar("cozy_attention_seen", default=None)
-_FUNCTIONS: dict[str, Callable[..., Tensor]] = {}
+_FUNCTIONS: dict[str, BackendCall] = {}
 _MEMBERS: dict[str, AttentionBackendName] = {}
 
 
@@ -90,7 +126,7 @@ class Execution(Protocol):
 
     def attend(
         self,
-        call: Callable[..., Tensor],
+        call: Callable[[Tensor, Tensor, Tensor, Tensor | None], Tensor],
         q: Tensor,
         k: Tensor,
         v: Tensor,
@@ -111,10 +147,10 @@ def install(execution: Execution | None) -> None:
 
 #: the torch side, served only after the executor imports torch.
 _GROUP: Callable[[object], ProcessGroup] | None = None
-_EXCHANGE: Callable[..., Tensor] | None = None
+_EXCHANGE: Exchange | None = None
 
 
-def serve(group_of: Callable[[object], ProcessGroup], exchange_of: Callable[..., Tensor]) -> None:
+def serve(group_of: Callable[[object], ProcessGroup], exchange_of: Exchange) -> None:
     global _GROUP, _EXCHANGE
     _GROUP, _EXCHANGE = group_of, exchange_of
 
@@ -130,7 +166,7 @@ def observing() -> Iterator[Seen]:
         _SEEN.reset(token)
 
 
-def function(backend: str, local: Local) -> Callable[..., Tensor]:
+def function(backend: str, local: Local) -> BackendCall:
     """`backend`'s call, made once per process: Diffusers' backend signature."""
     found = _FUNCTIONS.get(backend)
     if found is None:
@@ -138,7 +174,7 @@ def function(backend: str, local: Local) -> Callable[..., Tensor]:
     return found
 
 
-def opened(backend: str) -> Callable[..., Tensor]:
+def opened(backend: str) -> BackendCall:
     """The call of a `backend` this process has made (`function`)."""
     found = _FUNCTIONS.get(backend)
     if found is None:
@@ -157,7 +193,7 @@ def member(backend: str, local: Local) -> AttentionBackendName:
     return found
 
 
-def _dispatch(backend: str, local: Local) -> Callable[..., Tensor]:
+def _dispatch(backend: str, local: Local) -> BackendCall:
     def attention(
         query: Tensor,
         key: Tensor,

@@ -1,18 +1,21 @@
 """One bridge for Runtime-owned backends into Diffusers' closed backend enum."""
 
+from __future__ import annotations
+
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, cast
 
-# Diffusers' backend functions and enum members are `Any`: diffusers is not in the check venv.
+if TYPE_CHECKING:
+    from diffusers.models.attention_dispatch import AttentionBackendName
 
 
-def register(
+def register(  # type: ignore[explicit-any]  # Diffusers takes any backend function and checks
     name: str,
-    function: Callable[..., Any],
+    function: Callable[..., object],
     *,
-    constraints: Sequence[Callable[..., Any]] = (),
+    constraints: Sequence[Callable[..., bool]] = (),
     supports_context_parallel: bool = False,
-) -> Any:
+) -> AttentionBackendName:
     """Register once without changing Diffusers' global active backend.
 
     Diffusers 0.40 accepts registry entries but converts every dispatch name through
@@ -25,7 +28,7 @@ def register(
     if found is not None:
         if _AttentionBackendRegistry._backends.get(found) is not function:
             raise ValueError(f"attention backend {name!r} already has another implementation")
-        return found
+        return cast("AttentionBackendName", found)  # its own map's member
     member = str.__new__(AttentionBackendName, name)
     member._name_ = name.upper()
     member._value_ = name

@@ -11,7 +11,7 @@ Never inside a graph capture; a native resident program runs between pause point
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Protocol
 
 import torch
 
@@ -22,11 +22,20 @@ _since = 0.0
 pauses = 0
 
 
-def configure(pace: Any) -> bool:
+class _Pace(Protocol):
+    """Start's `display_pace`: run `work_ms`, then pause `pause_ms`."""
+
+    @property
+    def work_ms(self) -> float: ...
+    @property
+    def pause_ms(self) -> float: ...
+
+
+def configure(pace: _Pace | None) -> bool:
     """This process's pace: Start's `display_pace`, None (or a zero pause) for none."""
     global _work, _pause, _since
     on = pace is not None and pace.pause_ms > 0
-    _work, _pause = (pace.work_ms / 1e3, pace.pause_ms / 1e3) if on else (0.0, 0.0)
+    _work, _pause = (pace.work_ms / 1e3, pace.pause_ms / 1e3) if on and pace else (0.0, 0.0)
     _since = time.perf_counter()
     return _pause > 0
 

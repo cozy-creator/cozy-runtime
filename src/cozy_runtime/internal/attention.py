@@ -37,7 +37,7 @@ from functools import partial
 from importlib import import_module, util
 from pathlib import Path
 from types import ModuleType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
 import msgspec
 
@@ -63,10 +63,23 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal import attention_upstream as upstream
 from cozy_runtime.internal.attention_site import Site
-from cozy_runtime.internal.attention_ulysses import Local
+from cozy_runtime.internal.attention_ulysses import BackendCall, Local
 from cozy_runtime.internal.encoding.formats import Tensor
 from cozy_runtime.internal.encoding.selection import DeviceFacts
 from cozy_runtime.internal.parallel.commands import Choice
+
+if TYPE_CHECKING:
+    from diffusers.models._modeling_parallel import ParallelConfig
+    from diffusers.models.attention_dispatch import AttentionBackendName, _AttentionBackendRegistry
+    from diffusers.models.attention_processor import Attention
+    from torch import nn
+
+    from cozy_runtime.internal.producers import SiteModule
+
+    class _Managed(Protocol):
+        """A processor with Diffusers' per-site backend selection."""
+
+        _attention_backend: object
 
 # Tensors, torch modules and Diffusers' registry, backend members and processors are `Any`:
 # neither torch nor diffusers is installed in the check venv.
@@ -182,7 +195,7 @@ class Candidate:
             if self.causal or not case[5]
         ]
 
-    def refusal(self, query: Any, key: Any, options: Mapping[str, Any]) -> str:
+    def refusal(self, query: Tensor, key: Tensor, options: attention_ulysses.Options) -> str:
         """Why it does not serve this call, or empty, read on every call: `_local`."""
         dtype, dim = str(query.dtype).removeprefix("torch."), int(query.shape[-1])
         scale = options.get("scale")
@@ -229,8 +242,23 @@ _E4M3 = "cozy_runtime.internal.attention_fp8"
 PREBUILT = "prebuilt"
 #: The fixed K means' compiled reduction (`attention_sage2_fixed_mean.REDUCE_MAX` tiles).
 _MEAN_TOKENS = 2048 * 256
+
+
+class _Admission(TypedDict):
+    """A row's admission fields (`Candidate`), as every sparse kernel's states them."""
+
+    sparse: bool
+    dtypes: frozenset[str]
+    max_head_dim: int
+    head_dims: frozenset[int]
+    causal: bool
+    gqa: bool
+    cross: bool
+    batches: bool
+
+
 #: Every sparse kernel's admission: one BF16 document at head dimension 128, equal Q/K/V.
-_SOL: dict[str, Any] = dict(
+_SOL = _Admission(
     sparse=True, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False, gqa=False,
     cross=False, batches=False,
 )  # fmt: skip
@@ -512,7 +540,7 @@ def walk(row: arch.Row, at: int, layout: bool = False) -> list[str]:
 
 
 #: An attention site: (component, module path, module, processor).
-type _Record = tuple[str, str, Any, Any]
+type _Record = tuple[str, str, SiteModule, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,7 +549,7 @@ class Ready:
     (`attention_ulysses.function`), which Diffusers' member and a Runtime site both reach."""
 
     candidate: Candidate
-    function: Any
+    function: BackendCall
     #: The compiled artifact serving it: flat string fields, as an observation row carries them.
     artifact: dict[str, str] | None = None
 
@@ -530,7 +558,7 @@ class Ready:
         return self.candidate.name
 
 
-def _registry() -> Any:
+def _registry() -> type[_AttentionBackendRegistry]:
     """Diffusers' attention backend registry, or a typed absence."""
     try:
         from diffusers.models.attention_dispatch import _AttentionBackendRegistry
@@ -542,17 +570,17 @@ def _registry() -> Any:
     return _AttentionBackendRegistry
 
 
-def _member(candidate: Candidate) -> Any:
+def _member(candidate: Candidate) -> AttentionBackendName:
     """The Diffusers member serving this candidate, registered on first use."""
     return attention_ulysses.member(candidate.backend, _local(candidate))
 
 
-def _function(candidate: Candidate) -> Any:
+def _function(candidate: Candidate) -> BackendCall:
     """This candidate's backend call, with no Diffusers."""
     return attention_ulysses.function(candidate.backend, _local(candidate))
 
 
-def _handle(processor: object, entry: Ready) -> Any:
+def _handle(processor: object, entry: Ready) -> str | AttentionBackendName:
     """What a site's processor dispatches by: a Runtime site its backend's name, a Diffusers
     processor Diffusers' member."""
     return entry.candidate.backend if isinstance(processor, Site) else _member(entry.candidate)
@@ -582,7 +610,7 @@ def _local(candidate: Candidate) -> Local:
     return found
 
 
-def _dense_rows(candidate: Candidate) -> Any:
+def _dense_rows(candidate: Candidate) -> attention_sol.DenseRows:
     """A sparse kernel's dense rows on CANDIDATE: `(query=, key=, value=, scale=)`."""
     local = _local(candidate)
 
@@ -598,7 +626,7 @@ def _dense_rows(candidate: Candidate) -> Any:
 #: kernel -> its artifact's latest state on this rank: what a run's evidence reports.
 _STATES: dict[str, kernel_compile.State] = {}
 #: A site and the kernel it is given: (component, module path, module, processor, kernel).
-type _Site = tuple[str, str, Any, Any, Ready]
+type _Site = tuple[str, str, SiteModule, _Managed, Ready]
 #: module -> the build this process imports it from, fixed by the first import or by `reserve`:
 #: a process holds one build of a module, so a kernel another build serves needs another one.
 _BUILDS: dict[str, str] = {}
@@ -951,7 +979,7 @@ def _launcher(module: ModuleType, name: str, device: DeviceFacts, wait: bool) ->
     return launch
 
 
-def _expected(live_tokens: int, module: Any) -> None:
+def _expected(live_tokens: int, module: nn.Module) -> None:
     """A model's early length statement reaches Sol when a Sol site serves `module`."""
     found = known()
     if not any(_sol_objects(found[n]) for n in observed({"": module}).totals() if n in found):
@@ -966,7 +994,7 @@ _EXPECTED.append(_expected)
 
 def evidence(
     served: Iterable[str], refused: Mapping[str, int] | None = None
-) -> list[dict[str, Any]]:
+) -> list[dict[str, object]]:
     """This rank's kernels for a run's execution record: every kernel it served, and every
     kernel of its chains it did not serve and why (compiling, failed, absent, unsupported).
     SDPA's row counts the calls a site's kernel refused, per reason (`attention_ulysses.Seen`)."""
@@ -1112,7 +1140,7 @@ def pinned(name: str, device: DeviceFacts, wait: bool = True) -> list[Ready]:
 # ------------------------------------------------------------------------------ the pin
 
 
-def _trees(roots: Mapping[str, object]) -> Iterator[tuple[str, Any]]:
+def _trees(roots: Mapping[str, object]) -> Iterator[tuple[str, nn.Module]]:
     """Yield each constructed module tree, preserving component labels."""
     seen: set[int] = set()
     queue: deque[tuple[str, object, int]] = deque(
@@ -1126,7 +1154,7 @@ def _trees(roots: Mapping[str, object]) -> Iterator[tuple[str, Any]]:
         if callable(getattr(value, "modules", None)) and callable(
             getattr(value, "parameters", None)
         ):
-            yield label, value
+            yield label, cast("nn.Module", value)  # a module tree, as it walks
             continue
         if depth >= 3:
             continue
@@ -1159,7 +1187,7 @@ def _attention_records(roots: Mapping[str, object]) -> Iterator[_Record]:
                 continue
             if isinstance(processor, Site) or isinstance(module, classes):
                 seen.add(id(module))
-                yield component, path, module, processor
+                yield component, path, cast("SiteModule", module), processor  # it holds one
 
 
 class ClassicSdpa:
@@ -1171,19 +1199,19 @@ class ClassicSdpa:
     another kernel.
     """
 
-    _attention_backend: Any = None
-    _parallel_config: Any = None
+    _attention_backend: AttentionBackendName | None = None
+    _parallel_config: ParallelConfig | None = None
 
     def __call__(
         self,
-        attn: Any,
-        hidden_states: Any,
-        encoder_hidden_states: Any = None,
-        attention_mask: Any = None,
-        temb: Any = None,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
+        attn: Attention,
+        hidden_states: Tensor,
+        encoder_hidden_states: Tensor | None = None,
+        attention_mask: Tensor | None = None,
+        temb: Tensor | None = None,
+        *args: object,
+        **kwargs: object,
+    ) -> Tensor:
         from diffusers.models.attention_dispatch import dispatch_attention_fn
 
         residual = hidden_states
@@ -1239,11 +1267,11 @@ def adopt(roots: Mapping[str, object]) -> None:
             module.set_processor(ClassicSdpa())
 
 
-def _site_records(roots: Mapping[str, object]) -> Iterator[_Record]:
+def _site_records(roots: Mapping[str, object]) -> Iterator[tuple[str, str, SiteModule, _Managed]]:
     """Only processors implementing Diffusers' per-site backend selection contract."""
-    for record in _attention_records(roots):
-        if hasattr(record[3], "_attention_backend"):
-            yield record
+    for component, path, module, processor in _attention_records(roots):
+        if hasattr(processor, "_attention_backend"):
+            yield component, path, module, processor
 
 
 def _unmanaged_reason(component: str, path: str, processor: object) -> str:
@@ -1253,7 +1281,7 @@ def _unmanaged_reason(component: str, path: str, processor: object) -> str:
     )
 
 
-def _sites(roots: Mapping[str, object]) -> Iterator[tuple[str, Any, Any]]:
+def _sites(roots: Mapping[str, object]) -> Iterator[tuple[str, SiteModule, _Managed]]:
     for component, _path, module, processor in _site_records(roots):
         yield component, module, processor
 
@@ -1263,7 +1291,7 @@ def sites(roots: Mapping[str, object]) -> list[tuple[str, object, object]]:
     return list(_sites(roots))
 
 
-def _head_dim(module: Any) -> int:
+def _head_dim(module: object) -> int:
     """This site's per-head dimension, or 0 when the module does not say.
 
     A site whose head dimension cannot be read is treated as unknown, which admits only the
@@ -1294,7 +1322,7 @@ def _base(projection: object) -> object:
 _FLOATS = frozenset({"float16", "bfloat16", "float32", "float64"})
 
 
-def _projection_dtype(projection: Any) -> str:
+def _projection_dtype(projection: object) -> str:
     """Encoded output contract, or an ordinary floating Linear's result dtype."""
     import torch
 
@@ -1307,7 +1335,7 @@ def _projection_dtype(projection: Any) -> str:
     return name if name in _FLOATS else ""
 
 
-def _dtype(module: Any) -> str:
+def _dtype(module: object) -> str:
     """The site's attention activation precision: its own `activation_dtype` when it declares
     one (a site that casts Q/K/V itself), else the active Q/K/V projection contracts.
 
@@ -1691,7 +1719,8 @@ def install(
             raise detail
         if _walked(entry.candidate) and sol_order is None:
             sol_order = order[order.index(entry.name) + 1 :]
-        assignments.append((component, path, module, processor, entry))
+        # Managed: a pin refuses an unmanaged processor (`_pin_reason`), the walk passes it by.
+        assignments.append((component, path, module, cast("_Managed", processor), entry))
         hosts.setdefault(component, {})
         hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
     if name and not matched:
@@ -1724,7 +1753,7 @@ def install(
     )
 
 
-def _walk_order(row: arch.Row, at: int, module: Any, processor: Any) -> list[str]:
+def _walk_order(row: arch.Row, at: int, module: object, processor: object) -> list[str]:
     """A site's kernels at level AT: a classic site keeps SDPA, every other one walks."""
     return ["sdpa"] if isinstance(processor, ClassicSdpa) else walk(row, at, sparse_site(module))
 
@@ -1742,15 +1771,15 @@ def _pin_reason(entry: Ready | None, why: str, record: _Record, degree: int) -> 
     return _unfit(entry.candidate, None, module, _dtype(module), _head_dim(module), degree)
 
 
-def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
+def _install_sites(records: Sequence[tuple[Ready, str, str, SiteModule]]) -> None:
     """Install metadata hooks atomically, preserving hooks owned by preparation."""
     # Validate all producer topology/hooks before any metadata or processor mutation.
     for entry, _component, _path, module in records:
         producer = entry.candidate.producer
         if producer is not None:
             producer.validate(module)
-    added: list[tuple[str, str, Any]] = []
-    processors: list[tuple[Any, Any]] = []
+    added: list[tuple[str, str, SiteModule]] = []
+    processors: list[tuple[SiteModule, object]] = []
     try:
         for entry, component, path, module in records:
             if not entry.candidate.sparse:
@@ -1840,7 +1869,7 @@ class Snapshot:
     """Prepared processor choices, restored without resolution or policy re-execution, with
     the dense reference Sol ran with when one of them is Sol."""
 
-    choices: tuple[tuple[Any, Any], ...]
+    choices: tuple[tuple[_Managed, object], ...]
     dense: attention_sol.Binding | None = None
 
     def restore(self) -> None:
@@ -2042,7 +2071,8 @@ def plan(device: DeviceFacts, roots: Mapping[str, object], name: str, degree: in
             if row not in fallbacks:
                 fallbacks.append(row)
             continue
-        sites.append((component, path, module, processor, entry))
+        # Managed: `_pin_reason` refuses an unmanaged processor.
+        sites.append((component, path, module, cast("_Managed", processor), entry))
     return Swap(tuple(sites), name, tuple(fallbacks), dense)
 
 
@@ -2068,7 +2098,8 @@ def exact(
         if entry is not None:
             if _walked(entry.candidate) and sol is None:
                 sol = order[order.index(entry.name) + 1 :]
-            sites.append((component, path, module, processor, entry))
+            # Managed: the loop passes an unmanaged processor by, above.
+            sites.append((component, path, module, cast("_Managed", processor), entry))
     dense = None if sol is None else _sol_dense(sol, device, resolved, refused)
     return Swap(tuple(sites), pin, tuple(fallbacks), dense)
 

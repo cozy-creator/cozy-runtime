@@ -45,8 +45,9 @@ DOC_MAX_BYTES = 256 << 20
 #: The one digest spelling, shared with tensorfs's `ids::prefixed`.
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
-#: A JSON document as plain Python: dict, list, str, int, float, bool or None.
-Json = Any
+#: A parsed JSON document as plain Python: dict, list, str, int, float, bool or None. Its
+#: reader narrows it, as `json.loads`'s does (a precise union would make every reader cast).
+Json = Any  # type: ignore[explicit-any]  # parsed JSON: the reader narrows
 
 
 class CanonicalError(Exception):
@@ -61,17 +62,17 @@ class CanonicalError(Exception):
 # --------------------------------------------------------------------------- writer
 
 
-def write(value: Json) -> bytes:
+def write(value: object) -> bytes:
     """The canonical bytes of `value`. These are what gets stored and what gets hashed."""
     return _write(value, application=False)
 
 
-def write_application(value: Json) -> bytes:
+def write_application(value: object) -> bytes:
     """Typed application values retain exact integers and integer/float kind."""
     return _write(value, application=True)
 
 
-def _write(value: Json, *, application: bool) -> bytes:
+def _write(value: object, *, application: bool) -> bytes:
     out: list[str] = []
     _emit(value, out, 0, application=application)
     data = "".join(out).encode("utf-8")
@@ -80,12 +81,12 @@ def _write(value: Json, *, application: bool) -> bytes:
     return data
 
 
-def digest(value: Json) -> str:
+def digest(value: object) -> str:
     """`sha256:<lowercase hex>` of the canonical bytes — a document's one identity."""
     return "sha256:" + hashlib.sha256(write(value)).hexdigest()
 
 
-def _emit(value: Json, out: list[str], depth: int, *, application: bool) -> None:
+def _emit(value: object, out: list[str], depth: int, *, application: bool) -> None:
     if depth > DEPTH_MAX:
         raise CanonicalError("depth_cap", f"nesting deeper than {DEPTH_MAX}")
     if value is None:
@@ -122,9 +123,9 @@ def _emit(value: Json, out: list[str], depth: int, *, application: bool) -> None
         raise CanonicalError("wrong_type", f"{type(value).__name__} is not a JSON type")
 
 
-def _sorted(mapping: Mapping[str, Json]) -> list[tuple[str, Json]]:
+def _sorted(mapping: Mapping[object, object]) -> list[tuple[str, object]]:
     """JCS orders keys by UTF-16 code unit — never by insertion, never by hand."""
-    pairs = []
+    pairs: list[tuple[str, object]] = []
     for key, item in mapping.items():
         if not isinstance(key, str):
             raise CanonicalError("key_grammar", f"object key {key!r} is not a string")

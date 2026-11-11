@@ -30,11 +30,19 @@ from __future__ import annotations
 import ctypes
 import math
 from collections.abc import Callable, Sequence
-from typing import Any
+from types import ModuleType
+from typing import TYPE_CHECKING
 
 from cozy_runtime.graphs import streams
 from cozy_runtime.internal.config import short_socket_directory
 from cozy_runtime.internal.parallel.group import gather
+
+if TYPE_CHECKING:
+    from tensorfs.varena._runtime import Pages, Staging
+    from torch import Tensor
+    from torch import device as Device
+    from torch._C._distributed_c10d import ProcessGroup, Store, _SymmetricMemory
+    from torch.cuda import Event, Stream
 
 #: The exchange the group formed with, by process group; absent: NCCL.
 _BY_GROUP: dict[int, Exchange] = {}
@@ -47,11 +55,11 @@ INBOX_BYTES = 128 << 20
 _PRIORITY = -1
 
 
-def for_group(handle: Any) -> Exchange | None:
+def for_group(handle: object) -> Exchange | None:
     return _BY_GROUP.get(id(handle))
 
 
-def install(exchange: Exchange | None, handle: Any) -> None:
+def install(exchange: Exchange | None, handle: object) -> None:
     _drop(keep=exchange)
     if exchange is not None:
         _BY_GROUP[id(handle)] = exchange
@@ -71,18 +79,18 @@ class Exchange:
     the same matrix and tensors of the same row shapes, so every GPU takes the same rounds."""
 
     name = ""
-    torch: Any
+    torch: ModuleType
     rank: int
     world: int
-    device: Any
+    device: Device
 
     def start(
         self,
-        sends: Sequence[Any],
+        sends: Sequence[Tensor],
         matrix: Sequence[Sequence[int]],
-        out: Sequence[Any],
+        out: Sequence[Tensor],
         chunk: int = 0,
-    ) -> Any:
+    ) -> Event:
         """The crossing on this exchange's streams after the caller's work so far; its end event.
         `chunk` caps each round's rows per pair (0: as many as a buffer holds)."""
         raise NotImplementedError
@@ -91,17 +99,17 @@ class Exchange:
         return None
 
     def all_to_all(
-        self, sends: Sequence[Any], matrix: Sequence[Sequence[int]], chunk: int = 0
-    ) -> list[Any]:
+        self, sends: Sequence[Tensor], matrix: Sequence[Sequence[int]], chunk: int = 0
+    ) -> list[Tensor]:
         out = [t.new_empty((sum(row[self.rank] for row in matrix), *t.shape[1:])) for t in sends]
         self.all_to_all_into(sends, matrix, out, chunk)
         return out
 
     def all_to_all_into(
         self,
-        sends: Sequence[Any],
+        sends: Sequence[Tensor],
         matrix: Sequence[Sequence[int]],
-        out: Sequence[Any],
+        out: Sequence[Tensor],
         chunk: int = 0,
     ) -> None:
         """The same crossing into actual preallocated receivers, on the current stream's order."""
@@ -109,7 +117,7 @@ class Exchange:
         self.torch.cuda.current_stream(self.device).wait_event(done)
 
     def _check(
-        self, sends: Sequence[Any], matrix: Sequence[Sequence[int]], out: Sequence[Any]
+        self, sends: Sequence[Tensor], matrix: Sequence[Sequence[int]], out: Sequence[Tensor]
     ) -> list[int]:
         if len(out) != len(sends):
             raise ValueError("exchange receiver count differs from its sends")
@@ -131,23 +139,26 @@ class CopyEngineExchange(Exchange):
 
     name = "copy-engine"
 
-    def __init__(self, torch: Any, symm: Any, pg: Any, rank: int, world: int) -> None:
+    def __init__(
+        self, torch: ModuleType, symm: ModuleType, pg: ProcessGroup, rank: int, world: int
+    ) -> None:
         self.torch, self.symm, self.pg = torch, symm, pg
         self.rank, self.world = rank, world
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.streams = [streams.stream(torch, self.device) for _ in range(world)]
         self.side = streams.stream(torch, self.device, priority=_PRIORITY)
-        self.buffer = symm.empty(BUFFER_BYTES, dtype=torch.uint8, device=self.device)
-        self.flag = torch.zeros(1, dtype=torch.int32, device=self.device)
-        self.handle: Any = None
-        self.peers: list[Any] = []
+        self.buffer: Tensor = symm.empty(BUFFER_BYTES, dtype=torch.uint8, device=self.device)
+        self.flag: Tensor = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self.handle: _SymmetricMemory | None = None
+        self.peers: list[Tensor] = []
 
     def map(self) -> None:
         """Collective, once per formation: every GPU maps every other's buffer."""
         with short_socket_directory():
-            self.handle = self.symm.rendezvous(self.buffer, self.pg.group_name)
+            handle: _SymmetricMemory = self.symm.rendezvous(self.buffer, self.pg.group_name)
+            self.handle = handle
         shape = (self.buffer.numel(),)
-        self.peers = [self.handle.get_buffer(p, shape, self.torch.uint8) for p in range(self.world)]
+        self.peers = [handle.get_buffer(p, shape, self.torch.uint8) for p in range(self.world)]
 
     def _barrier(self) -> None:
         """Every GPU's stream reached here: an abortable NCCL collective, never a spin."""
@@ -155,11 +166,11 @@ class CopyEngineExchange(Exchange):
 
     def start(
         self,
-        sends: Sequence[Any],
+        sends: Sequence[Tensor],
         matrix: Sequence[Sequence[int]],
-        out: Sequence[Any],
+        out: Sequence[Tensor],
         chunk: int = 0,
-    ) -> Any:
+    ) -> Event:
         torch = self.torch
         widths = self._check(sends, matrix, out)
         ready = torch.cuda.Event()
@@ -167,15 +178,15 @@ class CopyEngineExchange(Exchange):
         self.side.wait_event(ready)
         with torch.cuda.stream(self.side):
             self._rounds(sends, matrix, out, widths, chunk)
-            done = torch.cuda.Event()
+            done: Event = torch.cuda.Event()
             done.record(self.side)
         return done
 
     def _rounds(
         self,
-        sends: Sequence[Any],
+        sends: Sequence[Tensor],
         matrix: Sequence[Sequence[int]],
-        out: Sequence[Any],
+        out: Sequence[Tensor],
         widths: Sequence[int],
         chunk: int,
     ) -> None:
@@ -205,13 +216,13 @@ class CopyEngineExchange(Exchange):
 
     def _issue(
         self,
-        sends: Sequence[Any],
+        sends: Sequence[Tensor],
         matrix: Sequence[Sequence[int]],
         counts: Sequence[Sequence[int]],
         start: int,
         widths: Sequence[int],
-        issued: Any,
-        current: Any,
+        issued: Event,
+        current: Stream,
     ) -> None:
         """One copy-engine copy per tensor per peer for this round, each peer on its own stream."""
         torch, world, rank = self.torch, self.world, self.rank
@@ -247,7 +258,9 @@ class HostStagedExchange(Exchange):
 
     name = "host-staged"
 
-    def __init__(self, torch: Any, pg: Any, rank: int, world: int, pages: Any) -> None:
+    def __init__(
+        self, torch: ModuleType, pg: ProcessGroup, rank: int, world: int, pages: Pages | None
+    ) -> None:
         self.torch, self.pg, self.rank, self.world = torch, pg, rank, world
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.slot = INBOX_BYTES // (2 * world) // 4096 * 4096
@@ -256,24 +269,28 @@ class HostStagedExchange(Exchange):
         self.reads = streams.stream(torch, self.device, priority=_PRIORITY)
         self.flag = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.half = 0
-        self.inboxes: list[Any] = []
-        self.peers: list[Any] = []
-        self.own: Any = pages.staging(self.size) if pages is not None else None
-        if self.own is None:
+        self.inboxes: list[Tensor] = []
+        self.peers: list[Staging] = []
+        own = pages.staging(self.size) if pages is not None else None
+        if own is None:
             raise MemoryError("varena's host number has no room for this GPU's exchange inbox")
+        #: its own inbox until `close`, which `map` names to the group
+        self.own: Staging | None = own
 
-    def map(self, store: Any, agree: Callable[[bool], bool]) -> bool:
+    def map(self, store: Store, agree: Callable[[bool], bool]) -> bool:
         """Collective, once per formation: every GPU maps every inbox for its own; each unlinks
         its inbox's name once all agreed. False on every GPU alike when any could not."""
         from tensorfs.varena import _runtime as varena
 
-        store.set(f"cozy.staged/{self.rank}", self.own.name)
+        own = self.own
+        assert own is not None  # mapped once per formation, before `close`
+        store.set(f"cozy.staged/{self.rank}", own.name)
         keys = [f"cozy.staged/{r}" for r in range(self.world)]
         names = [bytes(name).decode() for name in gather(store, keys, "the exchange's inboxes")]
         ok = True
         try:
             for rank, name in enumerate(names):
-                staging = self.own
+                staging = own
                 if rank != self.rank:
                     staging = varena.Staging.open(self.device.index, name, self.size)
                     self.peers.append(staging)
@@ -281,11 +298,11 @@ class HostStagedExchange(Exchange):
         except Exception:
             ok = False
         agreed = agree(ok)
-        self.own.unlink()
+        own.unlink()
         if not agreed:
             self.close()
             return False
-        self.free = [self.torch.cuda.Event(), self.torch.cuda.Event()]
+        self.free: list[Event] = [self.torch.cuda.Event(), self.torch.cuda.Event()]
         for event in self.free:
             event.record(self.reads)
         return True
@@ -305,17 +322,17 @@ class HostStagedExchange(Exchange):
     def _barrier(self) -> None:
         self.torch.distributed.all_reduce(self.flag, group=self.pg)
 
-    def _region(self, inbox: Any, half: int, source: int) -> Any:
+    def _region(self, inbox: Tensor, half: int, source: int) -> Tensor:
         at = (half * self.world + source) * self.slot
         return inbox[at : at + self.slot]
 
     def start(
         self,
-        sends: Sequence[Any],
+        sends: Sequence[Tensor],
         matrix: Sequence[Sequence[int]],
-        out: Sequence[Any],
+        out: Sequence[Tensor],
         chunk: int = 0,
-    ) -> Any:
+    ) -> Event:
         torch, world, rank = self.torch, self.world, self.rank
         widths = self._check(sends, matrix, out)
         chunk = min(chunk or self.slot, self.slot // sum(widths))
@@ -346,9 +363,9 @@ class HostStagedExchange(Exchange):
                         n = counts[rank][peer]
                         for tensor, width in zip(sends, widths, strict=True):
                             if n:
-                                source = tensor[sent[peer] + start : sent[peer] + start + n]
+                                rows_out = tensor[sent[peer] + start : sent[peer] + start + n]
                                 region[base : base + n * width].copy_(
-                                    source.reshape(-1).view(torch.uint8), non_blocking=True
+                                    rows_out.reshape(-1).view(torch.uint8), non_blocking=True
                                 )
                             base += n * width
                 written = torch.cuda.Event()
@@ -367,16 +384,17 @@ class HostStagedExchange(Exchange):
                                     region[base : base + n * width], non_blocking=True
                                 )
                             base += n * width
-        done = torch.cuda.Event()
+        done: Event = torch.cuda.Event()
         done.record(self.reads)
         return done
 
 
-def _host(torch: Any, staging: Any) -> Any:
+def _host(torch: ModuleType, staging: Staging) -> Tensor:
     """`staging`'s bytes as a CPU uint8 tensor, valid while it is open."""
-    return torch.frombuffer(
+    host: Tensor = torch.frombuffer(
         (ctypes.c_uint8 * staging.bytes).from_address(staging.ptr), dtype=torch.uint8
     )
+    return host
 
 
 #: Bytes each GPU sends in the check a formation runs, in two rounds.
@@ -384,7 +402,12 @@ _CHECK_BYTES = 8 << 20
 
 
 def form(
-    torch: Any, pg: Any, rank: int, world: int, name: str, pages: Any = None
+    torch: ModuleType,
+    pg: ProcessGroup,
+    rank: int,
+    world: int,
+    name: str,
+    pages: Pages | None = None,
 ) -> tuple[Exchange | None, dict[str, bool]]:
     """Collective, on every GPU of a just-formed group: `name` (`links.Links.exchange`) mapped,
     and one all-to-all through it checked against the bytes NCCL lands. An exchange any GPU cannot
@@ -424,13 +447,13 @@ def form(
 
 def _open(
     name: str,
-    torch: Any,
-    pg: Any,
+    torch: ModuleType,
+    pg: ProcessGroup,
     rank: int,
     world: int,
     agree: Callable[[bool], bool],
-    store: Any,
-    pages: Any,
+    store: Store,
+    pages: Pages | None,
 ) -> Exchange | None:
     """`name`'s exchange mapped on every GPU of the group, or None on every one alike."""
     made: Exchange | None = None

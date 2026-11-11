@@ -26,7 +26,7 @@ from cozy_runtime.author._recipes import (
     Recipe,
     SelectionPlan,
 )
-from cozy_runtime.author._retained import retained
+from cozy_runtime.author._retained import State, Store, retained
 from cozy_runtime.author._services import (
     AdjustmentRow,
     AdjustmentRows,
@@ -70,6 +70,8 @@ __all__ = [
     "Seed",
     "SelectionPlan",
     "Serving",
+    "State",
+    "Store",
     "Telemetry",
     "ThreadPoolExecutor",
     "UnsupportedInput",

@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable
 from dataclasses import replace
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 from cozy_runtime.accel.attention import _ACTIVE_LAYOUT, AttentionProducer, ProducerCall
 from cozy_runtime.accel.kernels import PreQuantized
@@ -21,6 +21,14 @@ from cozy_runtime.internal import attention_sol, attention_ulysses, fp8_linear
 if TYPE_CHECKING:
     from torch import Tensor
     from torch.nn import Module
+
+    class SiteModule(Module):
+        """An attention site's module: Diffusers' attention or a Runtime `Site`, each holding its
+        processor."""
+
+        processor: object
+
+        def set_processor(self, processor: object) -> None: ...
 
 
 class _Processor(Protocol):
@@ -141,7 +149,7 @@ def _quantize(x: Tensor) -> PreQuantized:
 
 
 def install(
-    module: Module,
+    module: SiteModule,
     producer: AttentionProducer,
     backend: str,
     kernel: str,
@@ -153,5 +161,6 @@ def install(
     current = module.processor
     if isinstance(current, Processor) and current.producer is producer:
         return
-    original = current.original if isinstance(current, Processor) else current
+    # A site a producer serves has a managed processor: the walk installs it only on one.
+    original = current.original if isinstance(current, Processor) else cast("_Processor", current)
     module.set_processor(Processor(original, producer, backend, kernel, component, path))
