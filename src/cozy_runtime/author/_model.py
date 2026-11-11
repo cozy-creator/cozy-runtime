@@ -30,7 +30,6 @@ from fnmatch import fnmatchcase
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
-    Any,
     Concatenate,
     Literal,
     ParamSpec,
@@ -73,8 +72,11 @@ from cozy_runtime.author._stage_memo import StageMemo, is_memoized, memoized
 
 if TYPE_CHECKING:
     import torch
+    from torch.nn import Module
 
     from cozy_runtime.accel.kernels import Plan
+    from cozy_runtime.graphs.domain import Domain, Pool
+    from cozy_runtime.internal.residency import Binding, Region
 
 _LOG = logging.getLogger(__name__)
 
@@ -329,12 +331,12 @@ class Residency(Protocol):
         """An attempt begins on this placement."""
         ...
 
-    def retain(self, component: str, paths: tuple[str, ...]) -> Any:
+    def retain(self, component: str, paths: tuple[str, ...]) -> Binding:
         """Retain ordinary weight storage after prepare(), until the binding closes."""
         ...
 
     def represent(
-        self, component: str, dtype: Any, *, resident_only: bool = False
+        self, component: str, dtype: torch.dtype, *, resident_only: bool = False
     ) -> Callable[[], None]:
         """Validate a final representation and return its pre-capture metadata transition."""
         ...
@@ -343,30 +345,30 @@ class Residency(Protocol):
         """Whether per-process driver/context bytes can be included in graph admission."""
         ...
 
-    def graph_domain(self, component: str) -> Any:
+    def graph_domain(self, component: str) -> Domain:
         """Shared capture stream and library workspace, serialized across component graphs."""
         ...
 
     def region(
-        self, owner: str, kind: str, sets: Any, *, release: Callable[[], None] | None = None,
-        shrink: Callable[[], bool] | None = None,
-    ) -> Any:
+        self, owner: str, kind: str, sets: Module | Sequence[Module], *,
+        release: Callable[[], None] | None = None, shrink: Callable[[], bool] | None = None,
+    ) -> Region:
         """An explicitly owned cache, released only while it has no active user."""
         ...
 
-    def graph_pool(self, component: str) -> Any:
+    def graph_pool(self, component: str) -> Pool:
         """`component`'s ordinary Torch graph pool, owned with its cached recordings."""
         ...
 
-    def graph_pass(self, component: str, entry: str) -> Any:
+    def graph_pass(self, component: str, entry: str) -> AbstractContextManager[object]:
         """Open the ordinary model pass before capture; nested regions share it."""
         ...
 
-    def graph_idle(self) -> Any:
+    def graph_idle(self) -> AbstractContextManager[object]:
         """An idle capture's memory request: free bytes only, never an eviction."""
         ...
 
-    def graph_held(self, component: str) -> Any:
+    def graph_held(self, component: str) -> torch.cuda.Stream | None:
         """The stream `component`'s blocks were held bound on for its plan step, or None."""
         ...
 
@@ -374,7 +376,7 @@ class Residency(Protocol):
         """A local scope of `components` (`method`'s call): their memory passes and holds."""
         ...
 
-    def graph_resident(self, binding: Any) -> bool:
+    def graph_resident(self, binding: Binding) -> bool:
         """Every page a retained region covers is on the device now."""
         ...
 

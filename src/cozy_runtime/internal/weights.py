@@ -1098,8 +1098,8 @@ class _Bakes:
             lora_bake.bake(
                 torch,
                 dict(weight),
-                down,
-                up,
+                down,  # type: ignore[possibly-undefined]  # set where `delta` is, and it is
+                up,  # type: ignore[possibly-undefined]
                 seed=zlib.crc32(f"{identity}\0{stored}".encode()),
                 how=self.how,
                 gain=gain,

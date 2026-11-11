@@ -50,6 +50,8 @@ from cozy_runtime.author._context import AdapterRef, Device, device
 from cozy_runtime.author._errors import CapabilityError, ConformanceError, InvalidRequest
 
 if TYPE_CHECKING:
+    from torch.nn import Module
+
     from cozy_runtime.internal.fill import FitVerdict
 
 T = TypeVar("T")
@@ -746,15 +748,13 @@ class _Region(Protocol):
 
     def pin(self) -> AbstractContextManager[bool]: ...
 
-    def allocating(self) -> AbstractContextManager[bool]: ...
-
     def close(self) -> None: ...
 
 
 class _Residency(Protocol):
     def region(
-        self, owner: str, kind: str, sets: object, *, release: Callable[[], None] | None = None,
-        shrink: Callable[[], bool] | None = None,
+        self, owner: str, kind: str, sets: Module | Sequence[Module], *,
+        release: Callable[[], None] | None = None, shrink: Callable[[], bool] | None = None,
     ) -> _Region: ...
 
 

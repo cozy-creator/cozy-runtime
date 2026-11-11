@@ -89,7 +89,7 @@ def _routed(
         q, k, v, softmax_scale=scale, block_sparse_tensors=tiles, return_lse=True, **descales
     )[:2]
     _merge_approximation(query, kc, vc, pooled, out, lse, scale)
-    return out
+    return out  # type: ignore[no-any-return]  # flash_attn's cute interface is unannotated
 
 
 @request_path.forbid("kernel build: sol fa4")

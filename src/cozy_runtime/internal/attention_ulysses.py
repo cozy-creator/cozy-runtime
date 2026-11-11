@@ -46,7 +46,7 @@ class Options(TypedDict):
 
 
 @dataclass(frozen=True, slots=True)
-class Local:
+class Local:  # type: ignore[explicit-any]  # `forward`'s (below)
     """A forward-only kernel over [batch, sequence, heads, dim].
 
     `forward(query, key, value, *, attn_mask, dropout_p, is_causal, scale, enable_gqa)`

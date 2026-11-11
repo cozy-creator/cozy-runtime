@@ -2027,7 +2027,7 @@ class Executor:
                 else ""
             )
             if command.import_only:
-                if device and accel.initialized(torch, self.device_kind):
+                if device and accel.initialized(torch, self.device_kind):  # type: ignore[possibly-undefined]  # imported under `if device` above
                     self.poisoned = "the package import initialized a device before its grant"
                     return self._close_after(
                         self._refusal("cuda_initialized_before_runtime", self.poisoned)
@@ -3368,7 +3368,8 @@ class Executor:
                 for model in cast("Backend", member.backend).models.values():  # filtered above
                     for _, release in graphs.DECODERS:
                         release(model.module)
-                    graphs.retire(self.torch, model.module)
+                    # cast: a backend exists only once torch opened
+                    graphs.retire(cast("ModuleType", self.torch), model.module)
 
     def awaiting_invoke(self) -> bool:
         """A prepared request waits for its invoke, which comes next (TensorD's lookahead or its

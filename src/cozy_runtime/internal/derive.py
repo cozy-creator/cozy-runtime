@@ -43,6 +43,11 @@ if TYPE_CHECKING:
     from torch.nn import Module, Parameter
     from torch.overrides import TorchFunctionMode
 
+    class _Answer(Protocol):
+        """A `torch.cuda` probe's stand-in under derive: any arguments, its one answer."""
+
+        def __call__(self, *args: object, **kwargs: object) -> object: ...
+
 
 class _Op(Protocol):
     """A torch function a mode intercepts."""
@@ -79,7 +84,7 @@ def torch_module() -> ModuleType:
     """torch, imported LAZILY. `import cozy_runtime` stays torch-free (§1.0): torch is an
     optional extra that only the derivation harness and the serving executor need."""
     try:
-        import torch  # type: ignore[import-not-found]
+        import torch
     except ModuleNotFoundError as exc:
         raise HarnessGap(
             "torch",
@@ -87,7 +92,7 @@ def torch_module() -> ModuleType:
             "parameters, which needs torch in the release environment. Base cozy_runtime "
             "stays torch-free; install the `derive` extra",
         ) from exc
-    return cast("ModuleType", torch)
+    return torch
 
 
 def is_virtual(tensor: object) -> bool:
@@ -120,7 +125,7 @@ def _wrapped(tensor: object) -> tuple[object, ...]:
     if not is_traceable_wrapper_subclass(tensor):
         return ()
     try:
-        names, _ = tensor.__tensor_flatten__()  # type: ignore[attr-defined]
+        names, _ = tensor.__tensor_flatten__()
     except Exception:
         return ()
     return tuple(getattr(tensor, n) for n in names if hasattr(tensor, n))
@@ -155,13 +160,13 @@ def refuse_compile() -> Iterator[None]:
     def refuse(*args: object, **kwargs: object) -> object:
         raise ConstructionFault("torch.compile", why, site=_author_site())
 
-    torch.compile = refuse  # type: ignore[assignment,attr-defined]
-    torch.nn.Module.compile = refuse  # type: ignore[assignment,method-assign]
+    torch.compile = refuse  # type: ignore[attr-defined]  # a module's attribute, patched for construction
+    torch.nn.Module.compile = refuse
     try:
         yield
     finally:
-        torch.compile = original  # type: ignore[assignment,attr-defined]
-        torch.nn.Module.compile = original_method  # type: ignore[method-assign]
+        torch.compile = original  # type: ignore[attr-defined]
+        torch.nn.Module.compile = original_method
 
 
 @dataclass(slots=True)
@@ -206,7 +211,7 @@ def _capability(cap: _Capability) -> Iterator[None]:
         for name in ("get_device_capability", "get_device_name", "is_available", "device_count")
     }
 
-    def mark(name: str, value: object, *, read: bool = True) -> Callable[..., object]:
+    def mark(name: str, value: object, *, read: bool = True) -> _Answer:
         def answer(*args: object, **kwargs: object) -> object:
             # The Runtime's own placement and kernel probes read the real card: under a count of
             # 1, torch's `get_device_properties(1)` refused a group follower's probe.
@@ -219,10 +224,10 @@ def _capability(cap: _Capability) -> Iterator[None]:
         return answer
 
     cuda = cap.variant not in _NO_CUDA
-    torch.cuda.get_device_capability = mark("get_device_capability", cap.major_minor)  # type: ignore[assignment]
-    torch.cuda.get_device_name = mark("get_device_name", cap.variant)  # type: ignore[assignment]
-    torch.cuda.is_available = mark("is_available", cuda, read=False)  # type: ignore[assignment]
-    torch.cuda.device_count = mark("device_count", 1 if cuda else 0, read=False)  # type: ignore[assignment]
+    torch.cuda.get_device_capability = mark("get_device_capability", cap.major_minor)
+    torch.cuda.get_device_name = mark("get_device_name", cap.variant)
+    torch.cuda.is_available = mark("is_available", cuda, read=False)
+    torch.cuda.device_count = mark("device_count", 1 if cuda else 0, read=False)
     try:
         yield
     finally:

@@ -2871,7 +2871,9 @@ class _Engine:
         """Whether a held row has a constraint: its step reads `allow` and reports its tokens."""
         return any(row is not None and row.request.allowed is not None for row in self.slots)
 
-    def _allowed(self, scores: torch.Tensor, size: int, at: int | slice) -> torch.Tensor:
+    def _allowed(
+        self, scores: torch.Tensor, size: int, at: int | slice[int | None, int | None, int | None]
+    ) -> torch.Tensor:
         """`scores` (`[size, ..., vocab]`) with what a constrained row may not take at -inf: the
         host's bits (`allow`) for position `at` of the step (a slice: `[size, positions, vocab]`);
         as they are where no held row is constrained."""

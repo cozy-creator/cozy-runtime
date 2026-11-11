@@ -100,7 +100,6 @@ ignore_missing_imports = true
 # for the whole module (mypy has no per-function setting); every other check applies there.
 [[tool.mypy.overrides]]
 module = [
-    "cozy_runtime.accel.fusion._kernels",
     "cozy_runtime.accel.kernels",
     "cozy_runtime.accel.moe._kernels",
     "cozy_runtime.internal.attention_fp8",
@@ -121,6 +120,14 @@ module = [
 disable_error_code = ["no-untyped-def", "no-any-unimported", "untyped-decorator"]
 disallow_any_decorated = false
 # A def line's own `# type: ignore` is part of its cache key too, so one these settings make unused stays.
+warn_unused_ignores = false
+
+# The same for the fusion kernels, whose bodies also call `.to` on what a kernel's `range` yields: a Triton
+# tensor there, an int to mypy, and the body is the cache key, so it cannot carry an ignore.
+[[tool.mypy.overrides]]
+module = ["cozy_runtime.accel.fusion._kernels"]
+disable_error_code = ["no-untyped-def", "no-any-unimported", "untyped-decorator", "attr-defined"]
+disallow_any_decorated = false
 warn_unused_ignores = false
 
 [project.optional-dependencies]
