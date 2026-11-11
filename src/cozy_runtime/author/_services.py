@@ -523,8 +523,12 @@ class Outputs(_Bound):
         audio: _codec.Samples | None = None,
         sample_rate: int | None = None,
         format: str = "mp4",
+        keyframe_interval: int | None = None,
     ) -> VideoFile:
+        """`keyframe_interval`: frames between keyframes; None, the encoder's default; 1, every
+        frame a keyframe, so any frame shows at once when scrubbed (an orbit)."""
         self._attempt.check_open("Outputs.save_video")
+        keyframe_interval = _codec.keyframes(keyframe_interval)
         if format != "mp4":
             raise OutputError(
                 f"video format {format!r} has no encoder: save it as mp4 (h264+aac)",
@@ -560,14 +564,20 @@ class Outputs(_Bound):
             "audio_samples": planar.shape[1] if planar is not None else 0,
             "sample_rate": int(sample_rate or 0),
         }
+        if keyframe_interval is not None:
+            facts["keyframe_interval"] = keyframe_interval
         parts = (video.data,) if planar is None else (video.data, planar.data)
         # h264/aac are lossy: the raw snapshot bounds nothing about the container, so the
         # registration charges nothing and the post phase bounds the encoded bytes.
         return self._register_frame(VideoFile, "mp4", parts, facts, charge=0)
 
-    def save_video_stream(self, events: Iterator[DecodedMediaEvent]) -> SavedVideo:
-        """Consume one canonical event stream into one bounded, probed, atomic MP4."""
+    def save_video_stream(
+        self, events: Iterator[DecodedMediaEvent], *, keyframe_interval: int | None = None
+    ) -> SavedVideo:
+        """Consume one canonical event stream into one bounded, probed, atomic MP4.
+        `keyframe_interval` as `save_video`'s; None, a keyframe a second."""
         self._attempt.check_open("Outputs.save_video_stream")
+        keyframe_interval = _codec.keyframes(keyframe_interval)
         _codec.require_encoder()
         source = _AuthorEvents(events)
         try:
@@ -670,6 +680,7 @@ class Outputs(_Bound):
             audio_format,
             source,
             feed,
+            keyframe_interval=keyframe_interval,
         )
 
     def save_video_concat(
@@ -879,6 +890,8 @@ class Outputs(_Bound):
         source: _AuthorEvents,
         feed: Callable[[_codec.StreamingMP4Encoder], int],
         copy: _codec.VideoCopy | None = None,
+        *,
+        keyframe_interval: int | None = None,
     ) -> SavedVideo:
         """Write, probe and atomically register one MP4; `feed` writes `source` and returns
         its audio samples. Only encoder failures become `output_encode`."""
@@ -903,6 +916,7 @@ class Outputs(_Bound):
                 audio_channels=audio_format.channels if audio_format is not None else 0,
                 audio_sample_rate=audio_format.sample_rate if audio_format is not None else 0,
                 copy=copy,
+                keyframe_interval=keyframe_interval,
             )
             audio_samples = feed(encoder)
             if audio_format is not None and audio_samples == 0:
