@@ -25,7 +25,7 @@ def consume(wheel: Path) -> dict[str, object]:
     """Exercise identity, immutable data, replay and the supported executor frame."""
     runtime_version = version("cozy-runtime")
     assert runtime_version in ("0.45.0", "0.45.1")
-    assert tensorfs.__version__ == "0.24.2"
+    assert tensorfs.__version__ == "0.24.3"
     assert Path(weights_store.__file__).is_relative_to(Path(sys.prefix))
     with zipfile.ZipFile(wheel) as archive:
         extensions = [name for name in archive.namelist() if name == "tensorfs/_ext.abi3.so"]

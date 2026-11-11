@@ -127,10 +127,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
-      SDK_RELEASE: https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.24.2
-      SDK_WHEEL: tensorfs-0.24.2-cp311-abi3-manylinux_2_28_x86_64.whl
+      SDK_RELEASE: https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.24.3
+      SDK_WHEEL: tensorfs-0.24.3-cp311-abi3-manylinux_2_28_x86_64.whl
       SDK_MANIFEST_SHA: c85b6d4291e06e04c84fa7d714fcd509aeb7f63b7653a2ecc859d44d49ddb664
       OLD_CANDIDATE_DIR: /home/fidika/cozy/.worktrees/cozy-runtime/xs170-sdk-cohort/.task/qualification/candidate-v0.24.2/assets
+      COORDINATOR_CANDIDATE_DIR: /home/fidika/cozy/.worktrees/cozy-runtime/xs170-sdk-0243/.task/qualification/candidate-v0.24.3/assets
+      SDK_SOURCE: 3e1691a6558be86a356aa06e2be00b6f0c27dbba
     steps:
       - uses: actions/checkout@v5
         with:
@@ -151,12 +153,12 @@ jobs:
           set -euo pipefail
           curl -fLsS --retry 3 "$SDK_RELEASE/SHA256SUMS" -o "$RUNNER_TEMP/sdk-candidate/SHA256SUMS"
           printf '%s  %s\n' "$SDK_MANIFEST_SHA" "$RUNNER_TEMP/sdk-candidate/SHA256SUMS" | sha256sum -c -
-          for file in "$SDK_WHEEL" tensorfs-0.24.2.tar.gz; do
+          for file in "$SDK_WHEEL" tensorfs-0.24.3.tar.gz; do
             curl -fLsS --retry 3 "$SDK_RELEASE/$file" -o "$RUNNER_TEMP/sdk-candidate/$file"
             (cd "$RUNNER_TEMP/sdk-candidate" && grep -F " $file" SHA256SUMS | sha256sum -c -)
           done
           echo "UV_FIND_LINKS=$RUNNER_TEMP/sdk-candidate" >> "$GITHUB_ENV"
-      - name: Materialize only the candidate paths in the prepromotion lock
+      - name: Materialize or generate the actual candidate-only prepromotion lock
         run: |
           python3 - <<'PY'
           import hashlib, json, os
@@ -164,18 +166,41 @@ jobs:
           import tomllib
           path = Path('uv.lock')
           before = path.read_text()
-          old = os.environ['OLD_CANDIDATE_DIR']
+          graph = tomllib.loads(before)
+          sdk = [p for p in graph['package'] if p['name'] == 'tensorfs'][0]
+          ready = sdk['version'] == '0.24.3'
+          old = os.environ['COORDINATOR_CANDIDATE_DIR'] if ready else os.environ['OLD_CANDIDATE_DIR']
           new = str(Path(os.environ['RUNNER_TEMP']) / 'sdk-candidate')
           assert before.count(old) == 3
           after = before.replace(old, new)
           assert after.replace(new, old) == before
-          assert [p for p in tomllib.loads(before)['package'] if p['name'] == 'tensorfs'][0]['version'] == '0.24.2'
           path.write_text(after)
           proof = {'source_lock_sha256': hashlib.sha256(before.encode()).hexdigest(),
                    'verification_lock_sha256': hashlib.sha256(after.encode()).hexdigest(),
-                   'candidate_path_translation_only': True,
+                   'candidate_path_translation_only': ready,
                    'registry_relock_required_before_merge': True}
           (Path(os.environ['RUNNER_TEMP']) / 'proof/lock-translation.json').write_text(json.dumps(proof, indent=2) + '\n')
+          (Path(os.environ['RUNNER_TEMP']) / 'proof/lock-before.json').write_text(json.dumps(graph, sort_keys=True) + '\n')
+          PY
+          sdk_lock_ready=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_path_translation_only"])' "$RUNNER_TEMP/proof/lock-translation.json")
+          if [ "$sdk_lock_ready" != True ]; then
+            uv lock --upgrade-package tensorfs --find-links "$RUNNER_TEMP/sdk-candidate"
+          fi
+          python3 - <<'PY'
+          import json, os, tomllib
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'proof'
+          before = json.loads((root / 'lock-before.json').read_text())
+          path = Path('uv.lock')
+          after = tomllib.loads(path.read_text())
+          def unrelated(lock):
+              return [p for p in lock['package'] if p['name'] not in ('tensorfs', 'cozy-runtime')]
+          assert unrelated(before) == unrelated(after), 'unrelated dependency pins changed'
+          assert [p for p in after['package'] if p['name'] == 'tensorfs'][0]['version'] == '0.24.3'
+          candidate = str(Path(os.environ['RUNNER_TEMP']) / 'sdk-candidate')
+          source = path.read_text()
+          assert source.count(candidate) == 3
+          (root / 'uv.lock.coordinator').write_text(source.replace(candidate, os.environ['COORDINATOR_CANDIDATE_DIR']))
           PY
       - name: Normal locked sync, lint, compilation, import and strict typing
         run: |
@@ -210,6 +235,15 @@ jobs:
           assert all(old[key] == new[key] for key in fields)
           (root / 'consumer-comparison.json').write_text(json.dumps({'passed': True, 'equal_fields': fields}, indent=2) + '\n')
           PY
+      - name: Installed native payload, portable API and explicit model identities
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sdk-portable-tests"
+          curl -fLsS --retry 3 "https://raw.githubusercontent.com/cozy-creator/cozy-creator/$SDK_SOURCE/crates/tensorfs-py/tests/test_portable_checkpoint.py" -o "$RUNNER_TEMP/sdk-portable-tests/test_portable_checkpoint.py"
+          sha256sum "$RUNNER_TEMP/sdk-portable-tests/test_portable_checkpoint.py" > "$RUNNER_TEMP/proof/portable-source.sha256"
+          "$RUNNER_TEMP/new-runtime/bin/python" -m unittest discover -s "$RUNNER_TEMP/sdk-portable-tests" -v |& tee "$RUNNER_TEMP/proof/portable-tests.log"
+          grep -q 'Ran 3 tests' "$RUNNER_TEMP/proof/portable-tests.log"
+          "$RUNNER_TEMP/new-runtime/bin/python" -I checks/sdk_candidate_native.py --wheel "$RUNNER_TEMP/sdk-candidate/$SDK_WHEEL" --out "$RUNNER_TEMP/proof/native-candidate.json"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
