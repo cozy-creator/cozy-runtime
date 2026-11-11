@@ -1795,8 +1795,8 @@ class Memory:
             if _DERIVED and page is not None:
                 slot = _slot(block, identity, overlay)
         # `slot` is a newer TensorFS's (`_DERIVED`), which the pinned stubs do not know yet.
-        derived: dict[str, Any] = {} if slot is None else {"slot": slot}
-        return varena.Source(
+        make: Callable[..., varena.Source] = varena.Source
+        return make(
             self._tier(),
             model.name,
             block.index,
@@ -1805,7 +1805,7 @@ class Memory:
             parts=parts,
             page=page,
             derive=derive,
-            **derived,
+            **({} if slot is None else {"slot": slot}),
         )
 
     def _use(self, block: _Block, *, final: bool = False) -> varena.Use:
@@ -3195,7 +3195,7 @@ def _page(block: _Block, identity: object, overlay: Hashable, *, final: bool = F
     """A block's host-tier page key: a digest of its component by content, path, stored layout,
     fill identity and overlay, and `final` for its cast bytes. The same bytes have one key in every
     process, whichever release of a package loaded them."""
-    return _digest((block.model.content, block.path, _layout(block), identity, overlay, final))
+    return _digest((block.model.content, block.path, _stored_layout(block), identity, overlay, final))
 
 
 def _slot(block: _Block, identity: object, overlay: Hashable) -> str | None:
@@ -3204,10 +3204,10 @@ def _slot(block: _Block, identity: object, overlay: Hashable) -> str | None:
     named by an object of this process (`Filling.overlay`): its pages never leave it."""
     if not (_portable(identity) and _portable(overlay)):
         return None
-    return _digest((block.model.content, block.path, _layout(block), identity))
+    return _digest((block.model.content, block.path, _stored_layout(block), identity))
 
 
-def _layout(block: _Block) -> tuple[tuple[str, str, int], ...]:
+def _stored_layout(block: _Block) -> tuple[tuple[str, str, int], ...]:
     """Where `block`'s stored parts lie in its page."""
     parts = block.parts.items()
     return tuple((key, part.role, part.nbytes) for key, roles in parts for part in roles.values())
