@@ -569,6 +569,26 @@ class _Launcher:
 
 #: Loaded sets by (name, device index).
 _LOADED: dict[tuple[str, int], _Launcher] = {}
+#: Each loaded package set's build, by (name, device index): its arch, whether the build only
+#: copied what the package ships, its compile and when it was published (`sources`).
+_BUILT: dict[tuple[str, int], tuple[int, bool, float, float]] = {}
+
+
+def sources(index: int, since_unix_ms: float) -> list[dict[str, object]]:
+    """Where each package set loaded on GPU `index` came from: `shipped` (its package's
+    `_triton/`) or `compiled` on this machine (`compile_ms`) when built since `since_unix_ms`
+    (this executor's start), else `store` (an earlier build on this machine, `compile_ms` if
+    that one compiled). The Runtime's own sets are its wheel's and the machine's boot's."""
+    rows: list[dict[str, object]] = []
+    for (name, at), (arch, prebuilt, ms, built) in sorted(_BUILT.items()):
+        if at != index:
+            continue
+        source = "store" if built < since_unix_ms else "shipped" if prebuilt else "compiled"
+        row: dict[str, object] = {"kernel": name, "arch": f"sm{arch}", "source": source}
+        if not prebuilt:
+            row["compile_ms"] = round(ms, 1)
+        rows.append(row)
+    return rows
 
 
 def load(kernels: TritonKernels, *, device: DeviceLike) -> Launch:
@@ -615,6 +635,9 @@ def load(kernels: TritonKernels, *, device: DeviceLike) -> Launch:
     aligned = {entry.key: entry.aligned for entry in kernels.entries}
     launcher = _Launcher(arch, compiled, names, found.key.digest, index, aligned)
     _LOADED[(kernels.name, index)] = launcher
+    if home(kernels) != "cozy_runtime":
+        facts, built = kernel_compile.produced(Path(state.path))
+        _BUILT[(kernels.name, index)] = (arch, bool(facts.get("prebuilt")), state.ms, built)
     return launcher
 
 

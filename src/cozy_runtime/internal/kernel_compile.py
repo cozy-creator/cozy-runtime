@@ -322,12 +322,21 @@ def _spawn(store: kernel_cache.Store, job: Job, lock: int) -> None:
         store.set_state(job.key, {"pid": process.pid, "progress": 0.0, "phase": "starting"})
 
 
-def _compile_ms(entry_dir: Path) -> float:
+def produced(entry_dir: Path) -> tuple[Mapping[str, object], float]:
+    """An entry's producer facts and when it was published (unix ms); nothing when unreadable."""
+    entry = entry_dir / "entry.json"
     try:
-        facts = json.loads((entry_dir / "entry.json").read_text()).get("producer") or {}
-        return float(facts.get("compile_ms") or 0.0)
-    except (OSError, ValueError, TypeError):
-        return 0.0
+        facts = json.loads(entry.read_text()).get("producer") or {}
+        return (facts if isinstance(facts, dict) else {}), entry.stat().st_mtime * 1000
+    except (OSError, ValueError):
+        return {}, 0.0
+
+
+def _compile_ms(entry_dir: Path) -> float:
+    """What compiling the entry took; none for one a builder only copied in (`prebuilt`)."""
+    facts, _ = produced(entry_dir)
+    ms = facts.get("compile_ms")
+    return float(ms) if isinstance(ms, (int, float)) and not facts.get("prebuilt") else 0.0
 
 
 # ------------------------------------------------------------------ boot-scoped failures
