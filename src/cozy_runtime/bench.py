@@ -106,13 +106,17 @@ def varena_core(ctx: Context, *, case: str) -> Measured:
     command = [sys.executable, "-I", "-B", "-m", "cozy_runtime.internal.bench.varena_cases", case]
     lines: list[str] = []
     device = ctx.device.index or 0
-    # The child is this call's only GPU work, and its cases model a process beside no request: an idle tier pins nothing
-    # while a peer is in one (TensorFS a563efcd6). So this executor steps out of its request until the child ends.
-    varena.request_boundary(device, begin=False)
+    # fill-paths-agree pins its tier at idle, which an idle tier does only while no peer is in a request (TensorFS
+    # a563efcd6): this executor, waiting on the case's process, steps out of its request for that one. The other cases
+    # run beside the executor's request (split-waits-and-caps evicts the plan's weights without it, gate 43054657524).
+    idle = case == "fill-paths-agree"
+    if idle:
+        varena.request_boundary(device, begin=False)
     try:
         code = _child(command, lines, ctx)
     finally:
-        varena.request_boundary(device, begin=True)
+        if idle:
+            varena.request_boundary(device, begin=True)
     rows = [json.loads(line) for line in lines if line.startswith("{")]
     found = {"case": case, "exit": code, "rows": rows, "tail": lines[-40:] if code else []}
     if code:
