@@ -19,12 +19,10 @@ class Choice(msgspec.Struct, frozen=True, kw_only=True):
     """One GPU's whole selection, as a group's followers install it (`attention.install`): what
     each site serves, by (component, module path), per token band (`attention.Spec`: each band's
     upper bound on `min(Lq, Lk)`, 0 for none, and the kernels a call tries in turn), and the
-    dense reference Sol recomputes rows with where Sol serves, with the exact kernel beside a
-    quantizing one ("" for none)."""
+    16-bit dense rows sparse kernels' undeclared rows run on where one serves, the same way."""
 
     sites: tuple[tuple[str, str, tuple[tuple[int, tuple[str, ...]], ...]], ...] = ()
-    dense: str = ""
-    exact: str = ""
+    dense: tuple[tuple[int, tuple[str, ...]], ...] = ()
 
 
 class _Own(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True, tag_field="cmd"):

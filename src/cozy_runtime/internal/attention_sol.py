@@ -108,10 +108,10 @@ def outlier_keys(norm: object) -> bool:
 
 
 _SITE: ContextVar[Site | None] = ContextVar("cozy_sol_site", default=None)
+#: The 16-bit dense rows a sparse kernel's undeclared rows run on (`attention.Candidate.dense`,
+#: `exact_rows`): the table's 16-bit dense ladder for this card (`attention._bind_dense`).
 _DENSE: DenseRows | None = None
 _DENSE_IDENTITY = ""
-#: The BF16 kernel the model's exact paths take when the dense one quantizes; else `_DENSE`.
-_EXACT: DenseRows | None = None
 _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", default=None)
 _RANK_COUNTS: ContextVar[dict[int, dict[str, int]] | None] = ContextVar(
     "cozy_sol_rank_counts", default=None
@@ -188,32 +188,31 @@ def record_rank(rank: int, counts: dict[str, int]) -> None:
         total[name] += value
 
 
-def bind_dense(call: DenseRows, identity: str, exact: DenseRows | None = None) -> None:
-    """Install the dense reference a selection resolved, and the BF16 kernel the model's exact
-    paths take when that one quantizes. Selection runs at preparation and at a run's step and
-    stage boundaries, so a rebind never changes a running step."""
-    if not callable(call) or not identity or not (exact is None or callable(exact)):
+def bind_dense(call: DenseRows, identity: str) -> None:
+    """Install the 16-bit dense rows a selection resolved. Selection runs at preparation and at
+    a run's step and stage boundaries, so a rebind never changes a running step."""
+    if not callable(call) or not identity:
         raise ValueError("Sol requires a resolved dense attention reference and its identity")
-    global _DENSE, _DENSE_IDENTITY, _EXACT
-    _DENSE, _DENSE_IDENTITY, _EXACT = call, identity, exact
+    global _DENSE, _DENSE_IDENTITY
+    _DENSE, _DENSE_IDENTITY = call, identity
 
 
-#: A bound dense reference: (dense, its identity, exact).
-type Binding = tuple[DenseRows | None, str, DenseRows | None]
+#: A bound dense reference: (its rows, its identity).
+type Binding = tuple[DenseRows | None, str]
 
 
 def binding() -> Binding:
     """The dense reference bound now, for `rebind` after a request changes it."""
-    return _DENSE, _DENSE_IDENTITY, _EXACT
+    return _DENSE, _DENSE_IDENTITY
 
 
 def rebind(held: Binding) -> None:
-    global _DENSE, _DENSE_IDENTITY, _EXACT
-    _DENSE, _DENSE_IDENTITY, _EXACT = held
+    global _DENSE, _DENSE_IDENTITY
+    _DENSE, _DENSE_IDENTITY = held
 
 
 def dense_identity() -> str:
-    """The dense reference bound for a sparse kernel whose site's walk supplies one."""
+    """The 16-bit dense rows bound now (`bind_dense`)."""
     return _DENSE_IDENTITY
 
 
@@ -314,14 +313,6 @@ def _dense(query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Te
     if _DENSE is None:
         raise RuntimeError("Sol dense reference was not resolved before execution")
     output = _DENSE(query=query, key=key, value=value, scale=scale)
-    _validate_result(output, query)
-    return output
-
-
-def _exact(query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Tensor:
-    if _EXACT is None:
-        return _dense(query=query, key=key, value=value, scale=scale)
-    output = _EXACT(query=query, key=key, value=value, scale=scale)
     _validate_result(output, query)
     return output
 
@@ -962,10 +953,10 @@ def _execute(
 ) -> Tensor:
     """Apply the model's explicit policy after hardware/operand validation. An exact path's
     dense rows (its dense steps, its protected prefix, a dense path) take the exact kernel on
-    every route: the walked reference's (`_exact`), or the one a declaring row gives; on a
-    declaring row's quantizing sparse kernel, its sparse steps run dense on it too, and FA4's
-    exact tiles stay BF16. A layer whose key gain has outlier channels (`outlier_keys`) is an
-    exact path too."""
+    every route: the 16-bit rows (`_dense`), or the one a declaring row gives; on a declaring
+    row's quantizing sparse kernel, its sparse steps run dense on it too, and FA4's exact tiles
+    stay BF16. A layer whose key gain has outlier channels (`outlier_keys`) is an exact path
+    too."""
     import torch
 
     def on(paths: tuple[str, ...]) -> bool:
@@ -978,9 +969,7 @@ def _execute(
             said["exact:" + site.path] = "exact"
             _kernel_row({"source": "exact", "site": site.path})  # the receipt names each exact site
         fp8 = False
-        if dense is _dense:
-            dense = _exact
-        elif exact is not None:
+        if dense is not _dense and exact is not None:
             dense = prefix_dense = exact
             # A quantizing sparse kernel (Kitchen's INT8) cannot carry these keys on its sparse
             # rows either: the whole call is dense on the exact kernel. H3 block 49 on an RTX 4090,

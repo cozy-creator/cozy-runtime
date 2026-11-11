@@ -155,10 +155,11 @@ class Candidate:
     #: a sparse kernel: the model's layout routes each call's rows (`attention_sol`)
     sparse: bool = False
     #: the dense kernels a sparse one computes rows with, opened beside it: its dense steps',
-    #: then its protected prefix's; none: the one its site's walk binds (`_sol_dense`)
+    #: then its protected prefix's; none: the table's 16-bit dense ladder (`_bind_dense`), so
+    #: only a 16-bit sparse kernel may declare none
     dense: tuple[str, ...] = ()
-    #: the dense kernel a declaring sparse row's exact paths take (H3: the token refiner, block 1
-    #: and the blocks whose key gain has outlier channels); empty: SDPA
+    #: the dense kernel a sparse row's exact paths take (H3: the token refiner, block 1 and the
+    #: blocks whose key gain has outlier channels); empty: the 16-bit dense ladder
     exact_rows: str = ""
     #: the Runtime module whose `KERNELS` (a `TritonKernels` set) it launches: it serves once
     #: they are built here (`triton_kernels`)
@@ -336,8 +337,7 @@ KERNELS: tuple[Candidate, ...] = (
     ),
     Candidate(
         "sol-attn-fa4-fp8", "_cozy_sol_fa4_fp8", attention_sol.SOL_FP8, _TCGEN05, level=8,
-        artifact=_PY, import_name="sol_attn", dense=("flash-attn4-fp8",), exact_rows="cudnn",
-        **_SOL,
+        artifact=_PY, import_name="sol_attn", dense=("flash-attn4-fp8",), **_SOL,
     ),
     Candidate(
         attention_sage2_fixed.SOL_NAME, "_cozy_sol_sage2_fixed_kmean", attention_sage2_fixed.SOL,
@@ -370,6 +370,9 @@ KERNELS: tuple[Candidate, ...] = (
     ),
 )  # fmt: skip
 BY_NAME: dict[str, Candidate] = {c.name: c for c in KERNELS}
+#: A sparse kernel's undeclared rows run on the 16-bit dense ladder: only a 16-bit one may.
+if _UNDECLARED := [c.name for c in KERNELS if c.sparse and not c.dense and not c.exact]:
+    raise ValueError(f"quantizing sparse kernels without their dense rows: {_UNDECLARED}")
 #: Kernels no longer here (Paul, 2026-11-04): a pin naming one runs the normal choice and warns,
 #: where an unknown name refuses.
 RETIRED = frozenset({"flash-attn3-fp8", "sageattention-fp16pv", "flashinfer-bf16-fp8"})
@@ -434,29 +437,20 @@ def sparse_names(names: Iterable[str]) -> list[str]:
     return sorted(name for name in set(names) if name in found and found[name].sparse)
 
 
-def _walked(candidate: Candidate) -> bool:
-    """A sparse kernel whose dense reference its site's walk binds (`_sol_dense`)."""
-    return candidate.sparse and not candidate.dense
-
-
 def _sol_objects(candidate: Candidate) -> bool:
     """A sparse kernel whose sparse steps run Sol's compiled CuTe objects (`attention_sol`)."""
     return candidate.sparse and candidate.import_name == "sol_attn"
 
 
-def _exact_name(candidate: Candidate) -> str:
-    """The kernel a declaring sparse row's exact paths take: its own, else BF16 SDPA."""
-    return candidate.exact_rows or _SDPA
-
-
 def dense_identity(name: str) -> str:
-    """The dense reference a sparse kernel recomputes rows with: its row's declared kernels and
-    the exact one beside them, else the one its site's walk bound."""
-    dense = known()[name].dense
+    """The dense rows a sparse kernel recomputes with: its row's declared kernels and the exact
+    one beside them, where undeclared the 16-bit dense ladder bound now."""
+    candidate = known()[name]
+    ladder, dense = attention_sol.dense_identity(), candidate.dense
     if not dense:
-        return attention_sol.dense_identity()
+        return ladder
     prefix = f"; sparse-prefix={dense[-1]}" if dense[-1] != dense[0] else ""
-    return f"{dense[0]}{prefix}{_EXACT_AT}{_exact_name(known()[name])}"
+    return f"{dense[0]}{prefix}; exact={candidate.exact_rows or ladder}"
 
 
 def device_row(device: DeviceFacts | None) -> arch.Row:
@@ -671,7 +665,8 @@ def _local(candidate: Candidate) -> Local:
     forward = candidate.local.forward
     if candidate.dense:
         rows = [_dense_rows(BY_NAME[name]) for name in candidate.dense]
-        exact = _dense_rows(BY_NAME[_exact_name(candidate)])
+        named = candidate.exact_rows
+        exact = _dense_rows(BY_NAME[named]) if named else attention_sol._dense
         forward = partial(forward, dense=rows[0], prefix_dense=rows[-1], exact=exact)
     instead = None if candidate.name == _SDPA else _INSTEAD
     found = _LOCALS[candidate.backend] = replace(
@@ -1166,51 +1161,76 @@ def _sol_route(device: DeviceFacts, wait: bool) -> None:
             )
 
 
-def _sol_dense(
-    order: Sequence[str],
-    device: DeviceFacts,
-    resolved: dict[str, Ready],
-    refused: dict[str, str],
-) -> tuple[Ready, Ready | None]:
-    """The kernel BF16 Sol recomputes dense rows with (its dense steps, protected prefix and
-    dense paths): the first 16-bit one after Sol in the site's walk that serves BF16 at head
-    dimension 128 on this rank, else SDPA. Sol is filed at 16, so its rows are too. It runs
-    locally after the Ulysses exchange, so it needs no context parallelism. One still compiling
-    is passed over and selected again once ready."""
-    found, row = known(), device_row(device)
-    for name in (*order, "sdpa"):
-        candidate = found.get(name)
-        if (
-            candidate is None
-            or candidate.sparse
-            or not candidate.exact
-            or _off_row(candidate, row)
-            or not candidate.admits("bfloat16", 128)
-            or not candidate.cross
-            or name in refused
-        ):
-            continue
-        if name not in resolved:
-            try:
-                resolved[name] = _opened(candidate, device)
-            except Exception as exc:
-                refused.setdefault(name, f"{type(exc).__name__}: {exc}"[:300])
+def _dense_pick(
+    device: DeviceFacts, row: arch.Row, resolved: dict[str, Ready], refused: dict[str, str]
+) -> Pick:
+    """The 16-bit dense ladder a sparse kernel's undeclared rows run on (`Candidate.dense`,
+    `exact_rows`: BF16 Sol's dense steps, protected prefix and dense paths, every sparse kernel's
+    exact paths): per token bucket, the first kernel of the table's 16-bit dense cell for ROW's
+    class at head dimension 128 that serves BF16 rows of any query length here, else SDPA. It
+    runs locally after the Ulysses exchange, so it needs no context parallelism. One still
+    compiling is passed over and selected again once ready."""
+    found, rungs = known(), list[tuple[int, tuple[Ready, ...]]]()
+    for bucket in TABLE.buckets():
+        chosen: Ready | None = None
+        for name in walk(row, 16, False, 128, bucket):
+            candidate = found.get(name)
+            if (
+                candidate is None
+                or candidate.sparse
+                or _off_row(candidate, row)
+                or not candidate.admits("bfloat16", 128)
+                or not candidate.cross
+                or name in refused
+            ):
                 continue
-        return resolved[name], None
-    raise AttentionRefusal("attention_kernel_absent", "Sol has no ready dense reference")
+            if name not in resolved:
+                try:
+                    resolved[name] = _opened(candidate, device)
+                except Exception as exc:
+                    refused.setdefault(name, f"{type(exc).__name__}: {exc}"[:300])
+                    continue
+            chosen = resolved[name]
+            break
+        if chosen is None:
+            raise AttentionRefusal("attention_kernel_absent", "Sol has no ready dense reference")
+        if rungs and rungs[-1][1][0].name == chosen.name:
+            rungs[-1] = (bucket, (chosen,))
+        else:
+            rungs.append((bucket, (chosen,)))
+    edges = TABLE.tokens
+    return Pick(tuple((edges[b] if b < len(edges) else 0, chain) for b, chain in rungs))
 
 
-#: How a dense identity names the exact kernel beside a quantizing dense one.
-_EXACT_AT = "; exact="
+#: A bound dense ladder's identity -> its selection by name, for a group's choice
+_DENSE_SPECS: dict[str, Spec] = {}
 
 
-def _bind_sol_dense(chosen: tuple[Ready, Ready | None]) -> None:
-    dense, exact = chosen
-    attention_sol.bind_dense(
-        dense.function,
-        dense.name if exact is None else f"{dense.name}{_EXACT_AT}{exact.name}",
-        None if exact is None else exact.function,
+def _bind_dense(pick: Pick) -> None:
+    """PICK as the 16-bit dense rows (`attention_sol.bind_dense`): a call picks its band by
+    `min(Lq, Lk)`, so a protected prefix and a refiner's short document take their own."""
+    backend = pick.backend
+    local = attention_ulysses._LOCALS[backend] if backend in _LADDERS else _local(
+        pick.rungs[0][1][0].candidate
     )
+
+    def rows(*, query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Tensor:
+        options = attention_ulysses.Options(
+            attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=False
+        )
+        return attention_ulysses._call(backend, local, query, key, value, options)
+
+    identity = spelled(pick.spec)
+    _DENSE_SPECS[identity] = pick.spec
+    attention_sol.bind_dense(rows, identity)
+
+
+def bind_dense(device: DeviceFacts) -> str:
+    """Bind the 16-bit dense rows a sparse kernel's undeclared rows run on here, as a selection
+    with a sparse site does, and say which: what calls a sparse kernel outside a selection (the
+    attention bench) binds before calling it."""
+    _bind_dense(_dense_pick(device, device_row(device), {}, {}))
+    return attention_sol.dense_identity()
 
 
 def pinned(name: str, device: DeviceFacts, wait: bool = True) -> list[Ready]:
@@ -1855,15 +1875,14 @@ def _site_pick(
     resolved: dict[str, Ready],
     refused: dict[str, str],
     fallbacks: list[execution_evidence.AttentionFallback],
-) -> tuple[Pick, Sequence[str]] | None:
+) -> Pick | None:
     """A site's selection from its ORDERS, one per token bucket (`walk`): each bucket's first
     kernel that serves here (`_first`) and the ready kernels after it (`_tail`), adjacent equal
     buckets merged. At most one package producer per site (it replaces the site's processor): a
-    bucket whose first is another producer takes that producer's base. Also the order after
-    the first walked Sol (`_sol_dense`), else empty."""
+    bucket whose first is another producer takes that producer's base."""
     rungs: list[tuple[int, tuple[Ready, ...]]] = []
     passed: dict[tuple[str, str, str, str], list[int]] = {}
-    producer, sol_order = "", list[str]()
+    producer = ""
     for bucket, order in enumerate(orders):
         held: list[execution_evidence.AttentionFallback] = []
         names = list(order)
@@ -1876,8 +1895,6 @@ def _site_pick(
                 break
             names.remove(first.name)
         producer = producer or (first.name if first.candidate.producer is not None else "")
-        if _walked(first.candidate) and not sol_order:
-            sol_order = names[names.index(first.name) + 1 :]
         chain = (first, *_tail(names, first, row, device, module, degree, resolved, refused))
         for row_ in held:
             key = (row_["component"], row_["preferred"], row_["selected"], row_["reason"])
@@ -1896,7 +1913,7 @@ def _site_pick(
             fallback["band"] = ",".join(TABLE.band(b) for b in buckets)
         if fallback not in fallbacks:
             fallbacks.append(fallback)
-    return pick, sol_order
+    return pick
 
 
 def install(
@@ -1915,10 +1932,11 @@ def install(
 
     A site in the pin's scope takes the pinned kernel, or refuses (`EXACT`: its walk at level
     16). Given another GPU's CHOICE (a group follower takes rank 0's), each site takes the
-    selection that GPU serves there and Sol its dense reference, each kernel resolved on DEVICE
-    as a pin is, or refuses. Every other site takes, per token bucket, the first kernel of its
-    walk on ROW (else DEVICE's) at the model's `bits` for it (`walk`, `level`; `_site_pick`); a
-    classic site keeps SDPA. Without a DEVICE, sites take the READY kernels in order.
+    selection that GPU serves there, and sparse kernels its 16-bit dense rows, each kernel
+    resolved on DEVICE as a pin is, or refuses. Every other site takes, per token bucket, the
+    first kernel of its walk on ROW (else DEVICE's) at the model's `bits` for it (`walk`,
+    `level`; `_site_pick`); a classic site keeps SDPA. Without a DEVICE, sites take the READY
+    kernels in order.
     """
     scope, name = _pin_parts(pin)
     if device is not None:
@@ -1931,8 +1949,9 @@ def install(
         if device is None:
             raise AttentionRefusal("attention_kernel_unsupported", "a choice installs on a device")
         lacking: dict[str, str] = {}
-        named = {k for spec in taken.values() for _, chain in spec for k in chain}
-        for kernel in sorted({*named, choice.dense, choice.exact} - {""}):
+        specs = (*taken.values(), choice.dense)
+        named = {k for spec in specs for _, chain in spec for k in chain}
+        for kernel in sorted(named):
             try:
                 resolved[kernel] = pinned(kernel, device, wait=False)[0]
             except AttentionRefusal as exc:
@@ -1941,7 +1960,6 @@ def install(
             raise Lacking(lacking)
     refused: dict[str, str] = dict(skipped or {})
     matched = False
-    sol_order: list[str] | None = None
     fallbacks: list[execution_evidence.AttentionFallback] = []
     for record in _attention_records(roots):
         component, path, module, processor = record
@@ -1983,13 +2001,9 @@ def install(
                 if row is not None
                 else [[entry.name for entry in ready]]
             )
-            chosen = _site_pick(
+            pick = _site_pick(
                 orders, row, device, component, module, degree, resolved, refused, fallbacks
             )
-            if chosen is not None:
-                pick, walked = chosen
-                if walked and sol_order is None:
-                    sol_order = list(walked)
         if pick is None:
             detail = _site_refusal(first, component, _dtype(module), _head_dim(module))
             if degree > 1:
@@ -1998,8 +2012,6 @@ def install(
                     f"{detail}; sequence-parallel degree {degree} requires context parallelism",
                 )
             raise detail
-        if forced and _walked(pick.served[0].candidate) and sol_order is None:
-            sol_order = []
         # Managed: a pin refuses an unmanaged processor (`_pin_reason`), the walk passes it by.
         assignments.append((component, path, module, cast("_Managed", processor), pick))
         for entry in pick.served:
@@ -2009,14 +2021,13 @@ def install(
         raise AttentionRefusal(
             "attention_kernel_unsupported", f"{pin!r} matches no attention component"
         )
-    sol = any(_walked(e.candidate) for *_, pick in assignments for e in pick.served)
-    if choice is not None and sol:
+    sparse = any(e.candidate.sparse for *_, pick in assignments for e in pick.served)
+    if choice is not None and sparse:
         if not choice.dense:
             raise AttentionRefusal("attention_kernel_absent", "the choice names no dense reference")
-        exact = resolved[choice.exact] if choice.exact else None
-        _bind_sol_dense((resolved[choice.dense], exact))
-    elif device is not None and sol:
-        _bind_sol_dense(_sol_dense(sol_order or [], device, resolved, refused))
+        _bind_dense(Pick(tuple((u, tuple(resolved[k] for k in c)) for u, c in choice.dense)))
+    elif device is not None and row is not None and sparse:
+        _bind_dense(_dense_pick(device, row, resolved, refused))
     _install_sites(
         [
             (pick, component, path, module)
@@ -2170,8 +2181,8 @@ def observed(roots: Mapping[str, object], pin: str = "") -> Applied:
 
 
 def chosen(roots: Mapping[str, object]) -> Choice:
-    """What this GPU serves now: every site's selection, and Sol's dense reference where Sol
-    serves (`attention_sol.binding`)."""
+    """What this GPU serves now: every site's selection, and the 16-bit dense rows where a
+    sparse kernel serves (`attention_sol.binding`)."""
     names = _names()
     sites = tuple(
         (component, path, _spec(_backend(processor), names))
@@ -2179,19 +2190,18 @@ def chosen(roots: Mapping[str, object]) -> Choice:
     )
     found = known()
     if not any(
-        kernel in found and _walked(found[kernel]) for *_, spec in sites for kernel in _served(spec)
+        kernel in found and found[kernel].sparse for *_, spec in sites for kernel in _served(spec)
     ):
         return Choice(sites=sites)
-    dense, _, exact = attention_sol.binding()[1].partition(_EXACT_AT)
-    return Choice(sites=sites, dense=dense, exact=exact)
+    return Choice(sites=sites, dense=_DENSE_SPECS.get(attention_sol.dense_identity(), ()))
 
 
 def difference(ours: Choice, theirs: Choice) -> str:
     """The first way THEIRS serves other than OURS; "" when it serves the same."""
-    if (ours.dense, ours.exact) != (theirs.dense, theirs.exact):
+    if ours.dense != theirs.dense:
         return (
-            f"Sol's dense reference {ours.dense or 'none'} (exact {ours.exact or 'itself'}) "
-            f"against {theirs.dense or 'none'} (exact {theirs.exact or 'itself'})"
+            f"the 16-bit dense rows {spelled(ours.dense) if ours.dense else 'none'} "
+            f"against {spelled(theirs.dense) if theirs.dense else 'none'}"
         )
     held = {(component, path): spec for component, path, spec in theirs.sites}
     for component, path, spec in ours.sites:
@@ -2208,7 +2218,7 @@ def difference(ours: Choice, theirs: Choice) -> str:
 @dataclass(frozen=True, slots=True)
 class Snapshot:
     """Prepared processor choices, restored without resolution or policy re-execution, with
-    the dense reference Sol ran with when one of them is Sol."""
+    the 16-bit dense rows bound when one of them is sparse."""
 
     choices: tuple[tuple[_Managed, object], ...]
     dense: attention_sol.Binding | None = None
@@ -2225,7 +2235,7 @@ def snapshot(roots: Mapping[str, object]) -> Snapshot:
     held = [processor for _, _, processor in _sites(roots)]
     found = known()
     sol = any(
-        kernel in found and _walked(found[kernel])
+        kernel in found and found[kernel].sparse
         for processor in held
         for kernel in _served(_spec(_backend(processor), names))
     )
@@ -2316,13 +2326,13 @@ class Swap:
     pin: str = ""
     #: sites in scope that keep their prepared kernel, and why the pin could not run there
     fallbacks: tuple[execution_evidence.AttentionFallback, ...] = ()
-    #: Sol's dense reference for this request (`EXACT`, a walked pin), restored after it
-    dense: tuple[Ready, Ready | None] | None = None
+    #: the 16-bit dense rows for this request (a sparse kernel serves), restored after it
+    dense: Pick | None = None
 
     def apply(self) -> Applied:
         _install_sites([(pick, c, path, module) for c, path, module, _, pick in self.sites])
         if self.dense is not None:
-            _bind_sol_dense(self.dense)
+            _bind_dense(self.dense)
         hosts: dict[str, dict[str, int]] = {}
         for component, _, _, processor, pick in self.sites:
             processor._attention_backend = _handle(processor, pick)
@@ -2398,10 +2408,10 @@ def plan(device: DeviceFacts, roots: Mapping[str, object], name: str, degree: in
             if exc.code in ("attention_kernel_unknown", "attention_kernel_needs_executor"):
                 raise
             why = str(exc)
-    # A pinned walked kernel's dense rows are its own walk's, SDPA, for this request only: never
-    # whichever reference an earlier selection in this executor bound (route by rule).
-    walked = entry is not None and _walked(entry.candidate)
-    dense = _sol_dense((), device, {}, {}) if walked else None
+    # A pinned sparse kernel's undeclared rows are the table's 16-bit dense ladder, resolved for
+    # this request (route by rule), never whatever an earlier selection here bound.
+    sparse = entry is not None and entry.candidate.sparse
+    dense = _dense_pick(device, device_row(device), {}, {}) if sparse else None
     sites: list[_Site] = []
     fallbacks: list[execution_evidence.AttentionFallback] = []
     for record in records:
@@ -2435,21 +2445,18 @@ def exact(
     refused: dict[str, str] = {}
     sites: list[_Site] = []
     fallbacks: list[execution_evidence.AttentionFallback] = []
-    sol: list[str] | None = None
     for component, path, module, processor in records:
         if not hasattr(processor, "_attention_backend"):
             continue
         orders = [_walk_order(row, 16, module, processor, b) for b in TABLE.buckets()]
-        chosen = _site_pick(
+        pick = _site_pick(
             orders, row, device, component, module, degree, resolved, refused, fallbacks
         )
-        if chosen is not None:
-            pick, walked = chosen
-            if any(_walked(e.candidate) for e in pick.served) and sol is None:
-                sol = list(walked)
+        if pick is not None:
             # Managed: the loop passes an unmanaged processor by, above.
             sites.append((component, path, module, cast("_Managed", processor), pick))
-    dense = None if sol is None else _sol_dense(sol, device, resolved, refused)
+    sparse = any(e.candidate.sparse for *_, pick in sites for e in pick.served)
+    dense = _dense_pick(device, row, resolved, refused) if sparse else None
     return Swap(tuple(sites), pin, tuple(fallbacks), dense)
 
 
