@@ -8,7 +8,9 @@ alone."""
 from __future__ import annotations
 
 try:
-    from cozy_runtime._kernels._crash import arm, install, note
+    from cozy_runtime._kernels._crash import arm as arm
+    from cozy_runtime._kernels._crash import install as install
+    from cozy_runtime._kernels._crash import note as note
 except ImportError:  # the pure wheel and Windows
 
     def install() -> None:
