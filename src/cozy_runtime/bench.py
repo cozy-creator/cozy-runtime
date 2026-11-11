@@ -3,11 +3,14 @@
 The Runtime's exercisers of its own code: built-in calls of the Runtime's own App (`derive.operations`), which every
 environment holds, so the release gate measures and checks the Runtime from inside it (a package can't import its
 internals). A gate script calls them with `call(bench.attention_speed, ...)`; each returns one JSON document.
-`internal/bench/` says what each does: the attention bench (xs-171) and the kernels suite (xs-174)."""
+`internal/bench/` says what each does: the attention bench (xs-171), the kernels suite and the varena and execution
+suites' Runtime cells (xs-174)."""
 
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from collections.abc import Callable
 
 import msgspec
@@ -93,6 +96,50 @@ def kernel_ready(ctx: Context, *, mode: str, seed: int = 202610270201) -> Measur
     from cozy_runtime.internal.bench import kernel_ready as check
 
     return Measured(json.dumps(check.check(mode, seed), sort_keys=True))
+
+
+def varena_core(ctx: Context, *, case: str) -> Measured:
+    """`case`, one of varena's rules that only the Runtime's own adapter reaches (`internal/bench/varena_cases.py`), in a
+    fresh process: varena's allocator installs there before CUDA starts. Raises when it fails."""
+    command = [sys.executable, "-I", "-B", "-m", "cozy_runtime.internal.bench.varena_cases", case]
+    lines: list[str] = []
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as child:
+        assert child.stdout is not None
+        try:
+            for line in child.stdout:
+                lines.append(line.rstrip())
+                ctx.raise_if_cancelled()
+        except BaseException:
+            child.kill()
+            raise
+    rows = [json.loads(line) for line in lines if line.startswith("{")]
+    found = {"case": case, "exit": child.returncode, "rows": rows, "tail": lines[-40:] if child.returncode else []}
+    if child.returncode:
+        raise RuntimeError(f"varena case {case} failed: {json.dumps(found)[-4000:]}")
+    return Measured(json.dumps(found, sort_keys=True))
+
+
+def offload_in_executor(ctx: Context) -> Measured:
+    """`vt.offload` inside this executor, on the allocator it installed and the stream it chose: a small model offloaded
+    serves what it served on the CPU, and leaves the executor's stream current. Raises when not."""
+    import tensorfs.varena.torch as vt
+    import torch
+    from torch import nn
+
+    device = torch.device("cuda", 0)
+    stream = torch.cuda.current_stream(device)
+    x = torch.randn(1, 8)
+    model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8)).eval()
+    with torch.inference_mode():
+        want = model(x).to(device)
+    vt.offload(model, device=0)
+    with torch.inference_mode():
+        got = [model(x.to(device)) for _ in range(6)][-1]
+    found = {"close": bool(torch.allclose(got, want, atol=1e-5)), "same_stream": torch.cuda.current_stream(device) == stream,
+             "explicit_stream": stream.cuda_stream > 2}
+    if not all(found.values()):
+        raise RuntimeError(f"vt.offload inside an executor: {json.dumps(found, sort_keys=True)}")
+    return Measured(json.dumps(found, sort_keys=True))
 
 
 class Wired(msgspec.Struct, frozen=True):
