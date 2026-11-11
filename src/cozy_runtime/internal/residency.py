@@ -144,6 +144,24 @@ class Weights:
     bound: Mapping[str, str] | None = None
 
 
+class _SlottedSource(Protocol):
+    """`varena.Source` of a TensorFS whose derived pages persist (`_DERIVED`): `slot` names them."""
+
+    def __call__(
+        self,
+        pages: varena.Pages,
+        set: str,
+        block: int,
+        bytes: int,
+        *,
+        checkpoint: object,
+        parts: Sequence[tuple[str, int, int]],
+        page: str | None,
+        derive: Callable[[Tensor], object] | None,
+        slot: str,
+    ) -> varena.Source: ...
+
+
 class Filling(Protocol):
     """A model's fill. `identity` names what every page's fill shares (None: never kept);
     `overlay` names what a fill of one block would add to it now (a LoRA a package arms per
@@ -1794,9 +1812,19 @@ class Memory:
             derive = functools.partial(_derive, owner, "region", _bake)
             if _DERIVED and page is not None:
                 slot = _slot(block, identity, overlay)
-        # `slot` is a newer TensorFS's (`_DERIVED`), which the pinned stubs do not know yet.
-        make: Callable[..., varena.Source] = varena.Source
-        return make(
+        if slot is None:
+            return varena.Source(
+                self._tier(),
+                model.name,
+                block.index,
+                block.storage_bytes,
+                checkpoint=model.source.ck,
+                parts=parts,
+                page=page,
+                derive=derive,
+            )
+        # A newer TensorFS's (`_DERIVED`), which the pinned stubs do not know yet.
+        return cast(_SlottedSource, varena.Source)(
             self._tier(),
             model.name,
             block.index,
@@ -1805,7 +1833,7 @@ class Memory:
             parts=parts,
             page=page,
             derive=derive,
-            **({} if slot is None else {"slot": slot}),
+            slot=slot,
         )
 
     def _use(self, block: _Block, *, final: bool = False) -> varena.Use:
