@@ -223,12 +223,16 @@ from cozy_runtime.internal.parallel.commands import (
 )
 from cozy_runtime.internal.parallel.group import (
     ENDED,
+    LINK_STEPS,
+    STACKS,
     ChildProcess,
     RankGroup,
     RankSpec,
     abort_process_group,
+    aborted,
     form_rank,
     ready_rank,
+    rejoined,
 )
 from cozy_runtime.internal.parallel.plan import (
     GpuDivergence,
@@ -1461,6 +1465,7 @@ class Executor:
             # Rank 0 interrupted before it asked: the watcher has aborted the old group.
             self._interrupted.wait()
             self._interrupted.clear()
+            rejoined()
             if torch.distributed.is_initialized():
                 torch.distributed.destroy_process_group()
         spec = RankSpec(
@@ -1494,21 +1499,25 @@ class Executor:
                 "detail": f"{_gpu(self.rank)} was not joined",
             }
         spec, store = forming
+        reply = {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
         try:
             self.pg = form_rank(cast("ModuleType", self.torch), spec, store)  # opened at start
+            if command.exchange:
+                tier = self._host_tier()
+                exchange, reply["check"] = copy_engine.form(
+                    self.torch, self.pg, self.rank, self.world, command.exchange, tier  # type: ignore[arg-type]  # torch is imported before a request reaches here
+                )
+                copy_engine.install(exchange, self.pg)
         except Exception as exc:
             return self._unformed(exc, "form")
         if self.comms is not None:
             self.comms.pg = self.pg
-        reply = {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
-        if command.exchange:
-            exchange, reply["check"] = copy_engine.form(
-                self.torch, self.pg, self.rank, self.world, command.exchange, self._host_tier()  # type: ignore[arg-type]  # torch is imported before a request reaches here
-            )
-            copy_engine.install(exchange, self.pg)
         return reply
 
     def _unformed(self, exc: Exception, step: str) -> Reply:
+        if aborted():  # GPU 0 aborted a stalled formation: it forms again (`RankGroup._watch`)
+            ended = f"{_gpu(self.rank)}: {step} ended by GPU 0"
+            return {"ok": False, "code": ENDED, "detail": ended}
         self.poisoned = f"{step} failed: {type(exc).__name__}"
         detail = f"{_gpu(self.rank)} could not {step} the group: {type(exc).__name__}: {exc}"
         return {
@@ -1539,12 +1548,41 @@ class Executor:
         copy_engine.install(exchange, pg)
         self.transport.route = exchange.name if exchange is not None else "nccl"
 
+    def _formation_stalled(self, step: str, why: str) -> None:
+        """A formation stalled where NCCL connects and moves its first bytes, over peer memory
+        beyond NVLink: this boot's later groups form without it (`links.demote`). This process
+        keeps its route; NCCL reads it once."""
+        if (
+            step in LINK_STEPS
+            and self.transport is not None
+            and self.transport.nccl.get("NCCL_P2P_LEVEL") == "SYS"
+        ):
+            links.demote(
+                links.directory(_SEALED),
+                _sealed_entries()[: self.world],
+                f"a group stalled in {step} over peer memory: {why}",
+            )
+
+    def _refuse_start(self, why: str) -> bool:
+        """This start's group cannot form and GPU 0's process is about to end: the start is
+        refused first, so the call fails `group_unformed`, not as an executor that ended."""
+        if self.started:
+            return False
+        refused = {"ok": False, "code": "group_unformed", "detail": why[:900], "reply": "start"}
+        _send_reply(self.channel, refused)
+        return True
+
     def _watch_abort(self, watcher: socket.socket) -> None:
         """A follower's collectives end when rank 0 says so (`RankGroup.interrupt`): its main
         thread may be inside one, where no command reaches it."""
         with watcher:
             try:
-                while watcher.recv(1):
+                while byte := watcher.recv(1):
+                    if byte == STACKS:  # a stalled formation: this GPU's threads, for its record
+                        with contextlib.suppress(OSError, ValueError):
+                            sys.stderr.write(f"group_stalled: {_gpu(self.rank)}'s threads:\n")
+                            sys.stderr.flush()
+                            faulthandler.dump_traceback(sys.stderr, all_threads=True)
                     abort_process_group()
                     self._interrupted.set()
             finally:
@@ -2020,6 +2058,8 @@ class Executor:
                         devices=_sealed_entries(),
                         launch=self._follower,
                         waiting=functools.partial(_waiting, self.channel),
+                        stalled=self._formation_stalled,
+                        refuse=self._refuse_start,
                     )
                 if not self.group.followers:
                     self.group.spawn()
