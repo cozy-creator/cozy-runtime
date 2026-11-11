@@ -103,7 +103,7 @@ class _Rendezvous:
     def gather(self, value: _Proposal) -> list[_Proposal]:
         """Every rank's `value` for this sequence: four store calls a rank. Each rank has read
         the last sequence's values before it proposes this one, so its own of them goes. A rank
-        that never proposes ends the wait (`group.gather`); ranks whose values name different
+        that failed or died ends the wait (`group.gather`); ranks whose values name different
         sites made different calls, and each of them says so."""
         keys = [f"{self.sequence}/{rank}" for rank in range(self.world)]
         self.store.set(keys[self.rank], json.dumps(value))

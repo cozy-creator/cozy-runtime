@@ -4,8 +4,9 @@ Each follower has a framed JSON command socket and joins the group's distributed
 collectives. A follower whose handler failed ends the attempt on every GPU (`interrupt`); a lost
 follower or a device fault breaks the group and terminates its remaining followers, allowing
 blocked collectives to unwind. A wait ends with the reply or the
-follower's death, and one that blocks says which GPU it waits on; only a store meeting has a clock
-(`gather`), since a GPU that left the call sets no key. A group forms only after every follower
+follower's death, and one that blocks says which GPU it waits on. No wait has a clock: a store
+meeting (`gather`) waits for a GPU computing toward it for as long as that GPU lives, however long
+its work takes, and names the GPUs it waits on. A group forms only after every follower
 said it is ready; a follower that fails while GPU 0 is inside group init (which nothing can
 interrupt) ends GPU 0's process, so TensorD sees the exit at
 once. torch's own deadlines (`NEVER`) never end a group. A formation still unfinished after
@@ -53,16 +54,14 @@ ENDED = "group_call_ended"
 #: its members instead: a follower's death or refusal (`RankGroup._break`), or a GPU fault TensorD
 #: sees. Longer than any run, and within what torch's clocks hold.
 NEVER = timedelta(days=36500)
-#: How long a GPU waits at a store meeting for the others (`gather`). They run the same call, so one
-#: arrives within its peers' work on that call; past this the GPUs no longer run the same calls.
-GATHER = timedelta(minutes=5)
-#: How long a meeting waits for a GPU that said it computes what the meeting crosses (`gather`)
-WORKING = timedelta(minutes=30)
+#: A store meeting waited this long names the GPUs it waits on (`gather`); a step's meetings take
+#: milliseconds, a hosted call's result as long as its home GPU computes it.
+TOLD = timedelta(seconds=10)
 #: How long the GPUs may take to form the group, from the join to every GPU's proof. Each runs the
-#: same few steps (reach the store, group init, one barrier, one of each collective), so a GPU still
-#: forming past what a store meeting allows (`GATHER`) never will: 2x A40 sat in formation until
-#: cancelled, both GPUs alive, billing (cr-263).
-FORMATION = GATHER
+#: same few short steps (reach the store, group init, one barrier, one of each collective), so a GPU
+#: still forming after this never will: 2x A40 sat in formation until cancelled, both GPUs alive,
+#: billing (cr-263).
+FORMATION = timedelta(minutes=5)
 #: Rank 0's formation steps that wait in Python on followers' replies, which a follower's death
 #: ends; every other step waits inside torch, where an abort may not reach.
 _REPLY_STEPS = frozenset({"join", "proof"})
@@ -267,20 +266,20 @@ def gather(
     keys: Sequence[str],
     what: str,
     ended: Sequence[str] = (),
-    working: Sequence[str] = (),
+    told: Callable[[list[int]], None] | None = None,
 ) -> list[bytes]:
-    """Every key's value, once every GPU has set its own. The store's own read waits for a missing
-    key for as long as the store lives; this ends (code `ENDED`) when the formation ends
-    (`abort_process_group`: an interrupt, or a GPU that failed) or a missing GPU's `ended` key says
-    it failed; a missing GPU that returned is a divergence, named; and after `GATHER` it names the
-    GPUs that never arrived, unless each still missing set its `working` key (it computes what
-    this meeting crosses, a hosted call's result): those are waited for up to `WORKING` (`keys`,
-    `ended` and `working` are in GPU order)."""
+    """Every key's value, once every GPU has set its own. A GPU still computing toward this meeting
+    is waited for as long as it lives, however long its work takes (a hosted call's result on a
+    slow host, a long decode): no clock judges it (xs-172). The wait ends (code `ENDED`) when the
+    formation ends (`abort_process_group`: an interrupt, or a GPU that failed or died) or a missing
+    GPU's `ended` key says it failed; a missing GPU that returned is a divergence, named; GPUs at
+    different calls both arrive, and the caller names them. The store's own connection ends it
+    once GPU 0, which holds the store, is gone. A wait past `TOLD` calls `told` once with the
+    missing GPUs (`keys` and `ended` are in GPU order)."""
     import torch.distributed as dist
 
     keys = list(keys)
-    began = time.monotonic()
-    deadline = began + GATHER.total_seconds()
+    shown = time.monotonic() + TOLD.total_seconds() if told is not None else None
     while True:
         if _ENDED.is_set():
             raise GroupRefusal(f"{what}: another GPU ended this call", code=ENDED)
@@ -296,19 +295,10 @@ def gather(
                         "same calls",
                         code="group_diverged",
                     ) from None
-            now = time.monotonic()
-            if now < deadline:
-                continue
-            absent = [rank for rank, key in enumerate(keys) if not store.check([key])]
-            busy = working and all(store.check([working[rank]]) for rank in absent)
-            if busy and now < began + WORKING.total_seconds():
-                continue
-            waited = int(now - began)
-            raise GroupRefusal(
-                f"{what}: {', '.join(f'GPU {rank}' for rank in absent)} did not arrive in "
-                f"{waited} s; the GPUs no longer run the same calls",
-                code="group_diverged",
-            ) from None
+            if told is not None and shown is not None and time.monotonic() >= shown:
+                shown = None
+                told([rank for rank, key in enumerate(keys) if not store.check([key])])
+            continue
         return list(store.multi_get(keys))
 
 
