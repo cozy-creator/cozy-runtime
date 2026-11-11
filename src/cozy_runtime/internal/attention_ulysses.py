@@ -55,8 +55,11 @@ class Local:  # type: ignore[explicit-any]  # `forward`'s (below)
     query block a call may be cut at and compute each row as whole (memory's `attend` cut);
     0 where the kernel needs every query row at once (a scale or mean over the sequence).
     `refusal`: why its row does not serve a call, or empty; such a call runs on `instead`, a
-    (backend, kernel) whose row serves every call. `narrow`: it quantizes Q, K and V to int8 or
+    (backend, kernel) tried the same way, SDPA last. `narrow`: it quantizes Q, K and V to int8 or
     narrower itself, so under Ulysses they cross as int8 (`internal.parallel.ulysses.exchange`).
+    `rungs`: a ladder (`attention.Pick`), whose call takes the rung of its `min(Lq, Lk)`: each
+    (upper token bound, 0 for none, backend, kernel); its own `forward` is never called. `band`:
+    the label a ladder records a call of N tokens under (`attention_table.Table.band`).
     """
 
     #: `Options`' keywords, and a sparse kernel's `dense=` rows until `attention` binds them
@@ -67,6 +70,8 @@ class Local:  # type: ignore[explicit-any]  # `forward`'s (below)
     refusal: Callable[[Tensor, Tensor, Options], str] | None = None
     instead: tuple[str, Local] | None = None
     narrow: bool = False
+    rungs: tuple[tuple[int, str, Local], ...] = ()
+    band: Callable[[int], str] | None = None
 
 
 #: `impl(query, key, value, options)`: the concrete implementation serving those operands.
@@ -105,12 +110,15 @@ class BackendCall(Protocol):
 
 
 class Seen(dict[str, set[str]]):
-    """Backend -> implementations served in an observed scope on this rank, and `refused`: per
-    reason, the calls a kernel's row refused, which `Local.instead` served."""
+    """Backend -> implementations served in an observed scope on this rank; `refused`: per
+    (reason, backend that took the call), the calls a kernel's row refused, which an `instead`
+    served; `bands`: per (backend a site dispatched to, the call's band), the backends that
+    served it."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.refused: dict[str, int] = {}
+        self.refused: dict[tuple[str, str], int] = {}
+        self.bands: dict[tuple[str, str], set[str]] = {}
 
 
 #: what served in the observed scope on this rank, and the operand signatures already named
@@ -118,6 +126,8 @@ class Seen(dict[str, set[str]]):
 _SEEN: ContextVar[tuple[Seen, set[object]] | None] = ContextVar("cozy_attention_seen", default=None)
 _FUNCTIONS: dict[str, BackendCall] = {}
 _MEMBERS: dict[str, AttentionBackendName] = {}
+#: backend -> its kernel, as `function` made its call
+_LOCALS: dict[str, Local] = {}
 
 
 class Execution(Protocol):
@@ -171,7 +181,29 @@ def function(backend: str, local: Local) -> BackendCall:
     found = _FUNCTIONS.get(backend)
     if found is None:
         found = _FUNCTIONS[backend] = _dispatch(backend, local)
+        _LOCALS[backend] = local
     return found
+
+
+def _rung(local: Local, tokens: int) -> tuple[str, Local]:
+    """A ladder's rung for a call of TOKENS (`min(Lq, Lk)`): the first whose bound is above."""
+    return next((name, rung) for upper, name, rung in local.rungs if not upper or tokens < upper)
+
+
+def serves(backend: str) -> tuple[str, ...]:
+    """The backends a site dispatching to BACKEND serves on, by rung: a ladder's, else itself."""
+    local = _LOCALS.get(backend)
+    if local is None or not local.rungs:
+        return (backend,)
+    return tuple(dict.fromkeys(name for _, name, _ in local.rungs))
+
+
+def rung(backend: str, tokens: int) -> tuple[str, str]:
+    """The backend a site dispatching to BACKEND serves a call of TOKENS on, and its band."""
+    local = _LOCALS.get(backend)
+    if local is None or not local.rungs:
+        return backend, ""
+    return _rung(local, tokens)[0], local.band(tokens) if local.band is not None else ""
 
 
 def opened(backend: str) -> BackendCall:
@@ -236,16 +268,20 @@ def _dispatch(backend: str, local: Local) -> BackendCall:
 
 
 def _narrow(local: Local, query: Tensor, options: Options) -> Callable[[int], bool]:
-    """Whether a Ulysses call of `total` tokens crosses as int8: LOCAL quantizes Q, K and V
-    itself and serves the whole call, which `_call` would otherwise hand to its `instead`."""
+    """Whether a Ulysses call of `total` tokens crosses as int8: the kernel it takes (a ladder's
+    rung for `total`, the full sequence) quantizes Q, K and V itself, and so does whichever of
+    its `instead` serves the call when it refuses it (`_call`)."""
 
     def narrow(total: int) -> bool:
-        if not local.narrow:
+        taken = _rung(local, total)[1] if local.rungs else local
+        if not taken.narrow:
             return False
-        if local.refusal is None or local.instead is None or local.instead[1].narrow:
-            return True
         whole = query.new_empty((query.shape[0], total, 1, query.shape[3]), device="meta")
-        return not local.refusal(whole, whole, options)
+        while taken.refusal is not None and taken.instead is not None:
+            if not taken.refusal(whole, whole, options):
+                break
+            taken = taken.instead[1]
+        return taken.narrow
 
     return narrow
 
@@ -253,18 +289,29 @@ def _narrow(local: Local, query: Tensor, options: Options) -> Callable[[int], bo
 def _call(
     backend: str, local: Local, query: Tensor, key: Tensor, value: Tensor, options: Options
 ) -> Tensor:
+    # A ladder's rung first, by the call's whole length: under Ulysses this runs after the
+    # exchange, so N GPUs take the rung one takes, and memory's row cut never changes it.
+    site, band = backend, ""
+    if local.rungs:
+        tokens = min(int(query.shape[1]), int(key.shape[1]))
+        band = local.band(tokens) if local.band is not None else ""
+        backend, local = _rung(local, tokens)
     why = local.refusal(query, key, options) if local.refusal is not None else ""
-    if why and local.instead is not None:
-        refused(why)
+    first, refusing = why, local.instead is not None
+    while why and local.instead is not None:
         backend, local = local.instead
+        why = local.refusal(query, key, options) if local.refusal is not None else ""
+    if first and refusing:
+        refused(first, 1, backend)
     scope = _SEEN.get()
     if scope is not None:
         masked, causal = options["attn_mask"] is not None, options["is_causal"]
-        signature = (backend, query.shape, key.shape, query.dtype, masked, causal)
+        signature = (site, band, backend, query.shape, key.shape, query.dtype, masked, causal)
         seen, named = scope
         if signature not in named:
             named.add(signature)
             seen.setdefault(backend, set()).add(local.impl(query, key, value, options))
+            seen.bands.setdefault((site, band), set()).add(backend)
     if _EXECUTION is None or options["dropout_p"] != 0.0:
         return local.forward(query, key, value, **options)
     return _EXECUTION.attend(
@@ -313,15 +360,25 @@ def describe(seen: dict[str, set[str]], names: dict[str, str]) -> str:
     return ",".join(f"{name}:{impl}" for name, impl in sorted(rows.items()))
 
 
-def refused(why: str, calls: int = 1) -> None:
-    """Record CALLS a kernel's row refused for WHY."""
+def refused(why: str, calls: int = 1, took: str = "") -> None:
+    """Record CALLS a kernel's row refused for WHY, which backend TOOK served."""
     scope = _SEEN.get()
     if scope is not None:
-        scope[0].refused[why] = scope[0].refused.get(why, 0) + calls
+        scope[0].refused[(why, took)] = scope[0].refused.get((why, took), 0) + calls
 
 
-def record(backend: str, implementation: str) -> None:
-    """Record a producer that projects before the ordinary Q/K/V dispatch seam."""
+def record(backend: str, implementation: str, site: str = "", band: str = "") -> None:
+    """Record a call that did not pass `_call`: a producer that projects before the ordinary
+    Q/K/V dispatch seam (SITE: the backend its site dispatches to), a graph's replay."""
     scope = _SEEN.get()
     if scope is not None:
         scope[0].setdefault(backend, set()).add(implementation)
+        if site:
+            scope[0].bands.setdefault((site, band), set()).add(backend)
+
+
+def banded(site: str, band: str, backend: str) -> None:
+    """Record that BACKEND served a call of SITE's in BAND (a graph's replay)."""
+    scope = _SEEN.get()
+    if scope is not None:
+        scope[0].bands.setdefault((site, band), set()).add(backend)

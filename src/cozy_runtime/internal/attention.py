@@ -25,12 +25,13 @@ masks only its prefill's text, so its other steps keep their kernel).
 
 from __future__ import annotations
 
+import hashlib
 import math
 import shutil
 import site
 import sys
 from collections import deque
-from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from functools import partial
@@ -564,15 +565,99 @@ def _function(candidate: Candidate) -> BackendCall:
     return attention_ulysses.function(candidate.backend, _local(candidate))
 
 
-def _handle(processor: object, entry: Ready) -> str | AttentionBackendName:
+#: One site's selection by name (`Pick.spec`): per token band, its upper bound on `min(Lq, Lk)`
+#: (0: none) and the kernels a call tries in turn, SDPA after them.
+type Spec = tuple[tuple[int, tuple[str, ...]], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Pick:
+    """One site's selection: per token band, its upper bound (0: none, the last) and the ready
+    kernels a call tries in turn, the first unless its row refuses the call, SDPA after them.
+    One band of one kernel dispatches to that kernel's own backend; any other is a ladder, a
+    backend of its own (`_ladder`), whose call takes its band in `attention_ulysses._call`."""
+
+    rungs: tuple[tuple[int, tuple[Ready, ...]], ...]
+
+    @staticmethod
+    def of(entry: Ready) -> Pick:
+        return Pick(((0, (entry,)),))
+
+    @property
+    def spec(self) -> Spec:
+        return tuple((upper, tuple(r.name for r in chain)) for upper, chain in self.rungs)
+
+    @property
+    def served(self) -> tuple[Ready, ...]:
+        """The kernel each band serves, once each."""
+        return tuple({chain[0].name: chain[0] for _, chain in self.rungs}.values())
+
+    @property
+    def kernels(self) -> tuple[Ready, ...]:
+        """Every kernel a call may reach, once each."""
+        return tuple({r.name: r for _, chain in self.rungs for r in chain}.values())
+
+    @property
+    def backend(self) -> str:
+        """The backend its site dispatches to."""
+        if len(self.rungs) == 1 and len(self.rungs[0][1]) == 1:
+            return self.rungs[0][1][0].candidate.backend
+        return _ladder(self)[0]
+
+
+#: ladder backend -> its selection by name, for reading back what a site serves
+_LADDERS: dict[str, Spec] = {}
+
+
+def _ladder(pick: Pick) -> tuple[str, Local]:
+    """PICK's backend and kernel: a ladder named by its spec, made once per process."""
+    spec = pick.spec
+    name = "_cozy_ladder_" + hashlib.sha256(repr(spec).encode()).hexdigest()[:12]
+    if name not in _LADDERS:
+        rungs = tuple((upper, *_chained(chain)) for upper, chain in pick.rungs)
+        local = Local(
+            _unbanded,
+            lambda *_: name,
+            head_local=all(_local(r.candidate).head_local for r in pick.kernels),
+            rungs=rungs,
+            band=_band if len(rungs) > 1 else None,
+        )
+        attention_ulysses.function(name, local)
+        _LADDERS[name] = spec
+    return name, attention_ulysses._LOCALS[name]
+
+
+def _band(tokens: int) -> str:
+    """A ladder call's band: its token bucket's label (`attention_table.Table.band`)."""
+    return TABLE.band(TABLE.bucket(tokens))
+
+
+def _unbanded(*_: object, **__: object) -> Tensor:
+    raise RuntimeError("a ladder's call takes a band before its forward (`attention_ulysses`)")
+
+
+def _chained(chain: tuple[Ready, ...]) -> tuple[str, Local]:
+    """CHAIN's first kernel, whose refused call goes to the next, the last's to SDPA."""
+    first = chain[0].candidate
+    if len(chain) == 1:
+        return first.backend, _local(first)
+    return first.backend, replace(_local(first), instead=_chained(chain[1:]))
+
+
+def _handle(processor: object, pick: Pick) -> str | AttentionBackendName:
     """What a site's processor dispatches by: a Runtime site its backend's name, a Diffusers
     processor Diffusers' member."""
-    return entry.candidate.backend if isinstance(processor, Site) else _member(entry.candidate)
+    if len(pick.rungs) == 1 and len(pick.rungs[0][1]) == 1:
+        candidate = pick.rungs[0][1][0].candidate
+        return candidate.backend if isinstance(processor, Site) else _member(candidate)
+    name, local = _ladder(pick)
+    return name if isinstance(processor, Site) else attention_ulysses.member(name, local)
 
 
 #: backend -> the kernel its Diffusers member calls (`_local`)
 _LOCALS: dict[str, Local] = {}
-#: The kernel a call another kernel's row refuses runs on: SDPA's row refuses none.
+#: The kernel a call another kernel's row refuses runs on, after the band's next ones: SDPA's
+#: row refuses none.
 _SDPA = "sdpa"
 _INSTEAD = (BY_NAME[_SDPA].backend, BY_NAME[_SDPA].local)
 
@@ -588,8 +673,9 @@ def _local(candidate: Candidate) -> Local:
         rows = [_dense_rows(BY_NAME[name]) for name in candidate.dense]
         exact = _dense_rows(BY_NAME[_exact_name(candidate)])
         forward = partial(forward, dense=rows[0], prefix_dense=rows[-1], exact=exact)
+    instead = None if candidate.name == _SDPA else _INSTEAD
     found = _LOCALS[candidate.backend] = replace(
-        candidate.local, forward=forward, refusal=candidate.refusal, instead=_INSTEAD
+        candidate.local, forward=forward, refusal=candidate.refusal, instead=instead
     )
     return found
 
@@ -609,8 +695,8 @@ def _dense_rows(candidate: Candidate) -> attention_sol.DenseRows:
 
 #: kernel -> its artifact's latest state on this rank: what a run's evidence reports.
 _STATES: dict[str, kernel_compile.State] = {}
-#: A site and the kernel it is given: (component, module path, module, processor, kernel).
-type _Site = tuple[str, str, SiteModule, _Managed, Ready]
+#: A site and what it is given: (component, module path, module, processor, selection).
+type _Site = tuple[str, str, SiteModule, _Managed, Pick]
 #: module -> the build this process imports it from, fixed by the first import or by `reserve`:
 #: a process holds one build of a module, so a kernel another build serves needs another one.
 _BUILDS: dict[str, str] = {}
@@ -978,25 +1064,59 @@ def _expected(live_tokens: int, module: nn.Module) -> None:
 _EXPECTED.append(_expected)
 
 
-def evidence(
-    served: Iterable[str], refused: Mapping[str, int] | None = None
-) -> list[dict[str, object]]:
-    """This rank's kernels for a run's execution record: every kernel it served, and every
-    kernel of its chains it did not serve and why (compiling, failed, absent, unsupported).
-    SDPA's row counts the calls a site's kernel refused, per reason (`attention_ulysses.Seen`)."""
-    names = set(served)
-    if not names:
+def _called(seen: attention_ulysses.Seen) -> dict[str, set[str]]:
+    """Each kernel this rank's calls reached in SEEN, and the bands they fell in."""
+    names = _names()
+    called: dict[str, set[str]] = {names.get(b, b): set() for b in seen}
+    for (_site, band), backends in seen.bands.items():
+        for backend in backends:
+            called.setdefault(names.get(backend, backend), set()).add(band)
+    return called
+
+
+def evidence(seen: attention_ulysses.Seen | None) -> list[dict[str, object]]:
+    """This rank's kernels for a run's execution record: every kernel its calls reached, with
+    the bands they fell in, and every kernel of its chains it did not serve and why (compiling,
+    failed, absent, unsupported). A kernel that took calls another's row refused counts them,
+    per reason (`attention_ulysses.Seen`)."""
+    called = _called(seen) if seen is not None else {}
+    if not called:
         return []  # no attention site ran here
-    states = {name: kernel_compile.State(name, "ready") for name in names}
+    states = {name: kernel_compile.State(name, "ready") for name in called}
     states.update(_STATES)
-    if refused:
-        names.add(_SDPA)
-        why = "; ".join(f"{reason} x{calls}" for reason, calls in sorted(refused.items()))
-        states[_SDPA] = kernel_compile.State(_SDPA, "ready", detail=why)
-    return [
-        {**state.document(), "kernel": name, "served": name in names}
-        for name, state in sorted(states.items())
-    ]
+    names, took = _names(), dict[str, list[str]]()
+    for (reason, backend), calls in sorted((seen.refused if seen else {}).items()):
+        took.setdefault(names.get(backend, backend), []).append(f"{reason} x{calls}")
+    for name, reasons in took.items():
+        states[name] = kernel_compile.State(name, "ready", detail="; ".join(reasons))
+    rows: list[dict[str, object]] = []
+    for name, state in sorted(states.items()):
+        row: dict[str, object] = {**state.document(), "kernel": name, "served": name in called}
+        if any(called.get(name, ())):
+            row["bands"] = sorted(called[name] - {""}) or [""]
+        rows.append(row)
+    return rows
+
+
+def served_sites(
+    applied: Applied | None, seen: attention_ulysses.Seen | None
+) -> dict[str, list[execution_evidence.SiteGroup]]:
+    """A run's sites by kind (`Applied.groups`), with the kernel each band was served by in its
+    calls (SEEN); a group none of whose calls ran here has no bands."""
+    if applied is None or seen is None:
+        return {}
+    names = _names()
+    banded: dict[str, dict[str, set[str]]] = {}
+    for (dispatched, band), backends in seen.bands.items():
+        held = banded.setdefault(dispatched, {}).setdefault(band, set())
+        held.update(names.get(b, b) for b in backends)
+    return _site_document(
+        applied.groups,
+        lambda group: {
+            band: "+".join(sorted(kernels))
+            for band, kernels in sorted(banded.get(group.backend, {}).items())
+        },
+    )
 
 
 def failures(
@@ -1360,6 +1480,8 @@ class Applied:
     waiting: tuple[str, ...] = ()
     #: Selection-time reasons; later compile progress must not rewrite why a fallback ran.
     fallbacks: tuple[execution_evidence.AttentionFallback, ...] = ()
+    #: each component's sites by kind and the backend they dispatch to (`_groups`)
+    groups: tuple[Group, ...] = ()
 
     def joined(self, later: Applied) -> Applied:
         """This selection and one that served after it in the same run: every kernel each
@@ -1371,7 +1493,10 @@ class Applied:
         fallbacks = self.fallbacks + tuple(
             row for row in later.fallbacks if row not in self.fallbacks
         )
-        return replace(self, hosts=hosts, artifacts=artifacts or None, fallbacks=fallbacks)
+        groups = self.groups + tuple(g for g in later.groups if g not in self.groups)
+        return replace(
+            self, hosts=hosts, artifacts=artifacts or None, fallbacks=fallbacks, groups=groups
+        )
 
     def totals(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -1381,6 +1506,7 @@ class Applied:
         return out
 
     def document(self) -> execution_evidence.Boot:
+        names = _names()
         return _boot(
             self.totals(),
             {name: dict(kernels) for name, kernels in self.hosts.items()},
@@ -1389,11 +1515,66 @@ class Applied:
             self.artifacts or {},
             self.skipped or {},
             self.fallbacks,
+            _site_document(self.groups, lambda group: _labelled(_spec(group.backend, names))),
         )
 
     def line(self) -> str:
         """The ONE line a pod prints at boot. It is the whole per-run attention record."""
         return self.document()["line"]
+
+
+@dataclass(frozen=True, slots=True)
+class Group:
+    """A component's sites that are alike (layout, level, head dimension: their table cell) and
+    dispatch to one backend, and how many."""
+
+    component: str
+    layout: str
+    level: int
+    head_dim: int
+    backend: str
+    sites: int = 0
+
+
+def _labelled(spec: Spec) -> dict[str, str]:
+    """SPEC's band labels (`attention_table.Table.band`, over its merged bands) and the kernel
+    each serves; one band is ""."""
+    if len(spec) == 1:
+        return {"": spec[0][1][0]}
+    out, lower = {}, 0
+    for upper, chain in spec:
+        if not lower:
+            out[f"<{upper}"] = chain[0]
+        else:
+            out[f">={lower}" if not upper else f"{lower}-{upper - 1}"] = chain[0]
+        lower = upper
+    return out
+
+
+def _site_document(
+    groups: Sequence[Group], bands: Callable[[Group], dict[str, str]]
+) -> dict[str, list[execution_evidence.SiteGroup]]:
+    out: dict[str, list[execution_evidence.SiteGroup]] = {}
+    found = known()
+    for group in sorted(groups, key=lambda g: (g.component, g.layout, g.level, g.head_dim)):
+        served = bands(group)
+        row = execution_evidence.SiteGroup(
+            layout=group.layout,
+            level=group.level,
+            head_dim=group.head_dim,
+            sites=group.sites,
+            bands=served,
+        )
+        producers = {
+            name: producer.base
+            for kernels in served.values()
+            for name in kernels.split("+")
+            if name in found and (producer := found[name].producer) is not None
+        }
+        if producers:
+            row["producers"] = producers
+        out.setdefault(group.component, []).append(row)
+    return out
 
 
 def line(
@@ -1402,16 +1583,27 @@ def line(
     offered: Sequence[str],
     pin: str,
     skipped: Collection[str] = (),
+    sites: Mapping[str, Sequence[execution_evidence.SiteGroup]] | None = None,
 ) -> str:
     """The boot line, from the facts alone — so a GROUP prepare renders the same sentence from
-    its merged facts as a single one does from its own `Applied` (cr-124)."""
+    its merged facts as a single one does from its own `Applied` (cr-124). A component whose
+    sites serve by token band reads `flash-attn3 <12288, sageattention >=12288`."""
     ignored = f"; skipped {sorted(skipped)}" if skipped else ""
     if not totals:
         none = "NONE — this construction holds no backend-selectable diffusers attention site"
         return none + ignored
     chosen = ", ".join(f"{name} x{sites}" for name, sites in sorted(totals.items()))
+
+    def held(component: str, kernels: Mapping[str, int]) -> str:
+        banded = [
+            ", ".join(f"{kernel} {band}" for band, kernel in group["bands"].items())
+            for group in (sites or {}).get(component, ())
+            if len(group["bands"]) > 1
+        ]
+        return " | ".join(dict.fromkeys(banded)) if banded else "+".join(sorted(kernels))
+
     where = "; ".join(
-        f"{component}: {'+'.join(sorted(kernels))}" for component, kernels in sorted(hosts.items())
+        f"{component}: {held(component, kernels)}" for component, kernels in sorted(hosts.items())
     )
     how = f"PINNED {pin}" if pin else f"auto over {list(offered)}"
     return f"{chosen} ({how}) — {where}{ignored}"
@@ -1425,6 +1617,7 @@ def _boot(
     artifacts: Mapping[str, object],
     skipped: dict[str, str],
     fallbacks: Sequence[execution_evidence.AttentionFallback] = (),
+    sites: dict[str, list[execution_evidence.SiteGroup]] | None = None,
 ) -> execution_evidence.Boot:
     # RENDERED HERE, not by the worker: one renderer for the one line, in the module that
     # knows what it means.
@@ -1433,13 +1626,18 @@ def _boot(
         hosts=hosts,
         offered=offered,
         pin=pin,
-        line=line(kernels, hosts, offered, pin, skipped),
+        line=line(kernels, hosts, offered, pin, skipped, sites),
     )
+    if kernels:
+        boot["table"] = TABLE.identity
+    if sites:
+        boot["sites"] = sites
     if fallbacks:
         boot["fallbacks"] = list(fallbacks)
         boot["line"] += "; " + "; ".join(
             f"{row['component']}: selected {row['selected']} instead of "
-            f"{row['preferred']}: {row['reason']}"
+            f"{row['preferred']}{f' at {band}' if (band := row.get('band')) else ''}: "
+            f"{row['reason']}"
             for row in fallbacks
         )
     if artifacts:
@@ -1459,6 +1657,7 @@ def merge(documents: Mapping[str, object]) -> execution_evidence.Boot | None:
     artifacts: dict[str, object] = {}
     skipped: dict[str, str] = {}
     fallbacks: list[execution_evidence.AttentionFallback] = []
+    sites: dict[str, list[execution_evidence.SiteGroup]] = {}
     for parameter, document in documents.items():
         if not document:
             continue
@@ -1470,8 +1669,10 @@ def merge(documents: Mapping[str, object]) -> execution_evidence.Boot | None:
             ) from exc
         for component, chosen in row["hosts"].items():
             hosts[f"{parameter}/{component}"] = chosen
-        for name, sites in row["kernels"].items():
-            kernels[name] = kernels.get(name, 0) + sites
+        for component, groups in row.get("sites", {}).items():
+            sites[f"{parameter}/{component}"] = groups
+        for name, count in row["kernels"].items():
+            kernels[name] = kernels.get(name, 0) + count
         offered += [name for name in row["offered"] if name not in offered]
         if row["pin"]:
             pins.add(row["pin"])
@@ -1486,7 +1687,7 @@ def merge(documents: Mapping[str, object]) -> execution_evidence.Boot | None:
     if not kernels:
         return None
     pin = "+".join(sorted(pins))
-    return _boot(kernels, hosts, offered, pin, artifacts, skipped, fallbacks)
+    return _boot(kernels, hosts, offered, pin, artifacts, skipped, fallbacks, sites)
 
 
 def _pin_parts(pin: str) -> tuple[str, str]:
@@ -1602,6 +1803,102 @@ def _first(
     return None
 
 
+def _tail(
+    order: Sequence[str],
+    first: Ready,
+    row: arch.Row | None,
+    device: DeviceFacts | None,
+    module: object,
+    degree: int,
+    resolved: dict[str, Ready],
+    refused: dict[str, str],
+) -> tuple[Ready, ...]:
+    """The dense kernels after FIRST in its band's ORDER that a call FIRST's row refuses tries in
+    turn, SDPA after them: only ones ready here now (torch's own, or opened already), never one
+    this would start building."""
+    found, dtype, head_dim = known(), _dtype(module), _head_dim(module)
+    tail: list[Ready] = []
+    for name in order[order.index(first.name) + 1 :]:
+        candidate = found.get(name)
+        if (
+            name == _SDPA
+            or candidate is None
+            or candidate.sparse
+            or name in refused
+            or _unfit(candidate, row, module, dtype, head_dim, degree)
+        ):
+            continue
+        if name not in resolved:
+            if device is None:
+                continue
+            if candidate.artifact or candidate.import_name:
+                opened: Ready | None = kernel_ready.ready(_slot(name, device))
+                if opened is None:
+                    continue
+                resolved[name] = opened
+            else:
+                try:
+                    resolved[name] = _opened(candidate, device)
+                except AttentionRefusal:
+                    continue
+        tail.append(resolved[name])
+    return tuple(tail)
+
+
+def _site_pick(
+    orders: Sequence[Sequence[str]],
+    row: arch.Row | None,
+    device: DeviceFacts | None,
+    component: str,
+    module: object,
+    degree: int,
+    resolved: dict[str, Ready],
+    refused: dict[str, str],
+    fallbacks: list[execution_evidence.AttentionFallback],
+) -> tuple[Pick, Sequence[str]] | None:
+    """A site's selection from its ORDERS, one per token bucket (`walk`): each bucket's first
+    kernel that serves here (`_first`) and the ready kernels after it (`_tail`), adjacent equal
+    buckets merged. At most one package producer per site (it replaces the site's processor): a
+    bucket whose first is another producer takes that producer's base. Also the order after
+    the first walked Sol (`_sol_dense`), else empty."""
+    rungs: list[tuple[int, tuple[Ready, ...]]] = []
+    passed: dict[tuple[str, str, str, str], list[int]] = {}
+    producer, sol_order = "", list[str]()
+    for bucket, order in enumerate(orders):
+        held: list[execution_evidence.AttentionFallback] = []
+        names = list(order)
+        while True:
+            held.clear()
+            first = _first(names, row, device, component, module, degree, resolved, refused, held)
+            if first is None:
+                return None
+            if first.candidate.producer is None or producer in ("", first.name):
+                break
+            names.remove(first.name)
+        producer = producer or (first.name if first.candidate.producer is not None else "")
+        if _walked(first.candidate) and not sol_order:
+            sol_order = names[names.index(first.name) + 1 :]
+        chain = (first, *_tail(names, first, row, device, module, degree, resolved, refused))
+        for row_ in held:
+            key = (row_["component"], row_["preferred"], row_["selected"], row_["reason"])
+            passed.setdefault(key, []).append(bucket)
+        if rungs and [r.name for r in rungs[-1][1]] == [r.name for r in chain]:
+            rungs[-1] = (bucket, chain)
+        else:
+            rungs.append((bucket, chain))
+    edges = TABLE.tokens
+    pick = Pick(tuple((edges[b] if b < len(edges) else 0, chain) for b, chain in rungs))
+    for (component_, preferred, selected, reason), buckets in passed.items():
+        fallback = execution_evidence.AttentionFallback(
+            component=component_, preferred=preferred, selected=selected, reason=reason
+        )
+        if len(buckets) < len(orders):
+            fallback["band"] = ",".join(TABLE.band(b) for b in buckets)
+        if fallback not in fallbacks:
+            fallbacks.append(fallback)
+    return pick, sol_order
+
+
 def install(
     ready: list[Ready],
     roots: Mapping[str, object],
@@ -1618,10 +1915,10 @@ def install(
 
     A site in the pin's scope takes the pinned kernel, or refuses (`EXACT`: its walk at level
     16). Given another GPU's CHOICE (a group follower takes rank 0's), each site takes the
-    kernel that GPU serves there and Sol its dense reference, each resolved on DEVICE as a pin
-    is, or refuses. Every other site takes the first kernel of its walk on ROW (else DEVICE's)
-    at the model's `bits` for it (`walk`, `level`); a classic site keeps SDPA. Without a
-    DEVICE, sites take the READY kernels in order.
+    selection that GPU serves there and Sol its dense reference, each kernel resolved on DEVICE
+    as a pin is, or refuses. Every other site takes, per token bucket, the first kernel of its
+    walk on ROW (else DEVICE's) at the model's `bits` for it (`walk`, `level`; `_site_pick`); a
+    classic site keeps SDPA. Without a DEVICE, sites take the READY kernels in order.
     """
     scope, name = _pin_parts(pin)
     if device is not None:
@@ -1629,12 +1926,13 @@ def install(
     hosts: dict[str, dict[str, int]] = {}
     assignments: list[_Site] = []
     resolved = {entry.name: entry for entry in ready}
-    taken = {} if choice is None else {(c, path): k for c, path, k in choice.sites}
+    taken = {} if choice is None else {(c, path): spec for c, path, spec in choice.sites}
     if choice is not None:
         if device is None:
             raise AttentionRefusal("attention_kernel_unsupported", "a choice installs on a device")
         lacking: dict[str, str] = {}
-        for kernel in sorted({*taken.values(), choice.dense, choice.exact} - {""}):
+        named = {k for spec in taken.values() for _, chain in spec for k in chain}
+        for kernel in sorted({*named, choice.dense, choice.exact} - {""}):
             try:
                 resolved[kernel] = pinned(kernel, device, wait=False)[0]
             except AttentionRefusal as exc:
@@ -1649,7 +1947,12 @@ def install(
         component, path, module, processor = record
         forced = bool(name and _matches(component, scope))
         matched |= forced
-        entry: Ready | None
+        pick: Pick | None = None
+        first = "no available attention kernel"
+        if choice is None and hasattr(processor, "_attention_backend"):
+            # What the site is, for the records (`_groups`): its layout, level and head dim.
+            at = 16 if forced and name == EXACT else level(bits, component, path)
+            vars(module)["_cozy_attention_site"] = (sparse_site(module), at, _head_dim(module))
         if forced and name != EXACT:
             reason = _pin_reason(resolved.get(name), f"{name} is not open here", record, degree)
             if reason:
@@ -1657,68 +1960,71 @@ def install(
                     "attention_kernel_unsupported",
                     f"{reason}. A pinned kernel is never quietly replaced",
                 )
-            entry, order = resolved[name], [name]
+            pick = Pick.of(resolved[name])
         elif not hasattr(processor, "_attention_backend"):
             if forced:
                 reason = _unmanaged_reason(component, path, processor)
                 raise AttentionRefusal("attention_kernel_unsupported", reason)
             continue
         elif choice is not None:
-            order = [taken.get((component, path), "")]
-            if not order[0]:
+            spec = taken.get((component, path), ())
+            if not spec:
                 raise AttentionRefusal(
                     "attention_kernel_unsupported",
                     f"the choice names no kernel for {component}/{path}",
                 )
-            entry = _first(order, None, None, component, module, degree, resolved, refused, [])
+            first = spec[0][1][0]
+            if not any(_pin_reason(resolved[k], "", record, degree) for _, c in spec for k in c):
+                pick = Pick(tuple((upper, tuple(resolved[k] for k in c)) for upper, c in spec))
         else:
             at = 16 if forced else level(bits, component, path)
-            order = (
-                _walk_order(row, at, module, processor)
+            orders = (
+                [_walk_order(row, at, module, processor, b) for b in TABLE.buckets()]
                 if row is not None
-                else [entry.name for entry in ready]
+                else [[entry.name for entry in ready]]
             )
-            entry = _first(
-                order, row, device, component, module, degree, resolved, refused, fallbacks
+            chosen = _site_pick(
+                orders, row, device, component, module, degree, resolved, refused, fallbacks
             )
-        if entry is None:
-            detail = _site_refusal(
-                order[0] if choice is not None else "no available attention kernel",
-                component,
-                _dtype(module),
-                _head_dim(module),
-            )
+            if chosen is not None:
+                pick, walked = chosen
+                if walked and sol_order is None:
+                    sol_order = list(walked)
+        if pick is None:
+            detail = _site_refusal(first, component, _dtype(module), _head_dim(module))
             if degree > 1:
                 detail = AttentionRefusal(
                     detail.code,
                     f"{detail}; sequence-parallel degree {degree} requires context parallelism",
                 )
             raise detail
-        if _walked(entry.candidate) and sol_order is None:
-            sol_order = order[order.index(entry.name) + 1 :]
+        if forced and _walked(pick.served[0].candidate) and sol_order is None:
+            sol_order = []
         # Managed: a pin refuses an unmanaged processor (`_pin_reason`), the walk passes it by.
-        assignments.append((component, path, module, cast("_Managed", processor), entry))
-        hosts.setdefault(component, {})
-        hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
+        assignments.append((component, path, module, cast("_Managed", processor), pick))
+        for entry in pick.served:
+            hosts.setdefault(component, {})
+            hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
     if name and not matched:
         raise AttentionRefusal(
             "attention_kernel_unsupported", f"{pin!r} matches no attention component"
         )
-    if choice is not None and sol_order is not None:
+    sol = any(_walked(e.candidate) for *_, pick in assignments for e in pick.served)
+    if choice is not None and sol:
         if not choice.dense:
             raise AttentionRefusal("attention_kernel_absent", "the choice names no dense reference")
         exact = resolved[choice.exact] if choice.exact else None
         _bind_sol_dense((resolved[choice.dense], exact))
-    elif device is not None and sol_order is not None:
-        _bind_sol_dense(_sol_dense(sol_order, device, resolved, refused))
+    elif device is not None and sol:
+        _bind_sol_dense(_sol_dense(sol_order or [], device, resolved, refused))
     _install_sites(
         [
-            (entry, component, path, module)
-            for component, path, module, _processor, entry in assignments
+            (pick, component, path, module)
+            for component, path, module, _processor, pick in assignments
         ]
     )
-    for _component, _path, _module, processor, entry in assignments:
-        processor._attention_backend = _handle(processor, entry)
+    for _component, _path, _module, processor, pick in assignments:
+        processor._attention_backend = _handle(processor, pick)
     if skipped is not None:
         skipped.update(refused)
     artifacts = {name: entry.artifact for name, entry in resolved.items() if entry.artifact}
@@ -1726,15 +2032,25 @@ def install(
         n for n in sorted(refused) if device is not None and kernel_ready.opening(_slot(n, device))
     )
     return Applied(
-        hosts, tuple(resolved), pin, artifacts or None, refused or None, waiting, tuple(fallbacks)
+        hosts,
+        tuple(resolved),
+        pin,
+        artifacts or None,
+        refused or None,
+        waiting,
+        tuple(fallbacks),
+        _groups(roots, pin),
     )
 
 
-def _walk_order(row: arch.Row, at: int, module: object, processor: object) -> list[str]:
-    """A site's kernels at level AT: a classic site keeps SDPA, every other one walks."""
+def _walk_order(
+    row: arch.Row, at: int, module: object, processor: object, bucket: int = -1
+) -> list[str]:
+    """A site's kernels at level AT in one token BUCKET: a classic site keeps SDPA, every
+    other one walks."""
     if isinstance(processor, ClassicSdpa):
         return ["sdpa"]
-    return walk(row, at, sparse_site(module), _head_dim(module))
+    return walk(row, at, sparse_site(module), _head_dim(module), bucket)
 
 
 def _pin_reason(entry: Ready | None, why: str, record: _Record, degree: int) -> str:
@@ -1750,28 +2066,36 @@ def _pin_reason(entry: Ready | None, why: str, record: _Record, degree: int) -> 
     return _unfit(entry.candidate, None, module, _dtype(module), _head_dim(module), degree)
 
 
-def _install_sites(records: Sequence[tuple[Ready, str, str, SiteModule]]) -> None:
-    """Install metadata hooks atomically, preserving hooks owned by preparation."""
+def _install_sites(records: Sequence[tuple[Pick, str, str, SiteModule]]) -> None:
+    """Install metadata hooks atomically, preserving hooks owned by preparation: Sol's site
+    where any band serves a sparse kernel, a package producer's processor where one serves."""
     # Validate all producer topology/hooks before any metadata or processor mutation.
-    for entry, _component, _path, module in records:
-        producer = entry.candidate.producer
-        if producer is not None:
-            producer.validate(module)
+    for pick, _component, _path, module in records:
+        for entry in pick.served:
+            if entry.candidate.producer is not None:
+                entry.candidate.producer.validate(module)
     added: list[tuple[str, str, SiteModule]] = []
     processors: list[tuple[SiteModule, object]] = []
     try:
-        for entry, component, path, module in records:
-            if not entry.candidate.sparse:
+        for pick, component, path, module in records:
+            sparse = [e.candidate for e in pick.served if e.candidate.sparse]
+            if not sparse:
                 continue
             local = component.rsplit("/", 1)[-1]
             if getattr(module, "_cozy_sol_site", None) is None:
                 added.append((local, path, module))
             attention_sol.install_site(module, local, path)
-            producer = entry.candidate.producer
-            if producer is not None:
-                processors.append((module, module.processor))
-                kernel = entry.candidate.import_name
-                producers.install(module, producer, entry.candidate.backend, kernel, local, path)
+            for candidate in sparse:
+                if candidate.producer is not None:
+                    processors.append((module, module.processor))
+                    producers.install(
+                        module,
+                        candidate.producer,
+                        candidate.backend,
+                        candidate.import_name,
+                        local,
+                        path,
+                    )
     except BaseException:
         for module, processor in reversed(processors):
             module.set_processor(processor)
@@ -1786,11 +2110,46 @@ def _names() -> dict[str, str]:
     return {candidate.backend: candidate.name for candidate in known().values()}
 
 
-def _served(processor: object, names: Mapping[str, str]) -> str:
-    """The kernel a site's processor dispatches to now."""
+def _backend(processor: object) -> str:
+    """The backend a site's processor dispatches to now: a kernel's or a ladder's."""
     backend = getattr(processor, "_attention_backend", None)
-    value = getattr(backend, "value", str(backend))
-    return names.get(value, value)
+    return str(getattr(backend, "value", backend))
+
+
+def _spec(backend: str, names: Mapping[str, str]) -> Spec:
+    """What a site dispatching to BACKEND serves, by name (`Pick.spec`)."""
+    return _LADDERS.get(backend) or ((0, (names.get(backend, backend),)),)
+
+
+def _served(spec: Spec) -> tuple[str, ...]:
+    """The kernel each band of SPEC serves, once each."""
+    return tuple(dict.fromkeys(chain[0] for _, chain in spec))
+
+
+def spelled(spec: Spec) -> str:
+    """SPEC in a line: `flash-attn3 <12288, sageattention`, a refused call's next ones after
+    `>`; one kernel alone."""
+    return ", ".join(
+        f"{'>'.join(chain)}{f' <{upper}' if upper else ''}" for upper, chain in spec
+    )
+
+
+def _groups(roots: Mapping[str, object], pin: str = "") -> tuple[Group, ...]:
+    """Each component's sites by what they are (layout, level, head dim) and the backend they
+    dispatch to, counted. A site `install` never selected (a follower's) is not here; a request
+    at 16 bits (`EXACT`) is level 16 where it reaches."""
+    scope, name = _pin_parts(pin)
+    counted: dict[Group, int] = {}
+    for component, _path, module, processor in _site_records(roots):
+        facts = vars(module).get("_cozy_attention_site")
+        if facts is None:
+            continue
+        sparse, at, head_dim = facts
+        if name == EXACT and _matches(component, scope):
+            at = 16
+        group = Group(component, "sparse" if sparse else "dense", at, head_dim, _backend(processor))
+        counted[group] = counted.get(group, 0) + 1
+    return tuple(replace(group, sites=sites) for group, sites in counted.items())
 
 
 def observed(roots: Mapping[str, object], pin: str = "") -> Applied:
@@ -1798,28 +2157,30 @@ def observed(roots: Mapping[str, object], pin: str = "") -> Applied:
     names = _names()
     hosts: dict[str, dict[str, int]] = {}
     for component, _module, processor in _sites(roots):
-        name = _served(processor, names)
-        hosts.setdefault(component, {})
-        hosts[component][name] = hosts[component].get(name, 0) + 1
+        for name in _served(_spec(_backend(processor), names)):
+            hosts.setdefault(component, {})
+            hosts[component][name] = hosts[component].get(name, 0) + 1
     served = {name for kernels in hosts.values() for name in kernels}
     artifacts = {
         ready.name: ready.artifact
         for ready in cast("list[Ready]", kernel_ready.served(_SLOTS))
         if ready.name in served and ready.artifact
     }
-    return Applied(hosts, (), pin, artifacts=artifacts or None)
+    return Applied(hosts, (), pin, artifacts=artifacts or None, groups=_groups(roots, pin))
 
 
 def chosen(roots: Mapping[str, object]) -> Choice:
-    """What this GPU serves now: every site's kernel, and Sol's dense reference where Sol
+    """What this GPU serves now: every site's selection, and Sol's dense reference where Sol
     serves (`attention_sol.binding`)."""
     names = _names()
     sites = tuple(
-        (component, path, _served(processor, names))
+        (component, path, _spec(_backend(processor), names))
         for component, path, _module, processor in _site_records(roots)
     )
     found = known()
-    if not any(kernel in found and _walked(found[kernel]) for *_, kernel in sites):
+    if not any(
+        kernel in found and _walked(found[kernel]) for *_, spec in sites for kernel in _served(spec)
+    ):
         return Choice(sites=sites)
     dense, _, exact = attention_sol.binding()[1].partition(_EXACT_AT)
     return Choice(sites=sites, dense=dense, exact=exact)
@@ -1832,14 +2193,15 @@ def difference(ours: Choice, theirs: Choice) -> str:
             f"Sol's dense reference {ours.dense or 'none'} (exact {ours.exact or 'itself'}) "
             f"against {theirs.dense or 'none'} (exact {theirs.exact or 'itself'})"
         )
-    held = {(component, path): kernel for component, path, kernel in theirs.sites}
-    for component, path, kernel in ours.sites:
+    held = {(component, path): spec for component, path, spec in theirs.sites}
+    for component, path, spec in ours.sites:
         other = held.pop((component, path), None)
-        if other != kernel:
-            return f"{component}/{path}: {kernel} against {other or 'none'}"
+        if other != spec:
+            theirs_ = spelled(other) if other else "none"
+            return f"{component}/{path}: {spelled(spec)} against {theirs_}"
     if held:
-        (component, path), kernel = sorted(held.items())[0]
-        return f"{component}/{path}: none against {kernel}"
+        (component, path), spec = sorted(held.items())[0]
+        return f"{component}/{path}: none against {spelled(spec)}"
     return ""
 
 
@@ -1863,8 +2225,9 @@ def snapshot(roots: Mapping[str, object]) -> Snapshot:
     held = [processor for _, _, processor in _sites(roots)]
     found = known()
     sol = any(
-        (kernel := _served(processor, names)) in found and _walked(found[kernel])
+        kernel in found and _walked(found[kernel])
         for processor in held
+        for kernel in _served(_spec(_backend(processor), names))
     )
     return Snapshot(
         tuple((processor, processor._attention_backend) for processor in held),
@@ -1881,11 +2244,14 @@ def override(
     changed = swap.sites if swap is not None else ()
     temporary_sites = [
         (component.rsplit("/", 1)[-1], path, module)
-        for component, path, module, _, entry in changed
-        if entry.candidate.sparse and getattr(module, "_cozy_sol_site", None) is None
+        for component, path, module, _, pick in changed
+        if any(e.candidate.sparse for e in pick.served)
+        and getattr(module, "_cozy_sol_site", None) is None
     ]
     temporary_processors = [
-        (module, module.processor) for _, _, module, _, entry in changed if entry.candidate.producer
+        (module, module.processor)
+        for _, _, module, _, pick in changed
+        if any(e.candidate.producer for e in pick.served)
     ]
     dense = attention_sol.binding()
     try:
@@ -1945,7 +2311,7 @@ def _baked_in(roots: Mapping[str, object]) -> str:
 class Swap:
     """A validated per-request attention change, applied atomically."""
 
-    #: (component, path, module, processor, kernel) per site it changes
+    #: (component, path, module, processor, selection) per site it changes
     sites: tuple[_Site, ...]
     pin: str = ""
     #: sites in scope that keep their prepared kernel, and why the pin could not run there
@@ -1954,15 +2320,16 @@ class Swap:
     dense: tuple[Ready, Ready | None] | None = None
 
     def apply(self) -> Applied:
-        _install_sites([(entry, c, path, module) for c, path, module, _, entry in self.sites])
+        _install_sites([(pick, c, path, module) for c, path, module, _, pick in self.sites])
         if self.dense is not None:
             _bind_sol_dense(self.dense)
         hosts: dict[str, dict[str, int]] = {}
-        for component, _, _, processor, entry in self.sites:
-            processor._attention_backend = _handle(processor, entry)
-            hosts.setdefault(component, {})
-            hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
-        served = {entry.name: entry for *_, entry in self.sites}
+        for component, _, _, processor, pick in self.sites:
+            processor._attention_backend = _handle(processor, pick)
+            for entry in pick.served:
+                hosts.setdefault(component, {})
+                hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
+        served = {e.name: e for *_, pick in self.sites for e in pick.kernels}
         artifacts = {name: e.artifact for name, e in served.items() if e.artifact}
         return Applied(hosts, tuple(served), self.pin, artifacts or None, fallbacks=self.fallbacks)
 
@@ -2051,7 +2418,7 @@ def plan(device: DeviceFacts, roots: Mapping[str, object], name: str, degree: in
                 fallbacks.append(row)
             continue
         # Managed: `_pin_reason` refuses an unmanaged processor.
-        sites.append((component, path, module, cast("_Managed", processor), entry))
+        sites.append((component, path, module, cast("_Managed", processor), Pick.of(entry)))
     return Swap(tuple(sites), name, tuple(fallbacks), dense)
 
 
@@ -2061,8 +2428,8 @@ def exact(
     pin: str = EXACT,
     degree: int = 1,
 ) -> Swap:
-    """A request at 16 bits: each site its walk at level 16; a sparse site keeps its sparse
-    kernel, whose dense rows go exact too."""
+    """A request at 16 bits: each site its walk at level 16, per token bucket; a sparse site
+    keeps its sparse kernel, whose dense rows go exact too."""
     row = device_row(device)
     resolved: dict[str, Ready] = {}
     refused: dict[str, str] = {}
@@ -2072,13 +2439,16 @@ def exact(
     for component, path, module, processor in records:
         if not hasattr(processor, "_attention_backend"):
             continue
-        order = _walk_order(row, 16, module, processor)
-        entry = _first(order, row, device, component, module, degree, resolved, refused, fallbacks)
-        if entry is not None:
-            if _walked(entry.candidate) and sol is None:
-                sol = order[order.index(entry.name) + 1 :]
+        orders = [_walk_order(row, 16, module, processor, b) for b in TABLE.buckets()]
+        chosen = _site_pick(
+            orders, row, device, component, module, degree, resolved, refused, fallbacks
+        )
+        if chosen is not None:
+            pick, walked = chosen
+            if any(_walked(e.candidate) for e in pick.served) and sol is None:
+                sol = list(walked)
             # Managed: the loop passes an unmanaged processor by, above.
-            sites.append((component, path, module, cast("_Managed", processor), entry))
+            sites.append((component, path, module, cast("_Managed", processor), pick))
     dense = None if sol is None else _sol_dense(sol, device, resolved, refused)
     return Swap(tuple(sites), pin, tuple(fallbacks), dense)
 
