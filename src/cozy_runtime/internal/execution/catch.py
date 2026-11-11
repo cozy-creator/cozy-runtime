@@ -363,7 +363,7 @@ def passing(module: nn.Module, args: Args, kwargs: Kwargs) -> Iterator[None]:
     with phase.observing(
         device,
         "eager",
-        request.working_phases,  # type: ignore[arg-type]  # residency's rows: WorkingPhase on the boundary branch
+        request.working_phases,
         key=key,
     ) as observation:
         yield
