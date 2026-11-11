@@ -3,8 +3,8 @@
 The Runtime's exercisers of its own code: built-in calls of the Runtime's own App (`derive.operations`), which every
 environment holds, so the release gate measures and checks the Runtime from inside it (a package can't import its
 internals). A gate script calls them with `call(bench.attention_speed, ...)`; each returns one JSON document.
-`internal/bench/` says what each does: the attention bench (xs-171), the kernels suite and the varena and execution
-suites' Runtime cells (xs-174)."""
+`internal/bench/` says what each does: the attention bench (xs-171), the GEMM bench (xs-177), the kernels suite and the
+varena and execution suites' Runtime cells (xs-174)."""
 
 from __future__ import annotations
 
@@ -72,6 +72,25 @@ def attention_quality(
 
     with tel.stage("measure"):
         return _run(lambda: attention.quality(kernel, seed, ctx, corpus))
+
+
+def gemm_speed(ctx: Context, *, lanes: str = "", shapes: str = "", seed: int = 177) -> Measured:
+    """Every GEMM candidate of each lane (`lanes`, comma-separated; empty is every one) at our packages' shapes
+    (`shapes`: shape ids or model names, comma-separated; empty is every one), interleaved, three rounds, beside the
+    pick the Runtime's rule makes (xs-177)."""
+    from cozy_runtime.internal.bench import gemm
+
+    chosen = [n for n in lanes.split(",") if n]
+    wanted = [n for n in shapes.split(",") if n]
+    return _run(lambda: gemm.speed(chosen, wanted, seed, ctx))
+
+
+def gemm_tiles(ctx: Context, *, seed: int = 177) -> Measured:
+    """Two of the Runtime's Triton kernels (nvfp4's weight decode and GEMV) over the tile settings that keep every output
+    bit, at our shapes: whether one card of a class wants another tile than its sibling (xs-177)."""
+    from cozy_runtime.internal.bench import gemm
+
+    return _run(lambda: gemm.tiles(seed, ctx))
 
 
 def kernels_inventory(ctx: Context) -> Measured:

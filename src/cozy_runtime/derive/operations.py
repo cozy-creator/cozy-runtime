@@ -16,6 +16,8 @@ from cozy_runtime.bench import (
     attention_quality,
     attention_speed,
     child_wire,
+    gemm_speed,
+    gemm_tiles,
     kernel_check,
     kernel_ready,
     kernels_inventory,
@@ -292,11 +294,13 @@ app.entrypoint(
     weights=(WeightsOutput("model", max_new_bytes=MAX_QUANTIZED_BYTES),),
     accelerator=False,
 )
-# The release gate's exercisers (`cozy_runtime.bench`, unstable): the attention bench (xs-171), the kernels suite and the
-# varena and execution suites' Runtime cells (xs-174), the Runtime's own code from inside the Runtime.
+# The release gate's exercisers (`cozy_runtime.bench`, unstable): the attention bench (xs-171), the GEMM bench (xs-177),
+# the kernels suite and the varena and execution suites' Runtime cells (xs-174), the Runtime's own code from inside it.
 app.entrypoint(attention_inventory, accelerator=True)
 app.entrypoint(attention_speed, accelerator=True)
 app.entrypoint(attention_quality, accelerator=True)
+app.entrypoint(gemm_speed, accelerator=True)
+app.entrypoint(gemm_tiles, accelerator=True)
 app.entrypoint(kernels_inventory, accelerator=True)
 app.entrypoint(kernel_check, accelerator=True)
 app.entrypoint(kernel_ready, accelerator=False)
