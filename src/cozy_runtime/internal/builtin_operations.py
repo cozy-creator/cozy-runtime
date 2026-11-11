@@ -6,7 +6,7 @@ from __future__ import annotations
 from cozy_runtime.author._errors import ConformanceError
 
 #: Each module's operations: quantize, and the release gate's exercisers (`cozy_runtime.bench`, unstable): the attention
-#: bench (xs-171), the kernels suite and the execution suite's Runtime cells (xs-174).
+#: bench (xs-171), the kernels suite and the varena and execution suites' Runtime cells (xs-174).
 EXPORTS = {
     "cozy_runtime.derive.operations": ("quantize",),
     "cozy_runtime.bench": (
@@ -17,6 +17,8 @@ EXPORTS = {
         "kernel_check",
         "kernel_ready",
         "child_wire",
+        "varena_core",
+        "offload_in_executor",
         "overlay_replay",
         "lora_overlay_refill",
     ),
