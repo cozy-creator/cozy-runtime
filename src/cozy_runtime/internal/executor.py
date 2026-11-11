@@ -1256,7 +1256,6 @@ class Executor:
                 "allocator boundary; package execution is refused",
             }
         numerical_environment.apply(torch, self.device_kind)
-        contract.pin(torch)
         try:
             accel.bind_allocator(torch, self.device_kind)
             if self.device_kind == "cuda":
@@ -1267,6 +1266,7 @@ class Executor:
             if self.device_kind == "cuda":
                 index = self.rank if self.world > 1 else 0
                 torch.cuda.set_device(index)
+                numerical_environment.apply_device(torch, index)
                 owner.execution_stream = accel.owned_stream(torch, index)
                 # This first command entered before a stream existed. Select it now, before
                 # Memory, library warm-up or any package allocation/launch can run.
@@ -1275,6 +1275,7 @@ class Executor:
                     torch.cuda.stream, owner.execution_stream
                 )
                 _activity.WORKER_CONTEXT = lambda: torch.cuda.stream(torch.cuda.current_stream())
+            contract.pin(torch)
             self._open_memory(torch)
         except ResidencyError as exc:
             return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}

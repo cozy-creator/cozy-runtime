@@ -17,6 +17,7 @@ from types import ModuleType
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author import _model
+from cozy_runtime.internal import arch
 from cozy_runtime.internal.hostfacts import HostFacts
 
 
@@ -60,6 +61,7 @@ def fingerprint(
             "architecture": device.gpu_sm,
         },
         "settings": {
+            "blas": blas_library(device.gpu_sm) if device.backend == "cuda" else "",
             "threads": threads,
             "environment": {
                 key: value for key, value in inherited.items() if key in _NUMERICAL_SETTINGS
@@ -90,6 +92,22 @@ def apply(torch: ModuleType, kind: str) -> None:
     native = getattr(torch, "_native", None)
     if kind == "cuda" and native is not None:
         native.registry.deregister_op_overrides(disable_dsl_names=list(JIT_DSLS))
+
+
+def blas_library(sm: int) -> str:
+    """The BLAS torch's 16-bit GEMMs take on a card: cuBLASLt on Hopper, torch's own choice elsewhere ("").
+    xs-177, the GEMM bench at our packages' shapes: on an H100 cuBLASLt is 4-9% faster on H3's linears and within 2%
+    on the rest (release gate 43065023645); on an RTX 5090 it is 6-18% slower on H3's and Klein's (43054702894), and
+    on Ada within a few percent either way (43063687592, 43066026392)."""
+    return "cublaslt" if sm and arch.row(sm).family == arch.WGMMA else ""
+
+
+def apply_device(torch: ModuleType, index: int) -> None:
+    """The policy's part that depends on the card, set once its device is current and before anything runs on it."""
+    major, minor = torch.cuda.get_device_capability(index)
+    library = blas_library(major * 10 + minor)
+    if library:
+        torch.backends.cuda.preferred_blas_library(library)
 
 
 class _Determinism:

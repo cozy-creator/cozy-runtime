@@ -309,6 +309,11 @@ _FLAGS: tuple[
         for kind in ("flash", "mem_efficient", "math", "cudnn")
     ),
     (
+        "torch.backends.cuda.preferred_blas_library",
+        lambda t: t.backends.cuda.preferred_blas_library(),
+        lambda t, v: t.backends.cuda.preferred_blas_library(v),
+    ),
+    (
         "torch.get_float32_matmul_precision",
         lambda t: t.get_float32_matmul_precision(),
         lambda t, v: _unguarded(t.set_float32_matmul_precision)(v),
