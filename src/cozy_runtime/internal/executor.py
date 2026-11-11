@@ -155,6 +155,7 @@ from cozy_runtime.internal import (
     accel,
     arch,
     attention,
+    attention_capture,
     attention_sol,
     attention_ulysses,
     builtin_operations,
@@ -3443,7 +3444,18 @@ class Executor:
                 prepared = target.prepared.pop(command.request_id, None)
             if prepared is None:  # trimmed by a prepare meanwhile
                 return target._unadmitted(command) or {}
-            reply = target.invoke(command, prepared, slot)
+            # Dev-only (`cozy run --attention-capture`): TensorFS carries it from 0.25.
+            capture = str(getattr(command, "attention_capture", "") or "")
+            sites: Sequence[tuple[str, str, object]] = ()
+            if capture:
+                try:
+                    attention_capture.parse(capture)
+                except ValueError as exc:
+                    return {"ok": False, "code": "attention_capture_invalid", "detail": str(exc)}
+                roots = target._attention_roots()
+                sites = [(c, path, m) for c, path, m, _ in attention._site_records(roots)]
+            with attention_capture.capturing(capture, command.request_id, sites):
+                reply = target.invoke(command, prepared, slot)
         self.attempts += 1
         self.poisoned = self.poisoned or target.poisoned
         reply["poisoned"] = self.poisoned
