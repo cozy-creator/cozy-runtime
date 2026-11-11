@@ -11,6 +11,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
+from cozy_runtime.bench import attention_inventory, attention_quality, attention_speed
 from cozy_runtime.author import (
     MAX_WEIGHTS_NEW_BYTES,
     App,
@@ -278,6 +279,10 @@ app.entrypoint(
     weights=(WeightsOutput("model", max_new_bytes=MAX_QUANTIZED_BYTES),),
     accelerator=False,
 )
+# The attention bench (xs-171): the release gate's measurements of the Runtime's own kernels.
+app.entrypoint(attention_inventory, accelerator=True)
+app.entrypoint(attention_speed, accelerator=True)
+app.entrypoint(attention_quality, accelerator=True)
 
 
 def calibrate(
