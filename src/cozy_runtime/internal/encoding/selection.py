@@ -70,6 +70,8 @@ class DeviceFacts:
     rather than in place of it. This is the field that used to be called `driver`."""
     os_arch: str = ""
     """`Linux/x86_64` or `Linux/aarch64`."""
+    half_accumulate: bool = False
+    """Half-rate FP32-accumulating MMA, by NVML's brand (`arch.Row.half_accumulate`)."""
 
     @property
     def predicate(self) -> str:
@@ -143,6 +145,10 @@ def measure_device(torch: ModuleType, index: int = 0, kind: str = "") -> DeviceF
             os_arch=os_arch,
         )
     driver, power, mig = accel.device_settings(index)
+    try:  # NVML by UUID: `index` is torch's ordinal under the seal, not NVML's
+        uuid = f"GPU-{torch.cuda.get_device_properties(index).uuid}"
+    except Exception:
+        uuid = ""
     return DeviceFacts(
         kind=kind,
         name=str(identity["name"]),
@@ -156,6 +162,7 @@ def measure_device(torch: ModuleType, index: int = 0, kind: str = "") -> DeviceF
         index=int(index),
         cuda_runtime=str(identity["cuda_runtime"]),
         os_arch=os_arch,
+        half_accumulate=bool(uuid) and accel.half_accumulate(uuid),
     )
 
 

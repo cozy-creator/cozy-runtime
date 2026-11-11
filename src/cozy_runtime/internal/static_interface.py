@@ -173,8 +173,9 @@ _VOCAB_MODULES = {
     "enum": "enum",
     **dict.fromkeys(author.MODULES, "author"),
 }
-#: Runtime modules a package builds its surface from: followed for types, models and constants.
-_TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.vlm")
+#: Runtime modules a package builds its surface from: followed for types, models and constants. The release gate's
+#: exercisers (`cozy_runtime.bench`) take models defined in `internal/bench`, which packages still can't import.
+_TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.vlm", "cozy_runtime.bench", "cozy_runtime.internal.bench")
 
 
 _ARITHMETIC: dict[type[ast.operator], Callable[[float, float], object]] = {

@@ -341,6 +341,7 @@ class _Recording:
         self.inputs, self.outputs, self.layout = inputs, outputs, layout
         self.served = [(b, i) for b, impls in served.items() for i in impls]
         self.refused = dict(served.refused)
+        self.bands = [(site, band, b) for (site, band), held in served.bands.items() for b in held]
         #: bytes the last replay copied in and out
         self.copied = 0
         self.done: Event | None = None
@@ -390,8 +391,10 @@ class _Recording:
                 vt.replay(cast("CUDAGraph", self.graph), stream=stream)
             for backend, implementation in self.served:
                 attention_ulysses.record(backend, implementation)
-            for why, calls in self.refused.items():
-                attention_ulysses.refused(why, calls)
+            for (why, took), calls in self.refused.items():
+                attention_ulysses.refused(why, calls, took)
+            for site, band, backend in self.bands:
+                attention_ulysses.banded(site, band, backend)
             source = torch.utils._pytree.tree_leaves(self.outputs)
             for dst, src in zip(torch.utils._pytree.tree_leaves(out), source, strict=True):
                 if isinstance(src, torch.Tensor):

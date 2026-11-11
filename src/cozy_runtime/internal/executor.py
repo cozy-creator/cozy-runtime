@@ -155,6 +155,7 @@ from cozy_runtime.internal import (
     accel,
     arch,
     attention,
+    attention_capture,
     attention_sol,
     attention_ulysses,
     builtin_operations,
@@ -1146,6 +1147,8 @@ class Executor:
         self._installs: list[_Install] = []
         #: Device facts for this prepared generation, reused for per-request pin checks.
         self.device_facts: DeviceFacts | None = None
+        #: The hardware class attention selected for (`arch.klass`): the group's, in a group.
+        self.attention_class = ""
         #: a follower's hold of rank 0's attention selection for the current attempt
         self._attention_hold = contextlib.ExitStack()
         self._producer_hold: tuple[str, dict[str, object]] | None = None
@@ -1329,7 +1332,7 @@ class Executor:
         end_us: int,
         impl: str = "",
         segments: Sequence[Mapping[str, object]] = (),
-        refused: Mapping[str, int] | None = None,
+        seen: attention_ulysses.Seen | None = None,
     ) -> Reply:
         """The attempt's execution record: degree, every GPU, and the setup it ran on."""
         gpus = [
@@ -1341,9 +1344,11 @@ class Executor:
                     pin,
                     execution_evidence.observed(choices.hosts) if choices else "",
                     impl,
-                    attention.evidence(choices.totals() if choices else (), refused),
+                    attention.evidence(seen),
                     segments,
                     choices.fallbacks if choices else (),
+                    self._attention_class(),
+                    attention.served_sites(choices, seen),
                 ),
             )
         ]
@@ -1681,7 +1686,9 @@ class Executor:
                 execution_evidence.attention(
                     observed=execution_evidence.observed(held.hosts),
                     impl=attention.implementations(served),
-                    kernels=attention.evidence(held.totals(), served.refused),
+                    kernels=attention.evidence(served),
+                    klass=self._attention_class(),
+                    sites=attention.served_sites(held, served),
                 ),
             ),
             memory=msgspec.to_builtins(rows[0]) if rows else None,
@@ -2882,19 +2889,27 @@ class Executor:
             stage("execution_plan")
             # EACH SITE'S KERNEL FROM THE GROUP'S FAMILY CELL AT THE MODEL'S ATTENTION LEVEL,
             # PINNED POST-FILL (cr-124), before any warm step (`attention.select`).
-            sms = [accel.device_capability(entry) for entry in _sealed_entries()]
+            entries = _sealed_entries()
+            sms = [accel.device_capability(entry) for entry in entries]
+            group_row = (
+                arch.common(
+                    replace(arch.row(sm), half_accumulate=accel.half_accumulate(entry))
+                    for sm, entry in zip(sms, entries, strict=True)
+                )
+                if self.world > 1 and sms and all(sms)
+                else None
+            )
             self._reselect = functools.partial(
                 attention.select,
                 device_facts,
                 roots,
                 degree=self.world,
                 bits=type(model).__attention_bits__,
-                row=arch.common(map(arch.row, sms))
-                if self.world > 1 and sms and all(sms)
-                else None,
+                row=group_row,
             )
             applied = self._reselect()
             self.device_facts = device_facts
+            self.attention_class = arch.klass(group_row or attention.device_row(device_facts))
             stage("attention_pin")
         except (attention.AttentionRefusal, _PlanRefusal) as exc:
             backend.poison(())
@@ -3430,7 +3445,18 @@ class Executor:
                 prepared = target.prepared.pop(command.request_id, None)
             if prepared is None:  # trimmed by a prepare meanwhile
                 return target._unadmitted(command) or {}
-            reply = target.invoke(command, prepared, slot)
+            # Dev-only (`cozy run --attention-capture`): TensorFS carries it from 0.25.
+            capture = str(getattr(command, "attention_capture", "") or "")
+            sites: Sequence[tuple[str, str, object]] = ()
+            if capture:
+                try:
+                    attention_capture.parse(capture)
+                except ValueError as exc:
+                    return {"ok": False, "code": "attention_capture_invalid", "detail": str(exc)}
+                roots = target._attention_roots()
+                sites = [(c, path, m) for c, path, m, _ in attention._site_records(roots)]
+            with attention_capture.capturing(capture, command.request_id, sites):
+                reply = target.invoke(command, prepared, slot)
         self.attempts += 1
         self.poisoned = self.poisoned or target.poisoned
         reply["poisoned"] = self.poisoned
@@ -3959,7 +3985,7 @@ class Executor:
                     released_us,
                     attention.implementations(served_impls),
                     segments if len(segments) > 1 else (),
-                    served_impls.refused,
+                    served_impls,
                 ),
                 "safeguards": safeguards,
                 # When this reply was built, and (`_send_reply`) when it went on the seam: a
@@ -4114,6 +4140,11 @@ class Executor:
             return attention.reaches(self._attention_roots(), pin)
         except attention.AttentionRefusal:
             return True  # a malformed pin refuses where it is planned
+
+    def _attention_class(self) -> str:
+        """The hardware class this process's constructions selected attention for."""
+        found = (e.attention_class for e in self.model_executors or [self] if e.attention_class)
+        return next(found, "")
 
     def _attention_device(self, pin: str) -> DeviceFacts:
         device = next(

@@ -1,6 +1,6 @@
 name: build
-# The PR check (tracker/design/ci-v2.md §1): errors-only lint, every source compiles, the package imports on CPU, and
-# the type check (scripts/typecheck.sh: mypy --strict).
+# The PR check (tracker/design/ci-v2.md §1): errors-only lint, every source compiles, the package imports on CPU, the
+# attention table's check, and the type check (scripts/typecheck.sh: mypy --strict).
 # Required for merges into master and rc/*: it runs on the merge queue's group (merge_group), on the final
 # PR + branch state; on a pull request it is skipped, which lets the PR be queued. A docs-only group passes
 # without building.
@@ -50,6 +50,10 @@ jobs:
         run: uv run --locked python -m compileall -q src
       - if: steps.scope.outputs.run == 'true'
         run: uv run --locked python -c "import cozy_runtime"
+      # The attention table (xs-171): it regenerates byte for byte from measurements/, every kernel it lists is the build
+      # that was measured, and every kernel a class runs was measured (scripts/attention_table.py check).
+      - if: steps.scope.outputs.run == 'true'
+        run: uv run --locked python scripts/attention_table.py check
       # The type check (mypy --strict): new errors fail, .mypy-baseline.txt holds the known ones.
       - if: steps.scope.outputs.run == 'true'
         uses: actions/cache@v5
