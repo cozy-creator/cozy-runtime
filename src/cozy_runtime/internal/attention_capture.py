@@ -107,9 +107,9 @@ class _Capture:
             "causal": bool(options["is_causal"]),
             "scale": options["scale"],
         }
-        progress = STEP_NOW.get()
-        if progress is not None:  # the Runtime's count: a model may declare one layout per phase
-            facts["stage"], facts["step"] = progress
+        # The Runtime's count (a model may declare one layout per phase): steps finished under the
+        # latest `ctx.progress`, 0 before the first one reports.
+        facts["stage"], facts["step"] = STEP_NOW.get() or ("", 0)
         held = self.sites.get(site)
         if held is not None:
             module, facts["level"] = held
