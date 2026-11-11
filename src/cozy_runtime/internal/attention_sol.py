@@ -846,11 +846,13 @@ def _attention(
     dense: DenseRows = _dense,
     prefix_dense: DenseRows | None = None,
     exact: DenseRows | None = None,
+    fp8: bool = False,
 ) -> Tensor:
     """Shared input and model-policy boundary for the opt-in sparse implementations. What a
     sparse kernel admits (one BF16 document, head dimension 128, equal Q/K/V, no mask or
     causality) is its row's (`attention.Candidate`), asserted before this runs. A row that
-    declares its dense kernels gives `exact` too: the BF16 kernel its model's exact paths take."""
+    declares its dense kernels gives `exact` too: the BF16 kernel its model's exact paths take.
+    `fp8`: FA4's exact tiles in e4m3 (`sol-attn-fa4-fp8`), else BF16."""
     import torch
 
     if torch.compiler.is_compiling():
@@ -885,6 +887,7 @@ def _attention(
         dense=dense,
         prefix_dense=prefix_dense,
         exact=exact,
+        fp8=fp8,
     )
 
 
@@ -908,6 +911,41 @@ def backend(device: Device | int) -> str:
 SOL = Local(sol_attention, lambda query, *_: backend(query.device))
 
 
+def sol_attention_fp8(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    *,
+    dense: DenseRows,
+    prefix_dense: DenseRows,
+    exact: DenseRows | None = None,
+    attn_mask: Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> Tensor:
+    """`sol_attention` on FA4's route with e4m3 exact tiles, its row's declared dense rows
+    (`attention.Candidate.dense`) for the dense ones."""
+    return _attention(
+        query,
+        key,
+        value,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
+        dense=dense,
+        prefix_dense=prefix_dense,
+        exact=exact,
+        fp8=True,
+    )
+
+
+SOL_FP8 = Local(sol_attention_fp8, lambda query, *_: f"{backend(query.device)}(e4m3 tiles)")
+
+
 def _execute(
     query: Tensor,
     key: Tensor,
@@ -920,12 +958,14 @@ def _execute(
     dense: DenseRows = _dense,
     prefix_dense: DenseRows | None = None,
     exact: DenseRows | None = None,
+    fp8: bool = False,
 ) -> Tensor:
     """Apply the model's explicit policy after hardware/operand validation. An exact path's
     dense rows (its dense steps, its protected prefix, a dense path) take the exact kernel on
     every route: the walked reference's (`_exact`), or the one a declaring row gives; on a
-    declaring row's quantizing sparse kernel, its sparse steps run dense on it too. A layer whose
-    key gain has outlier channels (`outlier_keys`) is an exact path too."""
+    declaring row's quantizing sparse kernel, its sparse steps run dense on it too, and FA4's
+    exact tiles stay BF16. A layer whose key gain has outlier channels (`outlier_keys`) is an
+    exact path too."""
     import torch
 
     def on(paths: tuple[str, ...]) -> bool:
@@ -937,6 +977,7 @@ def _execute(
         if said is not None and "exact:" + site.path not in said:
             said["exact:" + site.path] = "exact"
             _kernel_row({"source": "exact", "site": site.path})  # the receipt names each exact site
+        fp8 = False
         if dense is _dense:
             dense = _exact
         elif exact is not None:
@@ -977,7 +1018,7 @@ def _execute(
         live_output = dense(query=q, key=k, value=v, scale=scale)
         _count(instead)
     elif fa4:
-        # The exact tiles take the dense rows' precision; the model's exact paths stay BF16.
+        # The exact tiles take the kernel's precision (`fp8`); the model's exact paths stay BF16.
         # The protected prefix's query tiles attend every key inside the same call.
         from cozy_runtime.internal import attention_sol_fa4
 
@@ -988,7 +1029,7 @@ def _execute(
             scale,
             layout.protected_prefix,
             layout.tau,
-            fp8=_EXACT is not None and dense is _dense,
+            fp8=fp8,
         )
         _validate_result(live_output, q)
         _count("sparse")

@@ -56,14 +56,16 @@ def cards(devices: str) -> dict[int, str]:
 
 def boot(row: arch.Row) -> list[attention.Candidate]:
     """What a card builds ahead of any request: the first kernel the row runs at each level of
-    its cells, dense and sparse, and the dense kernels those compute with. Every installed
-    package's declared levels are among them; a later kernel builds when a site reaches it."""
+    its cells, dense and sparse, and the dense kernels those compute with, exact rows included.
+    Every installed package's declared levels are among them; a later kernel builds when a site
+    reaches it."""
     found: list[attention.Candidate] = []
     for cells in (attention.DENSE, attention.SPARSE):
         for names in cells.get(row.family, {}).values():
             for candidate in (attention.BY_NAME[n] for n in names):
                 if not attention._off_row(candidate, row):
-                    found += [candidate, *(attention.BY_NAME[n] for n in candidate.dense)]
+                    beside = dict.fromkeys((*candidate.dense, candidate.exact_rows))
+                    found += [candidate, *(attention.BY_NAME[n] for n in beside if n)]
                     break
     return found
 
