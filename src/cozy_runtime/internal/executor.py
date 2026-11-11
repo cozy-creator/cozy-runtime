@@ -1145,6 +1145,8 @@ class Executor:
         self._installs: list[_Install] = []
         #: Device facts for this prepared generation, reused for per-request pin checks.
         self.device_facts: DeviceFacts | None = None
+        #: The hardware class attention selected for (`arch.klass`): the group's, in a group.
+        self.attention_class = ""
         #: a follower's hold of rank 0's attention selection for the current attempt
         self._attention_hold = contextlib.ExitStack()
         self._producer_hold: tuple[str, dict[str, object]] | None = None
@@ -1343,6 +1345,7 @@ class Executor:
                     attention.evidence(choices.totals() if choices else (), refused),
                     segments,
                     choices.fallbacks if choices else (),
+                    self._attention_class(),
                 ),
             )
         ]
@@ -1681,6 +1684,7 @@ class Executor:
                     observed=execution_evidence.observed(held.hosts),
                     impl=attention.implementations(served),
                     kernels=attention.evidence(held.totals(), served.refused),
+                    klass=self._attention_class(),
                 ),
             ),
             memory=msgspec.to_builtins(rows[0]) if rows else None,
@@ -2881,19 +2885,27 @@ class Executor:
             stage("execution_plan")
             # EACH SITE'S KERNEL FROM THE GROUP'S FAMILY CELL AT THE MODEL'S ATTENTION LEVEL,
             # PINNED POST-FILL (cr-124), before any warm step (`attention.select`).
-            sms = [accel.device_capability(entry) for entry in _sealed_entries()]
+            entries = _sealed_entries()
+            sms = [accel.device_capability(entry) for entry in entries]
+            group_row = (
+                arch.common(
+                    replace(arch.row(sm), half_accumulate=accel.half_accumulate(entry))
+                    for sm, entry in zip(sms, entries, strict=True)
+                )
+                if self.world > 1 and sms and all(sms)
+                else None
+            )
             self._reselect = functools.partial(
                 attention.select,
                 device_facts,
                 roots,
                 degree=self.world,
                 bits=type(model).__attention_bits__,
-                row=arch.common(map(arch.row, sms))
-                if self.world > 1 and sms and all(sms)
-                else None,
+                row=group_row,
             )
             applied = self._reselect()
             self.device_facts = device_facts
+            self.attention_class = arch.klass(group_row or attention.device_row(device_facts))
             stage("attention_pin")
         except (attention.AttentionRefusal, _PlanRefusal) as exc:
             backend.poison(())
@@ -4113,6 +4125,11 @@ class Executor:
             return attention.reaches(self._attention_roots(), pin)
         except attention.AttentionRefusal:
             return True  # a malformed pin refuses where it is planned
+
+    def _attention_class(self) -> str:
+        """The hardware class this process's constructions selected attention for."""
+        found = (e.attention_class for e in self.model_executors or [self] if e.attention_class)
+        return next(found, "")
 
     def _attention_device(self, pin: str) -> DeviceFacts:
         device = next(

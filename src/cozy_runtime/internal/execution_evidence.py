@@ -3,8 +3,8 @@
 The executor reports one record per process of its group, in process order, as `gpus`:
 
     {"gpu": int, "pid": int, "uuid": str, "arch": str, "start_us": int, "end_us": int,
-     "attention": {"requested": str, "observed": str, "impl": str, "kernels"?: [kernel],
-                   "segments"?: [segment]}}
+     "attention": {"requested": str, "observed": str, "impl": str, "class"?: str,
+                   "kernels"?: [kernel], "segments"?: [segment]}}
     kernel = {"kernel": str, "state": str, "line": str, "served": bool,
               "progress"?: float, "compile_ms"?: float, "detail"?: str}
     segment = {"stage": str, "step": int, "at_us": int, "observed": str, "dense": str}
@@ -16,6 +16,7 @@ GPU's work for the attempt, 0 for one that did none: nanoseconds since the epoch
 ±2^53 integer range canonical JSON (and every JSON reader) admits. `attention.requested` is
 the request's pin ("" = automatic), `observed` what the process's processors held, in the
 pin grammar, and `impl` the kernel implementation under that backend when one was observed.
+`class` is the hardware class its kernels were selected for (`arch.klass`; a group's, in a group).
 `kernels` is every compiled kernel this GPU knows of: `state` ready, compiling (with its
 `progress`), failed or absent, whether it `served` this attempt, and how long its compile
 took. `segments` is present when the run took a kernel that finished compiling mid-run: each
@@ -67,15 +68,19 @@ class Boot(TypedDict):
     line: str
 
 
-class RankAttention(TypedDict):
-    """A process's `attention` (the shape above)."""
-
-    requested: str
-    observed: str
-    impl: str
-    kernels: NotRequired[list[dict[str, object]]]
-    segments: NotRequired[list[dict[str, object]]]
-    fallbacks: NotRequired[list[AttentionFallback]]
+#: A process's `attention` (the shape above); functional, for its `class` key.
+RankAttention = TypedDict(
+    "RankAttention",
+    {
+        "requested": str,
+        "observed": str,
+        "impl": str,
+        "class": NotRequired[str],
+        "kernels": NotRequired[list[dict[str, object]]],
+        "segments": NotRequired[list[dict[str, object]]],
+        "fallbacks": NotRequired[list[AttentionFallback]],
+    },
+)
 
 
 class GpuEvidence(TypedDict):
@@ -123,8 +128,11 @@ def attention(
     kernels: Sequence[Mapping[str, object]] = (),
     segments: Sequence[Mapping[str, object]] = (),
     fallbacks: Sequence[AttentionFallback] = (),
+    klass: str = "",
 ) -> RankAttention:
     row = RankAttention(requested=requested, observed=observed, impl=impl)
+    if klass:
+        row["class"] = klass
     if kernels:
         row["kernels"] = [dict(kernel) for kernel in kernels]
     if segments:
