@@ -53,7 +53,7 @@ class Processor:
         self.component = component
         self.path = path
         base = BY_NAME.get(producer.base)
-        # Its base quantizes Q and V itself: they may cross as int8 (`attention_ulysses.Local`).
+        # Its base quantizes Q, K and V itself: they may cross as int8 (`attention_ulysses.Local`).
         self.narrow = base is not None and base.local.narrow
 
     @property
