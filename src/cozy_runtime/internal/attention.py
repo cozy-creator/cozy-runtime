@@ -370,6 +370,11 @@ KERNELS: tuple[Candidate, ...] = (
     ),
 )  # fmt: skip
 BY_NAME: dict[str, Candidate] = {c.name: c for c in KERNELS}
+#: The 8-bit dense kernels whose rows carry keys with outlier channels: the ones a sparse kernel's
+#: exact paths take (`exact_rows`, Kitchen INT8). Every other quantizing dense kernel refuses a
+#: call at a site whose key gain has outlier channels (`_keys_refused`), so the call walks its
+#: band's next kernels: these, else the 16-bit ones, as the sparse route's exact rows do.
+KEYS_EXACT = frozenset(c.exact_rows for c in KERNELS if c.exact_rows)
 #: A sparse kernel's undeclared rows run on the 16-bit dense ladder: only a 16-bit one may.
 if _UNDECLARED := [c.name for c in KERNELS if c.sparse and not c.dense and not c.exact]:
     raise ValueError(f"quantizing sparse kernels without their dense rows: {_UNDECLARED}")
@@ -669,10 +674,23 @@ def _local(candidate: Candidate) -> Local:
         exact = _dense_rows(BY_NAME[named]) if named else attention_sol._dense
         forward = partial(forward, dense=rows[0], prefix_dense=rows[-1], exact=exact)
     instead = None if candidate.name == _SDPA else _INSTEAD
+    refusal = partial(_keys_refusal, candidate) if _keys_refused(candidate) else candidate.refusal
     found = _LOCALS[candidate.backend] = replace(
-        candidate.local, forward=forward, refusal=candidate.refusal, instead=instead
+        candidate.local, forward=forward, refusal=refusal, instead=instead
     )
     return found
+
+
+def _keys_refused(candidate: Candidate) -> bool:
+    """Whether CANDIDATE's row refuses a site whose keys have outlier channels: a quantizing
+    dense kernel not in `KEYS_EXACT` (a sparse kernel routes them itself, `attention_sol`)."""
+    return not candidate.sparse and candidate.level < 16 and candidate.name not in KEYS_EXACT
+
+
+def _keys_refusal(
+    candidate: Candidate, query: Tensor, key: Tensor, options: attention_ulysses.Options
+) -> str:
+    return attention_sol.outlier_refusal() or candidate.refusal(query, key, options)
 
 
 def _dense_rows(candidate: Candidate) -> attention_sol.DenseRows:
@@ -2079,7 +2097,8 @@ def _pin_reason(entry: Ready | None, why: str, record: _Record, degree: int) -> 
 
 def _install_sites(records: Sequence[tuple[Pick, str, str, SiteModule]]) -> None:
     """Install metadata hooks atomically, preserving hooks owned by preparation: Sol's site
-    where any band serves a sparse kernel, a package producer's processor where one serves."""
+    where any band serves a sparse kernel or a kernel that refuses outlier keys at a site with a
+    key norm (`_keys_refused`), a package producer's processor where one serves."""
     # Validate all producer topology/hooks before any metadata or processor mutation.
     for pick, _component, _path, module in records:
         for entry in pick.served:
@@ -2090,7 +2109,10 @@ def _install_sites(records: Sequence[tuple[Pick, str, str, SiteModule]]) -> None
     try:
         for pick, component, path, module in records:
             sparse = [e.candidate for e in pick.served if e.candidate.sparse]
-            if not sparse:
+            keyed = getattr(module, "norm_k", None) is not None and any(
+                _keys_refused(e.candidate) for e in pick.kernels
+            )
+            if not sparse and not keyed:
                 continue
             local = component.rsplit("/", 1)[-1]
             if getattr(module, "_cozy_sol_site", None) is None:

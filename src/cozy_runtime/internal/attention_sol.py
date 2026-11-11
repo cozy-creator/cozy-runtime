@@ -107,6 +107,16 @@ def outlier_keys(norm: object) -> bool:
     return bool(vars(norm)["_cozy_outlier_keys"])
 
 
+def outlier_refusal() -> str:
+    """Why a quantizing dense kernel's row refuses the call at hand: its site's key gain has
+    outlier channels (`outlier_keys`), which no coarse scale carries; empty elsewhere. The call
+    walks its band's next kernels: the 8-bit ones whose rows carry such keys, else 16-bit ones."""
+    site = _SITE.get()
+    if site is None or not outlier_keys(site.keys):
+        return ""
+    return f"outlier keys at {site.component}/{site.path}"
+
+
 _SITE: ContextVar[Site | None] = ContextVar("cozy_sol_site", default=None)
 #: The 16-bit dense rows a sparse kernel's undeclared rows run on (`attention.Candidate.dense`,
 #: `exact_rows`): the table's 16-bit dense ladder for this card (`attention._bind_dense`).

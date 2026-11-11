@@ -1,0 +1,1 @@
+A dense attention site whose key RMSNorm gain has outlier channels no longer serves a quantizing kernel that cannot carry them: Sage2 (Hopper) and FA4 FP8 (B200) refuse such a call, which then takes Kitchen INT8 where the card runs it (the sparse route's exact rows), else the 16-bit kernel. The run record names each site and the kernel that took its calls.
