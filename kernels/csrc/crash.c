@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // The executor's record of a fatal signal (cr-275). On SIGSEGV, SIGBUS, SIGABRT, SIGFPE or SIGILL it writes to stderr,
-// which the machine keeps with the run: the crash line, every other thread's native stack (each thread answers a
+// which the machine keeps with the run: where it faulted, every other thread's native stack (each thread answers a
 // real-time signal into a static slot; identical stacks print once), every Python stack (faulthandler, the handler before
-// this one), then the crashed thread's native stack, what the executor was answering and the crash line again, last, so
+// this one), then the crashed thread's native stack, what the executor was answering and the crash line, last, so
 // the run's detail ends on them. Then the process dies by the same signal: its exit status and core are the kernel's.
 // Handlers make async-signal-safe calls only; backtrace() is warmed at install, so the dlopen of its first call never
 // runs in one. A record that hangs ends at the watchdog, by the same signal.
@@ -280,18 +280,15 @@ static void chain(int sig, siginfo_t *info, void *raw) {
     }
 }
 
-static void line(int sig, const siginfo_t *info, void *frame, void *pc) {
-    say("executor crashed: ");
-    say(signame(sig));
-    say(" in ");
-    name(frame);
+// Where the signal came from: the faulting address and why, or the process that sent it; then the pc.
+static void origin(int sig, const siginfo_t *info, void *pc) {
     if (info->si_code <= 0 && info->si_pid == getpid()) {
-        say("\n  raised by this process");
+        say("raised by this process");
     } else if (info->si_code <= 0) {
-        say("\n  sent by process ");
+        say("sent by process ");
         number((uintptr_t)info->si_pid, 10);
     } else {
-        say("\n  address ");
+        say("address ");
         number((uintptr_t)info->si_addr, 16);
         say(" (");
         say(cause(sig, info->si_code));
@@ -299,7 +296,6 @@ static void line(int sig, const siginfo_t *info, void *frame, void *pc) {
     }
     say(", pc ");
     number((uintptr_t)pc, 16);
-    say("\n");
 }
 
 static void die(int sig) {
@@ -348,7 +344,14 @@ static void on_fatal(int sig, siginfo_t *info, void *raw) {
     atomic_store(&crash_signal, sig);
     sigaction(SIGALRM, &watch, NULL);
     alarm(WATCHDOG_S);
-    line(sig, info, pc, pc);  // first, so a fault while unwinding still leaves it
+    // First, so a fault while unwinding still leaves it; worded apart from the crash line, which comes last.
+    say("fatal ");
+    say(signame(sig));
+    say(" in ");
+    name(pc);
+    say(", ");
+    origin(sig, info, pc);
+    say(": the record follows\n");
     int n = backtrace(frames, FRAMES + 8), start = from(frames, n, pc);
     void **own = frames + start;
     n = n - start > FRAMES ? FRAMES : n - start;
@@ -380,7 +383,13 @@ static void on_fatal(int sig, siginfo_t *info, void *raw) {
             break;
         }
     }
-    line(sig, info, frame, pc);
+    say("executor crashed: ");
+    say(signame(sig));
+    say(" in ");
+    name(frame);
+    say("\n  ");
+    origin(sig, info, pc);
+    say("\n");
     die(sig);
 }
 
