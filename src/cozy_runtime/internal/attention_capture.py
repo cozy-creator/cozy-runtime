@@ -10,8 +10,16 @@ rest seeded at random. Each process writes under `dir/<request id>/`: `census.js
 per call, and one safetensors file per captured call, BF16 `query`/`key`/`value` of the kept
 heads over the whole sequence, its facts in the header. The record is taken in
 `attention_ulysses._call` after the band pick, so it is what the kernel receives: after norms
-and RoPE, after Ulysses' exchange (the full sequence of this rank's heads). Rank 0 only; a call
-recorded into a CUDA graph is counted in the census but not captured.
+and RoPE, after Ulysses' exchange (the full sequence of this rank's heads). Rank 0 only.
+
+Every call is a site's own: each attention module of the construction is named, whether its call
+goes through the module or straight to its kernel (a fused block's composed attention, `at`); a
+kernel's nested calls (Sol's dense rows) belong to the site call that made them; a producer's
+site serves through its base Sol kernel, so its sparse steps are counted and captured with their
+layout (the attention table measures bases, never producers); and no CUDA graph replays or
+records, so every step's calls are seen. `step` and `stage` are the Runtime's own count of
+`ctx.progress` steps (finished before the call); `layout` is what the model declared, whose
+`step` may stay one value per phase (H3's).
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ from typing import TYPE_CHECKING, Any, cast
 import msgspec
 
 from cozy_runtime.accel.attention import _ACTIVE_LAYOUT
+from cozy_runtime.author._services import STEP_NOW
 from cozy_runtime.internal import attention_ulysses
 
 if TYPE_CHECKING:
@@ -59,8 +68,8 @@ _SITE: ContextVar[str] = ContextVar("cozy_capture_site", default="")
 
 
 class _Capture:
-    def __init__(self, spec: Spec, out: Path) -> None:
-        self.spec, self.out = spec, out
+    def __init__(self, spec: Spec, out: Path, names: dict[int, str]) -> None:
+        self.spec, self.out, self.names = spec, out, names
         self.calls: dict[str, int] = {}
         self.census = (out / "census.jsonl").open("a")
 
@@ -93,6 +102,9 @@ class _Capture:
             "causal": bool(options["is_causal"]),
             "scale": options["scale"],
         }
+        progress = STEP_NOW.get()
+        if progress is not None:  # the Runtime's count: a model may declare one layout per phase
+            facts["stage"], facts["step"] = progress
         if layout is not None:
             facts["layout"] = {
                 "step": layout.step,
@@ -144,6 +156,22 @@ class _Capture:
         return name
 
 
+@contextmanager
+def at(module: object) -> Iterator[None]:
+    """Within it, kernel calls belong to MODULE's site: a path that calls the site's kernel
+    without calling MODULE (a fused block's composed attention, `accel.fusion`)."""
+    capture = attention_ulysses.CAPTURE.get()
+    name = capture.names.get(id(module), "") if isinstance(capture, _Capture) else ""
+    if not name:
+        yield
+        return
+    token = _SITE.set(name)
+    try:
+        yield
+    finally:
+        _SITE.reset(token)
+
+
 def _wrapped(module: Module, site: str) -> Any:  # type: ignore[explicit-any]  # torch's hook handles
     """Name MODULE's calls SITE for the capture, around its whole forward."""
 
@@ -165,19 +193,20 @@ def _wrapped(module: Module, site: str) -> Any:  # type: ignore[explicit-any]  #
 def capturing(
     text: str, request_id: str, sites: Sequence[tuple[str, str, object]]
 ) -> Iterator[None]:
-    """Within it, this process's attention calls are captured per SPEC (TEXT); SITES are this
-    construction's (component, module path, module)."""
+    """Within it, this process's attention calls are captured per SPEC (TEXT); SITES are every
+    attention module of this construction (component, module path, module)."""
     if not text:
         yield
         return
     spec = parse(text)
     out = Path(spec.dir) / request_id
     out.mkdir(parents=True, exist_ok=True)
-    capture = _Capture(spec, out)
+    names = {id(m): f"{component.rsplit('/', 1)[-1]}/{path}" for component, path, m in sites}
+    capture = _Capture(spec, out, names)
     handles = [
         handle
-        for component, path, module in sites
-        for handle in _wrapped(cast("Module", module), f"{component.rsplit('/', 1)[-1]}/{path}")
+        for _, _, module in sites
+        for handle in _wrapped(cast("Module", module), names[id(module)])
     ]
     token = attention_ulysses.CAPTURE.set(capture)
     try:

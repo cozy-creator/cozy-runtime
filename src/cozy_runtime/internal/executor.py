@@ -3454,7 +3454,7 @@ class Executor:
                 except ValueError as exc:
                     return {"ok": False, "code": "attention_capture_invalid", "detail": str(exc)}
                 roots = target._attention_roots()
-                sites = [(c, path, m) for c, path, m, _ in attention._site_records(roots)]
+                sites = [(c, path, m) for c, path, m, _ in attention._attention_records(roots)]
             with attention_capture.capturing(capture, command.request_id, sites):
                 reply = target.invoke(command, prepared, slot)
         self.attempts += 1

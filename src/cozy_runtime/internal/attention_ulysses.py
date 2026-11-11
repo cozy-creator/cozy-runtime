@@ -309,8 +309,28 @@ def _call(
     if first and refusing:
         refused(first, 1, backend)
     capture = CAPTURE.get()
-    if capture is not None:
-        capture(site, band, backend, query, key, value, options)
+    if capture is None:
+        return _serve(site, band, backend, local, query, key, value, options)
+    capture(site, band, backend, query, key, value, options)
+    # The kernel's own nested calls (Sol's dense rows) are this site call's, not new ones.
+    token = CAPTURE.set(None)
+    try:
+        return _serve(site, band, backend, local, query, key, value, options)
+    finally:
+        CAPTURE.reset(token)
+
+
+def _serve(
+    site: str,
+    band: str,
+    backend: str,
+    local: Local,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    options: Options,
+) -> Tensor:
+    """`_call`'s kernel LOCAL (BACKEND, the rung SITE's call of BAND took), recorded and run."""
     scope = _SEEN.get()
     if scope is not None:
         masked, causal = options["attn_mask"] is not None, options["is_causal"]
