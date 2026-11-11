@@ -174,7 +174,7 @@ _VOCAB_MODULES = {
     **dict.fromkeys(author.MODULES, "author"),
 }
 #: Runtime modules a package builds its surface from: followed for types, models and constants.
-_TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.vlm")
+_TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.vlm", "cozy_runtime.bench")
 
 
 _ARITHMETIC: dict[type[ast.operator], Callable[[float, float], object]] = {
