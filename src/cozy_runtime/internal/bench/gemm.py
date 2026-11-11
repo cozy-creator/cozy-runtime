@@ -62,7 +62,9 @@ class Shape:
 #: The bench cells' requests (release-gate suites/bench/cells.tsv). H3 Turbo 15 s: 50 blocks x 8 steps on one GPU
 #: (111,598 rows) and on one of four (27,900). Qwen-Image 2.1 at 4 MP: 32 blocks x 40 steps x 2 (CFG). Klein: 33
 #: blocks x 16 steps, text to image (4,608 rows) and an edit (8,704). SDXL 1024², CFG as batch 2, 20 steps: 10
-#: transformer layers at 64² (six C x C linears each, cross-attention's q and out included), 60 at 32².
+#: transformer layers at 64² (six C x C linears each, cross-attention's q and out included), 60 at 32². An LM's
+#: decoder layer (H3's Qwen3-VL text model: 5120 wide, 64 query and 8 KV heads, 25,600 FFN) at 1, 16 and 256 rows: a
+#: token loop, a drafted step and a prefill; `calls` is its 64 layers, one forward.
 SHAPES: tuple[Shape, ...] = (
     *(
         Shape(model, site, m, n, k, 400 * c)
@@ -81,6 +83,11 @@ SHAPES: tuple[Shape, ...] = (
     Shape("sdxl32", "attn", 2048, 1280, 1280, 7200),
     Shape("sdxl32", "up", 2048, 10240, 1280, 1200),
     Shape("sdxl32", "down", 2048, 1280, 5120, 1200),
+    *(
+        Shape(f"lm-m{m}", site, m, n, k, 64)
+        for m in (1, 16, 256)
+        for site, n, k in (("qkv", 10240, 5120), ("o", 5120, 8192), ("up", 51200, 5120), ("down", 5120, 25600))
+    ),
 )  # fmt: skip
 
 Call = Callable[[], object]
@@ -432,6 +439,45 @@ def speed(lanes: list[str], wanted: list[str], seed: int, ctx: Context) -> Speed
         torch.cuda.empty_cache()
         ctx.progress(at, len(chosen))
     return {"inventory": card.inventory, "shapes": results}
+
+
+# ---- the host's calibration
+
+
+class Calibration(TypedDict):
+    """A pod's sustained throughput, for the gate to hold against its card's reference: bf16 GEMM TFLOPS (cuBLAS,
+    8192 cubed, median of the samples and its 10th percentile) and device-memory GB/s (a 512 MiB copy, read plus
+    write)."""
+
+    inventory: Inventory
+    tflops: float
+    tflops_p10: float
+    gbps: float
+
+
+def _samples(call: Call, budget_ms: float, count: int) -> list[float]:
+    """`count` samples of ms per call, each sample as many calls as fill `budget_ms / count`."""
+    _warm(call)
+    reps = max(1, math.ceil(budget_ms / count / max(_timed(call, None), 1e-3)))
+    return [_sample(call, reps, None) for _ in range(count)]
+
+
+def calibrate() -> Calibration:
+    """About two seconds of each, after a warm-up: long enough that a power- or heat-limited host shows."""
+    card = _card()
+    g = torch.Generator(device="cuda:0").manual_seed(177)
+    a, b = (torch.randn(8192, 8192, generator=g, device="cuda:0", dtype=torch.float32).to(BF16) for _ in range(2))
+    flops = 2.0 * 8192**3
+    gemm = sorted(_samples(partial(torch.matmul, a, b), 2000.0, 20))
+    src = torch.empty(512 << 20, dtype=torch.uint8, device="cuda:0")
+    dst = torch.empty_like(src)
+    copy = statistics.median(_samples(partial(dst.copy_, src), 1000.0, 10))
+    return {
+        "inventory": card.inventory,
+        "tflops": round(flops / statistics.median(gemm) / 1e9, 1),
+        "tflops_p10": round(flops / gemm[int(0.9 * (len(gemm) - 1))] / 1e9, 1),
+        "gbps": round(2 * (512 << 20) / copy / 1e6, 1),
+    }
 
 
 # ---- Triton tiles that keep every bit

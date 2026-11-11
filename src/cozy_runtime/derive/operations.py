@@ -15,6 +15,7 @@ from cozy_runtime.bench import (
     attention_inventory,
     attention_quality,
     attention_speed,
+    calibrate,
     child_wire,
     gemm_speed,
     gemm_tiles,
@@ -299,6 +300,7 @@ app.entrypoint(
 app.entrypoint(attention_inventory, accelerator=True)
 app.entrypoint(attention_speed, accelerator=True)
 app.entrypoint(attention_quality, accelerator=True)
+app.entrypoint(calibrate, accelerator=True)
 app.entrypoint(gemm_speed, accelerator=True)
 app.entrypoint(gemm_tiles, accelerator=True)
 app.entrypoint(kernels_inventory, accelerator=True)

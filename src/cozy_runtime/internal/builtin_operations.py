@@ -13,6 +13,7 @@ EXPORTS = {
         "attention_inventory",
         "attention_speed",
         "attention_quality",
+        "calibrate",
         "gemm_speed",
         "gemm_tiles",
         "kernels_inventory",

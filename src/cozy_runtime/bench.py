@@ -85,6 +85,14 @@ def gemm_speed(ctx: Context, *, lanes: str = "", shapes: str = "", seed: int = 1
     return _run(lambda: gemm.speed(chosen, wanted, seed, ctx))
 
 
+def calibrate(ctx: Context) -> Measured:
+    """This pod's sustained bf16 GEMM TFLOPS and memory GB/s, which the gate holds against its card's reference: a host
+    far below it (an H100 that ran every kernel 3x slow, release gate 43061813774) is refused (xs-177)."""
+    from cozy_runtime.internal.bench import gemm
+
+    return _run(gemm.calibrate)
+
+
 def gemm_tiles(ctx: Context, *, seed: int = 177) -> Measured:
     """Two of the Runtime's Triton kernels (nvfp4's weight decode and GEMV) over the tile settings that keep every output
     bit, at our shapes: whether one card of a class wants another tile than its sibling (xs-177)."""
