@@ -1081,6 +1081,9 @@ def _region_call(
         if torch.utils._python_dispatch._get_current_dispatch_mode() is not None
         else "across GPUs"
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+        # A dev-only attention capture sees every call with its own inputs and step.
+        else "under an attention capture"
+        if attention_ulysses.CAPTURE.get() is not None
         # A sparse step picks its key blocks from the values, and a package's producer may
         # keep request state at a call: a replay would freeze one call's.
         else "under a sparse attention layout"

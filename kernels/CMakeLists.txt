@@ -243,3 +243,14 @@ add_library(rms_rope OBJECT csrc/norm/rms_rope.cu)
 set_target_properties(rms_rope PROPERTIES CUDA_ARCHITECTURES "${EVERY}")
 target_compile_options(rms_rope PRIVATE --expt-extended-lambda --use_fast_math)
 kernel_module(_norm norm.cpp rms_rope)
+
+# The executor's record of a fatal signal (`csrc/crash.c`, cr-275): plain C on the stable ABI, Linux only.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    enable_language(C)
+    Python_add_library(_crash MODULE USE_SABI 3.12 WITH_SOABI csrc/crash.c)
+    set_target_properties(_crash PROPERTIES C_STANDARD 11 C_VISIBILITY_PRESET hidden)
+    target_link_libraries(_crash PRIVATE ${CMAKE_DL_LIBS})
+    target_link_options(_crash PRIVATE -Wl,--build-id=none
+                        -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/modules.map)
+    install(TARGETS _crash LIBRARY DESTINATION cozy_runtime/_kernels)
+endif()

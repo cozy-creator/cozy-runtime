@@ -1,0 +1,1 @@
+The release gate's checks of per-component quantization across an Output's lifetime (finished reuse, resume after a close, identity refusals) are a built-in call: `cozy_runtime.bench.quantize_reuse` (unstable, for the gate only). They reopen the Runtime's own Outputs, which no package can.

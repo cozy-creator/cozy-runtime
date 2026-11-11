@@ -701,14 +701,25 @@ def _attend(
             )
             for norm, t in zip(site.qk, (q, k), strict=True)
         )
+    from cozy_runtime.internal import attention_capture, attention_sol
+
     processor = site.attention.processor
-    attended = dispatch_attention_fn(
-        q,
-        k,
-        v,
-        backend=processor._attention_backend,
-        parallel_config=processor._parallel_config,
-    )
+    # The module is not called: its site's scope (its key norm, `attention_sol.outlier_refusal`)
+    # and its capture name are set here.
+    installed = vars(site.attention).get("_cozy_sol_site")
+    token = attention_sol._SITE.set(installed.site) if installed is not None else None
+    try:
+        with attention_capture.at(site.attention):
+            attended = dispatch_attention_fn(
+                q,
+                k,
+                v,
+                backend=processor._attention_backend,
+                parallel_config=processor._parallel_config,
+            )
+    finally:
+        if token is not None:
+            attention_sol._SITE.reset(token)
     return cast("_Linear", site.out)(attended.flatten(2))  # a composed site has its `to_out`
 
 

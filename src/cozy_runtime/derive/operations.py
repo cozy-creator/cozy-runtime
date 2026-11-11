@@ -20,7 +20,10 @@ from cozy_runtime.bench import (
     kernel_ready,
     kernels_inventory,
     lora_overlay_refill,
+    offload_in_executor,
     overlay_replay,
+    quantize_reuse,
+    varena_core,
 )
 from cozy_runtime.author import (
     MAX_WEIGHTS_NEW_BYTES,
@@ -289,8 +292,8 @@ app.entrypoint(
     weights=(WeightsOutput("model", max_new_bytes=MAX_QUANTIZED_BYTES),),
     accelerator=False,
 )
-# The release gate's exercisers (`cozy_runtime.bench`, unstable): the attention bench (xs-171) and the kernels suite
-# (xs-174), the Runtime's kernels from inside the Runtime.
+# The release gate's exercisers (`cozy_runtime.bench`, unstable): the attention bench (xs-171), the kernels suite and the
+# varena and execution suites' Runtime cells (xs-174), the Runtime's own code from inside the Runtime.
 app.entrypoint(attention_inventory, accelerator=True)
 app.entrypoint(attention_speed, accelerator=True)
 app.entrypoint(attention_quality, accelerator=True)
@@ -298,6 +301,9 @@ app.entrypoint(kernels_inventory, accelerator=True)
 app.entrypoint(kernel_check, accelerator=True)
 app.entrypoint(kernel_ready, accelerator=False)
 app.entrypoint(child_wire, accelerator=False)
+app.entrypoint(varena_core, accelerator=True)
+app.entrypoint(offload_in_executor, accelerator=True)
+app.entrypoint(quantize_reuse, accelerator=False)
 app.entrypoint(
     overlay_replay,
     defaults={

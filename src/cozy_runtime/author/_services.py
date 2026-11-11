@@ -84,6 +84,9 @@ MAX_OUTPUT_BYTES = 256 * 1024 * 1024
 
 #: A saved file's handle by its media type's family.
 _SAVED: dict[str, type[File]] = {"image": ImageFile, "video": VideoFile, "audio": AudioFile}
+#: The `ctx.progress` step in progress: its stage and the steps of it already finished. The
+#: dev-only attention capture records it on each call (a model may declare one layout per phase).
+STEP_NOW: ContextVar[tuple[str, int] | None] = ContextVar("cozy_step_now", default=None)
 
 
 def _saved(media_type: str) -> type[File]:
@@ -1523,6 +1526,7 @@ class Telemetry(_Bound):
         # too. Starting it at the first call would silently drop step 0 from the count — and
         # on a one-step request that is the whole measurement.
         attempt._step_mark = work_clock()
+        STEP_NOW.set((name or stage, 0))
         clock = DEVICE[0] if DEVICE else None
         attempt._step_device = clock.mark() if clock is not None else None
         if attempt._stall_watch is None:
@@ -1533,6 +1537,7 @@ class Telemetry(_Bound):
         def on_step(step: int) -> None:
             self._ctx.raise_if_cancelled()
             self._ctx._steps += 1
+            STEP_NOW.set((name or stage, step + 1 if isinstance(step, int) else self._ctx._steps))
             now = work_clock()
             mark = attempt._step_mark
             ran = clock.mark() if clock is not None else None

@@ -1,0 +1,1 @@
+The release gate's varena rules that only the Runtime's own varena adapter reaches (weights Regions with staging pages and a derive, Plans with phases, cache owners, capture guards) and `vt.offload` inside an executor are built-in calls too: `cozy_runtime.bench.varena_core` and `offload_in_executor` (unstable, for the gate only).
