@@ -4,8 +4,11 @@ The executor reports one record per process of its group, in process order, as `
 
     {"gpu": int, "pid": int, "uuid": str, "arch": str, "start_us": int, "end_us": int,
      "attention": {"requested": str, "observed": str, "impl": str, "class"?: str,
-                   "kernels"?: [kernel], "segments"?: [segment]}}
-    kernel = {"kernel": str, "state": str, "line": str, "served": bool,
+                   "sites"?: {component: [site group]}, "kernels"?: [kernel],
+                   "segments"?: [segment]}}
+    site group = {"layout": "dense"|"sparse", "level": int, "head_dim": int, "sites": int,
+                  "bands": {band: kernel}, "producers"?: {producer: base kernel}}
+    kernel = {"kernel": str, "state": str, "line": str, "served": bool, "bands"?: [band],
               "progress"?: float, "compile_ms"?: float, "detail"?: str}
     segment = {"stage": str, "step": int, "at_us": int, "observed": str, "dense": str}
 
@@ -17,6 +20,9 @@ GPU's work for the attempt, 0 for one that did none: nanoseconds since the epoch
 the request's pin ("" = automatic), `observed` what the process's processors held, in the
 pin grammar, and `impl` the kernel implementation under that backend when one was observed.
 `class` is the hardware class its kernels were selected for (`arch.klass`; a group's, in a group).
+`sites` groups each component's sites by layout, level and head dimension, with the kernel each
+token band of `min(Lq, Lk)` was served by (`attention_table.Table.band`: `<2048`, `2048-12287`,
+`>=65536`; "" where a site's selection has one band); a kernel's `bands` are where its calls fell.
 `kernels` is every compiled kernel this GPU knows of: `state` ready, compiling (with its
 `progress`), failed or absent, whether it `served` this attempt, and how long its compile
 took. `segments` is present when the run took a kernel that finished compiling mid-run: each
@@ -52,6 +58,21 @@ class AttentionFallback(TypedDict):
     preferred: str
     selected: str
     reason: str
+    #: the token bands it happened in (`attention_table.Table.band`), when not every one
+    band: NotRequired[str]
+
+
+class SiteGroup(TypedDict):
+    """A component's sites that are alike, and the kernel each token band serves them on: the
+    boot record's by selection (one band of one kernel is ""), a run's by its calls."""
+
+    layout: str
+    level: int
+    head_dim: int
+    sites: int
+    bands: dict[str, str]
+    #: a package producer among the bands' kernels -> the Runtime kernel it serves through
+    producers: NotRequired[dict[str, str]]
 
 
 class Boot(TypedDict):
@@ -65,6 +86,10 @@ class Boot(TypedDict):
     artifacts: NotRequired[dict[str, object]]
     skipped: NotRequired[dict[str, str]]
     fallbacks: NotRequired[list[AttentionFallback]]
+    #: component -> its sites by kind, each band's kernel
+    sites: NotRequired[dict[str, list[SiteGroup]]]
+    #: the kernel table selection read (`attention_table.Table.identity`)
+    table: NotRequired[str]
     line: str
 
 
@@ -76,6 +101,7 @@ RankAttention = TypedDict(
         "observed": str,
         "impl": str,
         "class": NotRequired[str],
+        "sites": NotRequired[dict[str, list[SiteGroup]]],
         "kernels": NotRequired[list[dict[str, object]]],
         "segments": NotRequired[list[dict[str, object]]],
         "fallbacks": NotRequired[list[AttentionFallback]],
@@ -129,10 +155,13 @@ def attention(
     segments: Sequence[Mapping[str, object]] = (),
     fallbacks: Sequence[AttentionFallback] = (),
     klass: str = "",
+    sites: Mapping[str, list[SiteGroup]] | None = None,
 ) -> RankAttention:
     row = RankAttention(requested=requested, observed=observed, impl=impl)
     if klass:
         row["class"] = klass
+    if sites:
+        row["sites"] = dict(sites)
     if kernels:
         row["kernels"] = [dict(kernel) for kernel in kernels]
     if segments:

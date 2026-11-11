@@ -1330,7 +1330,7 @@ class Executor:
         end_us: int,
         impl: str = "",
         segments: Sequence[Mapping[str, object]] = (),
-        refused: Mapping[str, int] | None = None,
+        seen: attention_ulysses.Seen | None = None,
     ) -> Reply:
         """The attempt's execution record: degree, every GPU, and the setup it ran on."""
         gpus = [
@@ -1342,10 +1342,11 @@ class Executor:
                     pin,
                     execution_evidence.observed(choices.hosts) if choices else "",
                     impl,
-                    attention.evidence(choices.totals() if choices else (), refused),
+                    attention.evidence(seen),
                     segments,
                     choices.fallbacks if choices else (),
                     self._attention_class(),
+                    attention.served_sites(choices, seen),
                 ),
             )
         ]
@@ -1683,8 +1684,9 @@ class Executor:
                 execution_evidence.attention(
                     observed=execution_evidence.observed(held.hosts),
                     impl=attention.implementations(served),
-                    kernels=attention.evidence(held.totals(), served.refused),
+                    kernels=attention.evidence(served),
                     klass=self._attention_class(),
+                    sites=attention.served_sites(held, served),
                 ),
             ),
             memory=msgspec.to_builtins(rows[0]) if rows else None,
@@ -3970,7 +3972,7 @@ class Executor:
                     released_us,
                     attention.implementations(served_impls),
                     segments if len(segments) > 1 else (),
-                    served_impls.refused,
+                    served_impls,
                 ),
                 "safeguards": safeguards,
                 # When this reply was built, and (`_send_reply`) when it went on the seam: a

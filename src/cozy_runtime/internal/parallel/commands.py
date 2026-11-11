@@ -16,11 +16,13 @@ from tensorfs import executor as wire
 
 
 class Choice(msgspec.Struct, frozen=True, kw_only=True):
-    """One GPU's whole selection, as a group's followers install it (`attention.install`): the
-    kernel each site serves, by (component, module path), and the dense reference Sol recomputes
-    rows with where Sol serves, with the exact kernel beside a quantizing one ("" for none)."""
+    """One GPU's whole selection, as a group's followers install it (`attention.install`): what
+    each site serves, by (component, module path), per token band (`attention.Spec`: each band's
+    upper bound on `min(Lq, Lk)`, 0 for none, and the kernels a call tries in turn), and the
+    dense reference Sol recomputes rows with where Sol serves, with the exact kernel beside a
+    quantizing one ("" for none)."""
 
-    sites: tuple[tuple[str, str, str], ...] = ()
+    sites: tuple[tuple[str, str, tuple[tuple[int, tuple[str, ...]], ...]], ...] = ()
     dense: str = ""
     exact: str = ""
 
