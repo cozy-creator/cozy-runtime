@@ -2,7 +2,7 @@
 # `scripts/typecheck.sh lock` pins them into typecheck-requirements.txt.
 mypy
 # TensorFS by git rev until a release carries its typed stubs (the boundary types read tensorfs.varena._facts).
-tensorfs @ git+https://github.com/cozy-creator/cozy-creator@11290d28872f57f971e551121873edc412430ee0#subdirectory=crates/tensorfs-py
+tensorfs @ git+https://github.com/cozy-creator/cozy-creator@edb8b0c6fff0b1cf51e00fb82b808873023b27be#subdirectory=crates/tensorfs-py
 msgspec
 numpy
 packaging
