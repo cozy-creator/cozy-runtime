@@ -224,6 +224,7 @@ from cozy_runtime.internal.parallel.commands import (
 from cozy_runtime.internal.parallel.group import (
     ENDED,
     LINK_STEPS,
+    STACKS,
     ChildProcess,
     RankGroup,
     RankSpec,
@@ -1574,7 +1575,12 @@ class Executor:
         thread may be inside one, where no command reaches it."""
         with watcher:
             try:
-                while watcher.recv(1):
+                while byte := watcher.recv(1):
+                    if byte == STACKS:  # a stalled formation: this GPU's threads, for its record
+                        with contextlib.suppress(OSError, ValueError):
+                            sys.stderr.write(f"group_stalled: {_gpu(self.rank)}'s threads:\n")
+                            sys.stderr.flush()
+                            faulthandler.dump_traceback(sys.stderr, all_threads=True)
                     abort_process_group()
                     self._interrupted.set()
             finally:

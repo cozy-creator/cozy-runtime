@@ -73,6 +73,9 @@ UNWIND = timedelta(seconds=10)
 #: Rank 0's formation steps that wait in Python on followers' replies, which a follower's death
 #: ends; every other step waits inside torch, where an abort may not reach.
 _REPLY_STEPS = frozenset({"join", "proof"})
+#: A follower's abort byte that asks for its threads' stacks first (a stalled formation). Never a
+#: signal: one lands on any thread, and faulthandler's dump from a CUDA thread crashed a follower.
+STACKS = b"\2"
 #: Steps whose stall is the GPUs' link failing them: NCCL connects and moves its first bytes here.
 LINK_STEPS = frozenset({"barrier", "warm", "exchange", "proof"})
 #: A store wait's slice: how soon an ended formation ends it.
@@ -528,9 +531,10 @@ class RankGroup:
         if self.pg is not None:
             abort_process_group()
 
-    def interrupt(self) -> None:
+    def interrupt(self, stacks: bool = False) -> None:
         """End the collective in flight on every GPU and keep the group whole: each
-        follower's watcher aborts its communicator, and this process aborts its own. The group
+        follower's watcher aborts its communicator (`stacks`: after writing its threads' stacks,
+        `STACKS`), and this process aborts its own. The group
         forms again (`form(again=...)`) before its next call. Once per formation: a second
         caller (the reader thread and the call's own thread both may) returns only once the
         first one's abort is done, so the group is never formed again under an abort still
@@ -547,7 +551,7 @@ class RankGroup:
             for follower in self.followers:
                 if follower.abort is not None:
                     with contextlib.suppress(OSError):
-                        follower.abort.send(b"\1")
+                        follower.abort.send(STACKS if stacks else b"\1")
             self._abort_collectives()
         finally:
             self._ended.set()
@@ -761,9 +765,12 @@ class RankGroup:
             never.append(f"{self.gpu(0)} (in {step})")
         seconds = int(ATTEMPT.total_seconds())
         why = f"attempt {attempt} stalled {seconds} s: {', '.join(never)}"[:400]
-        self._stacks(why)
+        with contextlib.suppress(OSError, ValueError):  # GPU 0's threads; each follower's follow
+            sys.stderr.write(f"group_stalled: {why}; GPU 0's threads:\n")
+            sys.stderr.flush()
+            faulthandler.dump_traceback(sys.stderr, all_threads=True)
         self.stalled = why
-        self.interrupt()
+        self.interrupt(stacks=True)
         with contextlib.suppress(Exception):  # a report: it never keeps the attempt from ending
             self.on_stall(step, why)
         if done.wait(UNWIND.total_seconds()):
@@ -771,19 +778,6 @@ class RankGroup:
         self._break(f"the group did not form: {why}")  # GPU 0 in group init ends here
         if self.forming not in _REPLY_STEPS:
             self._end(f"{self.broken}; GPU 0 cannot leave {self.forming}, so its process ends")
-
-    def _stacks(self, why: str) -> None:
-        """Every GPU's threads to stderr, which the machine keeps with the run: each follower's
-        (SIGUSR1, the executor's faulthandler; it lives on), then GPU 0's."""
-        for follower in self.followers:
-            with contextlib.suppress(ProcessLookupError, OSError):
-                if follower.exit_status() is None:
-                    follower.process.send_signal(signal.SIGUSR1)
-        time.sleep(0.5)  # their dumps before GPU 0's, not interleaved with it
-        with contextlib.suppress(OSError, ValueError):
-            sys.stderr.write(f"group_stalled: {why}; GPU 0's threads:\n")
-            sys.stderr.flush()
-            faulthandler.dump_traceback(sys.stderr, all_threads=True)
 
     def _settle(self) -> None:
         """After a stalled attempt: each follower's answer to the command it was in, which the
