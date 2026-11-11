@@ -1073,6 +1073,9 @@ class Executor:
         self.load_reply: Reply = {}
         #: HOST ONLY: this process's start, for the execution record (wall ms and its legs)
         self.boot: Reply = {}
+        #: HOST ONLY: when this executor began (unix ms), its import-only parent's start for a
+        #: fork: a package set built since was built for it (`triton_kernels.sources`)
+        self.since_unix_ms = time.time() * 1000
         #: HOST ONLY: this rank's pid, host ordinal, GPU uuid and arch, read once after device init
         self._identity: execution_evidence.Identity | None = None
         #: THIS process's rank in its generation's group and the group's size (cr-068). A
@@ -1353,6 +1356,7 @@ class Executor:
                     self._attention_class(),
                     attention.served_sites(choices, seen),
                 ),
+                self._kernel_sources(),
             )
         ]
         if self.group is not None:
@@ -1417,6 +1421,14 @@ class Executor:
         """A group of `degree` drives one sealed GPU per process; a CPU group (gloo, the free
         end-to-end test's) any number of processes."""
         return degree <= 1 or self.device_kind != "cuda" or degree == len(_sealed_entries())
+
+    def _kernel_sources(self) -> list[dict[str, object]]:
+        """Where each package Triton set this GPU loaded came from (`triton_kernels.sources`)."""
+        built = sys.modules.get("cozy_runtime.internal.triton_kernels")
+        if built is None or self.torch is None or self.device_kind != "cuda":
+            return []
+        index = self._rank_device(self.torch).index or 0
+        return cast("list[dict[str, object]]", built.sources(index, self.host.since_unix_ms))
 
     def _rank_device(self, torch: ModuleType) -> TorchDevice:
         device: TorchDevice
@@ -1693,6 +1705,7 @@ class Executor:
                     klass=self._attention_class(),
                     sites=attention.served_sites(held, served),
                 ),
+                self._kernel_sources(),
             ),
             memory=msgspec.to_builtins(rows[0]) if rows else None,
             exchange=exchange,
@@ -2207,6 +2220,7 @@ class Executor:
             "fork": round((time.perf_counter() - started) * 1000, 1),
         }
         child.boot = {**self.boot, "legs_ms": legs}
+        child.since_unix_ms = self.since_unix_ms
         return serve(child, channel)
 
     def _start_reply(

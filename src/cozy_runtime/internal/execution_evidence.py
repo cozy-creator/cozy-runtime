@@ -5,12 +5,15 @@ The executor reports one record per process of its group, in process order, as `
     {"gpu": int, "pid": int, "uuid": str, "arch": str, "start_us": int, "end_us": int,
      "attention": {"requested": str, "observed": str, "impl": str, "class"?: str,
                    "sites"?: {component: [site group]}, "kernels"?: [kernel],
-                   "segments"?: [segment]}}
+                   "segments"?: [segment]},
+     "kernels": [package set]}
     site group = {"layout": "dense"|"sparse", "level": int, "head_dim": int, "sites": int,
                   "bands": {band: kernel}, "producers"?: {producer: base kernel}}
     kernel = {"kernel": str, "state": str, "line": str, "served": bool, "bands"?: [band],
               "progress"?: float, "compile_ms"?: float, "detail"?: str}
     segment = {"stage": str, "step": int, "at_us": int, "observed": str, "dense": str}
+    package set = {"kernel": str, "arch": str, "source": "shipped"|"compiled"|"store",
+                   "compile_ms"?: float}
 
 `gpu` is the number nvidia-smi shows (NVML's index for the card's UUID, else the seal's
 `CUDA_VISIBLE_DEVICES` entry; -1 off CUDA), `uuid` the NVML `GPU-…` identity and `arch` its
@@ -29,6 +32,9 @@ took. `segments` is present when the run took a kernel that finished compiling m
 selection from the step of its stage it first served (`stage` "" is the run's start), in the
 pin grammar, with Sol's dense reference (`dense`, "" without Sol). `observed` and `kernels`
 then cover every selection the run served.
+The outer `kernels` is where each package Triton set loaded on the GPU came from
+(`triton_kernels.sources`): `shipped` in its package's `_triton/`, `compiled` on this machine for
+this executor (`compile_ms`), or already in the machine's `store` from an earlier build.
 """
 
 from __future__ import annotations
@@ -120,6 +126,7 @@ class GpuEvidence(TypedDict):
     start_us: int
     end_us: int
     attention: RankAttention
+    kernels: list[dict[str, object]]
 
 
 class Identity(TypedDict, total=False):
@@ -198,6 +205,7 @@ def record(
     start_us: int,
     end_us: int,
     seen: RankAttention | None = None,
+    kernels: Sequence[dict[str, object]] = (),
 ) -> GpuEvidence:
     return {
         "gpu": int(who.get("gpu", -1)),
@@ -207,6 +215,7 @@ def record(
         "start_us": start_us,
         "end_us": end_us,
         "attention": (seen or attention()).copy(),
+        "kernels": list(kernels),
     }
 
 
@@ -220,6 +229,7 @@ def widen(held: dict[int, GpuEvidence], process: int, row: GpuEvidence) -> None:
     current["start_us"] = min(current["start_us"], row["start_us"])
     current["end_us"] = max(current["end_us"], row["end_us"])
     current["attention"] = row["attention"]
+    current["kernels"] = row["kernels"]
 
 
 def gpu_name(devices: Sequence[str], rank: int) -> str:
