@@ -490,7 +490,10 @@ def dense_identity(name: str) -> str:
 
 
 def device_row(device: DeviceFacts | None) -> arch.Row:
-    return arch.row(device.sm) if device is not None and device.kind == "cuda" else arch.NONE
+    """DEVICE's row, with its half-rate accumulation (`arch.klass`); none off CUDA."""
+    if device is None or device.kind != "cuda":
+        return arch.NONE
+    return replace(arch.row(device.sm), half_accumulate=device.half_accumulate)
 
 
 def _off_row(candidate: Candidate, row: arch.Row) -> str:

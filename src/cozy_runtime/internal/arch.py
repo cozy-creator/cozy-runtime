@@ -28,6 +28,9 @@ class Row:
     #: s4 integer MMA (mma.sync m16n8k64): Ampere and Ada; Hopper and Blackwell have none
     int4: bool = False
     inherited: bool = False
+    #: FP16/BF16/FP8 MMA with FP32 accumulation at half rate: GeForce and TITAN cards, by NVML's
+    #: brand (`accel.half_accumulate`), since one cc holds both (sm89: the 4090 and the L40S)
+    half_accumulate: bool = False
 
     def formats(self) -> frozenset[str]:
         """Its tensor-core formats: what a native leaf's `formats` must be within. `mxfp8` is
@@ -95,7 +98,8 @@ def learn(sm: int, family: str) -> None:
 
 
 def common(rows: Iterable[Row]) -> Row:
-    """A set of GPUs: each column ANDed, the oldest family."""
+    """A set of GPUs: each column ANDed, the oldest family, half-rate accumulation if any has
+    it."""
     found = list(rows)
     order = [family for family, _ in FAMILIES]
     families_ = [r.family for r in found]
@@ -109,7 +113,27 @@ def common(rows: Iterable[Row]) -> Row:
         fp4=all(r.fp4 for r in found),
         int4=all(r.int4 for r in found),
         inherited=any(r.inherited for r in found),
+        half_accumulate=any(r.half_accumulate for r in found),
     )
+
+
+#: The hardware classes attention is measured and chosen by (`klass`): a family, split where a
+#: hardware property moves the ranking (block-scaled FP4 MMA, half-rate FP32 accumulation).
+CLASSES = (
+    MMA_SYNC,
+    f"{MMA_SYNC}/half",
+    f"{MMA_SYNC}+fp4",
+    f"{MMA_SYNC}+fp4/half",
+    WGMMA,
+    TCGEN05,
+)
+
+
+def klass(row: Row) -> str:
+    """ROW's hardware class (`CLASSES`); "" for a row with no tensor-core family."""
+    if row.family != MMA_SYNC:
+        return row.family
+    return MMA_SYNC + ("+fp4" if row.fp4 else "") + ("/half" if row.half_accumulate else "")
 
 
 def inherited(sm: int, name: str) -> str:
