@@ -124,6 +124,11 @@ class Seen(dict[str, set[str]]):
 #: what served in the observed scope on this rank, and the operand signatures already named
 #: there (an implementation is named once per signature, not per call)
 _SEEN: ContextVar[tuple[Seen, set[object]] | None] = ContextVar("cozy_attention_seen", default=None)
+#: The dev-only attention capture's hook (`attention_capture`), called with each call's site
+#: backend, band, the backend that serves it, Q/K/V and options, right after the band pick.
+CAPTURE: ContextVar[Callable[[str, str, str, Tensor, Tensor, Tensor, Options], None] | None] = (
+    ContextVar("cozy_attention_capture", default=None)
+)
 _FUNCTIONS: dict[str, BackendCall] = {}
 _MEMBERS: dict[str, AttentionBackendName] = {}
 #: backend -> its kernel, as `function` made its call
@@ -303,6 +308,9 @@ def _call(
         why = local.refusal(query, key, options) if local.refusal is not None else ""
     if first and refusing:
         refused(first, 1, backend)
+    capture = CAPTURE.get()
+    if capture is not None:
+        capture(site, band, backend, query, key, value, options)
     scope = _SEEN.get()
     if scope is not None:
         masked, causal = options["attn_mask"] is not None, options["is_causal"]
