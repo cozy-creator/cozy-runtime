@@ -3195,7 +3195,8 @@ def _page(block: _Block, identity: object, overlay: Hashable, *, final: bool = F
     """A block's host-tier page key: a digest of its component by content, path, stored layout,
     fill identity and overlay, and `final` for its cast bytes. The same bytes have one key in every
     process, whichever release of a package loaded them."""
-    return _digest((block.model.content, block.path, _stored_layout(block), identity, overlay, final))
+    layout = _stored_layout(block)
+    return _digest((block.model.content, block.path, layout, identity, overlay, final))
 
 
 def _slot(block: _Block, identity: object, overlay: Hashable) -> str | None:
