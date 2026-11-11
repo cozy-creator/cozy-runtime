@@ -35,6 +35,9 @@ SCHEMA = "cozy.attention-table/1"
 MEASURED = "cozy.attention-measurements/1"
 #: The `report` of the one hand-made table, R3's transcription of the cells before any measurement.
 TRANSCRIBED = "transcribed"
+#: The lowest precision any cell lists (Paul, 11-11; the Runtime's validator, `attention_table.LOWEST`): a 4-bit kernel
+#: serves only by pin, so a level-4 cell lists the 8-bit and 16-bit kernels.
+LOWEST = 8
 #: The machine every pod is: a platform wheel's pin for another CPU is not what was measured.
 _MACHINE = "x86_64"
 
@@ -328,6 +331,8 @@ def _cells(name: str, record: Json, kernels: Mapping[str, Kernel], rules: Rules,
         why = rules.excludes(k, name) or failed.get(k, "") or _passes(name, kernels[k], record["quality"].get(k), rules, report)
         if why:
             report.append(f"{name}: {k} left out: {why}")
+        elif kernels[k].level < LOWEST:
+            report.append(f"{name}: {k} passes its {kernels[k].level}-bit bar and is listed nowhere: 4-bit serves only by pin")
         else:
             passing.append(k)
     cells = []

@@ -22,8 +22,11 @@ import msgspec
 from cozy_runtime.internal import arch
 
 SCHEMA = "cozy.attention-table/1"
-#: A hand-made table's `report`: it lists no 4-bit kernel (Paul, 11-11).
+#: A hand-made table's `report`.
 TRANSCRIBED = "transcribed"
+#: The lowest precision any cell lists (Paul, 11-11): a 4-bit kernel serves only by pin, until a model opts in with a
+#: measured quality pass and Paul's eye check, which a change to this rule records.
+LOWEST = 8
 PATH = Path(__file__).with_name("attention_table.json")
 #: The attention levels a cell is filed at: the precision its site tolerates, 16 the exact one.
 LEVELS = (4, 8, 16)
@@ -146,8 +149,8 @@ def _problems(document: Document, kernels: Mapping[str, Kernel]) -> list[str]:
                     found.append(f"{where}: {name} is sparse")
                 elif kernel.families and family not in kernel.families:
                     found.append(f"{where}: {name} does not run on {family}")
-                elif kernel.level < 8 and document.report == TRANSCRIBED:
-                    found.append(f"{where}: {name} is 4-bit; only a measured table lists one")
+                elif kernel.level < LOWEST:
+                    found.append(f"{where}: {name} is {kernel.level}-bit; one serves only by pin")
     for klass in arch.CLASSES:
         for layout in LAYOUTS:
             for level in LEVELS:
