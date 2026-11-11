@@ -1,0 +1,1 @@
+Two GPUs without peer access run H3 1.6x as fast as one (was 1.37x on 2x RTX 4090): Ulysses packs and unpacks on streams of its own beside the attention, Q, K, V and the output cross as int8 through fused Triton kernels, and a call's first and last head groups take one head per GPU.
