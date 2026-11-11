@@ -1,0 +1,1 @@
+A caller gets each file of a child's result as the type its field declares: a `Latents` field arrives as `Latents`, so a package can call minimax-h3's `generate` and keep its `ShotResult` (Runtime 0.45.0 refused it: `child_result_invalid`, "Expected `Latents`, got `File`"). The same holds for any subclass of `File`, `ImageFile`, `VideoFile`, `AudioFile` or `Tree` (cr-276).

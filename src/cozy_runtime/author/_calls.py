@@ -157,7 +157,6 @@ class _CallType:
     export: str
     request: type[msgspec.Struct]
     result: type[msgspec.Struct]
-    python_result: type[msgspec.Struct] | None = None
     #: Why the machine cannot serve this operation; "" when it can.
     unavailable: str = ""
     #: A callable bound from its own code: its model slots, which a caller passes beside its
@@ -441,7 +440,6 @@ class _Broker:
                             request_id=self.request_id,
                             guard=guard,
                             grant_token=self.grant_token,
-                            python_type=call.binding.python_result,
                             media=self.media,
                         )
                         return cast(R, result)
