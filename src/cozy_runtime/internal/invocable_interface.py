@@ -8,7 +8,7 @@ import re
 import types
 import typing
 from collections.abc import Mapping, Sequence
-from typing import Any, get_args, get_origin
+from typing import get_args, get_origin
 
 import msgspec
 
@@ -30,14 +30,14 @@ def from_types(
     parameter_defaults: Mapping[str, object],
     memoize: bool,
     capabilities: Sequence[str],
-) -> dict[str, Any]:
+) -> dict[str, canonical.Json]:
     """Portable names/defaults from resolved types, shared by both interface readers.
     `parameters` None: a handler, whose caller names are its request struct's fields."""
     serving = parameters is None
     if parameters is None:
         payload = typing.cast(type[msgspec.Struct], payload_type)
         parameters = [field.encode_name for field in msgspec.structs.fields(payload)]
-    defaults: dict[str, Any] = {}
+    defaults: dict[str, canonical.Json] = {}
     names: dict[str, str] = {}
     enums: dict[str, list[str]] = {}
 
@@ -146,7 +146,7 @@ def _identifier(value: object) -> bool:
     return isinstance(value, str) and value.isidentifier() and not keyword.iskeyword(value)
 
 
-def project_serving_models(document: dict[str, Any]) -> None:
+def project_serving_models(document: dict[str, canonical.Json]) -> None:
     """Expose injected Model parameters once, in the serving Model plane.
 
     Only the interface builder calls it, for a function whose request is its own parameters.
@@ -236,9 +236,9 @@ def validate(value: Invocable, request: object, result: object) -> None:
             "invocable parameters differ from request fields", code="invocable_interface"
         )
     check_memo_requires(value, request)
-    nodes: dict[str, Any] = {}
+    nodes: dict[str, canonical.Json] = {}
 
-    def walk(node: Any, path: str) -> None:
+    def walk(node: canonical.Json, path: str) -> None:
         nodes[path] = node
         if isinstance(node, dict):
             node = node.get("pickup", node)

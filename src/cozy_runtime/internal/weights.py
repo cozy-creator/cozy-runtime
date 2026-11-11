@@ -23,7 +23,7 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType, ModuleType
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from tensorfs.raw import parts as stored_parts
 
@@ -41,7 +41,7 @@ from cozy_runtime.author._model import PLACED, LoRAServing
 from cozy_runtime.internal import execution, lora_bake
 from cozy_runtime.internal.accel import ResidencyError, StaleBinding
 from cozy_runtime.internal.derive import placing
-from cozy_runtime.internal.encoding.formats import TORCH_DTYPES, LeafProvider
+from cozy_runtime.internal.encoding.formats import TORCH_DTYPES, Leaf, LeafProvider
 from cozy_runtime.internal.encoding.leaves import sites as leaf_sites
 from cozy_runtime.internal.encoding.selection import (
     DeviceFacts,
@@ -82,6 +82,11 @@ from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution
 if TYPE_CHECKING:
     import torch
     from torch import Tensor
+
+    class _Adopting(Protocol):
+        """An svdq leaf (`SvdqLinear.adopt`): told its LoRAs' factors as it runs, or None."""
+
+        def adopt(self, lora: Callable[[], list[tuple[object, Tensor, Tensor, float]]] | None) -> None: ...
     from torch.nn import Linear, Module
 
 
@@ -153,7 +158,7 @@ class Backend:
         }
         self.encoded_leaves = "refuse"
         #: contract key -> (installed leaf, replaced module, derived roles)
-        self.leaves: dict[str, tuple[Any, Any, tuple[str, ...]]] = {}
+        self.leaves: dict[str, tuple[Leaf, object, tuple[str, ...]]] = {}
         #: (component, provider) -> installed leaves, counted when they install (`gemm.selected`)
         self.gemm_sites: Counter[tuple[str, str]] = Counter()
         #: component -> its 16-bit stored float dtypes, which a CPU executor computes in float32
@@ -503,7 +508,7 @@ class Backend:
         self.legs.append((name, round((now - since) * 1000, 1)))
         return now
 
-    def _install_leaf(self, key: str) -> tuple[Any, Any, tuple[str, ...]]:
+    def _install_leaf(self, key: str) -> tuple[Leaf, object, tuple[str, ...]]:
         """Replace the linear op that owns `key` with its encoded leaf, on meta. Returns the
         leaf, the replaced module, and the roles the provider derives from stored bytes."""
         torch = self.torch
@@ -779,7 +784,7 @@ def _float32(torch: ModuleType, root: Module) -> None:
             sub.register_forward_pre_hook(widen, with_kwargs=True)
 
 
-def _derived(leaf: Any, parts: Mapping[str, Any]) -> tuple[str, ...]:
+def _derived(leaf: Leaf, parts: Mapping[str, Tensor]) -> tuple[str, ...]:
     """The stored roles `leaf` keeps as other tensors than the stored ones (cast, swizzled): a
     bind makes them again from the stored bytes. A stored role it does not read is neither."""
     kept = leaf.roles()
@@ -787,7 +792,7 @@ def _derived(leaf: Any, parts: Mapping[str, Any]) -> tuple[str, ...]:
 
 
 def _bound(
-    leaf: Any, derived: Sequence[str], parts: Mapping[str, Tensor], fresh: Callable[[], Any]
+    leaf: Leaf, derived: Sequence[str], parts: Mapping[str, Tensor], fresh: Callable[[], Leaf]
 ) -> dict[str, Tensor]:
     """`leaf`'s role buffers, by buffer name, from one bind's stored `parts`: the roles it keeps
     as stored, and the `derived` ones from a fresh leaf of the same provider."""
@@ -797,7 +802,8 @@ def _bound(
     }
     if derived:
         built = fresh()
-        made.update({buffers.get(r, r): built._buffers[buffers.get(r, r)] for r in derived})
+        # cast: a derived role's buffer is one the fresh leaf made
+        made.update({buffers.get(r, r): cast("Tensor", built._buffers[buffers.get(r, r)]) for r in derived})
     return made
 
 
@@ -837,7 +843,7 @@ class _Bake:
     hooks: list[LoRASource] = field(default_factory=list)
     #: An svdq.nvfp4 leaf: its LoRAs join its low-rank branch as more ranks when it runs
     #: (`SvdqLinear.adopt`), never its bytes, so no page refills for them.
-    leaf: Any = None
+    leaf: _Adopting | None = None
 
 
 class _Bakes:
@@ -872,7 +878,7 @@ class _Bakes:
                 module = root.get_submodule(site)
             except AttributeError:  # a tensor named `.weight` on no module of its own
                 module = None
-            leaf = module if hasattr(module, "adopt") else None
+            leaf = cast("_Adopting | None", module if hasattr(module, "adopt") else None)  # cast: svdq's
             if site == local or not (
                 leaf is not None or lora_bake.bakeable(encoded.scheme, dict(encoded.params), roles)
             ):
@@ -1304,7 +1310,7 @@ class Placement:
     def note(self, key: str, value: str) -> None:
         self.notes[key] = value
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, dict[str, object]]:
         """Aggregate at the request boundary; replay updates only constant-size counters."""
         return {
             "notes": dict(self.notes),

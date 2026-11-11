@@ -298,6 +298,9 @@ class Leaf(Protocol):
     _cozy_roles: tuple[str, ...]
     _buffers: dict[str, torch.Tensor | None]
     _non_persistent_buffers_set: set[str]
+    #: the provider that made it (`leaves.sites`) and the dtype it writes
+    provider: str
+    out_dtype: torch.dtype
 
     def __call__(self, x: Tensor, /) -> Tensor:
         """The linear op it replaced, on its encoded weight."""

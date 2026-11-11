@@ -26,11 +26,12 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 import msgspec
 
 from cozy_runtime.internal import execution_evidence, spawn
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.config import inherited_environment, update_environment
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.parallel.plan import GroupRefusal
@@ -127,7 +128,7 @@ class Follower:
     #: how people name the GPU this process drives (`execution_evidence.gpu_name`)
     gpu: str = ""
     #: routed replies; the body stays a mapping because its readers index it by key
-    replies: queue.Queue[tuple[Frame, dict[str, Any]] | None] = field(default_factory=queue.Queue)
+    replies: queue.Queue[tuple[Frame, dict[str, Json]] | None] = field(default_factory=queue.Queue)
     #: the seam-closed verdict once the reader saw EOF or a torn frame; "" while live
     gone: str = ""
     #: a byte here aborts its collectives (its watcher thread; `RankGroup.interrupt`)
@@ -213,7 +214,7 @@ def ready_rank(torch: ModuleType, spec: RankSpec, sealed: Mapping[str, str]) -> 
     return store
 
 
-def form_rank(torch: Any, spec: RankSpec, store: Any) -> Any:
+def form_rank(torch: ModuleType, spec: RankSpec, store: Store) -> ProcessGroup:
     """A follower's half of the group, on the store `ready_rank` reached. Returns the group
     handle every collective is given explicitly."""
     dist = torch.distributed
@@ -228,7 +229,7 @@ def form_rank(torch: Any, spec: RankSpec, store: Any) -> Any:
     )
     dist.barrier()
     warm(torch, spec.backend, spec.rank, spec.world)
-    return dist.group.WORLD
+    return cast("ProcessGroup", dist.group.WORLD)  # cast: torch passed in as a module
 
 
 def _device(torch: ModuleType, backend: str) -> object:
@@ -548,7 +549,7 @@ class RankGroup:
 
     def form(
         self,
-        torch: Any,
+        torch: ModuleType,
         sealed: Mapping[str, str],
         again: bool = False,
         nccl: Mapping[str, str] | None = None,
@@ -704,7 +705,7 @@ class RankGroup:
         """Hand every follower rank 0's Start."""
         self.broadcast(command)
 
-    def collect(self, name: str, shown: bool = True) -> list[dict[str, Any]]:
+    def collect(self, name: str, shown: bool = True) -> list[dict[str, Json]]:
         """One reply named `name` from every follower, in rank order. Each wait ends with the
         reply or the follower's death, observed through its seam, never inferred from silence.
         A call's replies follow its collectives every step, so those waits are not `shown`."""
@@ -719,10 +720,10 @@ class RankGroup:
                 f"{self.gpu(rank)} cannot be commanded: {exc}", code="group_broken"
             ) from exc
 
-    def reply_one(self, rank: int, name: str, shown: bool = True) -> dict[str, Any]:
+    def reply_one(self, rank: int, name: str, shown: bool = True) -> dict[str, Json]:
         return self._reply(self.followers[rank - 1], name, shown)
 
-    def _reply(self, follower: Follower, name: str, shown: bool = True) -> dict[str, Any]:
+    def _reply(self, follower: Follower, name: str, shown: bool = True) -> dict[str, Json]:
         if shown and follower.replies.empty():
             self.waiting(f"waiting on {follower.gpu}: {name}")
         frame = follower.replies.get()
@@ -735,7 +736,7 @@ class RankGroup:
             raise GroupRefusal(self.broken, code="group_broken")
         return body
 
-    def call(self, command: Mapping[str, object]) -> list[dict[str, Any]]:
+    def call(self, command: Mapping[str, object]) -> list[dict[str, Json]]:
         self.broadcast(command)
         return self.collect(str(command["cmd"]))
 
