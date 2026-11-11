@@ -161,6 +161,14 @@ def offload_in_executor(ctx: Context) -> Measured:
     return Measured(json.dumps(found, sort_keys=True))
 
 
+def quantize_reuse(ctx: Context, tel: Telemetry, *, case: str, seed: int = 156) -> Measured:
+    """The Runtime's per-component quantization across an Output's lifetime, on the CPU: `components` or `resume`
+    (`internal/bench/quantize_reuse.py`). Raises when a conversion is reused, refused or written wrong."""
+    from cozy_runtime.internal.bench import quantize_reuse as check
+
+    return Measured(json.dumps(check.exercise(ctx, tel, case, seed), sort_keys=True, default=str))
+
+
 class Wired(msgspec.Struct, frozen=True):
     """`child_wire`'s refusal codes, as JSON, and the file it saved for them (returned, as every saved file is)."""
 

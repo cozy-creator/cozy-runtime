@@ -22,6 +22,7 @@ from cozy_runtime.bench import (
     lora_overlay_refill,
     offload_in_executor,
     overlay_replay,
+    quantize_reuse,
     varena_core,
 )
 from cozy_runtime.author import (
@@ -302,6 +303,7 @@ app.entrypoint(kernel_ready, accelerator=False)
 app.entrypoint(child_wire, accelerator=False)
 app.entrypoint(varena_core, accelerator=True)
 app.entrypoint(offload_in_executor, accelerator=True)
+app.entrypoint(quantize_reuse, accelerator=False)
 app.entrypoint(
     overlay_replay,
     defaults={

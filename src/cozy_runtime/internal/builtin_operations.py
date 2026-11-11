@@ -19,6 +19,7 @@ EXPORTS = {
         "child_wire",
         "varena_core",
         "offload_in_executor",
+        "quantize_reuse",
         "overlay_replay",
         "lora_overlay_refill",
     ),
