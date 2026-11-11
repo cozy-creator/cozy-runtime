@@ -190,6 +190,7 @@ PATH_KEYS = frozenset(
         "folder",
         "repo",
         "repo_id",
+        "model_id",
         "checkpoint",
         "checkpoint_path",
         "weights",

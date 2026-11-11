@@ -492,9 +492,9 @@ def _replay_code(command: Invoke, request: str) -> str:
     return f"{command.operation}\0{hashlib.sha256(canonical.write(asked)).hexdigest()}"
 
 
-def _show_checkpoint(exchange: Exchange, slot: str, repo_id: str, revision: str) -> None:
+def _show_checkpoint(exchange: Exchange, slot: str, model_id: str, revision: str) -> None:
     """A weights output's checkpoint as the run's checkpoint item (`CheckpointItem`)."""
-    answer = exchange(CheckpointItem(output=slot, repo_id=repo_id, revision=revision))
+    answer = exchange(CheckpointItem(output=slot, model_id=model_id, revision=revision))
     if not answer.ok:
         raise RuntimeFailure(
             answer.detail or "the machine refused the checkpoint item",
@@ -2653,7 +2653,7 @@ class Executor:
         # whole per-tensor encoding plan at 400,592 B read, zero tensor bytes), so this
         # costs one header read and no load.
         # Package installation carries no pre-qualified hardware variant. Derive it from
-        # the executor's device; a repository lane is never a hardware claim. THE DEVICE IS
+        # the executor's device; a model lane is never a hardware claim. THE DEVICE IS
         # ORDINAL 0 BY CONSTRUCTION (cr-066): the worker sealed this process to exactly its
         # lane's devices, so there is nothing to select here and no index to carry.
         device_index = self.rank if self.world > 1 else 0
