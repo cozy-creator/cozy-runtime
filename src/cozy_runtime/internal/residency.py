@@ -88,6 +88,16 @@ _PARKED = 2
 _HOST_STAGING = 64 << 20
 #: Host RAM that host-resident weights leave free: the host tier's pages, a CPU's held blocks.
 _HOST_HEADROOM = 8 << 30
+
+
+@functools.cache
+def _headroom() -> int:
+    """`_HOST_HEADROOM`, or a quarter of a smaller host's RAM: 8 GiB was half a 16 GB laptop's or
+    CI runner's, whose free RAM was most often less, so every CPU binding was refused (cl-885)."""
+    total = host_memory().total_bytes
+    return min(_HOST_HEADROOM, total // 4) if total > 0 else _HOST_HEADROOM
+
+
 #: Stored float dtypes a CPU executor serves widened to float32 (`weights._float32`).
 _NARROW = ("F16", "BF16")
 _DTYPES = {
@@ -882,7 +892,7 @@ class Binding:
                     # Bound whole, its blocks cannot stream: past the host's room it refuses as
                     # an allocation would, and a decode streams them per forward instead.
                     missing = sum(b.allocation_bytes for b in self.groups if b.data is None)
-                    if missing > memory._free() - _HOST_HEADROOM:
+                    if missing and missing > memory._free() - _headroom():
                         raise torch.OutOfMemoryError(
                             f"{self.model.component}: {missing / (1 << 30):.1f} GiB of float32 "
                             "weights to bind, more than the host can give"
@@ -1205,15 +1215,15 @@ class Memory:
 
     def _fitting(self, model: Model, groups: list[_Block]) -> list[_Block]:
         """A CPU step's hold, decided once: the longest prefix of `groups` whose bytes as served
-        fit what the host can still give less `_HOST_HEADROOM`, once other models' holds outside
-        the step have gone. The rest stream, read and widened per forward (`_idle`)."""
+        fit what the host can still give less its headroom (`_headroom`), once other models' holds
+        outside the step have gone. The rest stream, read and widened per forward (`_idle`)."""
         request = _REQUEST.get()
         step = request.phase(model.name) if request is not None else frozenset({model.name})
         for other in list(self.models.values()):
             if other.name not in step and not other.users:
                 for hold in [h for h in other.holds if h.reclaimable]:
                     hold.shed()
-        room = self._free() - _HOST_HEADROOM
+        room = self._free() - _headroom()
         held: list[_Block] = []
         for block in groups:
             room -= 0 if block.data is not None else block.allocation_bytes
