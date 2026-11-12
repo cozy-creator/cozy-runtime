@@ -193,7 +193,10 @@ NEUTRAL_ERROR_SET: Mapping[str, object] = {
 SUCCEEDED = Outcome("succeeded", "runtime", "ok")
 #: The card's room as a device OOM's line names it ("X live, Y of weights in use, of Z"), set by the
 #: execution layer where it runs on a device: a refusal that stands says what it stood against.
-ROOM: list[Callable[[], str]] = []
+ROOM: list[Callable[[BaseException], str]] = []
+#: The attribute a device OOM that stood after the Runtime ran its forward again carries: what it
+#: tried, for its line (`execution.catch.rerun`).
+RERAN = "cozy_reran"
 
 #: The code a device out-of-memory escaping a handler reports under. It is RUNTIME-origin
 #: on purpose: residency is the runtime's whole job here, the package owns no memory
@@ -289,6 +292,15 @@ def is_capacity(exc: BaseException) -> bool:
     return fault(exc) in (Fault.OOM, Fault.EXHAUSTED)
 
 
+def from_driver(exc: BaseException) -> bool:
+    """A device OOM with no allocation of ours refused: the driver's own (a kernel's code at its
+    first launch, local memory, a library's handle) or a CUDA library's. varena's refusal reaches
+    torch as its `OutOfMemoryError`, every evictable byte already offered for it."""
+    kind = type(exc)
+    torch_oom = kind.__name__ == "OutOfMemoryError" and kind.__module__.startswith("torch")
+    return not torch_oom and fault(exc) is Fault.OOM
+
+
 def unwind(exc: BaseException) -> None:
     """Let a failure's frames go, and the tensors their locals hold: every traceback in its
     cause and context chain (its outcome keeps the text)."""
@@ -335,7 +347,9 @@ def classify(exc: BaseException | None) -> Outcome:
     if found is Fault.OOM:
         first = str(exc).partition("\n")[0][:300] or "the device ran out of memory"
         if ROOM and " beside " not in first:
-            first = f"{first} beside {ROOM[0]()}"
+            first = f"{first} beside {ROOM[0](exc)}"
+        if reran := getattr(exc, RERAN, ""):
+            first = f"{first}; {reran}"
         return Outcome("failed", "runtime", DEVICE_OOM, first[:400], (), _trace(exc))
     if found is Fault.EXHAUSTED:
         return Outcome("failed", "runtime", MEMORY_EXHAUSTED, str(exc)[:400], (), _trace(exc))
