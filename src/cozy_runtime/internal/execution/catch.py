@@ -24,7 +24,7 @@ from tensorfs import varena
 from torch import Tensor, nn
 
 from cozy_runtime.author._context import CURRENT as ATTEMPT
-from cozy_runtime.author._errors import DoesNotFit, is_capacity
+from cozy_runtime.author._errors import ROOM, DoesNotFit, is_capacity
 from cozy_runtime.author._model import TRANSPARENT
 from cozy_runtime.internal.execution import phase, sizing
 from cozy_runtime.internal.residency import Model, Request
@@ -117,6 +117,27 @@ def owners(request: Request) -> tuple[Model | Request, ...]:
 
 def _gib(n: int) -> str:
     return f"{n / (1 << 30):.1f} GiB"
+
+
+def _room_line() -> str:
+    """The card's room now, for a device OOM's line (`_errors.ROOM`): read where the failure is
+    classified, its frames still held."""
+    try:
+        if not torch.cuda.is_initialized():
+            return "a card this process has not started"
+        device = torch.cuda.current_device()
+        room = vt.room(device)
+    except Exception as exc:  # the line only describes the failure; it never replaces it
+        return f"a room that could not be read ({type(exc).__name__})"
+    return (
+        f"{_gib(room['working_live'])} live and {_gib(room['pinned'])} of weights in use, "
+        f"{_gib(room['weights_resident'])} resident, of {_gib(room['capacity'])} on GPU {device}, "
+        "every evictable byte offered"
+    )
+
+
+if not ROOM:
+    ROOM.append(_room_line)
 
 
 def refuse(device: int, name: str, level: str, need: int, exc: BaseException) -> DoesNotFit:

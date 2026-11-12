@@ -8,7 +8,7 @@ whether a package is broken or a request is.
 from __future__ import annotations
 
 import traceback as _tb
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
@@ -191,6 +191,9 @@ NEUTRAL_ERROR_SET: Mapping[str, object] = {
 }
 
 SUCCEEDED = Outcome("succeeded", "runtime", "ok")
+#: The card's room as a device OOM's line names it ("X live, Y of weights in use, of Z"), set by the
+#: execution layer where it runs on a device: a refusal that stands says what it stood against.
+ROOM: list[Callable[[], str]] = []
 
 #: The code a device out-of-memory escaping a handler reports under. It is RUNTIME-origin
 #: on purpose: residency is the runtime's whole job here, the package owns no memory
@@ -330,8 +333,10 @@ def classify(exc: BaseException | None) -> Outcome:
         return Outcome("failed", "author", exc.code, exc.message, exc.fields, _trace(exc))
     found = fault(exc)
     if found is Fault.OOM:
-        first = str(exc).partition("\n")[0][:400] or "the device ran out of memory"
-        return Outcome("failed", "runtime", DEVICE_OOM, first, (), _trace(exc))
+        first = str(exc).partition("\n")[0][:300] or "the device ran out of memory"
+        if ROOM and " beside " not in first:
+            first = f"{first} beside {ROOM[0]()}"
+        return Outcome("failed", "runtime", DEVICE_OOM, first[:400], (), _trace(exc))
     if found is Fault.EXHAUSTED:
         return Outcome("failed", "runtime", MEMORY_EXHAUSTED, str(exc)[:400], (), _trace(exc))
     if found in (Fault.STICKY, Fault.DEVICE):
