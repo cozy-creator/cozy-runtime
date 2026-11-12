@@ -31,6 +31,7 @@ from cozy_runtime.author._context import CURRENT
 
 if TYPE_CHECKING:
     from torch import Tensor
+    from torch import device as Device
 
 #: The least time between two previews of one attempt.
 INTERVAL_S = 0.5
@@ -206,7 +207,6 @@ class Previews:
         self._busy = False
         self._said: set[str] = set()
         self._pinned: dict[tuple[int, ...], Tensor] = {}
-        self._factors: dict[tuple[int, str], tuple[Tensor, Tensor]] = {}
 
     def offer(
         self,
@@ -242,25 +242,25 @@ class Previews:
         x = _frames(latents.detach(), family, grid)
         if isinstance(x, str):
             return x
-        if x.shape[0] == family.channels * 4:  # each 2x2 patch in the channels
-            c, t, h, w = family.channels, *x.shape[1:]
-            x = x.reshape(c, 2, 2, t, h, w).permute(0, 3, 4, 1, 5, 2).reshape(c, t, h * 2, w * 2)
-        if x.shape[0] != family.channels:
+        if x.shape[0] not in (family.channels, family.channels * 4):
             return f"{x.shape[0]} channels, where this VAE's latents have {family.channels}"
         with torch.no_grad():
-            x = x.float()
+            # The frames shown first, as a strided view: no temporary the latents' size, no index
+            # copied to the device.
             if x.shape[1] > FRAMES:
-                x = x[:, torch.linspace(0, x.shape[1] - 1, FRAMES, device=x.device).round().long()]
+                x = x[:, :: math.ceil(x.shape[1] / FRAMES)]
+            if x.shape[0] == family.channels * 4:  # each 2x2 patch in the channels
+                c, t, h, w = family.channels, *x.shape[1:]
+                x = (
+                    x.reshape(c, 2, 2, t, h, w)
+                    .permute(0, 3, 4, 1, 5, 2)
+                    .reshape(c, t, h * 2, w * 2)
+                )
+            x = x.float()
             longest = max(x.shape[-2:])
             if longest > LONGEST:
                 x = torch.nn.functional.avg_pool2d(x, math.ceil(longest / LONGEST), ceil_mode=True)
-            key = (id(family), str(x.device))
-            if key not in self._factors:  # copied to the device once: a copy waits on its queue
-                self._factors[key] = (
-                    torch.tensor(family.factors, device=x.device),
-                    torch.tensor(family.bias, device=x.device),
-                )
-            factors, bias = self._factors[key]
+            factors, bias = _on(family, x.device)
             rgb = torch.einsum("cthw,cr->thwr", x, factors).add_(bias)
             rgb = rgb.add_(1.0).mul_(127.5).clamp_(0.0, 255.0).to(torch.uint8)
             if rgb.device.type != "cuda":
@@ -290,7 +290,9 @@ class Previews:
                     body, format="WEBP", quality=70, method=0, save_all=True,
                     append_images=pictures[1:], duration=FRAME_MS, loop=0,
                 )  # fmt: skip
-            self._sink(PreviewFrame(step[0], step[1], "image/webp", width, height, frames, body.getvalue()))
+            self._sink(
+                PreviewFrame(step[0], step[1], "image/webp", width, height, frames, body.getvalue())
+            )
         except Exception as exc:  # a preview never fails the run it shows
             self._misuse(f"encode: {type(exc).__name__}: {exc}"[:300])
         finally:
@@ -300,6 +302,24 @@ class Previews:
         if why not in self._said:
             self._said.add(why)
             self._say(f"preview: {why}")
+
+
+#: Each family's factors and bias on each device: a pinned copy that never waits on the GPU's queue
+#: (a pageable one would hold the loop's thread until every queued kernel ran).
+_ON: dict[tuple[int, str], tuple[Tensor, Tensor]] = {}
+
+
+def _on(family: Family, device: Device) -> tuple[Tensor, Tensor]:
+    import torch
+
+    key = (id(family), str(device))
+    found = _ON.get(key)
+    if found is None:
+        host = torch.tensor([*family.factors, family.bias], dtype=torch.float32)
+        cuda = device.type == "cuda"
+        moved = (host.pin_memory() if cuda else host).to(device, non_blocking=cuda)
+        found = _ON[key] = (moved[:-1], moved[-1])
+    return found
 
 
 def _frames(x: Tensor, family: Family, grid: tuple[int, ...] | None) -> Tensor | str:
