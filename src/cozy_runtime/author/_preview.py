@@ -316,7 +316,8 @@ def _on(family: Family, device: Device) -> tuple[Tensor, Tensor]:
     found = _ON.get(key)
     if found is None:
         host = torch.tensor([*family.factors, family.bias], dtype=torch.float32)
-        moved = host.pin_memory().to(device, non_blocking=True)
+        cuda = device.type == "cuda"
+        moved = (host.pin_memory() if cuda else host).to(device, non_blocking=cuda)
         found = _ON[key] = (moved[:-1], moved[-1])
     return found
 
