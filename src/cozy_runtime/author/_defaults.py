@@ -27,11 +27,17 @@ import msgspec
 import msgspec.inspect as mi
 
 from cozy_runtime.author._errors import DefaultResolutionError, InvalidRequest
-from cozy_runtime.author._files import asset_dec_hook
+from cozy_runtime.author._files import (
+    References,
+    asset_dec_hook,
+    reference_kinds,
+    unmentioned,
+    unused_reference,
+)
 from cozy_runtime.author._image import Control
 from cozy_runtime.author._markers import _ModelDefaultMarker, applies, condition
 from cozy_runtime.author._services import AdjustmentRow
-from cozy_runtime.author._walker import MISSING, Node, walk
+from cozy_runtime.author._walker import MISSING, Node, strip, walk
 
 Layer = Literal["checkpoint", "adapter"]
 
@@ -238,8 +244,10 @@ def fit(
     name fields this package does not know, whatever its structs' `forbid_unknown_fields`.
     A value over a limit is clamped or cut with a row, never refused (owner, 2026-11-03): a
     number holds to its bounds and `multiple_of`, or a numeric Literal's nearest member, and text
-    and lists to their `max_length`, and a resolution takes its enum's nearest tier. Types and
-    required fields stay the decoder's, and stay strict.
+    and lists to their `max_length`, and a resolution takes its enum's nearest tier. A modality
+    the function has no use for is ignored with a row (Paul, 11-12): a prompt's reference its
+    `Prompt[T]` takes none of, which decoding leaves out, and a prompt given to a text field, as
+    its text. Types and required fields stay the decoder's, and stay strict.
     """
     ignored: list[str] = []
     rows: list[AdjustmentRow] = []
@@ -266,13 +274,19 @@ def _prune(
         return _prune(info.type, value, path, ignored, rows)
     if isinstance(info, mi.UnionType):
         branch = _branch(info, value)
+        if branch is None and _text(value) is not None:  # a prompt for `str | None`
+            members = [m.type if isinstance(m, mi.Metadata) else m for m in info.types]
+            branch = next((m for m in members if isinstance(m, mi.StrType)), None)
         return value if branch is None else _prune(branch, value, path, ignored, rows)
     if isinstance(info, _OBJECTS) and isinstance(value, dict):
         fields = {field.encode_name: field.type for field in info.fields}
         tag = info.tag_field if isinstance(info, mi.StructType) else None
+        mentions = _mentions(info.cls) if isinstance(info, mi.StructType) else {}
         kept: dict[object, object] = {}
         for key, item in value.items():
             where = f"{path}.{key}" if path else str(key)
+            if key in mentions:
+                _unused(mentions[key], item, where, rows)
             if key in fields:
                 kept[key] = _prune(fields[key], item, where, ignored, rows)
             elif key == tag:
@@ -302,6 +316,9 @@ def _prune(
         return {
             k: _prune(info.value_type, v, f"{path}.{k}", ignored, rows) for k, v in value.items()
         }
+    if isinstance(info, mi.StrType) and (text := _text(value)) is not None:
+        references = cast("dict[str, object]", value).get("references")
+        value = unmentioned(text, _unused(frozenset(), references, f"{path}.references", rows))
     if isinstance(info, mi.StrType) and isinstance(value, str):
         most = info.max_length
         if most is None or len(value) <= most:
@@ -318,6 +335,38 @@ def _prune(
     if applied != value:
         rows.append(AdjustmentRow("clamp", path, value, applied, _LIMIT, "policy"))
     return applied
+
+
+@functools.lru_cache(maxsize=256)
+def _mentions(cls: type[msgspec.Struct]) -> dict[str, frozenset[str]]:
+    """A struct's `References[T]` fields by wire name, each with the media it takes: what
+    `_references` is given for it when it decodes."""
+    found: dict[str, frozenset[str]] = {}
+    for field in msgspec.structs.fields(cls):
+        base, _ = strip(field.type)
+        if (get_origin(base) or base) is References:
+            found[field.encode_name] = reference_kinds(base)
+    return found
+
+
+def _unused(
+    kinds: frozenset[str], references: object, path: str, rows: list[AdjustmentRow]
+) -> list[str]:
+    """An `ignored` row for each wire reference of a modality `kinds` doesn't take; their keys."""
+    keys: list[str] = []
+    for at, item in enumerate(references if isinstance(references, list) else ()):
+        if (kind := unused_reference(kinds, item)) is not None:
+            keys.append(str(cast("dict[str, object]", item).get("key", "")))
+            rows.append(AdjustmentRow.ignored(f"{path}.{at}", keys[-1], kind))
+    return keys
+
+
+def _text(value: object) -> str | None:
+    """A prompt's text, when a value is a prompt (`{"text", "references"}`)."""
+    if not isinstance(value, dict) or "text" not in value or value.keys() - {"text", "references"}:
+        return None
+    text, references = value["text"], value.get("references", [])
+    return text if isinstance(text, str) and isinstance(references, list) else None
 
 
 def _when(info: mi.Type) -> Mapping[str, object] | None:

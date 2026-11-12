@@ -175,7 +175,12 @@ _VOCAB_MODULES = {
 }
 #: Runtime modules a package builds its surface from: followed for types, models and constants. The release gate's
 #: exercisers (`cozy_runtime.bench`) take models defined in `internal/bench`, which packages still can't import.
-_TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.vlm", "cozy_runtime.bench", "cozy_runtime.internal.bench")
+_TRUSTED_ROOTS = (
+    "cozy_runtime.derive",
+    "cozy_runtime.vlm",
+    "cozy_runtime.bench",
+    "cozy_runtime.internal.bench",
+)
 
 
 _ARITHMETIC: dict[type[ast.operator], Callable[[float, float], object]] = {
@@ -464,6 +469,11 @@ class Reader:
         self.enums: dict[tuple[Path, str], type[enum.Enum]] = {}
         self.models: dict[tuple[Path, str], ModelSpec] = {}
         self.type_aliases: set[tuple[Path, int]] = set()
+        #: per module: the names imports inside its functions bind (`_local_import_hint`), and its
+        #: source's lines (`refuse`). A reader refuses thousands of lookups it then catches (a
+        #: call of a local name, `_managed`), each of which walked or split the whole module.
+        self.local_imports: dict[str, dict[str, str]] = {}
+        self.lines: dict[str, list[str]] = {}
 
     # ---------------------------------------------------------------- modules
 
@@ -706,18 +716,10 @@ class Reader:
         return ModuleRef(self.module(f"{base}.{name}", where=(module, stmt)))
 
     def _local_import_hint(self, module: Module, name: str) -> str:
-        for node in ast.walk(module.tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for inner in ast.walk(node):
-                if isinstance(inner, (ast.Import, ast.ImportFrom)) and any(
-                    (alias.asname or alias.name.partition(".")[0]) == name for alias in inner.names
-                ):
-                    return (
-                        f" (line {inner.lineno} imports it inside `def {node.name}` — every "
-                        "import goes at the top of the file)"
-                    )
-        return ""
+        hints = self.local_imports.get(module.name)
+        if hints is None:
+            hints = self.local_imports[module.name] = _local_imports(module.tree)
+        return hints.get(name, "")
 
     # ------------------------------------------------------------- constants
 
@@ -1344,7 +1346,10 @@ class Reader:
     def refuse(
         self, module: Module, node: ast.AST, why: str, code: str = "static_unresolvable"
     ) -> typing.NoReturn:
-        segment = ast.get_source_segment(module.source, node) or type(node).__name__
+        lines = self.lines.get(module.name)
+        if lines is None:
+            lines = self.lines[module.name] = _LINE.findall(module.source)
+        segment = _segment(lines, node) or type(node).__name__
         construct = " ".join(segment.split())
         if len(construct) > CONSTRUCT_CHARS:
             construct = construct[:CONSTRUCT_CHARS] + "…"
@@ -1354,6 +1359,44 @@ class Reader:
             "interface from its source, without running it",
             code=code,
         )
+
+
+def _local_imports(tree: ast.Module) -> dict[str, str]:
+    """Each name an import inside one of `tree`'s functions binds, with the hint that names the
+    first such import in the order `ast.walk` reaches them (functions, then their bodies)."""
+    found: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, (ast.Import, ast.ImportFrom)):
+                for alias in inner.names:
+                    found.setdefault(
+                        alias.asname or alias.name.partition(".")[0],
+                        f" (line {inner.lineno} imports it inside `def {node.name}` — every "
+                        "import goes at the top of the file)",
+                    )
+    return found
+
+
+#: A source line as the parser splits them (`ast._splitlines_no_ff`): `\r\n`, `\r` or `\n` ends one.
+_LINE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
+
+
+def _segment(lines: Sequence[str], node: ast.AST) -> str | None:
+    """`ast.get_source_segment` over a module's lines split once (`_LINE`)."""
+    lineno: int | None = getattr(node, "lineno", None)
+    end: int | None = getattr(node, "end_lineno", None)
+    col: int | None = getattr(node, "col_offset", None)
+    end_col: int | None = getattr(node, "end_col_offset", None)
+    if lineno is None or end is None or col is None or end_col is None:
+        return None
+    first, last = lineno - 1, end - 1
+    if first == last:
+        return lines[first].encode()[col:end_col].decode()
+    head = lines[first].encode()[col:].decode()
+    tail = lines[last].encode()[:end_col].decode()
+    return "".join([head, *lines[first + 1 : last], tail])
 
 
 def _required(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[str, ...]:
@@ -2296,7 +2339,9 @@ def _installed_source(reader: Reader, parts: Sequence[str]) -> Path | None:
 def missing_app(where: str, attribute: str, others: Sequence[str]) -> str:
     """What to do about a module with no `attribute = App()`."""
     if others:
-        return f"{where} has `{others[0]} = App()`: name it `{attribute}`, which is where cozy looks"
+        return (
+            f"{where} has `{others[0]} = App()`: name it `{attribute}`, which is where cozy looks"
+        )
     return (
         f"{where} has no `{attribute} = App()`: add `from cozy_runtime.author import App` and "
         f"`{attribute} = App()`, and decorate your function with `@{attribute}.entrypoint`"

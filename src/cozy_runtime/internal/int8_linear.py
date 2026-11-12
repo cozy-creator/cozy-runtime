@@ -344,8 +344,7 @@ def prologue(
         if (
             getattr(module, "operand", None) != INT8_CONVROT
             or getattr(module, "in_features", None) != width
-            or module._forward_hooks  # type: ignore[attr-defined]
-            or module._forward_pre_hooks  # type: ignore[attr-defined]
+            or not _inert(module)
         ):
             return None
     try:
@@ -356,6 +355,18 @@ def prologue(
         failed(OP, x.get_device(), exc)
         return None
     return PreQuantized(payload, row_scale, (*x.shape[:-1], width), INT8_CONVROT)
+
+
+def _inert(module: object) -> bool:
+    """No hook of `module`'s changes its forward now: none, or overlays (`lora.Hook`) whose delta
+    is baked into the leaf (`_cozy_baked`) or that nothing arms."""
+    if getattr(module, "_forward_pre_hooks", None):
+        return False
+    for hook in getattr(module, "_forward_hooks", {}).values():
+        armed = getattr(hook, "armed", None)
+        if not (getattr(hook, "_cozy_baked", False) or (armed is not None and armed() is None)):
+            return False
+    return True
 
 
 def gemm(
