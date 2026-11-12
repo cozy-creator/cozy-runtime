@@ -1,0 +1,63 @@
+name: rc-dev
+# The open RC's Runtime for dev homes (cl-922): each push to rc/<x.y.z> builds dev-build.yaml's wheels
+# (<version>+dev.g<sha8>, with their kernels) and puts the native ones on the rolling GitHub prerelease
+# `rc-<x.y.z>`, never latest, in place of the last push's. Its SHA256SUMS names them; a dev home's Calcifer
+# reads it and brings its rentals to it. By hand: gh workflow run rc-dev.yaml -R cozy-creator/cozy-runtime --ref rc/<x.y.z>
+on:
+  push:
+    branches: ['rc/*']
+  workflow_dispatch:
+
+# One build per RC at a time: a push while one runs waits, and only the newest waiting one runs.
+concurrency:
+  group: rc-dev-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/dev-build.yaml
+    with:
+      ref: ${{ github.sha }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cozy-runtime-${{ github.sha }}
+          path: dist
+      # New files first, SHA256SUMS next (a reader sees the old build or this one, whole), stale files last.
+      - name: The RC's prerelease holds this build
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          case $BRANCH in rc/*) ;; *) echo "::error::$BRANCH is no RC branch"; exit 1 ;; esac
+          tag="rc-${BRANCH#rc/}"
+          shopt -s nullglob
+          wheels=(*-manylinux_*.whl)
+          [ "${#wheels[@]}" -gt 0 ] || { echo "::error::the build made no native wheel"; ls -la; exit 1; }
+          sha256sum "${wheels[@]}" > SHA256SUMS
+          cat SHA256SUMS
+          if ! gh release view "$tag" -R "$REPO" >/dev/null 2>&1; then
+            gh release create "$tag" -R "$REPO" --target "$SHA" --prerelease --latest=false \
+              --title "$BRANCH dev builds" --notes "The newest build of $BRANCH, for dev homes (cl-922). Replaced by each push."
+          fi
+          gh api -X PATCH "repos/$REPO/git/refs/tags/$tag" -f sha="$SHA" -F force=true >/dev/null
+          stale=$(gh release view "$tag" -R "$REPO" --json assets --jq '.assets[].name')
+          gh release upload "$tag" -R "$REPO" --clobber "${wheels[@]}"
+          gh release upload "$tag" -R "$REPO" --clobber SHA256SUMS
+          for name in $stale; do
+            case " ${wheels[*]} SHA256SUMS " in *" $name "*) ;; *) gh release delete-asset "$tag" "$name" -R "$REPO" -y ;; esac
+          done
+          gh release edit "$tag" -R "$REPO" --notes "$BRANCH at $SHA, for dev homes (cl-922). Replaced by each push."
+          echo "$tag: $BRANCH at $SHA" >> "$GITHUB_STEP_SUMMARY"

@@ -28,6 +28,24 @@ on:
         description: Caller's id, shown in the run name so the caller can find its run
         type: string
         default: ''
+  # rc-dev.yaml's builds.
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+      build:
+        type: string
+        default: wheels
+      runner:
+        type: string
+        default: ubuntu-latest
+      billed_runner:
+        type: string
+        default: ''
+      nonce:
+        type: string
+        default: ''
 run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.nonce }}
 
 permissions:
