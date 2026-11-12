@@ -71,7 +71,7 @@ from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import Cancelled, DoesNotFit, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
-from cozy_runtime.author._services import stage_progress
+from cozy_runtime.author._services import counting, stage_tokens
 from cozy_runtime.graphs import (
     BYPASS,
     DECODERS,
@@ -279,7 +279,8 @@ def generate(
     `progress(tokens)` is told the tokens decoded so far (a call's longest row), at most every
     `PROGRESS_S`, for display only; one that raises is dropped, with a run warning (a cancel is
     the decode's own check's to act on). Without one, the running telemetry stage is told them
-    as its fraction of `max_new_tokens`."""
+    as a count of tokens, `max_new_tokens` only their cap. `ctx.progress` called from it counts
+    tokens too, never steps."""
     for named in (draft, _DRAFT.get(), HEADS.get(model)):
         if named is not None:
             draft = named
@@ -288,7 +289,7 @@ def generate(
         raise ValueError(
             f"temperature {temperature}, top_p {top_p}, top_k {top_k}, seed {seed}: out of range"
         )
-    if progress is None and (stage := stage_progress()) is not None:
+    if progress is None and (stage := stage_tokens()) is not None:
         progress = partial(_share, stage, max_new_tokens)
     sampling = _Sampling(float(temperature), float(top_p), int(seed), int(top_k))
     tell = _Tell(progress)
@@ -320,9 +321,9 @@ def generate(
         BYPASS.reset(token)
 
 
-def _share(stage: Callable[[float], None], most: int, tokens: int) -> None:
-    """`tokens` decoded of at most `most`, as the running stage's fraction."""
-    stage(min(tokens / max(most, 1), 1.0))
+def _share(stage: Callable[[int, int], None], most: int, tokens: int) -> None:
+    """`tokens` decoded of at most `most`, as the running stage's count."""
+    stage(tokens, most)
 
 
 def release(model: torch.nn.Module) -> None:
@@ -1028,6 +1029,8 @@ class _Tell:
         if now - self.told < PROGRESS_S:
             return
         self.told = now
+        # What it tells counts tokens, though it is a package's `ctx.progress(step, total)`.
+        unit = counting.set("tokens")
         try:
             self.progress(count())
         except Cancelled:  # the decode's own check ends the call
@@ -1037,6 +1040,8 @@ class _Tell:
             WARNINGS.append(
                 ("decode progress stopped: its report failed", {"error": str(exc)[:200]})
             )
+        finally:
+            counting.reset(unit)
 
 
 def _batch(rows: int) -> int:

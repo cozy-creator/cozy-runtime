@@ -118,6 +118,8 @@ class ProgressFrame:
     step_ms: float = 0.0
     call_request: str | None = None
     call_attempt: int | None = None
+    #: What `position` counts: empty for steps, `tokens` for a decode's, whose `total` is only its cap.
+    unit: str = ""
 
 
 class _VideoFormat(TypedDict):
@@ -149,16 +151,18 @@ class _ProgressScope:
 _progress_scope: ContextVar[_ProgressScope | None] = ContextVar("cozy_progress_scope", default=None)
 #: The `Telemetry.stage` running on this thread, and its name.
 _stage: ContextVar[tuple[Telemetry, str] | None] = ContextVar("cozy_stage", default=None)
+#: What `ctx.progress` counts while it is set: `tokens` while a decode tells its progress (`lm`).
+counting: ContextVar[str] = ContextVar("cozy_progress_unit", default="")
 
 
-def stage_progress() -> Callable[[float], None] | None:
-    """The running stage's `progress(fraction)`, for Runtime work inside it that is told no
-    progress of its own (a decode): a stage of minutes with none reads as stalled."""
+def stage_tokens() -> Callable[[int, int], None] | None:
+    """The running stage's `tokens(count, most)`, for a decode inside it that is told no progress
+    of its own: a stage of minutes with none reads as stalled."""
     current = _stage.get()
     if current is None:
         return None
     telemetry, name = current
-    return lambda fraction: telemetry._progress(fraction, stage=name)
+    return lambda count, most: telemetry._tokens(count, most, stage=name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1520,6 +1524,16 @@ class Telemetry(_Bound):
         if fraction is not None:
             self._progress_frame(name, stage_fraction=fraction)
 
+    def _tokens(self, count: int, most: int, *, stage: str) -> None:
+        """`count` tokens decoded under `stage`, of at most `most`: a count, never a share, as a
+        decode that stops early is done."""
+        attempt = self._attempt
+        attempt.check_open("Telemetry.progress")
+        self._ctx.raise_if_cancelled()
+        name = self._stage_name(stage)
+        if name is not None and most > 0:
+            self._progress_frame(name, position=min(max(count, 0), most), total=most, unit="tokens")
+
     def _step_counter(self, total: int, *, stage: str) -> Callable[[int], None]:
         """One count of `total` steps under `stage`, called with each finished step's index.
 
@@ -1609,6 +1623,10 @@ class Telemetry(_Bound):
 
         def progress(step: int, total: int) -> None:
             state["said"] = True
+            # A decode's count: tokens, timed as no step.
+            if counting.get() == "tokens":
+                self._tokens(step + 1, total, stage=stage("decoding"))
+                return
             key = (stage("denoise"), total)
             if step == 0 or key not in counts:
                 counts[key] = self._step_counter(total, stage=key[0])
@@ -1692,6 +1710,7 @@ class Telemetry(_Bound):
         except OverflowError:
             pass
         call_request, call_attempt = payload.get("call_request"), payload.get("call_attempt")
+        unit = "tokens" if payload.get("unit") == "tokens" else ""
         if not isinstance(call_request, str) or not 0 < len(call_request) <= 255:
             call_request = None
         if type(call_attempt) is not int or call_attempt <= 0:
@@ -1705,6 +1724,7 @@ class Telemetry(_Bound):
             call_request=call_request,
             call_attempt=call_attempt,
             scoped=False,
+            unit=unit,
         )
 
     @contextmanager
@@ -1768,6 +1788,7 @@ class Telemetry(_Bound):
         call_request: str | None = None,
         call_attempt: int | None = None,
         scoped: bool = True,
+        unit: str = "",
     ) -> None:
         name = self._stage_name(stage)
         if name is None:
@@ -1791,6 +1812,7 @@ class Telemetry(_Bound):
                 step_ms=step_ms,
                 call_request=call_request,
                 call_attempt=call_attempt,
+                unit=unit,
             )
         )
 
