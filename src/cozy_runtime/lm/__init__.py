@@ -2155,7 +2155,10 @@ class _Engine:
         ):
             try:
                 self._pool(True)
-            except Exhausted as exc:  # no row decodes (else the pool is held): nothing ran
+            except Exhausted as exc:  # nothing of it ran
+                if occupied:  # the pool is held while rows decode: a refusal here waits for them
+                    request.waits = True
+                    return False
                 # The graphs are only speed: they go, the call decodes eagerly, and a later step
                 # captures again where its pool finds room.
                 why = no_room(_set(self.domain).device, "its graphs' pool", 0, exc)
@@ -2175,6 +2178,9 @@ class _Engine:
         if placed:
             card = self._card(device) + self.held
             if _never(self._need(*alone, position), card):
+                if self.draft is not None and occupied:
+                    request.waits = True  # the head goes once the rows drafting with it leave
+                    return False
                 if self._undraft(request, "its keys do not fit on this card"):
                     return False
                 raise DoesNotFit(self._refused(request, alone, position, card))
