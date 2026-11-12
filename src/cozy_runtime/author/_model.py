@@ -336,6 +336,12 @@ class Residency(Protocol):
         """Retain ordinary weight storage after prepare(), until the binding closes."""
         ...
 
+    def keep(self, component: str, since_ns: int, reserve: int) -> tuple[Binding, int, int] | None:
+        """Of a component a loop of forwards can't hold whole, a binding over the blocks used since
+        `since_ns` that fit beside `reserve` and the rest streaming, the bytes kept and those still
+        read a forward; None when none fits."""
+        ...
+
     def represent(
         self, component: str, dtype: torch.dtype, *, resident_only: bool = False
     ) -> Callable[[], None]:
@@ -436,11 +442,20 @@ class Yielded(Exception):
 
 
 type WarningRow = tuple[str, dict[str, str | bool | int | float | None]]
+#: The field that marks a row as a failure the Runtime caught and recovered from (`recovered`).
+RECOVERED = "recovered"
+
+
+def recovered(message: str, **fields: str | bool | int | float | None) -> WarningRow:
+    """A row for a failure the Runtime caught and served past (a graph refused at capture, a
+    slower kernel, a step cache off): the record keeps it and counts it, and the run says it once,
+    as one quiet line, never as a warning. A row that is no `recovered` one is a warning."""
+    return message, {**fields, RECOVERED: True}
 
 
 class _Warnings:
-    """Warnings Runtime's speed mechanisms raise (a graph that would not record or replayed
-    wrong), as (message, fields). Each lands in the attempt whose context raised it; one raised
+    """What Runtime's mechanisms raise, as (message, fields): warnings, and the failures they
+    recovered from (`recovered`). Each lands in the attempt whose context raised it; one raised
     outside every attempt lands in the next attempt to end."""
 
     def __init__(self) -> None:

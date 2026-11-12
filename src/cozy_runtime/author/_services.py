@@ -22,7 +22,7 @@ import warnings
 from collections.abc import Buffer, Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import (
@@ -39,8 +39,9 @@ from typing import (
 from tensorfs.executor import Answer, Publish, PublishPart
 
 import cozy_runtime.author._codec as _codec
+import cozy_runtime.author._phases as _phases
 import cozy_runtime.author._stalls as _stalls
-from cozy_runtime.author._activity import settle, work_clock
+from cozy_runtime.author._activity import settle, waited, work_clock
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import (
     DecodedAudioChunk,
@@ -118,7 +119,8 @@ class ProgressFrame:
     step_ms: float = 0.0
     call_request: str | None = None
     call_attempt: int | None = None
-    #: What `position` counts: empty for steps, `tokens` for a decode's, whose `total` is only its cap.
+    #: What `position` counts: empty for steps (or a phase's count: kernels compiled, graphs
+    #: captured), `tokens` for a decode's, whose `total` is only its cap, `bytes` for a load's.
     unit: str = ""
 
 
@@ -139,7 +141,8 @@ class _LoopState(TypedDict):
     said: bool
     calls: int
     shown: float
-    began: tuple[float, object] | None
+    #: the first model call's clocks since the last progress, and the stage it ran in
+    began: tuple[float, object, float, str] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +156,10 @@ _progress_scope: ContextVar[_ProgressScope | None] = ContextVar("cozy_progress_s
 _stage: ContextVar[tuple[Telemetry, str] | None] = ContextVar("cozy_stage", default=None)
 #: What `ctx.progress` counts while it is set: `tokens` while a decode tells its progress (`lm`).
 counting: ContextVar[str] = ContextVar("cozy_progress_unit", default="")
+#: The running attempt's telemetry, where its Runtime phases are told (`_phases`).
+TELLING: ContextVar[Telemetry | None] = ContextVar("cozy_telling", default=None)
+#: What a relayed child frame may count, and the most of it: a byte count is past any step count.
+_RELAYED_UNITS = {"": 1_000_000_000, "tokens": 1_000_000_000, "bytes": 1 << 62}
 
 
 def stage_tokens() -> Callable[[int, int], None] | None:
@@ -253,6 +260,8 @@ class Attempt:
     _step_mark: float = 0.0
     #: the device's mark at the previous step (`DEVICE`), when a GPU runs the attempt
     _step_device: object = None
+    #: the stepping thread's seconds off the clocks at the previous step (`_activity.waited`)
+    _step_waited: float = 0.0
     #: The stepping thread's host-stall sampler while a step loop runs (`_stalls`).
     _stall_watch: _stalls.Watch | None = None
     #: Sends one publish to the worker, which journals it on the run's output log. None in a
@@ -270,6 +279,10 @@ class Attempt:
     #: Its open `tel.stage`s, innermost last: `ctx.progress` from a thread of its own counts
     #: under the innermost.
     _stages: list[str] = field(default_factory=list)
+    #: Its last frame of its own (no phase's), and the lock its frames and its phases' are
+    #: told under: a phase never says its stage after the attempt moved on (`_phases`).
+    _said: ProgressFrame | None = None
+    _telling: threading.RLock = field(default_factory=threading.RLock)
     #: Overlapped calls (`author.concurrently`) record from their own threads.
     _recording: threading.Lock = field(default_factory=threading.Lock)
     #: Whether a model component-use scope is open; media reads refuse while one is.
@@ -1553,7 +1566,7 @@ class Telemetry(_Bound):
         # The mark starts HERE, at callback construction, so the FIRST step has an interval
         # too. Starting it at the first call would silently drop step 0 from the count — and
         # on a one-step request that is the whole measurement.
-        attempt._step_mark = work_clock()
+        attempt._step_mark, attempt._step_waited = work_clock(), waited()
         STEP_NOW.set((name or stage, 0))
         clock = DEVICE[0] if DEVICE else None
         attempt._step_device = clock.mark() if clock is not None else None
@@ -1566,11 +1579,17 @@ class Telemetry(_Bound):
             self._ctx.raise_if_cancelled()
             self._ctx._steps += 1
             STEP_NOW.set((name or stage, step + 1 if isinstance(step, int) else self._ctx._steps))
-            now = work_clock()
+            now, off = work_clock(), waited()
             mark = attempt._step_mark
             ran = clock.mark() if clock is not None else None
             if mark and name is not None:
-                marks = (attempt._step_device, ran) if ran is not None else None
+                # The device's clock runs on through a phase (a first read of the weights): the
+                # host's seconds off its clocks are no step's on the device either.
+                marks = (
+                    (attempt._step_device, ran, (off - attempt._step_waited) * 1000)
+                    if ran is not None
+                    else None
+                )
                 attempt.attribution.step(name, (now - mark) * 1000, marks)
             stalls = attempt._stall_watch
             if stalls is not None:
@@ -1579,7 +1598,7 @@ class Telemetry(_Bound):
                 if step == total - 1:
                     stalls.stop()
                     attempt._stall_watch = None
-            attempt._step_mark, attempt._step_device = now, ran
+            attempt._step_mark, attempt._step_device, attempt._step_waited = now, ran, off
             step_ms = (now - mark) * 1000 if mark else 0.0
             if (
                 name is None
@@ -1608,7 +1627,8 @@ class Telemetry(_Bound):
 
         Progress is a step count under the enclosing stage: this thread's, else the attempt's
         innermost open one, else "denoise". A step 0 starts a new count, timed from the first
-        model call after the previous progress. Until the attempt reports progress, model calls
+        model call in its stage after the previous progress (one in an earlier stage, a text
+        encoder's, is none of its first step). Until the attempt reports progress, model calls
         show as a count, at most two frames a second.
         """
         attempt = self._attempt
@@ -1630,22 +1650,29 @@ class Telemetry(_Bound):
             key = (stage("denoise"), total)
             if step == 0 or key not in counts:
                 counts[key] = self._step_counter(total, stage=key[0])
-                if state["began"] is not None:
-                    attempt._step_mark, attempt._step_device = state["began"]
+                began = state["began"]
+                if began is not None and began[3] == key[0]:
+                    attempt._step_mark, attempt._step_device, attempt._step_waited = began[:3]
             state["began"] = None
             counts[key](step)
 
         def called(method: str) -> None:
-            if state["began"] is None:
+            here, began = stage("denoise"), state["began"]
+            if began is None or began[3] != here:
                 clock = DEVICE[0] if DEVICE else None
-                state["began"] = (work_clock(), clock.mark() if clock is not None else None)
+                state["began"] = (
+                    work_clock(),
+                    clock.mark() if clock is not None else None,
+                    waited(),
+                    here,
+                )
             if state["said"] or attempt.closed:
                 return
             state["calls"] += 1
             now = work_clock()
             if now - state["shown"] >= 0.5:
                 state["shown"] = now
-                self._progress_frame(stage(method), position=state["calls"])
+                self._progress_frame(stage(method), position=state["calls"], said=False)
 
         return progress, called
 
@@ -1690,10 +1717,12 @@ class Telemetry(_Bound):
             else None
         )
         position, total = payload.get("position"), payload.get("total")
+        counted = payload.get("unit", "")
+        unit = counted if isinstance(counted, str) and counted in _RELAYED_UNITS else ""
         if not (
             type(position) is int
             and type(total) is int
-            and 0 <= position <= total <= 1_000_000_000
+            and 0 <= position <= total <= _RELAYED_UNITS[unit]
             and total > 0
         ):
             position = total = None
@@ -1710,7 +1739,6 @@ class Telemetry(_Bound):
         except OverflowError:
             pass
         call_request, call_attempt = payload.get("call_request"), payload.get("call_attempt")
-        unit = "tokens" if payload.get("unit") == "tokens" else ""
         if not isinstance(call_request, str) or not 0 < len(call_request) <= 255:
             call_request = None
         if type(call_attempt) is not int or call_attempt <= 0:
@@ -1789,7 +1817,10 @@ class Telemetry(_Bound):
         call_attempt: int | None = None,
         scoped: bool = True,
         unit: str = "",
+        said: bool = True,
     ) -> None:
+        """One frame of its own. `said`: False for a count of model calls, which says no stage
+        a phase under it moved on from (`_AttemptTeller`)."""
         name = self._stage_name(stage)
         if name is None:
             return
@@ -1802,8 +1833,8 @@ class Telemetry(_Bound):
         ):
             name = f"{scope.name} / {name}"[:120]
         attempt = self._attempt
-        attempt.signal(
-            ProgressFrame(
+        with attempt._telling:
+            frame = ProgressFrame(
                 stage=name,
                 stage_fraction=stage_fraction,
                 advance=attempt.position + 1,
@@ -1814,7 +1845,29 @@ class Telemetry(_Bound):
                 call_attempt=call_attempt,
                 unit=unit,
             )
+            if said:
+                attempt._said = frame
+            attempt.signal(frame)
+
+    def _base(self) -> str:
+        """The stage path this thread shows under now ("" none): what a phase shows below."""
+        attempt = self._attempt
+        current = _stage.get()
+        name = (
+            current[1]
+            if current is not None and current[0]._attempt is attempt
+            else attempt._stages[-1]
+            if attempt._stages
+            else ""
         )
+        scope = _progress_scope.get()
+        if scope is None or scope.telemetry._attempt is not attempt:
+            return name
+        if not name:
+            return scope.name
+        if name == scope.name or name.startswith(scope.name + " / "):
+            return name
+        return f"{scope.name} / {name}"[:120]
 
     def _stage_name(self, value: object) -> str | None:
         if not isinstance(value, str) or not value or len(value) > 120 or not value.isprintable():
@@ -1842,6 +1895,74 @@ class Telemetry(_Bound):
             return
         attempt._progress_diagnostics.add(reason)
         attempt.emit("log", "progress omitted", "warn", reason=reason)
+
+
+class _AttemptTeller:
+    """An attempt's phases, told on its live lane under the stage they ran in (`_phases`)."""
+
+    __slots__ = ("_attempt", "_opened", "base")
+
+    def __init__(self, attempt: Attempt, base: str) -> None:
+        self._attempt, self.base = attempt, base
+        #: its frame when the phase began: its stage, else the stage of the steps it counted
+        #: (`denoise`, where none is open)
+        self._opened = attempt._said
+
+    @property
+    def owner(self) -> object:
+        return self._attempt
+
+    def _here(self, said: ProgressFrame) -> bool:
+        """Whether `said` is of the stage the phase began in: the attempt has not moved on."""
+        return said.stage == self.base or (
+            self._opened is not None and said.stage == self._opened.stage
+        )
+
+    def tell(self, stage: str, position: int | None, total: int | None, unit: str) -> bool:
+        attempt = self._attempt
+        with attempt._telling:
+            said = attempt._said
+            if attempt.closed or (said is not None and not self._here(said)):
+                return False
+            attempt.signal(
+                ProgressFrame(
+                    stage=stage,
+                    stage_fraction=round(min(position / total, 1.0), 6)
+                    if position is not None and total
+                    else None,
+                    advance=attempt.position + 1,
+                    position=position,
+                    total=total,
+                    unit=unit,
+                )
+            )
+        return True
+
+    def back(self) -> None:
+        attempt = self._attempt
+        with attempt._telling:
+            said = attempt._said
+            if not attempt.closed and said is not None and self._here(said):
+                attempt.signal(replace(said, advance=attempt.position + 1, step_ms=0.0))
+
+    def row(self, name: str, ms: float) -> None:
+        attempt = self._attempt
+        with attempt._recording:
+            attempt.attribution.stage(name, ms)
+        attempt.emit("stage", name, round(ms, 3))
+
+
+def _attempt_teller() -> _AttemptTeller | None:
+    telemetry = TELLING.get()
+    if telemetry is None:
+        return None
+    attempt = telemetry._attempt
+    if attempt.closed or attempt.sink is None:
+        return None
+    return _AttemptTeller(attempt, telemetry._base())
+
+
+_phases.attempt = _attempt_teller
 
 
 class _AdjustmentMethods:

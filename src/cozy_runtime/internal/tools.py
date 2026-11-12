@@ -31,8 +31,11 @@ def missing(tool: str, code: str) -> None:
 
 
 def warnings() -> list[tuple[str, dict[str, str | bool | int | float | None]]]:
-    """A run's rows: one per missing tool."""
-    return [(warning(tool), {"code": code, "tool": tool}) for tool, code in _MISSING.items()]
+    """A run's rows: one per missing tool, each a fallback that served (`recovered`)."""
+    return [
+        (warning(tool), {"code": code, "tool": tool, "recovered": True})
+        for tool, code in _MISSING.items()
+    ]
 
 
 def triton() -> bool:

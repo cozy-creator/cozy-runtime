@@ -27,7 +27,7 @@ from cozy_runtime.author._context import CURRENT as ATTEMPT
 from cozy_runtime.author._errors import ROOM, DoesNotFit, is_capacity
 from cozy_runtime.author._model import TRANSPARENT
 from cozy_runtime.internal.execution import phase, sizing
-from cozy_runtime.internal.residency import Model, Request
+from cozy_runtime.internal.residency import PASS_SHAPE, Model, Request
 
 if TYPE_CHECKING:
     from tensorfs.varena._facts import SplitSelection
@@ -381,17 +381,22 @@ def passing(module: nn.Module, args: Args, kwargs: Kwargs) -> Iterator[None]:
     key = phase.execution_key(f"{type(module).__qualname__}:{shapes}", "runtime.pass/1")
     assert key is not None
     request.memory.remember_working_phase(key, owners(request))
-    with phase.observing(
-        device,
-        "eager",
-        request.working_phases,
-        key=key,
-    ) as observation:
-        yield
-        if observation is not None:
-            # An eager observation holds the stream it ran on (`phase.observing`).
-            cast("torch.cuda.Stream", observation.completion_stream).synchronize()
-            observation.complete()
+    # Its passes' shape where its blocks mark them: a prompt's prefill is not its decode (cr-286).
+    shape = PASS_SHAPE.set(hash(key) & ((1 << 64) - 1) or 1)
+    try:
+        with phase.observing(
+            device,
+            "eager",
+            request.working_phases,
+            key=key,
+        ) as observation:
+            yield
+            if observation is not None:
+                # An eager observation holds the stream it ran on (`phase.observing`).
+                cast("torch.cuda.Stream", observation.completion_stream).synchronize()
+                observation.complete()
+    finally:
+        PASS_SHAPE.reset(shape)
 
 
 def wrap(

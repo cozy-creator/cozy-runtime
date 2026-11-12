@@ -527,9 +527,15 @@ def _block_forward(self: _FusedBlock, *args: object, **kwargs: object) -> object
     tables = (rows.scale_msa, rows.gate_msa, rows.scale_mlp, rows.gate_mlp)
     if not _cuda(layout.wide, *tables, rows.shift_msa, rows.shift_mlp):
         return self._cozy_eager(*args, **kwargs)
+    run = _parallel if layout.parallel else _sequential
+    return run(site, launch, x, rows, arguments)
+
+
+def _first(site: _Site, launch: Launch, x: Tensor, rows: Modulation) -> Tensor:
+    """The block's first [modulated] norm of `x`. Each body holds it only while it reads it."""
     _, normed = _kernels.norm_modulate(
         launch,
-        layout.entries.first,
+        site.layout.entries.first,
         x,
         site.norms[0].weight,
         rows.scale_msa,
@@ -537,8 +543,7 @@ def _block_forward(self: _FusedBlock, *args: object, **kwargs: object) -> object
         rows.index,
         site.eps[0],
     )
-    run = _parallel if layout.parallel else _sequential
-    return run(site, launch, x, cast("Tensor", normed), rows, arguments)  # a norm's entry
+    return cast("Tensor", normed)  # a norm's entry
 
 
 def _inputs(linears: Sequence[_Linear], normed: Tensor) -> list[Tensor]:
@@ -562,6 +567,17 @@ def _mlp(launch: Launch, site: _Site, hidden: Sequence[Tensor]) -> Tensor:
         if rows is not None:
             return site.down(rows)
     return site.down(_kernels.swiglu(launch, site.layout.entries.swiglu, *hidden))
+
+
+def _mlp_rows(launch: Launch, site: _Site, normed: Tensor) -> Tensor:
+    """The MLP of the normed rows: token by token, so in the pieces native selection takes where
+    the whole call's [tokens, inner] rows don't fit (`execution.cuts.gated`); whole, as before."""
+    from cozy_runtime.internal.execution import cuts
+
+    def mlp(rows: Tensor) -> Tensor:
+        return _mlp(launch, site, _inputs(site.inputs, rows))
+
+    return cuts.gated(normed, (*site.inputs, site.down), mlp)
 
 
 def _call_attention(
@@ -609,16 +625,16 @@ def _sequential(
     site: _Site,
     launch: Launch,
     x: Tensor,
-    normed: Tensor,
     rows: Modulation,
     arguments: Mapping[str, object],
 ) -> Tensor:
     layout, entries = site.layout, site.layout.entries
+    normed = _first(site, launch, x, rows)
     if layout.composed:
-        # qkv holds exactly to_q, to_k and to_v.
-        attended = _attend(launch, site, *_inputs(site.qkv, normed), arguments)  # type: ignore[arg-type, call-arg]
+        attended = _attend(launch, site, _inputs(site.qkv, normed), arguments)
     else:
         attended = _call_attention(launch, site, normed, arguments)
+    del normed  # the MLP's rows take its room
     assert entries.second is not None
     x, second = _kernels.norm_modulate(
         launch,
@@ -632,7 +648,9 @@ def _sequential(
         branch=attended,
         gate=rows.gate_msa,
     )
-    mlp = _mlp(launch, site, _inputs(site.inputs, cast("Tensor", second)))  # a norm's entry
+    del attended
+    mlp = _mlp_rows(launch, site, cast("Tensor", second))  # a norm's entry
+    del second
     x, _ = _kernels.norm_modulate(
         launch,
         entries.residual,
@@ -652,11 +670,16 @@ def _parallel(
     site: _Site,
     launch: Launch,
     x: Tensor,
-    normed: Tensor,
     rows: Modulation,
     arguments: Mapping[str, object],
 ) -> Tensor:
-    q, k, v, *hidden = _inputs((*site.qkv, *site.inputs), normed)
+    normed = _first(site, launch, x, rows)
+    # Attention first, then the MLP: its [tokens, inner] rows never wait beside q, k and v. Both
+    # read one quantization of the normed rows, as one GEMM over all five would.
+    with quantize_once(normed):
+        attended = _attend(launch, site, [linear(normed) for linear in site.qkv], arguments)
+        mlp = _mlp_rows(launch, site, normed)
+    del normed
     x, _ = _kernels.norm_modulate(
         launch,
         site.layout.entries.residual,
@@ -666,8 +689,8 @@ def _parallel(
         None,
         rows.index,
         0.0,
-        branch=_attend(launch, site, q, k, v, arguments),
-        other=_mlp(launch, site, hidden),
+        branch=attended,
+        other=mlp,
         gate=rows.gate_msa,
     )
     return x
@@ -676,16 +699,16 @@ def _parallel(
 def _attend(
     launch: Launch,
     site: _Site,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
+    qkv: list[Tensor],
     arguments: Mapping[str, object],
 ) -> Tensor:
-    """A composed attention: q/k norms and RoPE fused, the kernel Runtime selected, `to_out`."""
+    """A composed attention of `qkv` (to_q's, to_k's and to_v's rows, taken from the list so the
+    projections go once normed): q/k norms and RoPE fused, the kernel Runtime selected, `to_out`."""
     layout, entries = site.layout, site.layout.entries
     heads = (site.attention.heads, layout.head_dim)
     # torch leaves `Tensor.unflatten` unannotated.
-    q, k, v = (t.unflatten(-1, heads) for t in (q, k, v))
+    q, k, v = (t.unflatten(-1, heads) for t in qkv)
+    qkv.clear()
     if layout.rope is None or arguments[layout.rope.argument] is None:
         q, k = (norm(t) for norm, t in zip(site.qk, (q, k), strict=True))
     else:

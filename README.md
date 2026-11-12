@@ -532,8 +532,10 @@ list of one), the package's own structs as groups (nested; `| None` for one, a l
 and `Seed`. `Pickup(take, out_frame)` is filled only by Pick up from here; a package subclasses
 it. Markers are `msgspec.Meta`, so they stack: `Range(min, max, step=, unit=)`, `Count(min, max)`,
 `Total()`, `Ratios(*allowed, min=, max=)`, `Snap(every, offset, first)`, `Spans(rows)`,
-`Label(text, options={value: words | (words, description)})`, `Placeholder(text)` and
-`Advanced()`. Publish refuses, statically: a required field a box can't draw (an unbounded number,
+`Label(text, options={value: words | (words, description)})`, `Placeholder(text)`,
+`Advanced()` and `When(field, *values)`: a field that applies only while a sibling field is truthy,
+or one of `values`; the box dulls it otherwise, and a run takes its default with a warning.
+Publish refuses, statically: a required field a box can't draw (an unbounded number,
 `list[str]`), two shapes or one in a group, a group holding itself, a result with no file or
 `str` for the box to show, and an imported cozy package `uv.lock` doesn't lock. An optional
 field a box can't draw keeps its default, off the box, and so does an optional group with a

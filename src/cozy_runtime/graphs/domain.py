@@ -57,6 +57,8 @@ class Pool:
     """
 
     handle: tuple[int, int]
+    #: the room its latest capture was prepared with (`graphs.capture`)
+    prepared: int = 0
 
 
 # A failed CUDA destruction does not prove whether its handle remains valid.

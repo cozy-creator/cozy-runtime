@@ -17,7 +17,7 @@ import time
 import warnings
 import weakref
 from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
@@ -34,9 +34,9 @@ from torch.utils._pytree import tree_leaves, tree_map
 from torch.utils.hooks import RemovableHandle
 
 from cozy_runtime import graphs
-from cozy_runtime.author import _retained
+from cozy_runtime.author import _phases, _retained
 from cozy_runtime.author._errors import DoesNotFit, Fault, fault, is_capacity
-from cozy_runtime.author._model import WARNINGS, WarningRow
+from cozy_runtime.author._model import WARNINGS, WarningRow, recovered
 from cozy_runtime.internal import cache_owners, pacing, proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
@@ -88,6 +88,16 @@ _PARKED = 2
 _HOST_STAGING = 64 << 20
 #: Host RAM that host-resident weights leave free: the host tier's pages, a CPU's held blocks.
 _HOST_HEADROOM = 8 << 30
+
+
+@functools.cache
+def _headroom() -> int:
+    """`_HOST_HEADROOM`, or a quarter of a smaller host's RAM: 8 GiB was half a 16 GB laptop's or
+    CI runner's, whose free RAM was most often less, so every CPU binding was refused (cl-885)."""
+    total = host_memory().total_bytes
+    return min(_HOST_HEADROOM, total // 4) if total > 0 else _HOST_HEADROOM
+
+
 #: Stored float dtypes a CPU executor serves widened to float32 (`weights._float32`).
 _NARROW = ("F16", "BF16")
 _DTYPES = {
@@ -113,6 +123,9 @@ _DTYPES = {
     )
 }
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
+#: The shape key of the component forward running now (`execution.catch.passing`), its passes'
+#: shape where its blocks mark them (`_entered`): 0 where none runs.
+PASS_SHAPE: ContextVar[int] = ContextVar("cozy_pass_shape", default=0)
 #: TensorFS tallies working memory by the pass and site it was born in (`vt.pass_mark`); an older
 #: one has no tally, and nothing is marked.
 _ESCAPES = hasattr(vt, "pass_mark")
@@ -516,11 +529,19 @@ class _Block:
             (p.nbytes + 255) // 256 * 256 for row in self.finals.values() for p in row.values()
         )
 
+    def raw_needed(self) -> bool:
+        return self.aliases is None or any(self.aliases.values()) or not self.finals
+
+    @property
+    def least_bytes(self) -> int:
+        """The fewest device bytes it holds in use: its stored rows where they're read, and its
+        final ones."""
+        return (self.storage_bytes if self.raw_needed() else 0) + self.final_bytes
+
     def cached(self) -> bool:
         if self.final_bytes and (self.final_region is None or not self.final_region.resident):
             return False
-        raw_needed = self.aliases is None or any(self.aliases.values()) or not self.finals
-        return not raw_needed or (self.region is not None and bool(self.region.resident))
+        return not self.raw_needed() or (self.region is not None and bool(self.region.resident))
 
     def final_only(self) -> bool:
         return bool(self.finals) and self.aliases is not None and not any(self.aliases.values())
@@ -630,6 +651,42 @@ class Model:
             yield self
         finally:
             self.memory._close(self, executing=executing)
+
+    def keep(self, since_ns: int, reserve: int) -> tuple[Binding, int, int] | None:
+        """For a loop of its forwards that can't hold it whole (an LM decoding streamed): of its
+        blocks used since `since_ns`, the most bytes that fit beside its live working memory,
+        `reserve` bytes and room for the largest of the rest to stream through, largest first. A
+        binding over them, which the caller prepares and holds while the loop runs, so each
+        forward reads only the others again; with the bytes kept and those still read a forward.
+        None when none fits. An embedding table is no block a forward reads whole (`_Block.table`)."""
+        if self.memory.native is None:
+            return None
+        # The common group (embeddings, the head, final norms) serves every forward, entered
+        # around it rather than block by block.
+        used = sorted(
+            (b for b in self.groups() if (b is self.common or b.last >= since_ns) and not b.table),
+            key=lambda b: b.least_bytes,
+            reverse=True,
+        )
+        room = vt.room(self.memory.device.index or 0)
+        budget = room["capacity"] - room["working_live"] - reserve
+        kept: list[_Block] = []
+        held = streamed = 0
+        for at, block in enumerate(used):
+            after = used[at + 1].least_bytes if at + 1 < len(used) else 0
+            if held + block.least_bytes + max(streamed, after) <= budget:
+                kept.append(block)
+                held += block.least_bytes
+            else:
+                streamed = max(streamed, block.least_bytes)
+        if not kept:
+            return None
+        self._claim()
+        try:
+            self.memory._declare(self)
+            return Binding(self, kept), held, sum(b.least_bytes for b in used) - held
+        finally:
+            self._release()
 
     def retain(self, paths: Collection[str] = ("",)) -> Binding:
         self._claim()
@@ -882,10 +939,26 @@ class Binding:
                     # Bound whole, its blocks cannot stream: past the host's room it refuses as
                     # an allocation would, and a decode streams them per forward instead.
                     missing = sum(b.allocation_bytes for b in self.groups if b.data is None)
-                    if missing > memory._free() - _HOST_HEADROOM:
+                    if missing and missing > memory._free() - _headroom():
                         raise torch.OutOfMemoryError(
                             f"{self.model.component}: {missing / (1 << 30):.1f} GiB of float32 "
                             "weights to bind, more than the host can give"
+                        )
+                if (
+                    not replay
+                    and memory.native is not None
+                    and any(b.data is None and not b.cached() for b in self.groups)
+                ):
+                    # Nor on a card that can never hold it: filled partway, it would only evict
+                    # everything else and then wait for memory that can't make it fit (cr-286:
+                    # an 11.1 GiB decode set on an 8 GiB cap waited 300 s, run 47309).
+                    least = sum(b.least_bytes for b in self.groups)
+                    most, said = memory.most_room()
+                    if least > most:
+                        raise Exhausted(
+                            f"{self.model.component}: {_gib(least)} of weights to hold at once, "
+                            f"more than {said} could ever give it",
+                            least,
                         )
                 self.used = True
                 with torch.cuda.stream(stream) if memory.cuda else nullcontext():
@@ -1188,6 +1261,17 @@ class Memory:
                     owners.remove(model)
                 model.working_phase_keys.remove(key)
 
+    def most_room(self) -> tuple[int, str]:
+        """The most weight bytes this process could ever hold on its card at once, with every
+        other byte of the card or its cap given back, less its own live working memory; and
+        that in words."""
+        index = self.device.index or 0
+        total = int(torch.cuda.get_device_properties(index).total_memory)
+        card = total if self.budget_bytes is None else min(self.budget_bytes, total)
+        live = int(vt.room(index)["working_live"])
+        said = f"GPU {index}'s {_gib(card)}{' cap' if card < total else ''} less {_gib(live)} live"
+        return max(card - live, 0), said
+
     def _free(self) -> int:
         """Free bytes where no native owner answers (MPS, CPU). A CPU's is what the host can still
         give this process: on Linux its tightest cgroup's, page cache counted as room (a pod's
@@ -1205,15 +1289,15 @@ class Memory:
 
     def _fitting(self, model: Model, groups: list[_Block]) -> list[_Block]:
         """A CPU step's hold, decided once: the longest prefix of `groups` whose bytes as served
-        fit what the host can still give less `_HOST_HEADROOM`, once other models' holds outside
-        the step have gone. The rest stream, read and widened per forward (`_idle`)."""
+        fit what the host can still give less its headroom (`_headroom`), once other models' holds
+        outside the step have gone. The rest stream, read and widened per forward (`_idle`)."""
         request = _REQUEST.get()
         step = request.phase(model.name) if request is not None else frozenset({model.name})
         for other in list(self.models.values()):
             if other.name not in step and not other.users:
                 for hold in [h for h in other.holds if h.reclaimable]:
                     hold.shed()
-        room = self._free() - _HOST_HEADROOM
+        room = self._free() - _headroom()
         held: list[_Block] = []
         for block in groups:
             room -= 0 if block.data is not None else block.allocation_bytes
@@ -1533,12 +1617,12 @@ class Memory:
         stats = self._tier().stats()
         rows: list[WarningRow] = []
         if stats["pin_failed"]:
-            rows.append(("a host page did not pin: its refills stay on the store", {}))
+            rows.append(recovered("a host page did not pin: its refills stay on the store"))
         if stats["refused"] is not None:
             rows.append(
-                (
+                recovered(
                     "weights stream from the store: pinning host memory failed",
-                    {"reason": stats["refused"][:300]},
+                    reason=stats["refused"][:300],
                 )
             )
         for row in rows:
@@ -2049,21 +2133,22 @@ class Memory:
         with self.lock:
             block.loading = True
         try:
-            if self.native is None:
-                data = self._read_host(block, reclaim, overlay)
-            else:
-                block.overlay = overlay
-                self._final_views(block)
-                data = {}
-                if not block.final_only():
-                    # Final bytes alone serve a final-only binding: nothing here touches its raw
-                    # Region, so an evicted one costs no read.
-                    raw = self._empty(0, False)
-                    if block.storage_bytes:
-                        block.native_use = self._use(block)
-                        raw = block.native_use.tensor
-                        block.native_storage = int(raw.untyped_storage().data_ptr())
-                    data = _data(block, raw)
+            with self._read_told(block):
+                if self.native is None:
+                    data = self._read_host(block, reclaim, overlay)
+                else:
+                    block.overlay = overlay
+                    self._final_views(block)
+                    data = {}
+                    if not block.final_only():
+                        # Final bytes alone serve a final-only binding: nothing here touches its
+                        # raw Region, so an evicted one costs no read.
+                        raw = self._empty(0, False)
+                        if block.storage_bytes:
+                            block.native_use = self._use(block)
+                            raw = block.native_use.tensor
+                            block.native_storage = int(raw.untyped_storage().data_ptr())
+                        data = _data(block, raw)
             ready = None
             if self.cuda:
                 ready = torch.cuda.Event()
@@ -2077,6 +2162,22 @@ class Memory:
         finally:
             with self.lock:
                 block.loading = False
+
+    def _read_told(self, block: _Block) -> AbstractContextManager[None]:
+        """A read of `block`'s weights, told as its component's load (`_phases.loading`): none for
+        one resident. A block this request read before is read again (paging): its step's time."""
+        if not block.nbytes or block.cached():
+            return nullcontext()
+        model, request = block.model, _REQUEST.get()
+        again = request is not None and not request.first_read(block)
+        return _phases.loading(
+            model.component, block.nbytes, functools.partial(self._unread, model), again=again
+        )
+
+    @staticmethod
+    def _unread(model: Model) -> int:
+        """The bytes of `model` no fill holds now: what a load of it that begins now reads."""
+        return sum(b.nbytes for b in model.groups() if b.data is None and not b.cached())
 
     def _read_host(
         self, block: _Block, reclaim: bool, overlay: Hashable
@@ -2191,7 +2292,9 @@ class Memory:
                 except Exhausted:  # varena refused its region before its forward ran
                     if not (block.table and reclaim and self.cuda and not capturing):
                         raise
-                    self._gather(block, overlay)
+                    gathered = block.gathered is not None and block.gathered[0] == overlay
+                    with nullcontext() if gathered else self._read_told(block):
+                        self._gather(block, overlay)
             # A cached Hold can keep count > 0 across sequential threads or streams.
             # Every consumer needs readiness in addition to storage ownership.
             # Capture's owner joined the prepared stream before capture began. Waiting on
@@ -2388,7 +2491,7 @@ class Memory:
         seen, last = request.heads.get(model, (None, None))
         if seen is None or (block.index in seen and block.index != last):
             request.heads[model] = ({block.index}, block.index)
-            self._pass(model, request, 0)
+            self._pass(model, request, PASS_SHAPE.get())
             self._born(block.escape_site)
         elif block.index != last:
             seen.add(block.index)
@@ -2406,8 +2509,17 @@ class Memory:
             model.escape_floor = common + max(
                 (block.allocation_bytes for block in model.blocks.values()), default=0
             )
+        floor = model.escape_floor
+        if any(b.retained for b in model.groups()):
+            # Held blocks are in the pass's held bytes already: the floor is what still streams
+            # (a decode keeping what fits, `keep`); an embedding table gathers on the host.
+            shared = model.common
+            floor = (shared.allocation_bytes if shared and not shared.retained else 0) + max(
+                (b.allocation_bytes for b in model.blocks.values() if not (b.retained or b.table)),
+                default=0,
+            )
         device = self.device.index or 0
-        refused = vt.pass_mark(device, model.escape_site, shape, model.escape_floor)
+        refused = vt.pass_mark(device, model.escape_site, shape, floor)
         self._born(model.escape_site)
         if refused is not None:
             raise DoesNotFit(_does_not_fit(model.component, refused))
@@ -2559,6 +2671,7 @@ class RequestStats(TypedDict):
     working_splits: list[SplitRecord]
     escaped: list[EscapeRecord]
     retries: int
+    regrown: int
     swallowed_ooms: int
     retained_bytes: int
     gathered: int
@@ -2692,7 +2805,15 @@ class _Kept:
     def get(self) -> tuple[Tensor, ...]:
         if self.region is None:
             raise RuntimeError("retained state read after its loop ended")
-        raw = self.region.use(self.memory._cuda_stream().cuda_stream).tensor
+        try:
+            raw = self.region.use(self.memory._cuda_stream().cuda_stream).tensor
+        except Exhausted as exc:
+            size = sum(n for _, n, _, _ in self.views)
+            raise Exhausted(
+                f"a retained state of {_gib(size)} found no room ({exc}): the states whose "
+                "tensors are held now stay on the card; read each where it is used",
+                exc.requested_bytes,
+            ) from exc
         return tuple(raw[at : at + n].view(dtype).view(shape) for at, n, dtype, shape in self.views)
 
 
@@ -2760,11 +2881,16 @@ class Request:
         self.heads: dict[Model, tuple[set[int], int]] = {}
         #: the models whose phases this request entered: what it has not is read ahead
         self.entered: set[str] = set()
+        #: the blocks it read (`Memory._read_told`), by identity: one read again is paging
+        self.read_blocks: set[int] = set()
         #: the attempt failed (its executor says): a refused allocation in its last pass is learned
         self.failed = False
         #: refusals the Runtime answered by running again another way (a pure op's finer split, an LM
         #: token decoded eagerly for a capture its pool couldn't hold): zero in a normal run
         self.retries = 0
+        #: refusals a CUDA graph capture answered by recording again with room for them
+        #: (`graphs.capture`): what runs is the same
+        self.regrown = 0
         #: refusals a package scope returned past (`contract._Scopes`): zero in a conforming run
         self.swallowed_ooms = 0
         #: cross-step state its loops declared (`author.retained`)
@@ -2792,6 +2918,12 @@ class Request:
             # or its floor is the largest decode the process ever ran (sieg: SDXL gave nothing)
             vt.reset_peak(memory.device.index or 0)
         self.sample()
+
+    def first_read(self, block: _Block) -> bool:
+        """Whether this is its first read of `block`."""
+        known = id(block) in self.read_blocks
+        self.read_blocks.add(id(block))
+        return not known
 
     def sample(self) -> None:
         if self.memory.cuda:
@@ -2906,6 +3038,7 @@ class Request:
             "working_splits": list(self.working_splits.values()),
             "escaped": list(self.escaped),
             "retries": self.retries,
+            "regrown": self.regrown,
             "swallowed_ooms": self.swallowed_ooms,
             "retained_bytes": self.retained_bytes,
             "gathered": self.gathered,

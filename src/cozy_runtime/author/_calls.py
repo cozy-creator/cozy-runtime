@@ -358,11 +358,12 @@ class _Broker:
             row: tuple[str, dict[str, Scalar]]
             for change in moved:
                 row = (
-                    "a package call passed a value over its callee's limit; it was clamped",
+                    "a package call passed a value its callee adjusted",
                     {
                         "callee": f"{module}:{export}",
                         "field": change.field,
                         "applied": str(change.applied),
+                        "reason": change.reason,
                     },
                 )
                 if row not in WARNINGS:

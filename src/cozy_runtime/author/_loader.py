@@ -242,11 +242,12 @@ class Config:
     a dynamic `__getattr__` would be exactly the declared `Any` seam §1.7 deletes.
     """
 
-    __slots__ = ("_bound", "_data", "_tensor_dtypes", "_where")
+    __slots__ = ("_bound", "_data", "_tensor_dtypes", "_tensor_shapes", "_where")
 
     _data: Mapping[str, object]
     _where: str
     _tensor_dtypes: Mapping[str, str] | None
+    _tensor_shapes: Mapping[str, tuple[int, ...]] | None
     _bound: frozenset[str] | None
 
     def __init__(
@@ -255,10 +256,12 @@ class Config:
         where: str = "config",
         *,
         tensor_dtypes: Mapping[str, str] | None = None,
+        tensor_shapes: Mapping[str, Sequence[int]] | None = None,
         bound: frozenset[str] | None = None,
     ) -> None:
         """Freeze one in-memory construction config. `bound` names the components the
-        binding selects (None: all); the others' tensors are not in `tensor_dtypes`."""
+        binding selects (None: all); the others' tensors are not in `tensor_dtypes` or
+        `tensor_shapes`."""
         data = _without_bookkeeping(data)
         for key, value in data.items():
             carrier = _carrier(key, value)
@@ -279,6 +282,13 @@ class Config:
             self,
             "_tensor_dtypes",
             None if tensor_dtypes is None else MappingProxyType(dict(tensor_dtypes)),
+        )
+        object.__setattr__(
+            self,
+            "_tensor_shapes",
+            None
+            if tensor_shapes is None
+            else MappingProxyType({key: tuple(shape) for key, shape in tensor_shapes.items()}),
         )
         object.__setattr__(self, "_bound", bound)
 
@@ -303,7 +313,11 @@ class Config:
                 code="config_kind",
             )
         return Config(
-            value, f"{self._where}.{name}", tensor_dtypes=self._tensor_dtypes, bound=self._bound
+            value,
+            f"{self._where}.{name}",
+            tensor_dtypes=self._tensor_dtypes,
+            tensor_shapes=self._tensor_shapes,
+            bound=self._bound,
         )
 
     def tensor_dtype(self, key: str, *, default: str) -> str:
@@ -320,6 +334,21 @@ class Config:
             return default
         try:
             return canonical_dtype(self._tensor_dtypes[key])
+        except KeyError:
+            raise ConformanceError(
+                f"checkpoint has no tensor {key!r}", code="config_tensor_missing", fields=[key]
+            ) from None
+
+    def tensor_shape(self, key: str, *, default: tuple[int, ...]) -> tuple[int, ...]:
+        """Logical shape of a component-qualified checkpoint tensor, before construction, as
+        `tensor_dtype`: ``default`` for config-only construction and an unselected component,
+        a refusal for a missing key of a bound one."""
+        if self._tensor_shapes is None:
+            return default
+        if self._bound is not None and key.split(".", 1)[0] not in self._bound:
+            return default
+        try:
+            return self._tensor_shapes[key]
         except KeyError:
             raise ConformanceError(
                 f"checkpoint has no tensor {key!r}", code="config_tensor_missing", fields=[key]
@@ -872,6 +901,9 @@ class Loader:
                 tensor_dtypes=config._tensor_dtypes
                 if config._tensor_dtypes is not None
                 else {key: spec.dtype for key, spec in self._artifact.tensor_schema.items()},
+                tensor_shapes=config._tensor_shapes
+                if config._tensor_shapes is not None
+                else {key: spec.shape for key, spec in self._artifact.tensor_schema.items()},
                 bound=self._backend.bound,
             )
         construction = CONSTRUCTION.set(object())

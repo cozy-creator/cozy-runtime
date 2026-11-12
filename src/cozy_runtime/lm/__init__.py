@@ -70,7 +70,7 @@ from cozy_runtime.accel.kernels import KernelsUnavailable, Launch, Plan, TritonK
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import Cancelled, DoesNotFit, is_capacity
-from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
+from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, recovered
 from cozy_runtime.author._services import counting, stage_tokens
 from cozy_runtime.graphs import (
     BYPASS,
@@ -300,7 +300,7 @@ def generate(
         say(
             type(model).__name__, f"[lm] {type(model).__name__} decodes through Transformers: {why}"
         )
-        row: WarningRow = ("decode ran through Transformers' loop", {"why": why})
+        row: WarningRow = recovered("decode ran through Transformers' loop", why=why)
         if row not in WARNINGS:
             WARNINGS.append(row)
         with contract.owned():  # the Runtime's own use of Transformers' loop and caches
@@ -358,6 +358,7 @@ def _graph_snapshot(
             "active_graphs": len(engine.graphs),
             "capture_attempts": int(engine.captured[0]),
             "captures": engine.recorded,
+            "regrown": [list(pair) for pair in engine.regrown],
             "retired_graphs": engine.retired_graphs,
             "replays": engine.replayed,
             "eager_steps": engine.eager,
@@ -753,23 +754,22 @@ def _fused_experts(model: torch.nn.Module, text: PreTrainedConfig) -> bool:
 
 
 def _capture_contract(model: torch.nn.Module, draft: torch.nn.Module | None = None) -> str:
-    """Shipped decode contracts, dense and with experts split (`moe`), and a drafted step's
-    head (`Draft` around Transformers' decoder layer); persistent KV, positions and counters
-    are device buffers.
+    """Why `model`'s decode step is no graph, "" when it is one: Transformers' own model whose
+    class declares its forward one compiled graph (`_can_compile_fullgraph`: no host sync and no
+    Python branch on a tensor's value, what torch.compile's CUDA graphs need too), dense or with
+    experts split (`moe`), and a drafted step's head (`Draft` around Transformers' decoder
+    layer); persistent KV, positions and counters are device buffers. One contract for every
+    such LM and VLM (Qwen3, Qwen3.5, Qwen3-VL, Mistral3, Llama, ...), not a list of names (cr-289).
 
     The real warm step initializes cache views and advances accepted history once. Capture
     only records the next step's device writes. Custom Python hooks and arbitrary model code
     are never speculatively executed by this graph builder.
     """
-    forward = type(model).forward
-    if not forward.__module__.startswith("transformers.models.") or type(model).__name__ not in {
-        "Qwen3ForCausalLM",
-        "Qwen3_5ForCausalLM",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-    }:
-        return "no shipped decode capture contract"
+    kind = type(model)
+    if not kind.forward.__module__.startswith("transformers.models."):
+        return "not a Transformers model's own forward"
+    if not getattr(kind, "_can_compile_fullgraph", False):
+        return f"Transformers does not declare {kind.__name__}'s forward one graph"
     # A component root's class is Runtime's graphed subclass (`graphs.install`): forward is Draft's.
     if draft is not None and (
         type(draft).forward is not Draft.forward
@@ -980,7 +980,8 @@ def _transformers(
     if sampling.temperature > 0:
         processors.append(_Draw(prompt, sampling))
     context = CURRENT.get()
-    with _PLANE, torch.inference_mode():
+    with _PLANE, torch.inference_mode(), ExitStack() as held:
+        cancel = _Cancel(context, tell, _Keeper(model, held))
         out = _lm(model).generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -988,17 +989,74 @@ def _transformers(
             eos_token_id=stops,
             pad_token_id=pad,
             logits_processor=LogitsProcessorList(processors),
-            stopping_criteria=StoppingCriteriaList([_Cancel(context, tell)]),
+            stopping_criteria=StoppingCriteriaList([cancel]),
         )
+        cancel.keeper.report(prompt, cancel.steps)
     return out[:, prompt:]
 
 
-class _Cancel(StoppingCriteria):
-    """Transformers' loop raises the attempt's cancellation between tokens and tells its
-    progress."""
+#: What a streamed decode step needs beyond its kept weights and live memory (its cache's growth,
+#: the logits): the room `_Keeper` leaves.
+KEEP_RESERVE = 512 << 20
 
-    def __init__(self, context: Context | None, tell: _Tell) -> None:
-        self.context, self.tell, self.steps = context, tell, 0
+
+class _Keeper:
+    """Transformers' loop over a model whose decode set doesn't fit: after its first decode step,
+    as many of the blocks that step read as fit stay held to the end of the call, so each later
+    token reads only the others again, not the whole model (cr-286: Qwen3.5-9B int8 at an 8 GiB
+    cap decoded about 1 s a token, every weight read again for each). The prompt's prefill runs
+    before any is held: its working memory is the call's largest."""
+
+    def __init__(self, model: torch.nn.Module, held: ExitStack) -> None:
+        self.placed = PLACED.get(model)
+        self.held, self.since, self.began = held, 0, time.perf_counter()
+        self.decoded = 0.0
+        self.kept = self.read = 0
+
+    def step(self, steps: int) -> None:
+        if self.placed is None or steps > 2:
+            return
+        if steps == 1:  # the prompt's token: the decode begins
+            self.since, self.decoded = time.monotonic_ns(), time.perf_counter()
+            return
+        try:
+            found = self.placed[0].keep(self.placed[1], self.since, KEEP_RESERVE)
+            if found is None:
+                return
+            binding, self.kept, self.read = found
+            self.held.callback(binding.close)
+            self.held.enter_context(binding.prepare())
+            print(
+                f"[lm] streamed decode holds {_gib(self.kept)} of its weights, reads "
+                f"{_gib(self.read)} again a token",
+                file=sys.stderr,
+            )
+        except Exception as exc:  # holding is only speed: the decode streams as it did
+            if not is_capacity(exc):
+                raise
+            _unwind(exc)
+            self.kept = 0
+
+    def report(self, prompt: int, steps: int) -> None:
+        """Its tokens a second, and the bytes kept and read again a token, in the run record."""
+        if self.placed is None or steps < 2:
+            return
+        seconds = time.perf_counter() - self.decoded
+        text = (
+            f"{steps} tokens after {prompt} through Transformers' loop: "
+            f"{(steps - 1) / max(seconds, 1e-9):.2f} tokens/s decoding, "
+            f"{_gib(self.kept)} of its weights held, {_gib(self.read)} read again a token"
+        )
+        print(f"[lm] {text}", file=sys.stderr)
+        self.placed[0].note(f"{self.placed[1]}.lm", text)
+
+
+class _Cancel(StoppingCriteria):
+    """Transformers' loop raises the attempt's cancellation between tokens, tells its progress
+    and, after the first decode step, keeps what of the model fits (`_Keeper`)."""
+
+    def __init__(self, context: Context | None, tell: _Tell, keeper: _Keeper) -> None:
+        self.context, self.tell, self.keeper, self.steps = context, tell, keeper, 0
 
     def __call__(
         self, input_ids: torch.Tensor, scores: tuple[torch.Tensor] | None, **kwargs: object
@@ -1006,6 +1064,7 @@ class _Cancel(StoppingCriteria):
         if self.context is not None:
             self.context.raise_if_cancelled()
         self.steps += 1  # one token a step: this loop drafts none
+        self.keeper.step(self.steps)
         self.tell(lambda: self.steps)
         flags = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         return cast("torch.BoolTensor", flags)  # cast: Transformers types its flags as BoolTensor
@@ -1038,7 +1097,7 @@ class _Tell:
         except Exception as exc:  # the decode (perhaps other calls' too) outlives its report
             self.progress = None
             WARNINGS.append(
-                ("decode progress stopped: its report failed", {"error": str(exc)[:200]})
+                recovered("decode progress stopped: its report failed", error=str(exc)[:200])
             )
         finally:
             counting.reset(unit)
@@ -1603,6 +1662,9 @@ class _Engine:
         self.captured = [0, 0.0]
         self.eager = 0
         self.recorded = 0
+        #: of those, each that took more than its warm-up's guess: the guess, and the room it
+        #: was recorded in (`graphs.capture`)
+        self.regrown: list[tuple[int, int]] = []
         self.replayed = 0
         self.retired_graphs = 0
         #: `LANDED` when a capture met a kernel still building (none records until one lands),
@@ -1690,7 +1752,9 @@ class _Engine:
                 f"lm:{type(self.model).__name__}:{request.fallback[:30]}",
                 f"[lm] {request.fallback}",
             )
-            WARNINGS.append(("decode ran through Transformers' loop", {"why": request.fallback}))
+            WARNINGS.append(
+                recovered("decode ran through Transformers' loop", why=request.fallback)
+            )
             return _transformers(
                 self.model,
                 request.inputs,
@@ -1781,7 +1845,9 @@ class _Engine:
                             if self._occupied():
                                 raise self.unprepared or RuntimeError("decode residency was lost")
                             for request in self.incoming:
-                                request.fallback = "its decode set does not fit at home"
+                                request.fallback = "its decode set does not fit at home" + (
+                                    f" ({str(self.unprepared)[:200]})" if self.unprepared else ""
+                                )
                             self.incoming = []
                         if self.incoming or self.retire:
                             self._settle(self.incoming)
@@ -2033,7 +2099,7 @@ class _Engine:
         if request.draft is not None and id(request.draft) in self.unfit:
             request.draft = None
             request.warnings.append(
-                ("decoded without drafting", {"why": "the draft head does not fit"})
+                recovered("decoded without drafting", why="the draft head does not fit")
             )
         if request.draft is not None and request.draft is not self.draft:
             if len(free) < len(self.slots):
@@ -2094,9 +2160,6 @@ class _Engine:
                 # captures again where its pool finds room.
                 why = no_room(_set(self.domain).device, "its graphs' pool", 0, exc)
                 safeguard("no_room", f"{type(self.model).__name__}: {why}")
-                request.warnings.append(
-                    ("a CUDA graph was not used", {"module": type(self.model).__name__, "why": why})
-                )
                 self._forget()
             return True
         if occupied + rows > BUCKETS[-1]:
@@ -2142,7 +2205,7 @@ class _Engine:
         self._drop()
         self.draft, self.rehold = None, True
         request.draft = None
-        request.warnings.append(("decoded without drafting", {"why": why}))
+        request.warnings.append(recovered("decoded without drafting", why=why))
         return True
 
     def _shed(self, request: _Request, what: str, exc: BaseException) -> None:
@@ -2739,7 +2802,7 @@ class _Engine:
             domain = _set(self.domain)  # a CUDA step's (`_one`)
             if key not in self.warmed:
                 # This is the caller's actual next token, never an extra speculative warmup; its
-                # working peak, as varena measured it, is what its capture's pool takes.
+                # working peak, as varena measured it, is its capture pool's first guess.
                 with self._graph_memory(drafted), _measured(domain.device) as peak:
                     self._advance(size)
                 self.warmed.add(key)
@@ -2765,14 +2828,22 @@ class _Engine:
                             if placed is not None
                             else Pool(torch.cuda.graph_pool_handle())
                         )
+                    pool = self.pool
                     try:
                         graph, why = capture(
-                            torch, lambda: self._advance(size), _set(self.pool), domain, reserve
+                            torch,
+                            lambda: self._advance(size),
+                            pool,
+                            domain,
+                            reserve,
+                            alone=not self.graphs,
                         )
-                    except Exception as exc:  # no room: refused before it, or short within it
+                        if graph is not None and pool.prepared > reserve:
+                            self.regrown.append((reserve, pool.prepared))
+                    except Exception as exc:  # no room for its pool, or short outside it
                         if not is_capacity(exc):
                             raise
-                        why = no_room(domain.device, "its pool", reserve, exc)
+                        why = no_room(domain.device, "its pool", pool.prepared, exc)
                         if not isinstance(exc, Exhausted):  # an allocation varena counted refused
                             from cozy_runtime.internal.execution.catch import CURRENT as REQUEST
 
@@ -2893,24 +2964,13 @@ class _Engine:
         self.pooled = hold
 
     def _unrecorded(self, key: _Key, why: str, code: str | None = "capture_refused") -> None:
-        """That step runs eagerly from now on, with a warning on the calls it serves, unless
-        `code` is None: a property of the code, in the record alone (`decode.refused`)."""
+        """That step runs eagerly from now on, counted in the record (`safeguard`: said once,
+        quietly) unless `code` is None: a property of the code, in the record alone
+        (`decode.refused`)."""
         self.unrecorded[key] = why
         if code is None:
             return
         safeguard(code, f"{type(self.model).__name__}: {why}")
-        warning: WarningRow = (
-            "a CUDA graph was not used",
-            {"module": type(self.model).__name__, "why": why},
-        )
-        for request in {id(r.request): r.request for r in self.slots if r is not None}.values():
-            if warning not in request.warnings:
-                request.warnings.append(warning)
-        for row in self.slots:
-            if row is not None:
-                row.request.warnings.append(
-                    ("a CUDA graph was not used", {"module": type(self.model).__name__, "why": why})
-                )
 
     def _drafting(self, size: int) -> bool:
         return (

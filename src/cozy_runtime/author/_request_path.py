@@ -12,6 +12,8 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 
+from cozy_runtime.author import _phases
+
 #: The request path's known violations, by the function holding each; nothing else is allowed.
 KNOWN = {
     # cr-210: a graphed component records a signature at its second call, on the request thread.
@@ -69,13 +71,37 @@ def _quiet() -> Iterator[None]:
 @contextmanager
 def forbid(work: str) -> Iterator[None]:
     """Work that must never block a request, timed: one row, which covers guarded work inside
-    it. Also a decorator."""
+    it. Also a decorator. Where it blocks a call it is a spell of that call's phase (`said`): a
+    burst of captures or compiles is one, counted."""
     started = time.perf_counter()
+    named = said(work)
     try:
-        with _quiet():
+        with _quiet(), _phases.spell(
+            named, named, row=named, done=1, told=not work.startswith(_WAIT)
+        ):
             yield
     finally:
         note(work, (time.perf_counter() - started) * 1000)
+
+
+#: A wait on a build, which `kernel_compile.wait` tells as "waiting for <kernel> compile" itself.
+_WAIT = "kernel build wait: "
+
+
+def said(work: str) -> str:
+    """How `work` shows as the stage of the call it blocks: `compiling sol`, `capturing graphs`."""
+    kind, _, what = work.partition(": ")
+    if work == "cuda graph capture":
+        return "capturing graphs"
+    if work.startswith(_WAIT):
+        return f"waiting for {work.removeprefix(_WAIT)} compile"
+    if kind == "kernel build":
+        return "compiling kernels" if what == "compiler" else f"compiling {what} kernels"
+    if kind == "kernel self-check":
+        return f"checking {what}"
+    if kind == "kernel copy":
+        return f"copying {what} kernels"
+    return work
 
 
 def known(site: str) -> AbstractContextManager[None]:

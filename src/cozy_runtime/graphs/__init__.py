@@ -44,8 +44,15 @@ from cozy_runtime.accel.attention import (
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._context import device as placed_device
-from cozy_runtime.author._errors import CAPTURE_ERRORS, Fault, OutputError, fault, is_capacity
-from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded
+from cozy_runtime.author._errors import (
+    CAPTURE_ERRORS,
+    Fault,
+    OutputError,
+    fault,
+    is_capacity,
+    unwind,
+)
+from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded, recovered
 from cozy_runtime.graphs import domain
 from cozy_runtime.internal import attention_ulysses, kernel_ready
 from cozy_runtime.internal.accel import StaleBinding
@@ -104,7 +111,8 @@ DECODERS: list[
 _SAID: set[str] = set()
 #: the isolated request used for idle warm-up and capture observations
 IDLE_REQUEST = "graphs-idle"
-#: what a run's record counts (`execution.safeguards`) and `cozy run show` warns of
+#: what a run's record counts (`execution.safeguards`): each a recovered failure (`recovered`), said
+#: once quietly, never a warning
 SAFEGUARDS = {
     "capture_refused": "a CUDA graph was refused at capture",
     "replay_mismatch": "a CUDA graph differed from eager and was discarded",
@@ -121,7 +129,7 @@ def say(key: str, line: str) -> None:
 
 def safeguard(code: str, why: str) -> None:
     """One for this attempt's record, or the next attempt's when raised at idle."""
-    WARNINGS.append((SAFEGUARDS[code], {"code": code, "why": why.splitlines()[0][:300]}))
+    WARNINGS.append(recovered(SAFEGUARDS[code], code=code, why=why.splitlines()[0][:300]))
 
 
 def no_room(device: int, what: str, need: int, error: BaseException) -> str:
@@ -255,18 +263,61 @@ def capture(
     pool: domain.Pool,
     owner: domain.Domain,
     reserve: int,
+    *,
+    alone: bool,
 ) -> tuple[CUDAGraph | None, str]:
     """Record a pure computation into Varena's capture pool, `reserve` bytes of it prepared first:
-    refused there (`varena.Exhausted`), nothing is captured. An allocation the capture still finds
-    no room for fails it, as a device fault does: no capacity is learned from it.
+    refused there (`varena.Exhausted`), nothing is captured.
 
-    Bindings and outputs remain caller-owned.
+    `reserve` is a guess from an eager pass's peak, which sizes no layout in one run: the capture
+    packs the same blocks there, and a small block left in the hole two freed large ones made has
+    the next large one find no run (cr-285: a 16 MiB `repeat_kv` at a 2,048-token window). A
+    capture that runs short in its pool records again with room for the block it lacked too
+    (`vt.pool_short`), until it fits or that room is refused: it never ends short while the card
+    has room. `alone`: the pool holds none of its owner's graphs, so a new one takes the short
+    one's place. `pool.prepared` is what the last attempt was prepared with. An allocation the
+    capture finds no room for outside its pool fails it, as a device fault does.
+
+    Bindings and outputs remain caller-owned; `step` runs again after a short attempt.
     """
-    try:
-        vt.prepare_pool(pool.handle, reserve, owner.device)
-    except BaseException:
-        vt.cancel_preparation(pool.handle, owner.device)
-        raise
+    from cozy_runtime.internal.execution.catch import CURRENT as REQUEST
+
+    mapped = -1  # the pool's bytes before this attempt
+    while True:
+        pool.prepared = reserve
+        try:
+            total = vt.prepare_pool(pool.handle, reserve, owner.device)
+        except BaseException:
+            vt.cancel_preparation(pool.handle, owner.device)
+            raise
+        refused = vt.ooms(owner.device)
+        try:
+            return _capture(torch, step, pool, owner, reserve)
+        except Exception as exc:
+            short = 0
+            if is_capacity(exc) and not isinstance(exc, varena.Exhausted):
+                short = vt.pool_short(pool.handle, owner.device)
+            if not short:
+                raise
+            unwind(exc)  # its tensors leave the pool before it is prepared again
+        if (request := REQUEST.get()) is not None:  # answered here, for the contract's count
+            request.regrown += vt.ooms(owner.device) - refused
+        if alone:
+            close_pool(pool, owner.device)
+            pool.handle = torch.cuda.graph_pool_handle()
+        elif total == mapped:  # no new run, so the same room: past every run the pool has
+            reserve = total
+        reserve, mapped = reserve + short, total
+
+
+def _capture(
+    torch: ModuleType,
+    step: Callable[[], object],
+    pool: domain.Pool,
+    owner: domain.Domain,
+    reserve: int,
+) -> tuple[CUDAGraph | None, str]:
+    """One capture into `pool`, prepared with `reserve`."""
     graph: CUDAGraph = torch.cuda.CUDAGraph()
     current: Stream = torch.cuda.current_stream()
     # cast: an initialized domain's streams and events (`Domain.initialize`), as each capture's
@@ -1042,9 +1093,10 @@ def _watch(root: Module, recorder: _Recorder) -> None:
             "first two calls: declare each that steers its forward in Model.__graph_keys__",
         )
         WARNINGS.append(
-            (
+            recovered(
                 "a component's undeclared state changed between calls",
-                {"component": name, "attributes": ", ".join(sorted(changed))},
+                component=name,
+                attributes=", ".join(sorted(changed)),
             )
         )
 
@@ -1309,10 +1361,10 @@ def _record(
     capture pool: a warm-up run, measured, then the capture unless the warm-up's host waited on
     the device half its time (device-bound: a graph saves nothing). The replay decides the rest:
     bit for bit equal to eager, and faster than its eager calls (`_no_gain`). Its pool gets one
-    free run of `vt.pool_bytes` of the warm-up's peak beside what the pool holds. No room for its
-    weights, warm-up, pool or capture: it runs as written, the run says what it needed, and its
-    next call queues it again (`_short`). False tries again at a later period (a kernel
-    building, its weights left)."""
+    free run of `vt.pool_bytes` of the warm-up's peak beside what the pool holds, more if the
+    capture takes more (`capture`). No room for its weights, warm-up, pool or capture: it runs as
+    written, the run says what it needed, and its next call queues it again (`_short`). False
+    tries again at a later period (a kernel building, its weights left)."""
     # This path is restricted to the shipped pure contracts. It does not time or select kernels,
     # or run arbitrary package code.
     key, call, owner = pending.key, pending.call, recorder.domain
@@ -1393,15 +1445,23 @@ def _record(
                 outputs: list[object] = []
 
                 def step() -> None:
-                    statics.extend(
-                        _static(torch, v) if isinstance(v, _Leaf) else None for v in pending.leaves
-                    )
-                    sargs, skwargs = _arguments(torch, pending, statics)
-                    outputs.append(call(module, *sargs, **skwargs))
+                    try:
+                        statics.extend(
+                            _static(torch, v) if isinstance(v, _Leaf) else None
+                            for v in pending.leaves
+                        )
+                        sargs, skwargs = _arguments(torch, pending, statics)
+                        outputs.append(call(module, *sargs, **skwargs))
+                    except BaseException:  # a short capture's go before it runs again
+                        statics.clear()
+                        outputs.clear()
+                        raise
 
                 IDLE.check()
                 stage, need = "its capture", reserve
-                graph, why = capture(torch, step, pool, owner, reserve)
+                graph, why = capture(
+                    torch, step, pool, owner, reserve, alone=not recorder.recordings
+                )
                 stage, need = "its replay check", 0
                 if graph is None:
                     _failed(module, recorder, key, why)
@@ -1447,6 +1507,8 @@ def _record(
         if isinstance(exc, Building | StaleBinding):
             return False  # a kernel still building, or its weights left: a later period
         if is_capacity(exc):
+            if stage == "its capture" and recorder.pool is not None:
+                need = recorder.pool.prepared
             return _short(module, recorder, key, no_room(owner.device, stage, need, exc))
         if not isinstance(exc, domain.Unavailable):
             raise
@@ -1756,7 +1818,9 @@ def _changed(
                 "Python number that changes between calls (pass it as a tensor)",
             )
             WARNINGS.append(
-                ("a graph region records again every call", {"region": component, "argument": name})
+                recovered(
+                    "a graph region records again every call", region=component, argument=name
+                )
             )
     else:
         names = ("declared keys", "weight addresses", "autocast")

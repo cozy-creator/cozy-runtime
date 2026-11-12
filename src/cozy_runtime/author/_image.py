@@ -18,14 +18,14 @@ import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated, Generic, Literal
 
 import msgspec
 
 from cozy_runtime.author import _group
 from cozy_runtime.author._errors import InvalidRequest
 from cozy_runtime.author._files import ImageFile
-from cozy_runtime.author._markers import FileBound, ModelDefault
+from cozy_runtime.author._markers import FileBound, ImagePreparation, ModelDefault
 from cozy_runtime.author._services import AdjustmentRows, Adjustments
 from cozy_runtime.author._tool import AspectRatio, Seed
 
@@ -69,6 +69,33 @@ class Region(msgspec.Struct):
     box: Box
     prompt: Annotated[str, msgspec.Meta(min_length=1)]
     text: Annotated[str, msgspec.Meta(min_length=1)] | None = None
+
+
+#: What a control map shows; `inpaint`'s is the picture with the area to redraw transparent.
+ControlKind = Literal["depth", "pose", "lineart", "sketch", "canny", "inpaint"]
+
+if TYPE_CHECKING:
+    from typing_extensions import TypeVar
+
+    #: The kinds a function takes: `Control[Literal["pose", "depth"]]` narrows it; bare `Control`
+    #: takes all six.
+    K = TypeVar("K", bound=ControlKind, default=ControlKind)
+else:
+    from typing import TypeVar
+
+    K = TypeVar("K", bound=ControlKind)
+
+
+class Control(msgspec.Struct, Generic[K], frozen=True, kw_only=True):  # noqa: UP046
+    """A ready control map steering a picture model, and how hard it steers. `image` is the map:
+    a depth map, a pose skeleton, line art, a sketch, canny edges; for `inpaint`, the picture with
+    the area to redraw transparent (`image.read(mode="RGBA")`). A function names the kinds it has
+    an adapter for, `control: list[Control[Literal["pose", "depth"]]] = []`: a request's control
+    of another kind is dropped with a row, and the page crosses it out."""
+
+    image: Annotated[ImageFile, ImagePreparation(max_pixels=16 << 20)]
+    kind: K
+    strength: Annotated[float, msgspec.Meta(ge=0.0, le=2.0)] = 1.0
 
 
 @dataclass(frozen=True, slots=True)
