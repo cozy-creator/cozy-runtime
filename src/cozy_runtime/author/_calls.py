@@ -358,7 +358,9 @@ class _Broker:
             row: tuple[str, dict[str, Scalar]]
             for change in moved:
                 row = (
-                    "a package call passed a value over its callee's limit; it was clamped",
+                    "a package call passed media its callee has no use for; it was left out"
+                    if change.kind == "ignored"
+                    else "a package call passed a value over its callee's limit; it was clamped",
                     {
                         "callee": f"{module}:{export}",
                         "field": change.field,

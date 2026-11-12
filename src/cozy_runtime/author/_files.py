@@ -19,13 +19,14 @@ from copy import copy
 from dataclasses import dataclass, is_dataclass
 from fractions import Fraction
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, UnionType
 from typing import (
     TYPE_CHECKING,
     ClassVar,
     Final,
     Literal,
     Self,
+    Union,
     cast,
     get_args,
     get_origin,
@@ -402,16 +403,19 @@ class Files[T](Sequence[T]):
 
     @classmethod
     def _from_bound(cls, values: Iterable[File]) -> Files[T]:
-        """Retain exact slot IDs/order after binding; no byte acquisition or decode."""
+        """Retain exact slot IDs/order after binding; no byte acquisition or decode. A file
+        left out of the request leaves a gap in the positions."""
         result = cls()
         items: list[File] = []
         seen: set[str] = set()
-        for position, value in enumerate(values):
+        last = -1
+        for value in values:
             if not isinstance(value, File):
                 raise TypeError("Files accepts typed file handles")
-            if not value.id or value.id in seen or value.position != position:
+            if not value.id or value.id in seen or value.position <= last:
                 raise ValueError("bound Files requires distinct input IDs in binding order")
             seen.add(value.id)
+            last = value.position
             items.append(copy(value))
         result._items = tuple(items)
         result._check_labels()
@@ -536,10 +540,12 @@ class References[T](Mapping[str, T]):
     """A prompt's references by mention, in order of first mention. On the wire each is its value
     with its `key`, in a list, because a JSON object's key order isn't kept."""
 
-    __slots__ = ("_items",)
+    __slots__ = ("_at", "_items")
 
     def __init__(self, items: Mapping[str, T] | Iterable[tuple[str, T]] = ()) -> None:
         self._items = dict(items)
+        #: Each value's index in the wire's list, which its files' input ids name.
+        self._at = tuple(range(len(self._items)))
 
     def __getitem__(self, key: str) -> T:
         return self._items[key]
@@ -562,25 +568,53 @@ class References[T](Mapping[str, T]):
         ]
 
 
+def _reference_type(target: object) -> object:
+    """What a `References[T]` holds: `T`, or its bound when unset (bare `Prompt`)."""
+    (item,) = get_args(target) or (object,)
+    return getattr(item, "__bound__", None) or item
+
+
+def reference_kinds(target: object) -> frozenset[str]:
+    """The media a `References[T]` takes, by its values' tags: `Prompt[Image]`'s is `image`."""
+    item = _reference_type(target)
+    if item is object:
+        return MEDIA_KINDS
+    members = get_args(item) if get_origin(item) in (Union, UnionType) else (item,)
+    tags = {getattr(getattr(m, "__struct_config__", None), "tag", None) for m in members}
+    return MEDIA_KINDS & tags
+
+
+def unused_reference(kinds: frozenset[str], item: object) -> str | None:
+    """The modality of a wire reference its prompt takes none of (a `<Video1>` in a
+    `Prompt[Image]`), which is left out with a note instead of refused (Paul, 11-12). None for
+    one it takes, or a malformed one, which stays the decoder's."""
+    kind = item.get("type") if isinstance(item, dict) else None
+    return kind if isinstance(kind, str) and kind in MEDIA_KINDS - kinds else None
+
+
 def _references(
     target: object, obj: object, hook: Callable[[type, object], object]
 ) -> References[object]:
-    """References from their wire list, each value converted to the prompt's media type."""
-    (item,) = get_args(target) or (object,)
-    item = getattr(item, "__bound__", None) or item
+    """References from their wire list, each value converted to the prompt's media type. One the
+    prompt has no use for is left out (`fit` notes it); the rest keep their wire index."""
+    item = _reference_type(target)
     if not isinstance(obj, list) or not all(
         isinstance(e, dict) and isinstance(e.get("key"), str) for e in obj
     ):
         raise TypeError("a prompt's references are a list of values, each with its `key`")
-    values = [(e["key"], {k: v for k, v in e.items() if k != "key"}) for e in obj]
-    if len({key for key, _ in values}) != len(values):
+    if len({e["key"] for e in obj}) != len(obj):
         raise ValueError("a prompt names each reference once")
+    kinds = reference_kinds(target)
+    kept = [(at, e) for at, e in enumerate(obj) if unused_reference(kinds, e) is None]
+    values = [(e["key"], {k: v for k, v in e.items() if k != "key"}) for _, e in kept]
     try:
-        return References(
+        references = References(
             (key, msgspec.convert(value, type=item, dec_hook=hook)) for key, value in values
         )
     except msgspec.ValidationError as exc:
         raise ValueError(f"a reference {exc}") from None
+    references._at = tuple(at for at, _ in kept)
+    return references
 
 
 class Tree:
@@ -760,6 +794,16 @@ def bind_tree(tree: Tree, *, root: Path, digest: str, attempt: str) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class Slot:
+    """Where a value sits: an item of a list or dict, or a record's attribute, and the annotation
+    that declares it there (its list's, for a list's item)."""
+
+    holder: object
+    key: str | int
+    annotation: object = None
+
+
+@dataclass(frozen=True, slots=True)
 class AssetInput:
     """One typed File occurrence and its lossless request address."""
 
@@ -769,6 +813,7 @@ class AssetInput:
     bound: FileBound | None
     segments: tuple[str | int, ...]
     preparation: Preparation | None = None
+    slot: Slot | None = None
 
 
 def asset_inputs(payload: object) -> list[AssetInput]:
@@ -793,6 +838,7 @@ def asset_inputs(payload: object) -> list[AssetInput]:
         seen: set[int],
         bound: FileBound | None,
         preparation: Preparation | None,
+        slot: Slot | None = None,
     ) -> None:
         if isinstance(value, File):
             bad = [part for part in segments if isinstance(part, str) and (not part or "." in part)]
@@ -804,21 +850,27 @@ def asset_inputs(payload: object) -> list[AssetInput]:
                 )
             input_id = ".".join(str(part) for part in segments)
             prepared = preparation if preparation and preparation.kind == value.kind else None
-            found.append(AssetInput(input_id, order, value, bound, segments, prepared))
+            found.append(AssetInput(input_id, order, value, bound, segments, prepared, slot))
             return
         if isinstance(value, Tree) or id(value) in seen:
             return
         seen.add(id(value))
         if isinstance(value, References):
-            # By position, as the wire's list spells it: `summary.references.0.file`.
-            value = list(value.values())
+            # By wire index, as the grant names it (`summary.references.2.file`), though one
+            # before it was left out.
+            for index, item in zip(value._at, value.values(), strict=True):
+                walk_value(item, (*segments, index), index, seen, bound, preparation)
+            return
+        declared = slot.annotation if slot is not None else None
         if isinstance(value, (list, tuple)):
             for index, item in enumerate(value):
-                walk_value(item, (*segments, index), index, seen, bound, preparation)
+                held = Slot(value, index, declared)
+                walk_value(item, (*segments, index), index, seen, bound, preparation, held)
             return
         if isinstance(value, dict):
             for key, item in value.items():
-                walk_value(item, (*segments, str(key)), order, seen, bound, preparation)
+                held = Slot(value, key, declared)
+                walk_value(item, (*segments, str(key)), order, seen, bound, preparation, held)
             return
         if isinstance(value, msgspec.Struct):
             fields = [
@@ -832,15 +884,16 @@ def asset_inputs(payload: object) -> list[AssetInput]:
             return
         for name, attribute, annotation in fields:
             base, markers = strip(annotation)
-            declared = next((m for m in markers if isinstance(m, FileBound)), None)
+            limit = next((m for m in markers if isinstance(m, FileBound)), None)
             prepared = field_preparation(base, markers)
             walk_value(
                 getattr(value, attribute),
                 (*segments, name),
                 order,
                 seen,
-                declared if declared is not None else bound,
+                limit if limit is not None else bound,
                 prepared if prepared is not None else preparation,
+                Slot(value, attribute, annotation),
             )
 
     walk_value(payload, (), 0, set(), None, None)

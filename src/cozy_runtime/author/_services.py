@@ -78,7 +78,7 @@ T = TypeVar("T")
 S = TypeVar("S")
 A = TypeVar("A", bound="File")
 
-RowKind = Literal["adjusted", "clamp", "warn"]
+RowKind = Literal["adjusted", "clamp", "warn", "ignored"]
 
 #: Default per-attempt output ceiling. The deployment lowers it; nothing raises it in code.
 MAX_OUTPUT_BYTES = 256 * 1024 * 1024
@@ -104,7 +104,17 @@ class AdjustmentRow:
     applied: object
     reason: str
     source: str = "handler"
-    """`handler`, or the runtime-owned origin (`checkpoint:…`, `adapter:…`, `policy`)."""
+    """`handler`, or the runtime-owned origin (`checkpoint:…`, `adapter:…`, `policy`, `runtime`)."""
+
+    @classmethod
+    def ignored(cls, field: str, requested: str, kind: str) -> AdjustmentRow:
+        """An input of a modality the function has no use for, left out instead of refused."""
+        reason = f"this function takes no {_NONE_OF[kind]} here"
+        return cls("ignored", field, requested, None, reason, "runtime")
+
+
+#: What an `ignored` row says a function takes none of.
+_NONE_OF = {"image": "images", "video": "videos", "audio": "audio"}
 
 
 @dataclass(frozen=True, slots=True)
