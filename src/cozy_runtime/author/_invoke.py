@@ -59,18 +59,20 @@ from cozy_runtime.author._errors import (
     unwind,
 )
 from cozy_runtime.author._files import (
+    AssetInput,
     File,
     Files,
     GrantedInput,
     ImageFile,
     InputMetadata,
+    Slot,
     Tree,
     asset_inputs,
     bind,
     bind_tree,
 )
 from cozy_runtime.author._markers import FileBound, ImagePreparation
-from cozy_runtime.author._media import KIND_MEDIA, admits, slot_kind
+from cozy_runtime.author._media import KIND_MEDIA, admits, slot_kind, unused
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation, Track
 from cozy_runtime.author._preview import PreviewFrame, Previews
@@ -191,6 +193,8 @@ class PreparedRequest:
     facts: object
     facts_digest: str | None
     asset_bounds: Mapping[str, FileBound | None] = field(default_factory=dict)
+    #: its input files as the grant names them, less those left out (`_usable_inputs`)
+    inputs: tuple[AssetInput, ...] = ()
     #: how this request's LoRAs are served (`LORA_MODE`): baked unless it asks per step
     lora: str = "bake"
     #: what preparing it waited for (its attention kernel's compile): its attempt's first stages
@@ -217,7 +221,9 @@ def prepare(
     surface = surface_of(registration)
     wire, lora = lora_mode(surface.payload_type, wire)
     overlay = resolve(surface.payload_type, wire, model_params=surface.model_params)
-    asset_bounds = _prepare_assets(surface, overlay.payload, input_metadata)
+    asset_bounds, unusable = _prepare_assets(surface, overlay.payload, input_metadata)
+    inputs, rows = _usable_inputs(surface, overlay.payload, input_metadata, unusable)
+    overlay = replace(overlay, rows=(*overlay.rows, *rows))
     facts, facts_digest = _preflight(surface, overlay)
     return PreparedRequest(
         surface=surface,
@@ -226,6 +232,7 @@ def prepare(
         facts=facts,
         facts_digest=facts_digest,
         asset_bounds=asset_bounds,
+        inputs=inputs,
         lora=lora,
     )
 
@@ -309,7 +316,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     record.components_active = lambda: any(model._cozy_active is not None for model in models)
 
     # Hydration is EAGER and happens only now: a refused request downloads nothing (§1.3).
-    _hydrate(overlay.payload, inv, prepared.asset_bounds, record)
+    _hydrate(prepared, inv, record)
 
     attempt = record
     attempt.outputs = surface.outputs
@@ -450,14 +457,19 @@ def _payload_value(surface: Surface, payload: object) -> object:
 
 def _prepare_assets(
     surface: Surface, payload: object, metadata: Mapping[str, InputMetadata]
-) -> dict[str, FileBound | None]:
+) -> tuple[dict[str, FileBound | None], dict[str, str]]:
+    """Each `Files` occurrence typed by its kind and bound, and the modality of each one the
+    slot has no use for, by input id, which `_usable_inputs` leaves out."""
     binding = surface.assets
     if binding is None:
-        return {}
+        return {}, {}
     values = getattr(payload, binding.parameter)
     bounds: dict[str, FileBound | None] = {}
+    unusable: dict[str, str] = {}
+    kept: list[File] = []
     counts: dict[str, int] = {}
     limits = dict(binding.counts)
+    kinds = [cls.kind for cls, _ in binding.kinds]
     for position, value in enumerate(values):
         input_id = f"{binding.parameter}.{position}.asset"
         row = metadata.get(input_id)
@@ -467,7 +479,10 @@ def _prepare_assets(
                 code="asset_ungranted",
                 fields=[input_id],
             )
-        taken = slot_kind((cls.kind for cls, _ in binding.kinds), row.media_type) or "file"
+        if (modality := unused(kinds, row.media_type)) is not None:
+            unusable[input_id] = modality
+            continue
+        taken = slot_kind(kinds, row.media_type) or "file"
         options = [(cls, bound) for cls, bound in binding.kinds if cls.kind == taken]
         if not options:
             raise InvalidRequest(
@@ -495,15 +510,90 @@ def _prepare_assets(
         asset._fidelity = value.fidelity
         asset._preparation = binding.preparation(cls.kind)
         value.asset = asset
+        kept.append(asset)
         if bound is not None and cls.kind in binding.undeclared:  # the machine's budget, not 2 GiB
             declares = bound.max_bytes is not None or bound.media_types
             bound = replace(bound, max_decoded_bytes=None) if declares else None
         bounds[input_id] = bound
     try:
-        Files._from_bound(value.asset for value in values)
+        Files._from_bound(kept)
     except ValueError as exc:
         raise InvalidRequest(str(exc), code="asset_labels", fields=[binding.parameter]) from exc
-    return bounds
+    return bounds, unusable
+
+
+def _usable_inputs(
+    surface: Surface,
+    payload: object,
+    metadata: Mapping[str, InputMetadata],
+    unusable: Mapping[str, str],
+) -> tuple[tuple[AssetInput, ...], tuple[AdjustmentRow, ...]]:
+    """The request's input files, as the grant names them, but each of a modality its field has
+    no use for: that one leaves the request with an `ignored` row (Paul, 11-12). Ids are taken
+    before any leaves, so the others keep theirs."""
+    if not declares_assets(type(payload)):
+        return (), ()
+    kept: list[AssetInput] = []
+    rows: list[AdjustmentRow] = []
+    for item in asset_inputs(payload):
+        granted = metadata.get(item.input_id)
+        modality = unusable.get(item.input_id)
+        if modality is None and granted is not None:
+            modality = unused((item.asset.kind,), granted.media_type)
+        if modality is None or granted is None:
+            kept.append(item)
+            continue
+        _leave_out(surface, payload, item, granted)
+        rows.append(AdjustmentRow.ignored(item.input_id, item.input_id, modality))
+    return tuple(kept), tuple(rows)
+
+
+def _leave_out(surface: Surface, payload: object, item: AssetInput, granted: InputMetadata) -> None:
+    """Take a file out of the request: an item of its list or `Files`, or an optional field as
+    None. A required field refuses, as does a list left shorter than its `min_length`: the
+    function can't run without it."""
+    files = surface.assets
+    slot, element = item.slot, item.asset
+    where = ".".join(str(part) for part in item.segments[:-1])
+    if files is not None and item.segments[0] == files.parameter:
+        # A `Files` occurrence leaves as its row of the parameter's list.
+        rows = getattr(payload, files.parameter)
+        slot, where = Slot(rows, item.segments[1], files.annotation), files.parameter
+        element = next(row for row in rows if row.asset is item.asset)
+    if slot is not None and isinstance(slot.holder, list):
+        held = slot.holder
+        del held[next(i for i, value in enumerate(held) if value is element)]
+        least = _min_length(slot.annotation)
+        if len(held) >= least:
+            return
+        raise InvalidRequest(
+            f"{where} takes at least {least} files, and {item.input_id} is "
+            f"{granted.media_type}, which it has no use for: give one it can use",
+            code="asset_media_type",
+            fields=[item.input_id],
+        )
+    if slot is not None and isinstance(slot.holder, dict):
+        del slot.holder[slot.key]
+        return
+    if slot is not None and unwrap_optional(strip(slot.annotation)[0])[1]:
+        if isinstance(slot.holder, msgspec.Struct):
+            msgspec.structs.force_setattr(slot.holder, str(slot.key), None)
+        else:
+            object.__setattr__(slot.holder, str(slot.key), None)
+        return
+    raise InvalidRequest(
+        f"{item.input_id} is {granted.media_type}, and this function needs its "
+        f"{item.asset.kind} file there: give one",
+        code="asset_media_type",
+        fields=[item.input_id],
+    )
+
+
+def _min_length(annotation: object) -> int:
+    base, markers = strip(annotation)
+    _, more = strip(unwrap_optional(base)[0])
+    found = [m.min_length for m in (*markers, *more) if isinstance(m, msgspec.Meta)]
+    return max((least for least in found if least is not None), default=0)
 
 
 _CARRIES: dict[tuple[object, str], bool] = {}
@@ -638,12 +728,7 @@ def _check_input(
         )
 
 
-def _hydrate(
-    payload: object,
-    inv: Invocation,
-    assets_bounds: Mapping[str, FileBound | None] = {},
-    record: Attempt | None = None,
-) -> None:
+def _hydrate(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> None:
     """Bind every declared input file to the bytes the GRANT already materialized (§1.3).
 
     Symmetric with `_materialize_trees` and for the same reason: an ungranted ref is a
@@ -654,10 +739,9 @@ def _hydrate(
     side does is match an identified input against the FIELD it fills, which is the half
     only this side knows.
     """
-    _materialize_trees(payload, inv)
-    if not declares_assets(type(payload)):
-        return
-    for item in asset_inputs(payload):
+    _materialize_trees(prepared.overlay.payload, inv)
+    assets_bounds = prepared.asset_bounds
+    for item in prepared.inputs:
         granted = inv.assets.get(item.input_id)
         if granted is None:
             raise InvalidRequest(
@@ -690,13 +774,12 @@ def _hydrate(
             max_decoded_bytes=(bound.max_decoded_bytes or 0) if bound is not None else 0,
             input_id=item.input_id,
             order=item.order,
-            read_guard=(lambda: record.check_open("File.read_bytes")) if record else None,
-            media=record.media if record else None,
+            read_guard=lambda: record.check_open("File.read_bytes"),
+            media=record.media,
         )
         if item.input_id not in assets_bounds:
             item.asset._preparation = item.preparation
-        if record is not None:
-            prepare_duration(item.asset, record)
+        prepare_duration(item.asset, record)
 
 
 def prepare_duration(asset: File, record: Attempt) -> None:

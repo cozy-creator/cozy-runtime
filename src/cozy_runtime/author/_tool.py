@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Annotated, Generic, NewType
 import msgspec
 
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._files import AudioFile, ImageFile, References, VideoFile
+from cozy_runtime.author._files import AudioFile, ImageFile, References, VideoFile, unmentioned
 from cozy_runtime.author._markers import ImagePreparation
 
 #: W:H as written: `16:9`, `2.39:1`, `16/9`. The box's own shape; `Ratios` names what it takes.
@@ -92,6 +92,8 @@ class Prompt(msgspec.Struct, Generic[T], frozen=True, kw_only=True):  # noqa: UP
         given: object = self.references
         if not isinstance(given, References):
             msgspec.structs.force_setattr(self, "references", References(self.references))
+        elif given._left:
+            msgspec.structs.force_setattr(self, "text", unmentioned(self.text, given._left))
 
 
 class Pickup(msgspec.Struct, frozen=True, kw_only=True):
