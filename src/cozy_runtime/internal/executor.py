@@ -4747,6 +4747,7 @@ class Executor:
                             "step_ms": frame.step_ms,
                             "call_request": frame.call_request,
                             "call_attempt": frame.call_attempt,
+                            "unit": frame.unit,
                         }
                     )
                 else:
