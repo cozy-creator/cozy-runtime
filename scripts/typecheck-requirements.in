@@ -1,7 +1,8 @@
 # The type check's environment (scripts/typecheck.sh): mypy and the libraries the Runtime's source imports, CPU-only.
 # `scripts/typecheck.sh lock` pins them into typecheck-requirements.txt.
 mypy
-tensorfs==0.24.0
+# TensorFS by git rev until a release carries `vt.driver_short` and `room()['driver_reserve']` (cr-293).
+tensorfs @ git+https://github.com/cozy-creator/cozy-creator@549169bc6aca9278a1e104c0b9c3d5c3070fdbc6#subdirectory=crates/tensorfs-py
 msgspec
 numpy
 packaging
