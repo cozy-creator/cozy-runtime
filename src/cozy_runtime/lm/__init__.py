@@ -754,23 +754,22 @@ def _fused_experts(model: torch.nn.Module, text: PreTrainedConfig) -> bool:
 
 
 def _capture_contract(model: torch.nn.Module, draft: torch.nn.Module | None = None) -> str:
-    """Shipped decode contracts, dense and with experts split (`moe`), and a drafted step's
-    head (`Draft` around Transformers' decoder layer); persistent KV, positions and counters
-    are device buffers.
+    """Why `model`'s decode step is no graph, "" when it is one: Transformers' own model whose
+    class declares its forward one compiled graph (`_can_compile_fullgraph`: no host sync and no
+    Python branch on a tensor's value, what torch.compile's CUDA graphs need too), dense or with
+    experts split (`moe`), and a drafted step's head (`Draft` around Transformers' decoder
+    layer); persistent KV, positions and counters are device buffers. One contract for every
+    such LM and VLM (Qwen3, Qwen3.5, Qwen3-VL, Mistral3, Llama, ...), not a list of names (cr-289).
 
     The real warm step initializes cache views and advances accepted history once. Capture
     only records the next step's device writes. Custom Python hooks and arbitrary model code
     are never speculatively executed by this graph builder.
     """
-    forward = type(model).forward
-    if not forward.__module__.startswith("transformers.models.") or type(model).__name__ not in {
-        "Qwen3ForCausalLM",
-        "Qwen3_5ForCausalLM",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-    }:
-        return "no shipped decode capture contract"
+    kind = type(model)
+    if not kind.forward.__module__.startswith("transformers.models."):
+        return "not a Transformers model's own forward"
+    if not getattr(kind, "_can_compile_fullgraph", False):
+        return f"Transformers does not declare {kind.__name__}'s forward one graph"
     # A component root's class is Runtime's graphed subclass (`graphs.install`): forward is Draft's.
     if draft is not None and (
         type(draft).forward is not Draft.forward
