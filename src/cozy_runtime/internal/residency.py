@@ -2509,10 +2509,11 @@ class Memory:
         floor = model.escape_floor
         if any(b.retained for b in model.groups()):
             # Held blocks are in the pass's held bytes already: the floor is what still streams
-            # (a decode keeping what fits, `keep`).
+            # (a decode keeping what fits, `keep`); an embedding table gathers on the host.
             shared = model.common
             floor = (shared.allocation_bytes if shared and not shared.retained else 0) + max(
-                (b.allocation_bytes for b in model.blocks.values() if not b.retained), default=0
+                (b.allocation_bytes for b in model.blocks.values() if not (b.retained or b.table)),
+                default=0,
             )
         device = self.device.index or 0
         refused = vt.pass_mark(device, model.escape_site, shape, floor)
