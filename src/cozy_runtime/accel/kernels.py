@@ -371,13 +371,28 @@ def int8_rows(
     `silu(x) * up`, rounded as an eager SwiGLU rounds them; without `up`, x is `[..., 2F]`, each
     row the [up | gate] halves of one fused projection (Diffusers' `SwiGLU`).
 
-    None unless every consumer is an un-hooked encoded leaf taking int8.convrot's operand (an int8
-    or w4a8 leaf) of x's width and the op serves this card: the caller then runs its own ops."""
+    None unless every consumer is an encoded leaf taking int8.convrot's operand (an int8 or w4a8
+    leaf) of x's width, or a LoRA'd or LoKr'd layer whose update is baked into one, with no hook
+    that changes its forward, and the op serves this card: the caller then runs its own ops."""
+    consumers = tuple(_baked_base(c) for c in consumers)
     if not consumers or getattr(consumers[0], "operand", None) != INT8_CONVROT:
         return None
     # Only the native int8 leaf's operand is int8.convrot's, and it has the prologue.
     leader = cast("_Prologue", consumers[0])
     return leader.int8_prologue(x, consumers, norm, eps, scale, shift, activation, up)
+
+
+def _baked_base(module: nn.Module) -> nn.Module:
+    """The leaf a consumer's forward hands its operand to: itself, or a composed layer's base
+    (`lora_composition`'s `_cozy_baked`) once its update is in the base's bytes."""
+    while getattr(module, "_cozy_baked", False) and not (
+        module._forward_hooks or module._forward_pre_hooks
+    ):
+        base: nn.Module | None = getattr(module, "base_layer", None)
+        if base is None:
+            break
+        module = base
+    return module
 
 
 def native() -> str:

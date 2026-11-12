@@ -7,6 +7,9 @@ rotated basis, `nvfp4` its E2M1 values under refitted block scales; the rounding
 because a delta below half a grid step vanishes under nearest rounding. `Stats` is what a
 quality gate reads: how much of the delta survived and how much rounding error the bake added.
 
+A LoKr term (`Kron`) is a dense delta, `scale * kron(W1, W2)`'s rows, made a chunk at a time and
+added beside `up @ down` (`dense`); it bakes by the eager path on every device.
+
 A DoRA term bakes as a row gain beside its delta (`dora`): each output row of the stored weight
 times `g` (a row-scaled weight's scale times it, exactly), then the delta added; its norms are
 taken in f32 from the decoded rows (`norms`).
@@ -24,7 +27,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from types import ModuleType
@@ -199,8 +202,48 @@ def _chunks(rows: int, cols: int) -> list[tuple[int, int]]:
     return [(start, min(start + step, rows)) for start in range(0, rows, step)]
 
 
-def _delta(up: Tensor, down_fp32: Tensor, alpha: float, start: int, stop: int) -> Tensor:
-    return (up[start:stop].float() @ down_fp32) * alpha
+#: A dense delta's rows `[start, stop)`, f32 `[rows, in]`, added beside `up @ down`.
+Dense = Callable[[int, int], "Tensor"]
+
+
+@dataclass(frozen=True, slots=True)
+class Kron:
+    """A LoKr term: `scale * kron(w1, w2)` (`w1` `[a, b]`, `w2` `[c, d]`), the product's rows
+    `index` (int64 `[out]`, in order: all of them, or a split target's)."""
+
+    w1: Tensor
+    w2: Tensor
+    scale: float
+    index: Tensor
+
+    def __call__(self, start: int, stop: int) -> Tensor:
+        # Row p * c + q of kron(w1, w2) is w1[p] (x) w2[q].
+        at = self.index[start:stop]
+        c = self.w2.shape[0]
+        w1, w2 = self.w1[at // c].float(), self.w2[at % c].float()
+        return (w1[:, :, None] * w2[:, None, :]).flatten(1).mul_(self.scale)
+
+
+def dense(terms: Sequence[Kron]) -> Dense | None:
+    """The sum of `terms`' rows, None for none."""
+    if not terms:
+        return None
+    first, *rest = terms
+
+    def rows(start: int, stop: int) -> Tensor:
+        out = first(start, stop)
+        for term in rest:
+            out.add_(term(start, stop))
+        return out
+
+    return rows
+
+
+def _delta(
+    up: Tensor, down_fp32: Tensor, alpha: float, start: int, stop: int, more: Dense | None = None
+) -> Tensor:
+    delta = (up[start:stop].float() @ down_fp32) * alpha
+    return delta if more is None else delta.add_(more(start, stop))
 
 
 def _account(
@@ -235,6 +278,7 @@ def bake_plain(
     rounding: Rounding = "nearest",
     generator: Generator | None = None,
     stats: Stats | None = None,
+    more: Dense | None = None,
     gain: Tensor | None = None,
 ) -> None:
     """`weight = gain * weight + alpha * up @ down` (`gain` f32 per row, else 1), computed in f32
@@ -251,7 +295,7 @@ def bake_plain(
         base = weight[start:stop].to(torch.float32, copy=True)
         if gain is not None:
             base.mul_(gain[start:stop, None])
-        delta = _delta(up, down_fp32, alpha, start, stop)
+        delta = _delta(up, down_fp32, alpha, start, stop, more)
         target = base + delta
         if rounding == "stochastic" and weight.dtype == torch.bfloat16:
             target = _bf16_either(torch, target, generator)
@@ -284,6 +328,7 @@ def bake_rowwise(
     grid: Grid = "refit",
     generator: Generator | None = None,
     stats: Stats | None = None,
+    more: Dense | None = None,
 ) -> None:
     """Bake into `fp8.rowwise`: `data` `[out, in]` E4M3, `scale` one f32 per output row.
 
@@ -300,7 +345,7 @@ def bake_rowwise(
     for start, stop in _chunks(*data.shape):
         old = scales[start:stop].float().unsqueeze(1)
         base = decode_e4m3(torch, raw[start:stop]) * old
-        delta = _delta(up, down_fp32, alpha, start, stop)
+        delta = _delta(up, down_fp32, alpha, start, stop, more)
         target = base + delta
         new = old
         if grid != "keep":
@@ -335,6 +380,7 @@ def bake_int8_convrot(
     rounding: Rounding = "nearest",
     generator: Generator | None = None,
     stats: Stats | None = None,
+    more: Dense | None = None,
 ) -> None:
     """Bake into `int8-convrot256/1`: `data` `[out, in]` int8 of the rotated rows, `scale` one
     f32 per output row, kept. The rotation is orthonormal, so the delta is rotated (`down`'s
@@ -346,7 +392,7 @@ def bake_int8_convrot(
     for start, stop in _chunks(*data.shape):
         unit = scales[start:stop].float().unsqueeze(1)
         code = data[start:stop].float()
-        delta = _delta(up, rotated, alpha, start, stop)
+        delta = _delta(up, rotated, alpha, start, stop, more)
         payload = code + delta / unit
         if rounding == "stochastic":
             draw = torch.rand(payload.shape, device=payload.device, generator=generator)
@@ -422,6 +468,7 @@ def bake_nvfp4(
     grid: Grid = "keep",
     generator: Generator | None = None,
     stats: Stats | None = None,
+    more: Dense | None = None,
     gain: Tensor | None = None,
 ) -> None:
     """Bake into canonical `nvfp4` (`NVFP4_PARAMS`): `weight` u8 `[out, in/2]`, `scale` E4M3
@@ -448,12 +495,12 @@ def bake_nvfp4(
     if grid != "keep":
         amax = 0.0
         for start, stop in _chunks(rows, cols):
-            target = decoded(start, stop) + _delta(up, down_fp32, alpha, start, stop)
+            target = decoded(start, stop) + _delta(up, down_fp32, alpha, start, stop, more)
             amax = max(amax, float(target.abs().amax()))
         second = amax / NVFP4_LEVELS if amax > 0 else 1.0
     for start, stop in _chunks(rows, cols):
         base = decoded(start, stop)
-        delta = _delta(up, down_fp32, alpha, start, stop)
+        delta = _delta(up, down_fp32, alpha, start, stop, more)
         target = (base + delta).view(stop - start, -1, NVFP4_BLOCK)
         need = target.abs().amax(dim=-1) / (6.0 * second)
         fits = torch.searchsorted(magnitudes, need.contiguous()).clamp(max=126)
@@ -514,6 +561,7 @@ def bake(
     stats: Stats | None = None,
     how: How | None = "eager",
     gain: Tensor | None = None,
+    more: Dense | None = None,
 ) -> None:
     """Bake `up @ down` into one stored weight by its roles: plain floats, `fp8.rowwise`
     (E4M3 data, f32 row scale), `int8-convrot256/1` (int8 data, f32 row scale) or `nvfp4`
@@ -524,14 +572,15 @@ def bake(
     measures them). A convolution's weight and factors bake as matrices, each kernel tap one
     more input column. `gain` (f32 per output row, a DoRA's) scales the stored rows first: a
     row-scaled weight's scale exactly (then fused where it serves), a plain or `nvfp4` one's
-    values in the eager reference, rounded once with the delta."""
+    values in the eager reference, rounded once with the delta. `more` (a LoKr's dense rows,
+    `dense`) adds beside `up @ down`, by the eager reference; `down` and `up` may have rank 0."""
     if down.dim() > 2:
         stored = {role: t.view(t.shape[0], -1) if t.dim() > 2 else t for role, t in stored.items()}
         down, up = down.flatten(1), up.flatten(1)
     if gain is not None and "value" not in stored and "scale_2" not in stored:
         stored["scale"].view(-1).mul_(gain)
         gain = None
-    how = "eager" if gain is not None else how
+    how = "eager" if gain is not None or more is not None else how
     device = next(iter(stored.values())).device
     if stats is None and device.type == "cuda" and how == "fused":
         fused(torch, _launch(device.index or 0), stored, down, up, seed)
@@ -549,6 +598,7 @@ def bake(
             generator=generator,
             stats=stats,
             gain=gain,
+            more=more,
         )
     elif set(stored) == {"value"}:
         weight = stored["value"]
@@ -563,8 +613,10 @@ def bake(
             generator=generator,
             stats=stats,
             gain=gain,
+            more=more,
         )
     elif stored["weight"].dtype == torch.int8:
+        rotated = None if more is None else _rotated(torch, more)
         bake_int8_convrot(
             torch,
             stored["weight"],
@@ -575,6 +627,7 @@ def bake(
             rounding="stochastic",
             generator=generator,
             stats=stats,
+            more=rotated,
         )
     else:
         bake_rowwise(
@@ -588,7 +641,13 @@ def bake(
             grid="keep",
             generator=generator,
             stats=stats,
+            more=more,
         )
+
+
+def _rotated(torch: ModuleType, rows: Dense) -> Dense:
+    """`rows` in an `int8-convrot256/1` weight's basis, as `rotate_factor` rotates `down`."""
+    return lambda start, stop: rotate_factor(torch, rows(start, stop))
 
 
 def norms(torch: ModuleType, stored: Mapping[str, Tensor], down: Tensor, up: Tensor) -> Tensor:
