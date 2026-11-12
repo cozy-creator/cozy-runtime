@@ -299,10 +299,6 @@ class _Recording:
         # Nothing reads a pool between replays, so the core may take its pages back when idle.
         held = [t for t in inputs if t is not None]
         held += [t for t in torch.utils._pytree.tree_leaves(outputs) if isinstance(t, torch.Tensor)]
-        #: what it holds in its pool for as long as it lives, beside any later capture's room
-        self.held_bytes = sum(
-            {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes() for t in held}.values()
-        )
         try:
             vt.pool_scratch(pool.handle, held, owner.device)
         except (RuntimeError, ValueError) as exc:  # An escaped alias: its pool just stays mapped.
@@ -1236,8 +1232,8 @@ def _record(
     """Records `pending`'s signature at idle on seeded inputs of its layout, in the device's
     capture pool: a warm-up run, measured, then the capture unless the warm-up's host waited on
     the device half its time (device-bound: a graph saves nothing). The replay decides the rest:
-    bit for bit equal to eager, and faster than its eager calls (`_no_gain`). Its pool is
-    `vt.pool_bytes` of the warm-up's peak beside what the pool holds already. No room for its
+    bit for bit equal to eager, and faster than its eager calls (`_no_gain`). Its pool gets one
+    free run of `vt.pool_bytes` of the warm-up's peak beside what the pool holds. No room for its
     weights, warm-up, pool or capture: it runs as written, the run says what it needed, and its
     next call queues it again (`_short`). False tries again at a later period (a kernel
     building, its weights left)."""
@@ -1304,9 +1300,7 @@ def _record(
                 if not peak:
                     recorder.judged[key] = "its warm-up's working memory was not measured"
                     return True
-                reserve = vt.pool_bytes(peak[0]) + sum(
-                    entry.held_bytes for entry in recorder.recordings.values()
-                )
+                reserve = vt.pool_bytes(peak[0])
                 pool = recorder.pool
                 if pool is None:
                     pool = recorder.pool = (
