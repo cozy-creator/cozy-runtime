@@ -31,6 +31,7 @@ from cozy_runtime.author._context import CURRENT
 
 if TYPE_CHECKING:
     from torch import Tensor
+    from torch import device as Device
 
 #: The least time between two previews of one attempt.
 INTERVAL_S = 0.5
@@ -308,7 +309,7 @@ class Previews:
 _ON: dict[tuple[int, str], tuple[Tensor, Tensor]] = {}
 
 
-def _on(family: Family, device: object) -> tuple[Tensor, Tensor]:
+def _on(family: Family, device: Device) -> tuple[Tensor, Tensor]:
     import torch
 
     key = (id(family), str(device))
