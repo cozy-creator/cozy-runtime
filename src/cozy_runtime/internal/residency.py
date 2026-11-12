@@ -2757,7 +2757,15 @@ class _Kept:
     def get(self) -> tuple[Tensor, ...]:
         if self.region is None:
             raise RuntimeError("retained state read after its loop ended")
-        raw = self.region.use(self.memory._cuda_stream().cuda_stream).tensor
+        try:
+            raw = self.region.use(self.memory._cuda_stream().cuda_stream).tensor
+        except Exhausted as exc:
+            size = sum(n for _, n, _, _ in self.views)
+            raise Exhausted(
+                f"a retained state of {_gib(size)} found no room ({exc}): the states whose "
+                "tensors are held now stay on the card; read each where it is used",
+                exc.requested_bytes,
+            ) from exc
         return tuple(raw[at : at + n].view(dtype).view(shape) for at, n, dtype, shape in self.views)
 
 
