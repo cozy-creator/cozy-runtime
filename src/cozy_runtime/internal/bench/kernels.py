@@ -545,10 +545,35 @@ def _means(launch: author_kernels.Launch, index: int, errors: dict[str, float]) 
         del x
 
 
+def _merged(index: int, errors: dict[str, float]) -> None:
+    """`merge_keys`: a query's rows over two key sets merged by their log-sum-exps (Sage2's log2 one over keys less their
+    mean), against FP64, at a ragged row tile and at one head."""
+    target = torch.device("cuda", index)
+    generator = torch.Generator(device=target).manual_seed(4)
+
+    def randn(*shape: int) -> torch.Tensor:
+        return torch.randn(*shape, generator=generator, device=target, dtype=torch.float32)
+
+    scale = 128**-0.5
+    for count, heads in ((300, 3), (64, 1)):
+        q, rows, keyed = (randn(1, count, heads, 128).to(torch.bfloat16) for _ in range(3))
+        km = (randn(1, 1, heads, 128) * 0.5).to(torch.bfloat16)
+        lse, raw = randn(1, count, heads) * 3.0, randn(1, heads, count) * 3.0
+        keyed_lse = raw.double().transpose(1, 2) / 1.44269504 + scale * (q.double() * km.double()).sum(-1)
+        top = torch.maximum(lse.double(), keyed_lse)
+        a, b = (lse.double() - top).exp()[..., None], (keyed_lse - top).exp()[..., None]
+        want = (rows.double() * a + keyed.double() * b) / (a + b)
+        got = rows.clone()
+        attention_sage2_fixed_mean.merge(got, lse, keyed, raw, q, km, scale)
+        errors[f"merge of {count} rows x {heads} heads"] = verify.error(torch, got, want)
+
+
 def _kmean(index: int) -> Outcome:
     errors: dict[str, float]
     launch, errors = _launcher(attention_sage2_fixed_mean.KERNELS, index), {}
+    attention_sage2_fixed_mean.serve(index, launch)
     _means(launch, index, errors)
+    _merged(index, errors)
     return _verdict(verify.within(errors, prebuilt.BUDGET))
 
 
