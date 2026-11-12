@@ -772,7 +772,7 @@ def _wire_default(value: object) -> None:
     )
 
 
-def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
+def _wire_type(annotation: object, seen: frozenset[object] = frozenset()) -> None:
     """Refuse interpreter-local values before an interface is generated."""
     base, _ = strip(annotation)
     if isinstance(base, typing.NewType):  # `Seed`

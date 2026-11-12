@@ -609,28 +609,31 @@ def _references(
     """References from their wire list, each value converted to the prompt's media type. One the
     prompt has no use for is left out (`fit` notes it); the rest keep their wire index."""
     item = _reference_type(target)
-    if not isinstance(obj, list) or not all(
-        isinstance(e, dict) and isinstance(e.get("key"), str) for e in obj
-    ):
-        raise TypeError("a prompt's references are a list of values, each with its `key`")
-    if len({e["key"] for e in obj}) != len(obj):
+    shape = "a prompt's references are a list of values, each with its `key`"
+    if not isinstance(obj, list):
+        raise TypeError(shape)
+    wire: list[tuple[str, dict[str, object]]] = []
+    for e in obj:
+        if not isinstance(e, dict) or not isinstance(key := e.get("key"), str):
+            raise TypeError(shape)
+        wire.append((key, {k: v for k, v in e.items() if k != "key"}))
+    if len({key for key, _ in wire}) != len(wire):
         raise ValueError("a prompt names each reference once")
     kinds = reference_kinds(target)
-    kept: list[tuple[int, dict[str, object]]] = []
+    kept: list[tuple[int, str, dict[str, object]]] = []
     left: list[str] = []
-    for at, e in enumerate(obj):
-        if unused_reference(kinds, e) is None:
-            kept.append((at, e))
+    for at, (key, value) in enumerate(wire):
+        if unused_reference(kinds, value) is None:
+            kept.append((at, key, value))
         else:
-            left.append(e["key"])
-    values = [(e["key"], {k: v for k, v in e.items() if k != "key"}) for _, e in kept]
+            left.append(key)
     try:
-        references = References(
-            (key, msgspec.convert(value, type=item, dec_hook=hook)) for key, value in values
+        references: References[object] = References(
+            (key, msgspec.convert(value, type=item, dec_hook=hook)) for _, key, value in kept
         )
     except msgspec.ValidationError as exc:
         raise ValueError(f"a reference {exc}") from None
-    references._at, references._left = tuple(at for at, _ in kept), tuple(left)
+    references._at, references._left = tuple(at for at, _, _ in kept), tuple(left)
     return references
 
 

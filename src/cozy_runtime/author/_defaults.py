@@ -338,7 +338,7 @@ def _prune(
 
 
 @functools.lru_cache(maxsize=256)
-def _mentions(cls: object) -> dict[str, frozenset[str]]:
+def _mentions(cls: type[msgspec.Struct]) -> dict[str, frozenset[str]]:
     """A struct's `References[T]` fields by wire name, each with the media it takes: what
     `_references` is given for it when it decodes."""
     found: dict[str, frozenset[str]] = {}

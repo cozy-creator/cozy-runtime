@@ -1141,7 +1141,7 @@ class _Bakes:
                 seed=zlib.crc32(f"{identity}\0{stored}".encode()),
                 how=self.how,
                 gain=gain,
-                more=more,  # type: ignore[possibly-undefined]  # set with `delta`
+                more=more,
             )
             self.baked += 1
         return self.baked > baked
