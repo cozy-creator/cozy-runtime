@@ -5,8 +5,9 @@ Changing GEMM row geometry may change rounding; bitwise equivalence is not promi
 The results stay on the device, at the level native selection takes from each call's operands
 (`catch`, `sizing`). Level L is 2^L pieces, down to the finest.
 
-Call cuts: Diffusers' FFNs by token, its channel RMS norms by rows, attention by head groups
-then query rows, a package's `split` by windows.
+Call cuts: Diffusers' FFNs by token, a Runtime-fused block's gated MLP by token (`gated`), its
+channel RMS norms by rows, attention by head groups then query rows, a package's `split` by
+windows.
 """
 
 from __future__ import annotations
@@ -276,6 +277,37 @@ def _token_local(module: nn.Module) -> bool:
     their full channel/block reduction within each token.
     """
     return not any(getattr(child, "provider", None) == NVFP4 for child in module.modules())
+
+
+def gated(x: Tensor, linears: Sequence[nn.Module], forward: Callable[[Tensor], Tensor]) -> Tensor:
+    """`forward(x)`: a Runtime-fused block's gated MLP over `x`'s token rows, `linears` its gate
+    [and up] projections, then its down one. In token pieces at the level native selection takes
+    under the current block, as Diffusers' FFNs (qwen-image-2's ten-reference edit, 65k tokens:
+    [tokens, 12288] gate and up refused at 8 GiB, runs 46964, 47037). Whole outside a named block,
+    under autograd, with an NVFP4 linear (`_token_local`) or one whose widths it can't read."""
+    site = catch.site("mlp")
+    widths = [_widths(m) for m in linears]
+    tokens = x.numel() // max(int(x.shape[-1]), 1)
+    if (
+        site is None
+        or tokens < 2
+        or torch.is_grad_enabled()
+        or any(w is None for w in widths)
+        or any(getattr(m, "provider", None) == NVFP4 for m in linears)
+    ):
+        return forward(x)
+    *ups, (inner, dout) = cast("list[tuple[int, int]]", widths)
+    shape = sizing.Ffn(
+        din=int(x.shape[-1]),
+        dout=dout,
+        inner=inner,
+        projected=sum(o for _, o in ups),
+        temps=1,
+        itemsize=x.element_size(),
+        quantized=any(getattr(m, "provider", None) is not None for m in linears),
+    )
+    run = functools.partial(_tokens, cast("Forward", forward), x, tokens)
+    return cast(Tensor, catch.cut(site, levels(tokens), levelled(tokens, shape.need(tokens)), run))
 
 
 class _Whole(Exception):
