@@ -658,8 +658,10 @@ class Model:
         None when none fits. An embedding table is no block a forward reads whole (`_Block.table`)."""
         if self.memory.native is None:
             return None
+        # The common group (embeddings, the head, final norms) serves every forward, entered
+        # around it rather than block by block.
         used = sorted(
-            (b for b in self.groups() if b.last >= since_ns and not b.table),
+            (b for b in self.groups() if (b is self.common or b.last >= since_ns) and not b.table),
             key=lambda b: b.least_bytes,
             reverse=True,
         )

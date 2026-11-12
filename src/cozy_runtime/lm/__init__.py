@@ -1027,6 +1027,11 @@ class _Keeper:
             binding, self.kept, self.read = found
             self.held.callback(binding.close)
             self.held.enter_context(binding.prepare())
+            print(
+                f"[lm] streamed decode holds {_gib(self.kept)} of its weights, reads "
+                f"{_gib(self.read)} again a token",
+                file=sys.stderr,
+            )
         except Exception as exc:  # holding is only speed: the decode streams as it did
             if not is_capacity(exc):
                 raise
