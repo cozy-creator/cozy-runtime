@@ -1787,7 +1787,9 @@ class _Engine:
                             if self._occupied():
                                 raise self.unprepared or RuntimeError("decode residency was lost")
                             for request in self.incoming:
-                                request.fallback = "its decode set does not fit at home"
+                                request.fallback = "its decode set does not fit at home" + (
+                                    f" ({str(self.unprepared)[:200]})" if self.unprepared else ""
+                                )
                             self.incoming = []
                         if self.incoming or self.retire:
                             self._settle(self.incoming)

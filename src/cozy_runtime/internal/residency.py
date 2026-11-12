@@ -526,11 +526,19 @@ class _Block:
             (p.nbytes + 255) // 256 * 256 for row in self.finals.values() for p in row.values()
         )
 
+    def raw_needed(self) -> bool:
+        return self.aliases is None or any(self.aliases.values()) or not self.finals
+
+    @property
+    def least_bytes(self) -> int:
+        """The fewest device bytes it holds in use: its stored rows where they're read, and its
+        final ones."""
+        return (self.storage_bytes if self.raw_needed() else 0) + self.final_bytes
+
     def cached(self) -> bool:
         if self.final_bytes and (self.final_region is None or not self.final_region.resident):
             return False
-        raw_needed = self.aliases is None or any(self.aliases.values()) or not self.finals
-        return not raw_needed or (self.region is not None and bool(self.region.resident))
+        return not self.raw_needed() or (self.region is not None and bool(self.region.resident))
 
     def final_only(self) -> bool:
         return bool(self.finals) and self.aliases is not None and not any(self.aliases.values())
@@ -897,6 +905,22 @@ class Binding:
                             f"{self.model.component}: {missing / (1 << 30):.1f} GiB of float32 "
                             "weights to bind, more than the host can give"
                         )
+                if (
+                    not replay
+                    and memory.native is not None
+                    and any(b.data is None and not b.cached() for b in self.groups)
+                ):
+                    # Nor on a card that can never hold it: filled partway, it would only evict
+                    # everything else and then wait for memory that can't make it fit (cr-286:
+                    # an 11.1 GiB decode set on an 8 GiB cap waited 300 s, run 47309).
+                    least = sum(b.least_bytes for b in self.groups)
+                    most, said = memory.most_room()
+                    if least > most:
+                        raise Exhausted(
+                            f"{self.model.component}: {_gib(least)} of weights to hold at once, "
+                            f"more than {said} could ever give it",
+                            least,
+                        )
                 self.used = True
                 with torch.cuda.stream(stream) if memory.cuda else nullcontext():
                     if self.last is not None and stream is not None:
@@ -1197,6 +1221,17 @@ class Memory:
                 else:
                     owners.remove(model)
                 model.working_phase_keys.remove(key)
+
+    def most_room(self) -> tuple[int, str]:
+        """The most weight bytes this process could ever hold on its card at once, with every
+        other byte of the card or its cap given back, less its own live working memory; and
+        that in words."""
+        index = self.device.index or 0
+        total = int(torch.cuda.get_device_properties(index).total_memory)
+        card = total if self.budget_bytes is None else min(self.budget_bytes, total)
+        live = int(vt.room(index)["working_live"])
+        said = f"GPU {index}'s {_gib(card)}{' cap' if card < total else ''} less {_gib(live)} live"
+        return max(card - live, 0), said
 
     def _free(self) -> int:
         """Free bytes where no native owner answers (MPS, CPU). A CPU's is what the host can still
