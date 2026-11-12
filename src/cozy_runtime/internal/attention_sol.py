@@ -853,9 +853,11 @@ def _native_from(
         kc, vc, threshold = import_module("sol_attn.preprocess").prepare(
             q, k, v, scale=softmax, tau=tau, thresh_type="exact"
         )
+        # The thresholds' slice starts at `block * heads * 4` bytes, which a head group of 2 or 3
+        # heads (Ulysses' finest level) leaves off the kernel's 16-byte alignment: a fresh copy.
         operands = (
             q[:, start:], k[:, start:], v[:, start:], rows,
-            kc[:, block:], vc[:, block:], threshold[:, block:], lse,
+            kc[:, block:], vc[:, block:], threshold[:, block:].clone(), lse,
         )  # fmt: skip
         sink = -(-tail // _BLOCK) << 16 if tail else 0  # upstream's packed range: blocks [0, 1)
         loaded(*(to_cute(t) for t in operands), softmax, sink, stream=interface._stream(q.device))
@@ -865,14 +867,12 @@ def _native_from(
 
 def _from(layout: AttentionLayout, query: Tensor, keys: KeyRows | None) -> int:
     """Where a sparse call's Sol rows start (`_native_from`): the protected prefix's last block
-    boundary, on SM90's route with a keys kernel, when its slices keep the kernel's 16-byte
-    alignment; else 0, the whole document."""
+    boundary, on SM90's route with a keys kernel; else 0, the whole document."""
     card = _card(query.device)
     if keys is None or card is None or route(card) != "sm90" or query.shape[0] != 1:
         return 0
     start = layout.protected_prefix // _BLOCK * _BLOCK
-    heads = query.shape[2]
-    return start if start < layout.live_tokens and (start // _BLOCK * heads * 4) % 16 == 0 else 0
+    return start if start < layout.live_tokens else 0
 
 
 def sol_attention(
