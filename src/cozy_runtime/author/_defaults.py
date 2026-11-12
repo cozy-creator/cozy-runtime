@@ -31,6 +31,7 @@ from cozy_runtime.author._files import (
     References,
     asset_dec_hook,
     reference_kinds,
+    unmentioned,
     unused_reference,
 )
 from cozy_runtime.author._markers import _ModelDefaultMarker
@@ -315,8 +316,7 @@ def _prune(
         }
     if isinstance(info, mi.StrType) and (text := _text(value)) is not None:
         references = cast("dict[str, object]", value).get("references")
-        _unused(frozenset(), references, f"{path}.references", rows)
-        value = text
+        value = unmentioned(text, _unused(frozenset(), references, f"{path}.references", rows))
     if isinstance(info, mi.StrType) and isinstance(value, str):
         most = info.max_length
         if most is None or len(value) <= most:
@@ -349,12 +349,14 @@ def _mentions(cls: object) -> dict[str, frozenset[str]]:
 
 def _unused(
     kinds: frozenset[str], references: object, path: str, rows: list[AdjustmentRow]
-) -> None:
-    """An `ignored` row for each wire reference of a modality `kinds` doesn't take."""
+) -> list[str]:
+    """An `ignored` row for each wire reference of a modality `kinds` doesn't take; their keys."""
+    keys: list[str] = []
     for at, item in enumerate(references if isinstance(references, list) else ()):
         if (kind := unused_reference(kinds, item)) is not None:
-            key = cast("dict[str, object]", item).get("key", "")
-            rows.append(AdjustmentRow.ignored(f"{path}.{at}", str(key), kind))
+            keys.append(str(cast("dict[str, object]", item).get("key", "")))
+            rows.append(AdjustmentRow.ignored(f"{path}.{at}", keys[-1], kind))
+    return keys
 
 
 def _text(value: object) -> str | None:

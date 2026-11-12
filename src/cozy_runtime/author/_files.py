@@ -13,6 +13,7 @@ paths cannot enter a schema, a digest, or serialized output.
 from __future__ import annotations
 
 import hashlib
+import re
 import stat
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from copy import copy
@@ -540,12 +541,14 @@ class References[T](Mapping[str, T]):
     """A prompt's references by mention, in order of first mention. On the wire each is its value
     with its `key`, in a list, because a JSON object's key order isn't kept."""
 
-    __slots__ = ("_at", "_items")
+    __slots__ = ("_at", "_items", "_left")
 
     def __init__(self, items: Mapping[str, T] | Iterable[tuple[str, T]] = ()) -> None:
         self._items = dict(items)
         #: Each value's index in the wire's list, which its files' input ids name.
         self._at = tuple(range(len(self._items)))
+        #: The keys of the wire's references left out (`unused_reference`).
+        self._left: tuple[str, ...] = ()
 
     def __getitem__(self, key: str) -> T:
         return self._items[key]
@@ -592,6 +595,14 @@ def unused_reference(kinds: frozenset[str], item: object) -> str | None:
     return kind if isinstance(kind, str) and kind in MEDIA_KINDS - kinds else None
 
 
+def unmentioned(text: str, keys: Iterable[str]) -> str:
+    """`text` with the mention of each reference left out as its name, as Calcifer's binder
+    sends one a function can't use: `<V>` as `V`, `<amy.2>` as `amy`, `<clip:0-5>` as `clip`."""
+    for key in keys:
+        text = text.replace(f"<{key}>", re.split(r"[.:]", key, maxsplit=1)[0])
+    return text
+
+
 def _references(
     target: object, obj: object, hook: Callable[[type, object], object]
 ) -> References[object]:
@@ -605,7 +616,13 @@ def _references(
     if len({e["key"] for e in obj}) != len(obj):
         raise ValueError("a prompt names each reference once")
     kinds = reference_kinds(target)
-    kept = [(at, e) for at, e in enumerate(obj) if unused_reference(kinds, e) is None]
+    kept: list[tuple[int, dict[str, object]]] = []
+    left: list[str] = []
+    for at, e in enumerate(obj):
+        if unused_reference(kinds, e) is None:
+            kept.append((at, e))
+        else:
+            left.append(e["key"])
     values = [(e["key"], {k: v for k, v in e.items() if k != "key"}) for _, e in kept]
     try:
         references = References(
@@ -613,7 +630,7 @@ def _references(
         )
     except msgspec.ValidationError as exc:
         raise ValueError(f"a reference {exc}") from None
-    references._at = tuple(at for at, _ in kept)
+    references._at, references._left = tuple(at for at, _ in kept), tuple(left)
     return references
 
 
