@@ -49,7 +49,8 @@ def generate(ctx: Context, payload: Request, model: Flow, out: Outputs, tel: Tel
   and the services `Outputs`, `Telemetry`, `Adjustments`.
 - **`Model`**: `load(loader)` builds the components. `loader.construct(factory)` takes a class or a
   function of the `Config` and fills its tensors; `loader.assets` holds the checkpoint's other
-  files. `unload(loader)` is optional.
+  files. A single file uploaded as it is (an adapter) has its safetensors metadata as its `Config`.
+  `unload(loader)` is optional.
 - **Errors**: raise `InvalidRequest` (the request is wrong), `UnsupportedInput` (this model can't)
   or `OutputError` (the result is bad). Any other exception fails the run with its first line.
 
