@@ -800,6 +800,11 @@ def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
         for arg in args:
             _wire_type(arg, seen)
         return
+    if isinstance(origin, type) and is_struct(origin) and base not in seen:
+        # A generic struct (`Control[Literal["pose"]]`): its fields, with its arguments.
+        for field in msgspec.structs.fields(typing.cast(type[msgspec.Struct], base)):
+            _wire_type(field.type, seen | {base})
+        return
     if isinstance(base, type):
         if issubclass(base, (File, Tree)):
             return

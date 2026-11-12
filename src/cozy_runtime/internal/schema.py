@@ -215,6 +215,16 @@ def _render_bare(
                 union_owns_tag_field=union_owns_tag_field,
                 decoded_bounds=decoded_bounds,
             )
+    if isinstance(origin, type) and is_struct(origin):
+        # A generic struct (`Control[Literal["pose"]]`): its fields, with its arguments.
+        return _struct(
+            typing.cast(type[msgspec.Struct], tp),
+            seen,
+            union_owns_tag_field=union_owns_tag_field,
+            decoded_bounds=decoded_bounds,
+        )
+    if isinstance(tp, typing.TypeVar) and tp.__bound__ is not None:
+        return _render(tp.__bound__, seen, decoded_bounds=decoded_bounds)
     # ANYTHING ELSE IS OPAQUE, NOT A BUILD FAILURE. `bytes`, `datetime`, a third-party
     # value type — msgspec still codes it and JSON still carries it. The package interface says
     # "this field exists and Creator cannot introspect it" instead of refusing the package.
@@ -339,7 +349,9 @@ def _struct(
     if tp in seen:
         return _opaque(tp)
     nested = seen | {tp}
-    config = tp.__struct_config__
+    # A generic struct's alias keeps its class's config and name on its origin.
+    cls = typing.cast(type[msgspec.Struct], get_origin(tp) or tp)
+    config = cls.__struct_config__
     fields = [_field(f, nested, decoded_bounds=decoded_bounds) for f in msgspec.structs.fields(tp)]
     names = [f["name"] for f in fields if isinstance(f, dict)]
     for rendered in (f for f in fields if isinstance(f, dict)):
@@ -349,21 +361,21 @@ def _struct(
             continue
         if when.get("field") == name or when.get("field") not in names:
             raise ConformanceError(
-                f"{tp.__name__}.{name}: When names {when.get('field')!r}, "
-                f"no other field of {tp.__name__}",
+                f"{cls.__name__}.{name}: When names {when.get('field')!r}, "
+                f"no other field of {cls.__name__}",
                 code="tool_marker",
                 fields=[str(name)],
             )
         if "wire" not in rendered:
             raise ConformanceError(
-                f"{tp.__name__}.{name}: When needs a default, "
+                f"{cls.__name__}.{name}: When needs a default, "
                 "which a run gives it while it doesn't apply",
                 code="tool_marker",
                 fields=[str(name)],
             )
     if config.tag is not None and (not isinstance(config.tag_field, str) or not config.tag_field):
         raise ConformanceError(
-            f"tagged struct {tp.__name__} declares no string tag field",
+            f"tagged struct {cls.__name__} declares no string tag field",
             code="tagged_union_incoherent",
         )
     doc: dict[str, Json] = {"fields": fields}
