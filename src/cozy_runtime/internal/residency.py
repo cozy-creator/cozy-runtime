@@ -2504,8 +2504,16 @@ class Memory:
             model.escape_floor = common + max(
                 (block.allocation_bytes for block in model.blocks.values()), default=0
             )
+        floor = model.escape_floor
+        if any(b.retained for b in model.groups()):
+            # Held blocks are in the pass's held bytes already: the floor is what still streams
+            # (a decode keeping what fits, `keep`).
+            common = model.common
+            floor = (common.allocation_bytes if common is not None and not common.retained else 0) + max(
+                (b.allocation_bytes for b in model.blocks.values() if not b.retained), default=0
+            )
         device = self.device.index or 0
-        refused = vt.pass_mark(device, model.escape_site, shape, model.escape_floor)
+        refused = vt.pass_mark(device, model.escape_site, shape, floor)
         self._born(model.escape_site)
         if refused is not None:
             raise DoesNotFit(_does_not_fit(model.component, refused))
