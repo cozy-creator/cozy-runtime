@@ -76,6 +76,23 @@ class SparseRows(Protocol):
     ) -> Tensor: ...
 
 
+class KeyRows(Protocol):
+    """A row's protected keys: `(query, key, value, scale, rows, lse)` merges QUERY's attention
+    over KEY/VALUE into ROWS, its attention over the other keys (log-sum-exp LSE, natural,
+    [1, n, heads] F32), in place."""
+
+    def __call__(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        scale: float | None,
+        rows: Tensor,
+        lse: Tensor,
+        /,
+    ) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class Site:
     component: str
@@ -132,7 +149,7 @@ _KERNEL_ROWS: ContextVar[list[dict[str, Scalar]] | None] = ContextVar(
 #: This request's word on each object it asked for, by key digest: building, served or failed.
 _SAID: ContextVar[dict[str, str] | None] = ContextVar("cozy_sol_said", default=None)
 #: What a step serves in place of a sparse one, by count; `dense_default` a call outside any
-#: `attention_scope`.
+#: `attention_scope`; `prefix_keys` a sparse call whose protected keys took its row's keys kernel.
 COUNTS = (
     "sparse",
     "dense_step",
@@ -141,6 +158,7 @@ COUNTS = (
     "dense_prefix",
     "prefix_heavy",
     "dense_default",
+    "prefix_keys",
 )
 
 
@@ -801,6 +819,62 @@ def _native(
     return out
 
 
+def _native_from(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    scale: float | None,
+    prefix: int,
+    start: int,
+    tau: float,
+    loaded: Loaded,
+    keys: KeyRows,
+) -> Tensor:
+    """SM90's sparse rows from `start` (the protected prefix's last block boundary) on, as one
+    call over the whole document routes them: upstream's preprocess of the whole document, its
+    thresholds and block means from `start`'s block, the object compiled for the rows from there,
+    and the prefix's rows in that block a sink. The keys before `start` go to the row's keys kernel
+    (`keys`), merged by log-sum-exp. Rows before `start` are left for the protected prefix's own
+    dense rows: upstream would compute them sparse only to have them replaced, and its sink would
+    take every protected key in BF16 64x64 tiles."""
+    import torch
+
+    _pin_preprocess()
+    interface = import_module("sol_attn.interface")
+    to_cute = import_module("sol_attn.common").to_cute_tensor
+    softmax = _SCALE if scale is None else float(scale)
+    q, k, v = (t.contiguous() for t in (query, key, value))
+    batch, tokens, heads, _ = q.shape
+    block, tail = start // _BLOCK, prefix - start
+    output = torch.empty_like(v)
+    rows = output[:, start:]
+    lse = torch.empty((batch, tokens - start, heads), device=q.device, dtype=torch.float32)
+    with torch.cuda.device(q.device):
+        kc, vc, threshold = import_module("sol_attn.preprocess").prepare(
+            q, k, v, scale=softmax, tau=tau, thresh_type="exact"
+        )
+        operands = (
+            q[:, start:], k[:, start:], v[:, start:], rows,
+            kc[:, block:], vc[:, block:], threshold[:, block:], lse,
+        )  # fmt: skip
+        sink = -(-tail // _BLOCK) << 16 if tail else 0  # upstream's packed range: blocks [0, 1)
+        loaded(*(to_cute(t) for t in operands), softmax, sink, stream=interface._stream(q.device))
+    keys(q[:, start:], k[:, :start], v[:, :start], scale, rows, lse)
+    return output
+
+
+def _from(layout: AttentionLayout, query: Tensor, keys: KeyRows | None) -> int:
+    """Where a sparse call's Sol rows start (`_native_from`): the protected prefix's last block
+    boundary, on SM90's route with a keys kernel, when its slices keep the kernel's 16-byte
+    alignment; else 0, the whole document."""
+    card = _card(query.device)
+    if keys is None or card is None or route(card) != "sm90" or query.shape[0] != 1:
+        return 0
+    start = layout.protected_prefix // _BLOCK * _BLOCK
+    heads = query.shape[2]
+    return start if start < layout.live_tokens and (start // _BLOCK * heads * 4) % 16 == 0 else 0
+
+
 def sol_attention(
     query: Tensor,
     key: Tensor,
@@ -847,13 +921,15 @@ def _attention(
     dense: DenseRows = _dense,
     prefix_dense: DenseRows | None = None,
     exact: DenseRows | None = None,
+    keys: KeyRows | None = None,
     fp8: bool = False,
 ) -> Tensor:
     """Shared input and model-policy boundary for the opt-in sparse implementations. What a
     sparse kernel admits (one BF16 document, head dimension 128, equal Q/K/V, no mask or
     causality) is its row's (`attention.Candidate`), asserted before this runs. A row that
     declares its dense kernels gives `exact` too: the BF16 kernel its model's exact paths take.
-    `fp8`: FA4's exact tiles in e4m3 (`sol-attn-fa4-fp8`), else BF16."""
+    `fp8`: FA4's exact tiles in e4m3 (`sol-attn-fa4-fp8`), else BF16. `keys`: the row's protected
+    keys kernel (`KeyRows`), on SM90's route (`_native_from`)."""
     import torch
 
     if torch.compiler.is_compiling():
@@ -888,6 +964,7 @@ def _attention(
         dense=dense,
         prefix_dense=prefix_dense,
         exact=exact,
+        keys=keys,
         fp8=fp8,
     )
 
@@ -959,6 +1036,7 @@ def _execute(
     dense: DenseRows = _dense,
     prefix_dense: DenseRows | None = None,
     exact: DenseRows | None = None,
+    keys: KeyRows | None = None,
     fp8: bool = False,
 ) -> Tensor:
     """Apply the model's explicit policy after hardware/operand validation. An exact path's
@@ -966,7 +1044,7 @@ def _execute(
     every route: the 16-bit rows (`_dense`), or the one a declaring row gives; on a declaring
     row's quantizing sparse kernel, its sparse steps run dense on it too, and FA4's exact tiles
     stay BF16. A layer whose key gain has outlier channels (`outlier_keys`) is an exact path
-    too."""
+    too, and keeps Sol's own BF16 sink for its protected keys."""
     import torch
 
     def on(paths: tuple[str, ...]) -> bool:
@@ -978,7 +1056,7 @@ def _execute(
         if said is not None and "exact:" + site.path not in said:
             said["exact:" + site.path] = "exact"
             _kernel_row({"source": "exact", "site": site.path})  # the receipt names each exact site
-        fp8 = False
+        fp8, keys = False, None
         if dense is not _dense and exact is not None:
             dense = prefix_dense = exact
             # A quantizing sparse kernel (Kitchen's INT8) cannot carry these keys on its sparse
@@ -993,6 +1071,7 @@ def _execute(
     if layout.live_tokens > query.shape[1]:
         raise ValueError("attention layout exceeds Q/K/V sequence length")
     q, k, v = (t[:, : layout.live_tokens] for t in (query, key, value))
+    start = 0 if sparse is not None or dense_path else _from(layout, query, keys)
     card = _card(query.device)
     fa4 = sparse is None and card is not None and route(card) == FA4
     loaded: object = None
@@ -1006,7 +1085,9 @@ def _execute(
         # The first sight of this length starts its kernels opening off the request (a CuTe
         # route's object, upstream's preprocess), and the dense steps run while they build.
         unbuilt = "" if card is None else _preprocessed(query)
-        ready, waiting = (FA4, "") if fa4 else _ready(layout.live_tokens, query.device, layout.step)
+        ready, waiting = (
+            (FA4, "") if fa4 else _ready(layout.live_tokens - start, query.device, layout.step)
+        )
         if ready is not None and unbuilt:
             ready, waiting = None, unbuilt
         if layout.sparse:
@@ -1035,6 +1116,13 @@ def _execute(
     else:
         if sparse is not None:
             live_output = sparse(q, k, v, scale, layout.protected_prefix, layout.tau)
+        elif start:
+            assert loaded is not None and keys is not None
+            live_output = _native_from(
+                q, k, v, scale, layout.protected_prefix, start, layout.tau,
+                cast("Loaded", loaded), keys,
+            )  # fmt: skip
+            _count("prefix_keys")
         else:
             assert loaded is not None
             live_output = _native(
