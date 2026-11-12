@@ -2291,7 +2291,17 @@ class Executor:
             "warmup_error": warmup_error,
             "rss_bytes": _rss(),
             **({"compiles": compiles} if compiles else {}),
+            **({"kernels_absent": absent} if (absent := self._kernels_absent()) else {}),
         }
+
+    def _kernels_absent(self) -> str:
+        """Why this Runtime serves a CUDA device none of its native kernels (cl-913: the pure wheel, or kernels that
+        don't load), which TensorD says on every run; empty with them, or on another device."""
+        if self.device_kind != "cuda":
+            return ""
+        from cozy_runtime._kernels import ABSENT
+
+        return ABSENT
 
     def serving(self) -> str:
         """The active construction's execution plans applied now (`Plan.report`), by name, or
