@@ -36,8 +36,9 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import NoReturn
 
 from cozy_runtime.internal.canonical import DOC_MAX_BYTES
@@ -81,15 +82,27 @@ class SeamError(Exception):
         self.detail = detail
 
 
-#: The commands that may carry a signer's run capability, at `tensorfs.token` only.
-SUPPLYING = frozenset({"load", "invoke"})
+#: The commands that may carry a signer's run capability, and the one place each carries it: a load's or invoke's
+#: `tensorfs.token`, and a group `run`'s, GPU 0's invoke handed to each follower, at `invoke.tensorfs.token`.
+SUPPLYING: Mapping[str, str] = MappingProxyType(
+    {"load": "tensorfs.token", "invoke": "tensorfs.token", "run": "invoke.tensorfs.token"}
+)
 
 
-def _scan(value: object, path: str = "", *, supplied: bool = False) -> None:
+def supplying(frame: Frame) -> Frame | None:
+    """The command in `frame` that carries a supplied capability: the frame itself, or a `run`'s invoke."""
+    cmd = frame.get("cmd")
+    if cmd not in SUPPLYING:
+        return None
+    carried = frame.get("invoke") if cmd == "run" else frame
+    return carried if isinstance(carried, dict) else None
+
+
+def _scan(value: object, path: str = "", *, supplied: str = "") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
             at = f"{path}{key}"
-            allowed = supplied and at == "tensorfs.token" and isinstance(item, str)
+            allowed = at == supplied and isinstance(item, str)
             if key.lower() in SECRET_KEYS and not allowed:
                 raise SeamError(
                     "credential_at_seam",
@@ -122,7 +135,7 @@ class Channel:
     sending: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def send(self, message: dict[str, object]) -> None:
-        _scan(message, supplied=message.get("cmd") in SUPPLYING)
+        _scan(message, supplied=SUPPLYING.get(str(message.get("cmd", "")), ""))
         data = json.dumps(message, separators=(",", ":"), sort_keys=True).encode()
         if len(data) > MAX_FRAME:
             self.refusals.append("frame_too_large")
@@ -558,8 +571,8 @@ class Mux:
             self.cancel(str(frame.get("request_id", "")))
             self._cancelled(str(frame.get("request_id", "")))
         else:
-            if frame.get("cmd") in SUPPLYING:
-                self._bearer(frame)
+            if (carried := supplying(frame)) is not None:
+                self._bearer(carried)
             with self._changed:
                 self._commands.append(frame)
 
