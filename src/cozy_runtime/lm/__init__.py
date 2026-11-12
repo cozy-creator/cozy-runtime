@@ -2719,8 +2719,15 @@ class _Engine:
                         graph, why = capture(
                             torch, lambda: self._advance(size), _set(self.pool), domain, reserve
                         )
-                    except Exhausted as exc:  # its pool's room, before anything was captured
+                    except Exception as exc:  # no room: refused before it, or short within it
+                        if not is_capacity(exc):
+                            raise
                         why = no_room(domain.device, "its pool", reserve, exc)
+                        if not isinstance(exc, Exhausted):  # an allocation varena counted refused
+                            from cozy_runtime.internal.execution.catch import CURRENT as REQUEST
+
+                            if (request := REQUEST.get()) is not None:
+                                request.retries += 1  # answered: this token decodes eagerly
             except Building:  # eager until a kernel lands
                 graph, why, self.building = None, "", LANDED[0]
             finally:
