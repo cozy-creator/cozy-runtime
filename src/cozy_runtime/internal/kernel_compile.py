@@ -209,13 +209,14 @@ def wait(store: kernel_cache.Store, job: Job, waiter: str = "") -> State:
     name = waiter or state.kernel
     woke = threading.Event()
     freed: threading.Event | None = None
+    tell = waiting if told.get() else None
     with request_path.forbid(f"kernel build wait: {name}"), held.get()(name, woke.set) as canceled:
         while state.state == "compiling":
-            if waiting is not None and told.get():
-                waiting(replace(state, kernel=name))
+            if tell is not None:
+                tell(replace(state, kernel=name))
             if freed is None or freed.is_set():
                 freed = _released(store, job.key, woke.set)
-            woke.wait(TELL_SECONDS)
+            woke.wait(TELL_SECONDS if tell is not None else None)  # untold: its exit or a cancel
             woke.clear()
             if canceled():
                 raise Canceled(f"canceled waiting for {name} to compile; the compile goes on")

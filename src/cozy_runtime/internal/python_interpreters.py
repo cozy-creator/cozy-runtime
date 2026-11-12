@@ -216,16 +216,10 @@ def _choose(
     return next(iter(exact or matching), None)
 
 
-def _check_cancel(cancel: Callable[[], bool] | None) -> None:
-    if cancel is not None and cancel():
-        raise InterpreterRefusal("Python provisioning cancelled")
-
-
-def _run_uv(command: list[str], *, env: dict[str, str], cancel: Callable[[], bool] | None) -> str:
-    """Drain both pipes and reap the child on cooperative cancellation."""
-    _check_cancel(cancel)
+def _run_uv(command: list[str], *, env: dict[str, str]) -> str:
+    """Drain both pipes to uv's exit. A signal that ends this process ends uv with it."""
     # Linux retains parent-death containment. Other platforms use ordinary process
-    # launch with the same cooperative cancellation and child reaping below.
+    # launch with the same child reaping below.
     if sys.platform.startswith("linux"):
         command = [
             sys.executable,
@@ -250,13 +244,7 @@ def _run_uv(command: list[str], *, env: dict[str, str], cancel: Callable[[], boo
         env=env,
     ) as child:
         try:
-            while True:
-                _check_cancel(cancel)
-                try:
-                    stdout, stderr = child.communicate(timeout=0.2)
-                    break
-                except subprocess.TimeoutExpired:
-                    continue
+            stdout, stderr = child.communicate()
         except BaseException:
             child.kill()
             child.communicate()
@@ -269,7 +257,6 @@ def _run_uv(command: list[str], *, env: dict[str, str], cancel: Callable[[], boo
 def _download_version(
     uv: str,
     constraint: SpecifierSet,
-    cancel: Callable[[], bool] | None = None,
     preferred: str = "",
 ) -> str:
     # uv's bundled catalogue is read offline. Filter every patch, so <3.13.5 does
@@ -287,7 +274,6 @@ def _download_version(
             "--offline",
         ],
         env=package_install_environment(),
-        cancel=cancel,
     )
     try:
         versions = {
@@ -318,7 +304,6 @@ def ensure(
     *,
     root: Path,
     default: Path = Path(sys.executable),
-    cancel: Callable[[], bool] | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> Interpreter:
     """Reuse installed CPython, otherwise provision one owned interpreter with uv.
@@ -328,7 +313,6 @@ def ensure(
     other dependency still belong to the existing exact package closure cache.
     """
     constraint = _constraint(requires, version)
-    _check_cancel(cancel)
     chosen = _choose(available(default, root=root), constraint, version)
     if chosen is not None:
         return chosen
@@ -338,8 +322,7 @@ def ensure(
             "this machine needs uv to fetch a supported Python: install it from "
             "https://docs.astral.sh/uv/ and run again"
         )
-    selected = _download_version(uv, constraint, cancel, version)
-    _check_cancel(cancel)
+    selected = _download_version(uv, constraint, version)
     _require_owned_root(root)
     # Recheck before installing. uv itself locks its managed directory across
     # the installed-version check and atomic publication, including races here.
@@ -376,7 +359,6 @@ def ensure(
             "cpython@" + selected,
         ],
         env=env,
-        cancel=cancel,
     )
     # A package executor may traverse/read its interpreter but never write it.
     if sys.platform != "win32":
