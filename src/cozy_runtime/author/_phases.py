@@ -20,7 +20,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from cozy_runtime.author import _activity
@@ -95,7 +95,8 @@ class Phase:
     #: Seconds its first spells held the call before it showed: off the clocks once it does.
     unclocked: float = 0.0
     since: float | None = None
-    last: float = 0.0
+    #: When its last spell ended (it opened): a run idle `IDLE_S` since has ended.
+    last: float = field(default_factory=time.perf_counter)
     shown: bool = False
     told_at: float = 0.0
     told: int = -1
@@ -115,8 +116,9 @@ class Phase:
             self.total = self.position
 
 
-#: An open spell of a run (`begin`): its run, when it began, and how it counts.
-type Spell = tuple[Phase, float, bool, bool]
+#: An open spell of a run (`begin`): its run, when it began, whether it is the outermost on its
+#: thread, whether its time stays the step's, and whether it nests others.
+type Spell = tuple[Phase, float, bool, bool, bool]
 
 
 def _join(base: str, name: str) -> str:
@@ -178,22 +180,26 @@ def finish(owner: object) -> None:
         _end(phase)
 
 
-def _begin(phase: Phase) -> tuple[float, bool]:
+def _begin(phase: Phase, nests: bool = True) -> tuple[float, bool]:
     """A spell of `phase` begins on this thread: when, and whether it is the outermost here (an
-    inner one's time is already its outer one's)."""
+    inner one's time is already its outer one's). One that `nests` makes those after it inner."""
     depth: int = getattr(_LOCAL, "depth", 0)
-    _LOCAL.depth = depth + 1
+    if nests:
+        _LOCAL.depth = depth + 1
     began = time.perf_counter()
     if phase.since is None:
         phase.since = began
     return began, depth == 0
 
 
-def _close(phase: Phase, began: float, outermost: bool, clocked: bool) -> None:
+def _close(
+    phase: Phase, began: float, outermost: bool, clocked: bool, nests: bool = True
+) -> None:
     """Its spell ends. Once the phase has held its call `SHOWN_S`, an unclocked spell's time
     (a first read, a compile) leaves this thread's clocks; a clocked one (a read again) stays its
     step's."""
-    _LOCAL.depth = getattr(_LOCAL, "depth", 1) - 1
+    if nests:
+        _LOCAL.depth = getattr(_LOCAL, "depth", 1) - 1
     now = time.perf_counter()
     spent = now - began
     phase.since, phase.last = None, now
@@ -249,11 +255,13 @@ def begin(
     row: str = "",
     clocked: bool = False,
     told: bool = True,
+    nests: bool = True,
 ) -> Spell | None:
     """A spell of the run `key` of the call on this thread (a read of a component's weights, one
     compile of a burst), the run named `name` from now on; `end` it. The run opens at its first
     spell, its total `total()` then. `clocked`: the spell stays its step's (a read again).
-    `told`: as `phase`'s."""
+    `told`: as `phase`'s. `nests`: False for one whose end may never come (a hook's, `drop`):
+    it makes no spell after it an inner one."""
     teller = _teller()
     if teller is None:
         return None
@@ -274,8 +282,8 @@ def begin(
             _register(run)
         else:
             run.name = name
-    began, outermost = _begin(run)
-    return run, began, outermost, clocked
+    began, outermost = _begin(run, nests)
+    return run, began, outermost, clocked, nests
 
 
 def end(spell: Spell | None, done: int = 0) -> None:
@@ -283,12 +291,22 @@ def end(spell: Spell | None, done: int = 0) -> None:
     total ends with it."""
     if spell is None:
         return
-    run, began, outermost, clocked = spell
-    _close(run, began, outermost, clocked)
+    run, began, outermost, clocked, nests = spell
+    _close(run, began, outermost, clocked, nests)
     if done:
         run.add(done)
     if run.total is not None and run.position >= run.total:
         _end(run)
+
+
+def drop(spell: Spell | None) -> None:
+    """`begin`'s spell never ended (what it timed raised): it ends now, its time no one's."""
+    if spell is None:
+        return
+    run, _, _, _, nests = spell
+    if nests:
+        _LOCAL.depth = getattr(_LOCAL, "depth", 1) - 1
+    run.since, run.last = None, time.perf_counter()
 
 
 @contextlib.contextmanager

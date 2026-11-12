@@ -692,7 +692,11 @@ def _compiled(*, src: _Source, times: _Times, cache_hit: bool, **_: object) -> N
 
 
 def _tuned(*, fn: JitKernel, duration: float | None, cache_hit: bool, **_: object) -> None:
-    """Triton timing an autotuned kernel's configurations to choose one."""
+    """Triton timing an autotuned kernel's configurations to choose one; a configuration whose
+    compile raised left its spell open (`_compiling`)."""
+    spells = _spells()
+    while spells:
+        _phases.drop(spells.pop())
     if not cache_hit and duration:
         request_path.note(f"triton autotune: {fn.__name__}", duration * 1000)
 
@@ -713,11 +717,11 @@ def _compiling(**hooked: object) -> None:
     `JitFunctionInfo`; None lets it compile): on a call's thread, a spell of its compiles,
     `compiling <kernel>`, with how many so far. An autotune's are its configurations' compiles."""
     spells = _spells()
-    while spells:  # a compile that raised never ended
-        _phases.end(spells.pop())
+    while spells:  # a compile that raised (an autotune's config past the card's resources)
+        _phases.drop(spells.pop())
     kernel = getattr(hooked.get("fn"), "name", None)
     named = f"compiling {kernel}" if isinstance(kernel, str) and kernel else "compiling kernels"
-    spells.append(_phases.begin("triton", named, row="compiling triton kernels"))
+    spells.append(_phases.begin("triton", named, row="compiling triton kernels", nests=False))
 
 
 def _compiled_now(**_: object) -> None:

@@ -2191,7 +2191,8 @@ class Executor:
                             code="group_unformed",
                         )
                 if not command.import_only and cpu_group:
-                    self.pg = self.group.form(cast("ModuleType", self.torch), _SEALED)  # opened above
+                    with _phases.phase("joining the group's GPUs"):
+                        self.pg = self.group.form(cast("ModuleType", self.torch), _SEALED)
                     stage("group_form")
                 elif not command.import_only:
                     with _phases.phase("measuring the links between GPUs"):
@@ -2205,13 +2206,14 @@ class Executor:
                         degree, _gpu_numbers(degree), "nccl", measured.nccl(), measured
                     )
                     exchange = self._group_exchange()
-                    self.pg = self.group.form(
-                        cast("ModuleType", self.torch),  # opened above
-                        _SEALED,
-                        nccl=self.transport.nccl,
-                        exchange=exchange,
-                        formed=self._formed if exchange else None,
-                    )
+                    with _phases.phase("joining the group's GPUs"):
+                        self.pg = self.group.form(
+                            cast("ModuleType", self.torch),  # opened above
+                            _SEALED,
+                            nccl=self.transport.nccl,
+                            exchange=exchange,
+                            formed=self._formed if exchange else None,
+                        )
                     stage("group_form")
         except GroupRefusal as exc:
             return self._group_refusal(exc)
