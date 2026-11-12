@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, NotRequired, TypedDict
 import tensorfs
 from tensorfs import raw
 
-from cozy_runtime.author._loader import TENSORFS_DTYPES, TensorSpec
+from cozy_runtime.author._loader import TENSORFS_DTYPES, TensorSpec, _carrier
 from cozy_runtime.internal.encoding.formats import (
     PLAIN,
     TORCH_DTYPES,
@@ -32,6 +32,10 @@ from cozy_runtime.internal.encoding.formats import (
     part_rule,
 )
 from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan
+
+#: The header metadata holding each component's source safetensors `__metadata__` (TensorFS's
+#: import keeps it as `{component: {key: value}}`).
+FILE_METADATA = "safetensors_metadata"
 
 if TYPE_CHECKING:
     from tensorfs._ext import ConfigValue, MetadataValue
@@ -311,8 +315,26 @@ class Checkpoint:
         return dict(self.ck.metadata)
 
     def configs(self) -> dict[str, dict[str, ConfigValue]]:
-        """Construction configs by component: each component's that has one."""
-        return {name: dict(c.config) for name, c in self.ck.components.items() if c.config}
+        """Construction configs by component: each component's that has one. A checkpoint with
+        none (a single file kept as it is, such as an adapter) takes each component's source
+        safetensors `__metadata__` instead, where trainers write its architecture (kohya's
+        `lllite.cond_dim`): strings, as the file holds them, without the paths and URLs a config
+        never carries (`modelspec.implementation`)."""
+        own = {name: dict(c.config) for name, c in self.ck.components.items() if c.config}
+        if own:
+            return own
+        files = self.ck.metadata.get(FILE_METADATA)
+        out: dict[str, dict[str, ConfigValue]] = {}
+        for name, held in (files.items() if isinstance(files, dict) else ()):
+            if name in self.ck.components and isinstance(held, dict):
+                strings: dict[str, ConfigValue] = {
+                    key: value
+                    for key, value in held.items()
+                    if isinstance(value, str) and _carrier(key, value) is None
+                }
+                if strings:
+                    out[name] = strings
+        return out
 
     def asset(self, component: str, name: str) -> bytes:
         with store_refusals(f"reading {component}/{name} of {self.id[:23]}"):
