@@ -19,10 +19,13 @@ this card (`verify`). A call asks through `serve`, which keeps a CUDA graph's re
 In a group every GPU switches at the same boundary, or none does. Each follower states its
 kernels in its load's and every call's reply (`pending`, `report`); at its boundary rank 0 serves
 what landed on some GPU and opens or failed on none, and sends that with its next call to each
-follower, which serves it from that call on. A GPU that never asked for an agreed kernel opens it
-at its first ask: it is built on this machine, since another GPU serves it. A `prime`d kernel lands
-for that boundary too: each GPU's load waits for its own (`settle`), so its first request's first
-boundary serves them.
+follower, which serves it from that call on. Within an attempt, every GPU states what it has
+`landed` at each sharded call's meeting and serves from there what landed on all of them
+(`spmd.install_call_check`), so a kernel built during an attempt (Sol's per-length object) serves
+from the next sharded call, as on one GPU (cr-268). A GPU that never asked for an agreed kernel
+opens it at its first ask: it is built on this machine, since another GPU serves it. A `prime`d
+kernel lands for that boundary too: each GPU's load waits for its own (`settle`), so its first
+request's first boundary serves them.
 """
 
 from __future__ import annotations
@@ -408,6 +411,12 @@ def pending() -> dict[str, str]:
 
 def _pending() -> dict[str, str]:
     return {_shared(name): slot.state for name, slot in _SLOTS.items() if slot.state != "ready"}
+
+
+def landed() -> list[str]:
+    """This GPU's kernels landed and not serving yet, as the group names them."""
+    with _LOCK:
+        return sorted(_shared(name) for name, slot in _SLOTS.items() if slot.state == "landed")
 
 
 def report(rank: int, kernels: Mapping[str, str]) -> None:

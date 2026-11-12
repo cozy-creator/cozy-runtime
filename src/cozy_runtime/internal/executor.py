@@ -3766,8 +3766,9 @@ class Executor:
             if frame.position is not None:
                 steps[frame.stage] = frame.position
             at = point[0] = {"stage": frame.stage, "step": steps.get(frame.stage, 0), **here}
-            # A group's kernels change only between attempts: its followers took this attempt's
-            # set with its `run` and meet no boundary of GPU 0's, so GPU 0 decides nothing new here.
+            # A group's kernels change between attempts (its followers took this attempt's set with
+            # its `run`) and at its sharded calls' meetings (`spmd.install_call_check`), never at
+            # a boundary of GPU 0's alone: GPU 0 decides nothing new here.
             agreed = kernel_ready.agreed() if self.group is not None else None
             swapped.extend((name, at) for name in kernel_ready.boundary(agreed))
             if pin or served_attention is None or self.group is not None:

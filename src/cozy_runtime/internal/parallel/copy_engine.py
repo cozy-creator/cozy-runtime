@@ -147,7 +147,11 @@ class CopyEngineExchange(Exchange):
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.streams = [streams.stream(torch, self.device) for _ in range(world)]
         self.side = streams.stream(torch, self.device, priority=_PRIORITY)
-        self.buffer: Tensor = symm.empty(BUFFER_BYTES, dtype=torch.uint8, device=self.device)
+        # Straight from symmetric memory's own allocator: `symm.empty` allocates inside a MemPool
+        # of the current allocator, which varena's (pluggable) refuses (`createOrIncrefPool`), so
+        # inside an executor the exchange never mapped and NCCL carried it (cr-268).
+        empty = symm._SymmetricMemory.empty_strided_p2p
+        self.buffer: Tensor = empty((BUFFER_BYTES,), (1,), torch.uint8, self.device)
         self.flag: Tensor = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.handle: _SymmetricMemory | None = None
         self.peers: list[Tensor] = []
