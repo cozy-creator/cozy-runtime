@@ -1,8 +1,11 @@
 name: rc-dev
-# The open RC's Runtime for dev homes (cl-922): each push to rc/<x.y.z> builds dev-build.yaml's wheels
-# (<version>+dev.g<sha8>, with their kernels) and puts the native ones on the rolling GitHub prerelease
-# `rc-<x.y.z>`, never latest, in place of the last push's. Its SHA256SUMS names them; a dev home's Calcifer
-# reads it and brings its rentals to it. By hand: gh workflow run rc-dev.yaml -R cozy-creator/cozy-runtime --ref rc/<x.y.z>
+# The open RC's Runtime for dev homes (cl-922): each push to rc/<x.y.z> builds dev-build.yaml's wheels, with their
+# kernels, as the minor it makes, a dev release (cl-952): pyproject 0.47.0.dev0 (set when 0.46.0 froze) builds
+# 0.47.0.dev<n>+g<sha8>, n the RC branch's first-parent commit count, and a release version (0.45.2) the next minor's; so a
+# package's floor can name it (`cozy-runtime>=0.47.0.dev2260`). They go on the rolling
+# GitHub prerelease `rc-<x.y.z>`, never latest, in place of the last push's native ones; each push's pure wheel stays
+# there, for the locks that take it by URL. Its SHA256SUMS names this push's; a dev home's Calcifer reads it and brings
+# its rentals to it. By hand: gh workflow run rc-dev.yaml -R cozy-creator/cozy-runtime --ref rc/<x.y.z>
 on:
   push:
     branches: ['rc/*']
@@ -17,10 +20,37 @@ permissions:
   contents: write
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          filter: blob:none
+      - id: version
+        run: |
+          set -euo pipefail
+          # The branch's own version says which minor it makes: a dev release (0.47.0.dev0, set at the last release's freeze)
+          # names it; a release (0.45.2) means the next. PyPI's newest release, when newer, moves it on too.
+          own=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -1)
+          read -r major minor <<< "$(awk -F. '{print $1, $2}' <<< "$own")"
+          case $own in *.dev*) ;; *) minor=$((minor + 1)) ;; esac
+          read -r pmajor pminor <<< "$(curl -fsSL https://pypi.org/pypi/cozy-runtime/json | jq -r '.info.version' | awk -F. '{print $1, $2}')"
+          if [ "$pmajor" -gt "$major" ] || { [ "$pmajor" = "$major" ] && [ "$pminor" -ge "$minor" ]; }; then major=$pmajor minor=$((pminor + 1)); fi
+          version="$major.$minor.0.dev$(git rev-list --count --first-parent HEAD)+g${GITHUB_SHA:0:8}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "the open RC's Runtime: $version" >> "$GITHUB_STEP_SUMMARY"
+
   build:
+    needs: version
     uses: ./.github/workflows/dev-build.yaml
     with:
       ref: ${{ github.sha }}
+      version: ${{ needs.version.outputs.version }}
 
   publish:
     needs: build
@@ -36,7 +66,7 @@ jobs:
         with:
           name: cozy-runtime-${{ github.sha }}
           path: dist
-      # New files first, SHA256SUMS next (a reader sees the old build or this one, whole), stale files last.
+      # New files first, SHA256SUMS next (a reader sees the old build or this one, whole), stale native files last.
       - name: The RC's prerelease holds this build
         working-directory: dist
         run: |
@@ -44,8 +74,8 @@ jobs:
           case $BRANCH in rc/*) ;; *) echo "::error::$BRANCH is no RC branch"; exit 1 ;; esac
           tag="rc-${BRANCH#rc/}"
           shopt -s nullglob
-          wheels=(*-manylinux_*.whl)
-          [ "${#wheels[@]}" -gt 0 ] || { echo "::error::the build made no native wheel"; ls -la; exit 1; }
+          wheels=(*-manylinux_*.whl *-py3-none-any.whl)
+          [ "${#wheels[@]}" -gt 1 ] || { echo "::error::the build made no native and pure wheel"; ls -la; exit 1; }
           sha256sum "${wheels[@]}" > SHA256SUMS
           cat SHA256SUMS
           if ! gh release view "$tag" -R "$REPO" >/dev/null 2>&1; then
@@ -56,8 +86,9 @@ jobs:
           stale=$(gh release view "$tag" -R "$REPO" --json assets --jq '.assets[].name')
           gh release upload "$tag" -R "$REPO" --clobber "${wheels[@]}"
           gh release upload "$tag" -R "$REPO" --clobber SHA256SUMS
+          # A pure wheel stays: a lock takes it by URL (cl-952).
           for name in $stale; do
-            case " ${wheels[*]} SHA256SUMS " in *" $name "*) ;; *) gh release delete-asset "$tag" "$name" -R "$REPO" -y ;; esac
+            case " ${wheels[*]} SHA256SUMS " in *" $name "*) ;; *-py3-none-any.whl) ;; *) gh release delete-asset "$tag" "$name" -R "$REPO" -y ;; esac
           done
           gh release edit "$tag" -R "$REPO" --notes "$BRANCH at $SHA, for dev homes (cl-922). Replaced by each push."
           echo "$tag: $BRANCH at $SHA" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,1 @@
+A generic struct field (`control: list[Control[Literal["pose", "depth"]]]`) is described as its struct, with its arguments in its fields, instead of opaque: Creator attaches the files in it (a control map was refused `asset_ungranted`), the page draws it, and its `kind` lists the function's kinds. A TypeVar describes as its bound.

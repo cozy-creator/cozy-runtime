@@ -46,9 +46,11 @@ def from_types(
         if base is ModelArtifact or (get_origin(base) or base) is Prompt:
             return
         origin = get_origin(base)
-        if isinstance(base, type) and is_struct(base):
-            names[path] = base.__name__
-            for field in msgspec.structs.fields(base):
+        # A generic struct (`Control[Literal["pose"]]`) is its class's, with its arguments.
+        cls = base if isinstance(base, type) else origin
+        if isinstance(cls, type) and is_struct(cls):
+            names[path] = cls.__name__
+            for field in msgspec.structs.fields(typing.cast(type[msgspec.Struct], base)):
                 if (not serving and field.name != field.encode_name) or not _identifier(
                     field.encode_name
                 ):
