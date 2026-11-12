@@ -199,7 +199,7 @@ class Previews:
         self,
         wanted: Callable[[], bool],
         sink: Callable[[PreviewFrame], None],
-        say: Callable[[str], None],
+        say: Callable[[str], object],
     ) -> None:
         self._wanted, self._sink, self._say = wanted, sink, say
         self._last = -math.inf
