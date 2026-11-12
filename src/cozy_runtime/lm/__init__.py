@@ -159,6 +159,8 @@ BUCKETS = (1, 2, 4, 8, 16)
 #: after each of its tokens (Qwen3.5-9B: 24 x 3 x 2 MiB a row), and with more rows the model's
 #: own step is compute-bound enough that drafts save little; larger buckets decode undrafted.
 DRAFT_ROWS = 4
+#: The most the draft head's prompt pass holds of attention scores at once (`_drafted_prompt`).
+DRAFT_SCORES = 256 << 20
 
 
 #: Generation-config fields that add a logits processor to greedy decoding, and their no-op values.
@@ -2334,16 +2336,9 @@ class _Engine:
         """The head's keys for the prompt and the first token, as it attends to them while
         drafting: slot j from token j and the model's state for the token before it, so drafts
         read the whole context the head was trained on; and its state for the token after."""
-        prompt = int(ids.shape[1])
+        prompt, rows = int(ids.shape[1]), int(ids.shape[0])
         tokens = torch.cat([ids[:, 1:], token[:, None]], dim=1)
         slots = torch.arange(prompt + 1, device=ids.device)
-        allowed = (slots[None, :] >= 1) & (slots[None, :] <= slots[1:, None])
-        mask = (
-            allowed
-            if self.closed is False
-            else torch.where(allowed, self.open, self.closed).to(self.model.dtype)
-        )
-        mask = mask[None, None].expand(int(ids.shape[0]), 1, prompt, prompt + 1)
         if position is not None:
             following = position[..., -1:] + 1
             at = torch.cat([position[..., 1:], following], dim=-1)
@@ -2354,8 +2349,24 @@ class _Engine:
         keys.cumulative_length = torch.ones((), dtype=torch.long, device=ids.device)
         embed = self.model.get_input_embeddings()
         rotary = _lm(self.model).get_decoder().rotary_emb
-        drafted: torch.Tensor = _set(self.draft)(embed(tokens), hidden, at, cache, mask, rotary)
-        last = drafted[:, -1:]
+        # Its mask is explicit, so attention may materialize each query's scores over every slot:
+        # queries go in pieces whose scores stay within DRAFT_SCORES, each writing its keys before
+        # the next attends to them (a 23,388-token prompt asked 17.5 GB whole: 16 heads x L x L+1).
+        heads = int(getattr(self.text, "num_attention_heads", 1))
+        piece = max(1, DRAFT_SCORES // (rows * heads * (prompt + 1) * 4))
+        drafted: torch.Tensor | None = None
+        for start in range(0, prompt, piece):
+            end = min(start + piece, prompt)
+            allowed = (slots[None, :] >= 1) & (slots[None, :] <= slots[start + 1 : end + 1, None])
+            mask = (
+                allowed
+                if self.closed is False
+                else torch.where(allowed, self.open, self.closed).to(self.model.dtype)
+            )
+            mask = mask[None, None].expand(rows, 1, end - start, prompt + 1)
+            these = embed(tokens[:, start:end]), hidden[:, start:end], at[..., start:end]
+            drafted = _set(self.draft)(*these, cache, mask, rotary)
+        last = _set(drafted)[:, -1:]
         return keys, last
 
     def _splice(self, request: _Request, fresh: _Prefill, free: list[int]) -> None:
