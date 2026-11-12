@@ -166,6 +166,9 @@ class Candidate:
     kernels: str = ""
     #: the most tokens its compiled kernels take; zero is any
     max_tokens: int = 0
+    #: rows (`arch.Row.name`) where it faults the GPU, with the evidence: refused there, a pin
+    #: too (`_off_row`), until its root cause is fixed (a GPU fault is worse than a refusal)
+    faults: tuple[tuple[str, str], ...] = ()
 
     @property
     def exact(self) -> bool:
@@ -306,6 +309,9 @@ KERNELS: tuple[Candidate, ...] = (
         "sageattention3-fp4", "_cozy_sage3_fp4", upstream.SAGE3, _MMA, _FP4, level=4,
         dtypes=_HALF, max_head_dim=128, head_dims=_D64_128, causal=False, gqa=False,
         scales=False, artifact=_SAGE3, import_name=_SAGE3, kernels=_SAGE3_WHEEL,
+        faults=(("Blackwell RTX", "Xid 13 on the RTX 5090 and RTX PRO 6000 alone, at 111,598 "
+                 "tokens x 28 heads: TMA descriptor 1 (a [28, 872, 872, 128] fp32 tensor) failed to "
+                 "initialize (release gate 43124491546; cr-280)"),),
     ),
     Candidate(
         "sageattention3-fp4-global-lowmem", "_cozy_sage3_fp4_global_lowmem",
@@ -467,6 +473,9 @@ def device_row(device: DeviceFacts | None) -> arch.Row:
 
 def _off_row(candidate: Candidate, row: arch.Row) -> str:
     """Empty when the row runs CANDIDATE, else why not."""
+    for name, why in candidate.faults:
+        if row.name == name:
+            return f"{candidate.name} faults the GPU on {row.name}: {why}"
     if not candidate.families or (
         row.family in candidate.families and candidate.formats <= row.formats()
     ):

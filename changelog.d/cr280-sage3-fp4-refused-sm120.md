@@ -1,0 +1,1 @@
+`sageattention3-fp4` is refused on RTX Blackwell (sm120, sm121), a pin to it too, with the reason: it faulted the GPU (Xid 13) there at H3 lengths (cr-280). Its fixed-means and global-lowmem forms serve as before.
