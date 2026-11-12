@@ -45,7 +45,7 @@ from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._errors import CAPTURE_ERRORS, Fault, OutputError, fault, is_capacity
-from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded
+from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded, recovered
 from cozy_runtime.graphs import domain
 from cozy_runtime.internal import attention_ulysses, kernel_ready
 from cozy_runtime.internal.accel import StaleBinding
@@ -104,7 +104,8 @@ DECODERS: list[
 _SAID: set[str] = set()
 #: the isolated request used for idle warm-up and capture observations
 IDLE_REQUEST = "graphs-idle"
-#: what a run's record counts (`execution.safeguards`) and `cozy run show` warns of
+#: what a run's record counts (`execution.safeguards`): each a recovered failure (`recovered`), said
+#: once quietly, never a warning
 SAFEGUARDS = {
     "capture_refused": "a CUDA graph was refused at capture",
     "replay_mismatch": "a CUDA graph differed from eager and was discarded",
@@ -121,7 +122,7 @@ def say(key: str, line: str) -> None:
 
 def safeguard(code: str, why: str) -> None:
     """One for this attempt's record, or the next attempt's when raised at idle."""
-    WARNINGS.append((SAFEGUARDS[code], {"code": code, "why": why.splitlines()[0][:300]}))
+    WARNINGS.append(recovered(SAFEGUARDS[code], code=code, why=why.splitlines()[0][:300]))
 
 
 def no_room(device: int, what: str, need: int, error: BaseException) -> str:
@@ -1042,9 +1043,10 @@ def _watch(root: Module, recorder: _Recorder) -> None:
             "first two calls: declare each that steers its forward in Model.__graph_keys__",
         )
         WARNINGS.append(
-            (
+            recovered(
                 "a component's undeclared state changed between calls",
-                {"component": name, "attributes": ", ".join(sorted(changed))},
+                component=name,
+                attributes=", ".join(sorted(changed)),
             )
         )
 
@@ -1756,7 +1758,9 @@ def _changed(
                 "Python number that changes between calls (pass it as a tensor)",
             )
             WARNINGS.append(
-                ("a graph region records again every call", {"region": component, "argument": name})
+                recovered(
+                    "a graph region records again every call", region=component, argument=name
+                )
             )
     else:
         names = ("declared keys", "weight addresses", "autocast")

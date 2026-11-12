@@ -136,6 +136,7 @@ from cozy_runtime.author._invoke import (
 from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
 from cozy_runtime.author._model import (
     LANDED,
+    RECOVERED,
     SCOPES,
     WARNINGS,
     Model,
@@ -707,21 +708,22 @@ def adjustment_row(row: AdjustmentRow) -> dict[str, str]:
     }
 
 
-def _safeguard_rows(found: dict[str, list[str]]) -> list[dict[str, str]]:
-    """`cozy run show`'s warning line for each safeguard this attempt tripped."""
-    return [
-        adjustment_row(
-            AdjustmentRow(
-                "warn",
-                "graphs",
-                None,
-                None,
-                f"{graphs.SAFEGUARDS[code]} ({len(whys)}×): {whys[0]}",
-                "Runtime",
-            )
-        )
-        for code, whys in found.items()
-    ]
+def _say_warnings(rows: list[WarningRow], record: AuthorAttempt) -> None:
+    """An attempt's warnings, each a `warn` line, and the failures the Runtime recovered from
+    (`_model.recovered`): one quiet line for each kind, how many times it happened. The record
+    keeps them all (`execution.safeguards`); none is an adjustment, nothing asked was changed."""
+    quiet: dict[str, tuple[int, dict[str, Scalar]]] = {}
+    for message, raised in rows:
+        if not raised.get(RECOVERED):
+            record.emit("log", message, "warn", **raised)
+            continue
+        times, first = quiet.get(message, (0, raised))
+        quiet[message] = (times + 1, first)
+    for message, (times, first) in quiet.items():
+        fields: dict[str, Scalar] = {key: v for key, v in first.items() if key != RECOVERED}
+        if times > 1:
+            fields["times"] = times
+        record.emit("log", message, "info", **fields)
 
 
 def _granted_inputs(command: Invoke) -> dict[str, GrantedInput]:
@@ -3995,8 +3997,7 @@ class Executor:
                 record.emit(
                     "log", f"{feature} unavailable on {self.device_kind}", "info", instead=instead
                 )
-            for message, raised in (*warnings, *tools.warnings()):
-                record.emit("log", message, "warn", **raised)
+            _say_warnings([*warnings, *tools.warnings()], record)
             on = IDLE_STAGE.pop(command.request_id, (0.0, ""))[1]
             if (waited := IDLE_WAITED.pop(command.request_id, 0.0)) >= 1:
                 record.emit("confession", "idle.waited", _IDLE_WORK, ms=round(waited, 1), on=on)
@@ -4052,7 +4053,8 @@ class Executor:
                     "confession", "attention.sol.kernel", fields.pop("source"), rank=0, **fields
                 )
             for failure in attention.failures(served_attention.totals(), sol_kernels):
-                record.emit("log", "attention kernel failed, a fallback served", "warn", **failure)
+                # A fallback served: recovered, so said quietly (the slow-run alarm speaks).
+                record.emit("log", "attention kernel failed, a fallback served", "info", **failure)
         # Nothing was swapped, so the restore left the sites exactly as the entry walk read them.
         restored = (
             served_attention
@@ -4156,7 +4158,6 @@ class Executor:
             "result_schema_digest": self._result_schema_digest(surface),
             "adjustments": [
                 *(adjustment_row(row) for row in (envelope.adjustments if envelope else ())),
-                *_safeguard_rows(safeguards),
             ],
             "ignored": list(record.ignored),
             "oversize_result_bytes": oversize,
@@ -4230,7 +4231,7 @@ class Executor:
             if stored:
                 weights = "/".join({"f16": "fp16"}.get(d, d) for d in stored)
                 said = f"served {weights} weights; computes in float32 on cpu"
-                record.emit("log", said, "warn", component=prefix + component, weights=weights)
+                record.emit("log", said, "info", component=prefix + component, weights=weights)
 
     @staticmethod
     def _emit_gemm(record: AuthorAttempt, member: Executor) -> None:
@@ -4241,7 +4242,7 @@ class Executor:
 
         def fallback(value: str, **fields: Scalar) -> None:
             record.emit("confession", "gemm.fallback", value, **fields)
-            record.emit("log", "a GEMM served below its lane", "warn", kernel=value, **fields)
+            record.emit("log", "a GEMM served below its lane", "info", kernel=value, **fields)
 
         prefix = member._prefix()
         counted = member.backend.gemm_sites if member.backend is not None else {}
