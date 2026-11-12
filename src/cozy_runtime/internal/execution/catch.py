@@ -236,7 +236,7 @@ def retry(
     pure: bool,
 ) -> Selection | None:
     """Close the failed leaf. For a pure op whose leaf varena refused memory, varena's answer: the
-    finer level to run again at, its room made (`stats.finer_splits`; a short estimate), or None,
+    finer level to run again at, its room made (`stats.retries`; a short estimate), or None,
     and the failure stands. The refused attempt's frames and tensors go before it counts room."""
     closed = vt.split_end(device, token, submitted=False)
     if not (pure and closed.get("refused_bytes") and is_capacity(exc)):
@@ -249,7 +249,7 @@ def retry(
     if again is not None:
         print(f"cozy-runtime: {name} refused at level {level}: a short estimate", file=sys.stderr)
         if (request := CURRENT.get()) is not None:
-            request.finer_splits += 1
+            request.retries += 1
     return again
 
 
