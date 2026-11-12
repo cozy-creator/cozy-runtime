@@ -24,8 +24,12 @@ back. Offload retires the graph before those addresses change; a later call can 
 anew. If the full set cannot be prepared before execution, the call uses Transformers' loop. A
 call's keys and state for its prompt and `max_new_tokens`, sized from the config, and the graphs'
 pool are decided before its prefill (`_Engine._enter`): allocated or mapped then, else it waits for
-decoding rows to leave, else `DoesNotFit` names what would fit; nothing after catches running out.
-Errors after execution starts are final; package code is never restarted. On a CPU, or after a safe
+decoding rows to leave. Running short never ends a call while a lever remains: graphs whose pool
+has no room go (decode runs eagerly, captured again where room allows), a draft head's keys go,
+and slots or a prefill that still do not fit beside the leased weights decode through
+Transformers' loop, its weights streamed and its cache only as long as its tokens. Only slots
+larger than the whole card are `DoesNotFit` up front, naming what would fit. Errors after
+execution starts are final; package code is never restarted. On a CPU, or after a safe
 capture refusal (a run warning), the same step runs eagerly. A model this does not
 serve (a layer type other than full or linear attention, an attention other than SDPA or eager, a
 generation config that adds logits processors) generates through Transformers, said once.
@@ -2040,7 +2044,18 @@ class _Engine:
         kwargs, mask, position = self._inputs(request)
         if not self._enter(request, position):
             return False
-        fresh = self._prefill(request, kwargs, mask, position, first)
+        if request.fallback:
+            return True
+        try:
+            fresh = self._prefill(request, kwargs, mask, position, first)
+        except Exception as exc:
+            if not is_capacity(exc) or request.inputs["input_ids"].device.type != "cuda":
+                raise
+            # Nothing of the engine's changed: the prompt went into a cache of its own. Its slots
+            # and leased weights go, and Transformers' loop streams the weights beside its prompt.
+            _unwind(exc)
+            self._shed(request, f"its prefill of {request.prompt} tokens", exc)
+            return True
         if why := self._misfit(fresh):
             self.misfit = f"its decode state is not what its config gives ({why})"
             request.error = RuntimeError(f"[lm] {type(self.model).__name__}: {self.misfit}")
@@ -2069,13 +2084,15 @@ class _Engine:
         ):
             try:
                 self._pool(True)
-            except Exhausted as exc:  # no room for the pool to come back: nothing of it ran
-                raise DoesNotFit(
-                    f"{type(self.model).__name__} decode: its graphs' pool cannot come back "
-                    f"beside {_gib(self.held)} of keys and state, and nothing more is free on "
-                    f"this card ({exc}): run it smaller, or rent a larger card: "
-                    "`cozy run … --on new`"
-                ) from exc
+            except Exhausted as exc:  # no row decodes (else the pool is held): nothing ran
+                # The graphs are only speed: they go, the call decodes eagerly, and a later step
+                # captures again where its pool finds room.
+                why = no_room(_set(self.domain).device, "its graphs' pool", 0, exc)
+                safeguard("no_room", f"{type(self.model).__name__}: {why}")
+                request.warnings.append(
+                    ("a CUDA graph was not used", {"module": type(self.model).__name__, "why": why})
+                )
+                self._forget()
             return True
         if occupied + rows > BUCKETS[-1]:
             request.waits = True  # slots free up as rows leave
@@ -2090,6 +2107,8 @@ class _Engine:
         if placed:
             card = self._card(device) + self.held
             if _never(self._need(*alone, position), card):
+                if self._undraft(request, "its keys do not fit on this card"):
+                    return False
                 raise DoesNotFit(self._refused(request, alone, position, card))
         if not occupied:
             self._drop()  # the idle slots go before the new ones come
@@ -2101,21 +2120,48 @@ class _Engine:
             if occupied:
                 request.waits = True  # it is tried again once these rows leave
                 return False
+            _unwind(exc)
+            if self._undraft(request, "its keys do not fit beside the model's"):
+                return False
             need = self._need(size, capacity, stops, position)
-            raise DoesNotFit(
-                f"{type(self.model).__name__} decode: "
-                f"{no_room(device.index or 0, 'its decode state', need, exc)}: run it smaller, "
-                "or rent a larger card: `cozy run … --on new`"
-            ) from exc
+            self._shed(request, f"its decode state ({_gib(need)})", exc)
         return True
 
+    def _undraft(self, request: _Request, why: str) -> bool:
+        """The engine's draft head goes, for its weights and keys: True when it had one (the call
+        is admitted again once the model's own blocks are held alone)."""
+        if self.draft is None:
+            return False
+        say(f"lm:{type(self.model).__name__}:undrafted", f"[lm] drafting stops: {why}")
+        self.unfit.add(id(self.draft))
+        self._drop()
+        self.draft, self.rehold = None, True
+        request.draft = None
+        request.warnings.append(("decoded without drafting", {"why": why}))
+        return True
+
+    def _shed(self, request: _Request, what: str, exc: BaseException) -> None:
+        """`request` decodes through Transformers' loop: `what` was refused beside the weights
+        this engine holds with everything else evictable gone. Its slots go now (no row decodes)
+        and the driver's leases when it hands over, so that loop streams the weights and keeps a
+        cache only as long as its tokens. A refusal there stands, with its numbers."""
+        device = request.inputs["input_ids"].device.index or 0
+        request.fallback = (
+            f"{no_room(device, what, 0, exc)}: decoding through Transformers' loop, its weights "
+            "streamed"
+        )
+        if not self._occupied():
+            self._drop()
+        _answered(exc)
+
     def _card(self, device: torch.device) -> int:
-        """The most this process could ever have for slots: the whole card, less its own live
-        working memory and weights in use. What other processes hold is not counted against it:
-        they give memory back when an allocation asks."""
+        """The most this process could ever have for slots: the whole card less its own live
+        working memory. Weights are not counted against it, even those leased now: beside slots
+        they do not fit with, Transformers' loop streams them (`_shed`). What other processes
+        hold is not either: they give memory back when an allocation asks."""
         room = vt.room(device.index or 0)
         total = int(torch.cuda.get_device_properties(device).total_memory)
-        return max(total - int(room["working_live"]) - int(room["pinned"]), 0)
+        return max(total - int(room["working_live"]), 0)
 
     def _refused(
         self,
@@ -2138,8 +2184,7 @@ class _Engine:
         return (
             f"{type(self.model).__name__} decode: {rows} row{'s' * (rows > 1)} of {prompt} + "
             f"{request.max_new} tokens need {_gib(self._need(*alone, position))} of keys and "
-            f"state, and the whole card has {_gib(room)} beside the weights in use and live "
-            "memory: "
+            f"state, and the whole card has {_gib(room)} beside live memory: "
             f"run it smaller ({smaller}), or rent a larger card: `cozy run … --on new`"
         )
 
@@ -3163,6 +3208,25 @@ class _Engine:
         pinned = ("flag", "allow_host", "took", "dtook")
         for name in (*type(self).__annotations__, *pinned, "rows_index", "bit", "dkeys", "dcache"):
             vars(self).pop(name, None)
+
+
+def _unwind(exc: BaseException) -> None:
+    """The refused attempt's frames and tensors go before anything counts room again."""
+    from cozy_runtime.internal.execution import catch
+
+    catch._unwind(exc)
+
+
+def _answered(exc: BaseException) -> None:
+    """A refusal varena counted (`vt.ooms`) that the Runtime answered by running another way, so
+    the package's scope is not judged to have swallowed it. `Exhausted` (a preparation refused
+    before anything ran) is not one it counted."""
+    if isinstance(exc, Exhausted):
+        return
+    from cozy_runtime.internal.execution.catch import CURRENT as SERVING
+
+    if (serving := SERVING.get()) is not None:
+        serving.retries += 1
 
 
 def _never(need: int, card: int) -> bool:
