@@ -358,6 +358,7 @@ def _graph_snapshot(
             "active_graphs": len(engine.graphs),
             "capture_attempts": int(engine.captured[0]),
             "captures": engine.recorded,
+            "regrown": [list(pair) for pair in engine.regrown],
             "retired_graphs": engine.retired_graphs,
             "replays": engine.replayed,
             "eager_steps": engine.eager,
@@ -1603,6 +1604,9 @@ class _Engine:
         self.captured = [0, 0.0]
         self.eager = 0
         self.recorded = 0
+        #: of those, each that took more than its warm-up's guess: the guess, and the room it
+        #: was recorded in (`graphs.capture`)
+        self.regrown: list[tuple[int, int]] = []
         self.replayed = 0
         self.retired_graphs = 0
         #: `LANDED` when a capture met a kernel still building (none records until one lands),
@@ -2738,7 +2742,7 @@ class _Engine:
             domain = _set(self.domain)  # a CUDA step's (`_one`)
             if key not in self.warmed:
                 # This is the caller's actual next token, never an extra speculative warmup; its
-                # working peak, as varena measured it, is what its capture's pool takes.
+                # working peak, as varena measured it, is its capture pool's first guess.
                 with self._graph_memory(drafted), _measured(domain.device) as peak:
                     self._advance(size)
                 self.warmed.add(key)
@@ -2764,14 +2768,22 @@ class _Engine:
                             if placed is not None
                             else Pool(torch.cuda.graph_pool_handle())
                         )
+                    pool = self.pool
                     try:
                         graph, why = capture(
-                            torch, lambda: self._advance(size), _set(self.pool), domain, reserve
+                            torch,
+                            lambda: self._advance(size),
+                            pool,
+                            domain,
+                            reserve,
+                            alone=not self.graphs,
                         )
-                    except Exception as exc:  # no room: refused before it, or short within it
+                        if graph is not None and pool.prepared > reserve:
+                            self.regrown.append((reserve, pool.prepared))
+                    except Exception as exc:  # no room for its pool, or short outside it
                         if not is_capacity(exc):
                             raise
-                        why = no_room(domain.device, "its pool", reserve, exc)
+                        why = no_room(domain.device, "its pool", pool.prepared, exc)
                         if not isinstance(exc, Exhausted):  # an allocation varena counted refused
                             from cozy_runtime.internal.execution.catch import CURRENT as REQUEST
 

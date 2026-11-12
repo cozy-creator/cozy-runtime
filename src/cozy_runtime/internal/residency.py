@@ -2588,6 +2588,7 @@ class RequestStats(TypedDict):
     working_splits: list[SplitRecord]
     escaped: list[EscapeRecord]
     retries: int
+    regrown: int
     swallowed_ooms: int
     retained_bytes: int
     gathered: int
@@ -2796,6 +2797,9 @@ class Request:
         #: refusals the Runtime answered by running again another way (a pure op's finer split, an LM
         #: token decoded eagerly for a capture its pool couldn't hold): zero in a normal run
         self.retries = 0
+        #: refusals a CUDA graph capture answered by recording again with room for them
+        #: (`graphs.capture`): what runs is the same
+        self.regrown = 0
         #: refusals a package scope returned past (`contract._Scopes`): zero in a conforming run
         self.swallowed_ooms = 0
         #: cross-step state its loops declared (`author.retained`)
@@ -2943,6 +2947,7 @@ class Request:
             "working_splits": list(self.working_splits.values()),
             "escaped": list(self.escaped),
             "retries": self.retries,
+            "regrown": self.regrown,
             "swallowed_ooms": self.swallowed_ooms,
             "retained_bytes": self.retained_bytes,
             "gathered": self.gathered,
