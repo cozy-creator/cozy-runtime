@@ -29,6 +29,10 @@ on:
         description: Caller's id, shown in the run name so the caller can find its run
         type: string
         default: ''
+      version:
+        description: "The files' version in place of <pyproject version>+dev.g<sha8> (rc-dev.yaml: 0.46.0.dev<n>+g<sha8>)"
+        type: string
+        default: ''
   # rc-dev.yaml's builds.
   workflow_call:
     inputs:
