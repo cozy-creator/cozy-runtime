@@ -342,8 +342,8 @@ def _struct(
     config = tp.__struct_config__
     fields = [_field(f, nested, decoded_bounds=decoded_bounds) for f in msgspec.structs.fields(tp)]
     names = [f["name"] for f in fields if isinstance(f, dict)]
-    for doc in (f for f in fields if isinstance(f, dict)):
-        extra, name = doc.get("extra"), doc["name"]
+    for rendered in (f for f in fields if isinstance(f, dict)):
+        extra, name = rendered.get("extra"), rendered["name"]
         when = extra.get("when") if isinstance(extra, dict) else None
         if not isinstance(when, dict):
             continue
@@ -354,7 +354,7 @@ def _struct(
                 code="tool_marker",
                 fields=[str(name)],
             )
-        if "wire" not in doc:
+        if "wire" not in rendered:
             raise ConformanceError(
                 f"{tp.__name__}.{name}: When needs a default, "
                 "which a run gives it while it doesn't apply",

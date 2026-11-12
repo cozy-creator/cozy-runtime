@@ -329,6 +329,14 @@ def _when(info: mi.Type) -> Mapping[str, object] | None:
     return None
 
 
+def _toggle(info: mi.Type) -> bool:
+    """Whether a field is a bool, or a bool's `| None`."""
+    if isinstance(info, mi.UnionType):
+        kept = [member for member in info.types if not isinstance(member, mi.NoneType)]
+        return len(kept) == 1 and _toggle(kept[0])
+    return isinstance(info.type if isinstance(info, mi.Metadata) else info, mi.BoolType)
+
+
 def _default(field: mi.Field) -> object:
     """A field's default as the wire spells it."""
     if field.default is not msgspec.NODEFAULT:
@@ -359,8 +367,7 @@ def _applying(
             continue
         where = f"{path}.{field.encode_name}" if path else field.encode_name
         given = kept.pop(field.encode_name)
-        kind = peer.type.type if isinstance(peer.type, mi.Metadata) else peer.type
-        said = condition(when, isinstance(kind, mi.BoolType))
+        said = condition(when, _toggle(peer.type))
         rows.append(AdjustmentRow("adjusted", where, given, _default(field), said, "policy"))
     return kept
 
