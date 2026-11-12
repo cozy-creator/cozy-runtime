@@ -28,7 +28,7 @@ import msgspec.inspect as mi
 
 from cozy_runtime.author._errors import DefaultResolutionError, InvalidRequest
 from cozy_runtime.author._files import asset_dec_hook
-from cozy_runtime.author._markers import _ModelDefaultMarker
+from cozy_runtime.author._markers import _ModelDefaultMarker, applies, condition
 from cozy_runtime.author._services import AdjustmentRow
 from cozy_runtime.author._walker import MISSING, Node, walk
 
@@ -278,7 +278,7 @@ def _prune(
                 kept[key] = item
             else:
                 ignored.append(where)
-        return kept
+        return _applying(info, kept, path, rows)
     if isinstance(info, (mi.CollectionType, mi.TupleType)) and isinstance(value, list):
         if isinstance(info, mi.TupleType):
             items = info.item_types
@@ -316,6 +316,60 @@ def _prune(
     if applied != value:
         rows.append(AdjustmentRow("clamp", path, value, applied, _LIMIT, "policy"))
     return applied
+
+
+def _when(info: mi.Type) -> Mapping[str, object] | None:
+    """A field's `When`, on it or on the value of its `| None`."""
+    members = info.types if isinstance(info, mi.UnionType) else (info,)
+    for member in members:
+        extra = member.extra if isinstance(member, mi.Metadata) and member.extra else {}
+        when = extra.get("when")
+        if isinstance(when, dict):
+            return when
+    return None
+
+
+def _toggle(info: mi.Type) -> bool:
+    """Whether a field is a bool, or a bool's `| None`."""
+    if isinstance(info, mi.UnionType):
+        kept = [member for member in info.types if not isinstance(member, mi.NoneType)]
+        return len(kept) == 1 and _toggle(kept[0])
+    return isinstance(info.type if isinstance(info, mi.Metadata) else info, mi.BoolType)
+
+
+def _default(field: mi.Field) -> object:
+    """A field's default as the wire spells it."""
+    if field.default is not msgspec.NODEFAULT:
+        value = field.default
+    else:
+        value = None if field.default_factory is msgspec.NODEFAULT else field.default_factory()
+    try:
+        return msgspec.to_builtins(value)
+    except TypeError:
+        return value
+
+
+def _applying(
+    info: mi.StructType | mi.DataclassType | mi.TypedDictType,
+    kept: dict[object, object],
+    path: str,
+    rows: list[AdjustmentRow],
+) -> dict[object, object]:
+    """Without each field given where its `When` doesn't hold: the function takes its default,
+    with a row."""
+    for field in info.fields:
+        when = _when(field.type)
+        peer = next((f for f in info.fields if when and f.name == when.get("field")), None)
+        if when is None or peer is None or field.encode_name not in kept:
+            continue
+        held = kept[peer.encode_name] if peer.encode_name in kept else _default(peer)
+        if applies(when, held):
+            continue
+        where = f"{path}.{field.encode_name}" if path else field.encode_name
+        given = kept.pop(field.encode_name)
+        said = condition(when, _toggle(peer.type))
+        rows.append(AdjustmentRow("adjusted", where, given, _default(field), said, "policy"))
+    return kept
 
 
 def _tier(info: mi.EnumType, value: str, path: str, rows: list[AdjustmentRow]) -> str:

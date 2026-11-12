@@ -364,6 +364,7 @@ _AUTHOR_VALUES = (
     "Label",
     "Placeholder",
     "Advanced",
+    "When",
     "data_values",
     "QuantizationPlan",
     "SelectionPlan",
