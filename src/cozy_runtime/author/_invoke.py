@@ -124,6 +124,9 @@ class Invocation:
     installed field's declared bound; a field that declares none has no size limit."""
     sources: Mapping[str, Weights[Model[object]]] = field(default_factory=dict)
     """`Weights[M]` parameter -> its raw checkpoint, read through this attempt's source."""
+    unbound: Mapping[str, tuple[str, str]] = field(default_factory=dict)
+    """On-demand model parameter -> (code, why) the machine bound it no checkpoint: reading it
+    fails with that (xs-186)."""
     weights_bytes: ReadBytes | None = None
     weights_values: ReadValues | None = None
     tensorfs_source: Callable[[str], Checkpoint] | None = None
@@ -812,7 +815,8 @@ def _inject(
 def _model(param: Param, inv: Invocation, on_demand: bool) -> object:
     model = (inv.sources if param.role == "weights" else inv.models).get(param.name)
     if model is None and on_demand:
-        return _Unbound(param.name)  # a request may leave it unused: refused only when read
+        # A request may leave it unused: refused only when read.
+        return _Unbound(param.name, inv.unbound.get(param.name))
     if model is None:
         raise InvalidRequest(
             f"this function needs a model for {param.name!r} and has no default: name one with "
@@ -824,14 +828,20 @@ def _model(param: Param, inv: Invocation, on_demand: bool) -> object:
 
 
 class _Unbound:
-    """An on-demand model slot the run names no model for: reading it refuses the request."""
+    """An on-demand model slot with no model: reading it refuses the request, with why the
+    machine bound it none (`refusal`: its code and one line naming the slot, the model and why),
+    else as one the run names no model for."""
 
-    __slots__ = ("_name",)
+    __slots__ = ("_name", "_refusal")
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, refusal: tuple[str, str] | None = None) -> None:
         self._name = name
+        self._refusal = refusal
 
     def __getattr__(self, attribute: str) -> object:
+        if self._refusal is not None:
+            code, why = self._refusal
+            raise InvalidRequest(why, code=code, fields=[self._name])
         raise InvalidRequest(
             f"this request needs a model for {self._name!r} and has no default: name one with "
             f"`model.{self._name}=<org/model>`",
