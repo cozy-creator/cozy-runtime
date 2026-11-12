@@ -33,8 +33,11 @@ jobs:
       - id: version
         run: |
           set -euo pipefail
-          release=$(sed -n 's/^version = "\([0-9]*\)\.\([0-9]*\)\..*"$/\1 \2/p' pyproject.toml | head -1)
-          read -r major minor <<< "$release"
+          # The minor after the newer of this branch's version and PyPI's newest release: a release published before the
+          # RC takes it in (0.46.0 while the branch says 0.45.1) leaves the RC newer than it, 0.47.0.dev<n>.
+          read -r major minor <<< "$(sed -n 's/^version = "\([0-9]*\)\.\([0-9]*\)\..*"$/\1 \2/p' pyproject.toml | head -1)"
+          read -r pmajor pminor <<< "$(curl -fsSL https://pypi.org/pypi/cozy-runtime/json | jq -r '.info.version' | awk -F. '{print $1, $2}')"
+          if [ "$pmajor" -gt "$major" ] || { [ "$pmajor" = "$major" ] && [ "$pminor" -gt "$minor" ]; }; then major=$pmajor minor=$pminor; fi
           version="$major.$((minor + 1)).0.dev$(git rev-list --count --first-parent HEAD)+g${GITHUB_SHA:0:8}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "the open RC's Runtime: $version" >> "$GITHUB_STEP_SUMMARY"
