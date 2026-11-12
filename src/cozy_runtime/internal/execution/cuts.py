@@ -6,13 +6,14 @@ The results stay on the device, at the level native selection takes from each ca
 (`catch`, `sizing`). Level L is 2^L pieces, down to the finest.
 
 Call cuts: Diffusers' FFNs by token, a Runtime-fused block's gated MLP by token (`gated`), its
-channel RMS norms by rows, attention by head groups then query rows, a package's `split` by
-windows.
+channel RMS norms by rows, attention by head groups then query rows, a Transformers vision tower
+by pictures, a package's `split` by windows.
 """
 
 from __future__ import annotations
 
 import functools
+import inspect
 import math
 import sys
 from collections.abc import Callable, Sequence
@@ -50,9 +51,16 @@ def install(module: nn.Module) -> int:
     cuts at the projection, whose [tokens, inner] intermediate is the widest), row bands for its
     channel RMS norms, and image or output-channel bands for its 2-D and 3-D convs (at the
     conv itself, so a subclass's forward around it, a causal pad, is untouched). Each site is
-    the module's path. Returns how many it cut."""
+    the module's path. A Transformers vision tower that reads packed patches and each picture's
+    grid (`forward(hidden_states, grid_thw)`: Qwen2.5-VL, Qwen3-VL, Qwen3.5) runs its pictures in
+    groups. Returns how many it cut."""
     count = 0
     for path, sub in module.named_modules():
+        if _tower(sub) and "_cozy_cut" not in vars(sub):
+            sub.forward = catch.transparent(_pictures(f"{path}:pictures", sub, _forward(sub)))
+            vars(sub)["_cozy_cut"] = True
+            count += 1
+            continue
         if (
             isinstance(sub, nn.Conv2d | nn.Conv3d)
             and "_cozy_cut" not in vars(sub)
@@ -312,6 +320,98 @@ def gated(x: Tensor, linears: Sequence[nn.Module], forward: Callable[[Tensor], T
 
 class _Whole(Exception):
     """A cut's pieces do not join (a call returned no tensor): it runs whole."""
+
+
+#: a vision tower's working bytes per patch, in widths of its hidden state: 16.5 measured on
+#: Qwen3.5-9B's tower (4.6 GiB live for 129,600 patches of width 1152, bf16, run 46568), and
+#: the rotary table it was refused growing
+_TOWER_WIDTHS = 24
+
+
+def _tower(module: nn.Module) -> bool:
+    """A Transformers vision tower whose pictures attend only to their own patches: its forward
+    reads packed patches, then each picture's (t, h, w) grid."""
+    forward = type(module).forward
+    if "forward" in vars(module) or not forward.__module__.startswith("transformers."):
+        return False
+    try:
+        names = list(inspect.signature(forward).parameters)[1:3]
+    except (TypeError, ValueError):
+        return False
+    return names == ["hidden_states", "grid_thw"]
+
+
+def _pictures(site: str, module: nn.Module, forward: Forward) -> Forward:
+    """A vision tower's pictures in groups: each attends only to its own patches (`cu_seqlens`),
+    so a group's output rows are the whole call's rows for those pictures. Patch rows, the
+    merged rows and any per-layer features join in picture order."""
+    whole: list[bool] = []
+
+    def cut(*given: object, **kwargs: object) -> object:
+        args = list(given)
+        patches = args.pop(0) if args else kwargs.pop("hidden_states", None)
+        grid = args.pop(0) if args else kwargs.pop("grid_thw", None)
+        if (
+            args
+            or whole
+            or not isinstance(patches, Tensor)
+            or not isinstance(grid, Tensor)
+            or grid.dim() != 2
+            or grid.shape[0] < 2
+            or module.training
+            or torch.is_grad_enabled()
+        ):
+            return forward(patches, grid, *args, **kwargs)
+        rows = [int(n) for n in grid.prod(-1).tolist()]
+        if sum(rows) != patches.shape[0]:
+            return forward(patches, grid, **kwargs)
+        config = getattr(module, "config", None)
+        width = int(getattr(config, "hidden_size", patches.shape[-1]))
+        each = _TOWER_WIDTHS * width * patches.element_size()
+        out = sum(rows) * width * patches.element_size()
+
+        def need(level: int) -> tuple[int, ...]:
+            size = pieces(len(rows), level)
+            return (out, max(sum(rows[at : at + size]) for at in range(0, len(rows), size)) * each)
+
+        def run(level: int) -> object:
+            if not level:
+                return forward(patches, grid, **kwargs)
+            size, parts, at = pieces(len(rows), level), [], 0
+            for first in range(0, len(rows), size):
+                catch.checkpoint()
+                count = sum(rows[first : first + size])
+                parts.append(
+                    forward(patches[at : at + count], grid[first : first + size], **kwargs)
+                )
+                at += count
+            return _join(parts)
+
+        try:
+            return catch.cut(site, levels(len(rows)), need, run)
+        except _Whole:
+            whole.append(True)
+            print(f"cozy-runtime: {site}'s pieces do not join: whole", file=sys.stderr)
+        return forward(patches, grid, **kwargs)
+
+    return cast("Forward", cut)  # it reads the tower's arguments by position or by name
+
+
+def _join(parts: list[object]) -> object:
+    """Pieces' outputs as the whole call's: tensors in order along their rows, a model output's
+    or a sequence's fields each so; None stays None. Anything else does not join (`_Whole`)."""
+    first = parts[0]
+    if isinstance(first, Tensor):
+        return torch.cat(cast("list[Tensor]", parts), 0)
+    if first is None:
+        return None
+    if isinstance(first, dict):  # Transformers' ModelOutput is an ordered dict of its fields
+        fields = {key: _join([cast("dict[str, object]", p)[key] for p in parts]) for key in first}
+        return type(first)(**fields)
+    if isinstance(first, list | tuple):
+        joined = [_join([cast("Sequence[object]", p)[i] for p in parts]) for i in range(len(first))]
+        return type(first)(joined) if isinstance(first, list) else tuple(joined)
+    raise _Whole
 
 
 def _tokens(forward: Forward, x: Tensor, tokens: int, level: int) -> object:
