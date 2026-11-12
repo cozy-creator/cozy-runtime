@@ -17,7 +17,7 @@ import time
 import warnings
 import weakref
 from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
@@ -34,7 +34,7 @@ from torch.utils._pytree import tree_leaves, tree_map
 from torch.utils.hooks import RemovableHandle
 
 from cozy_runtime import graphs
-from cozy_runtime.author import _retained
+from cozy_runtime.author import _phases, _retained
 from cozy_runtime.author._errors import DoesNotFit, Fault, fault, is_capacity
 from cozy_runtime.author._model import WARNINGS, WarningRow
 from cozy_runtime.internal import cache_owners, pacing, proctree
@@ -2049,21 +2049,22 @@ class Memory:
         with self.lock:
             block.loading = True
         try:
-            if self.native is None:
-                data = self._read_host(block, reclaim, overlay)
-            else:
-                block.overlay = overlay
-                self._final_views(block)
-                data = {}
-                if not block.final_only():
-                    # Final bytes alone serve a final-only binding: nothing here touches its raw
-                    # Region, so an evicted one costs no read.
-                    raw = self._empty(0, False)
-                    if block.storage_bytes:
-                        block.native_use = self._use(block)
-                        raw = block.native_use.tensor
-                        block.native_storage = int(raw.untyped_storage().data_ptr())
-                    data = _data(block, raw)
+            with self._read_told(block):
+                if self.native is None:
+                    data = self._read_host(block, reclaim, overlay)
+                else:
+                    block.overlay = overlay
+                    self._final_views(block)
+                    data = {}
+                    if not block.final_only():
+                        # Final bytes alone serve a final-only binding: nothing here touches its
+                        # raw Region, so an evicted one costs no read.
+                        raw = self._empty(0, False)
+                        if block.storage_bytes:
+                            block.native_use = self._use(block)
+                            raw = block.native_use.tensor
+                            block.native_storage = int(raw.untyped_storage().data_ptr())
+                        data = _data(block, raw)
             ready = None
             if self.cuda:
                 ready = torch.cuda.Event()
@@ -2077,6 +2078,22 @@ class Memory:
         finally:
             with self.lock:
                 block.loading = False
+
+    def _read_told(self, block: _Block) -> AbstractContextManager[None]:
+        """A read of `block`'s weights, told as its component's load (`_phases.loading`): none for
+        one resident. A block this request read before is read again (paging): its step's time."""
+        if not block.nbytes or block.cached():
+            return nullcontext()
+        model, request = block.model, _REQUEST.get()
+        again = request is not None and not request.first_read(block)
+        return _phases.loading(
+            model.component, block.nbytes, functools.partial(self._unread, model), again=again
+        )
+
+    @staticmethod
+    def _unread(model: Model) -> int:
+        """The bytes of `model` no fill holds now: what a load of it that begins now reads."""
+        return sum(b.nbytes for b in model.groups() if b.data is None and not b.cached())
 
     def _read_host(
         self, block: _Block, reclaim: bool, overlay: Hashable
@@ -2191,7 +2208,9 @@ class Memory:
                 except Exhausted:  # varena refused its region before its forward ran
                     if not (block.table and reclaim and self.cuda and not capturing):
                         raise
-                    self._gather(block, overlay)
+                    gathered = block.gathered is not None and block.gathered[0] == overlay
+                    with nullcontext() if gathered else self._read_told(block):
+                        self._gather(block, overlay)
             # A cached Hold can keep count > 0 across sequential threads or streams.
             # Every consumer needs readiness in addition to storage ownership.
             # Capture's owner joined the prepared stream before capture began. Waiting on
@@ -2760,6 +2779,8 @@ class Request:
         self.heads: dict[Model, tuple[set[int], int]] = {}
         #: the models whose phases this request entered: what it has not is read ahead
         self.entered: set[str] = set()
+        #: the blocks it read (`Memory._read_told`), by identity: one read again is paging
+        self.read_blocks: set[int] = set()
         #: the attempt failed (its executor says): a refused allocation in its last pass is learned
         self.failed = False
         #: refusals the Runtime answered by running again another way (a pure op's finer split, an LM
@@ -2792,6 +2813,12 @@ class Request:
             # or its floor is the largest decode the process ever ran (sieg: SDXL gave nothing)
             vt.reset_peak(memory.device.index or 0)
         self.sample()
+
+    def first_read(self, block: _Block) -> bool:
+        """Whether this is its first read of `block`."""
+        known = id(block) in self.read_blocks
+        self.read_blocks.add(id(block))
+        return not known
 
     def sample(self) -> None:
         if self.memory.cuda:

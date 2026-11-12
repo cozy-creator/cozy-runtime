@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, cast, get_args
 import msgspec
 from tensorfs.executor import Answer, Publish
 
-from cozy_runtime.author._activity import asides
+from cozy_runtime.author import _phases
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._calls import _Broker, _current
@@ -80,6 +80,7 @@ from cozy_runtime.author._services import (
     AdjustmentRow,
     Adjustments,
     Attempt,
+    TELLING,
     Outputs,
     ProgressFrame,
     Telemetry,
@@ -311,7 +312,8 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt.outputs = surface.outputs
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel)
     ctx._recipes = inv.recipes
-    ctx._progress, ctx._called = Telemetry(record, ctx).loop_progress()
+    telemetry = Telemetry(record, ctx)
+    ctx._progress, ctx._called = telemetry.loop_progress()
     if inv.previewing is not None and inv.preview is not None:
         ctx._preview = Previews(
             inv.previewing, inv.preview, lambda why: record.emit("log", why, "warning")
@@ -327,7 +329,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt.entered = True
     if inv.calls is not None:
         inv.calls.bind(ctx, Telemetry(record, ctx), record.media, record)
-    token, context = _current.set(inv.calls), CURRENT.set(ctx)
+    token, context, telling = _current.set(inv.calls), CURRENT.set(ctx), TELLING.set(telemetry)
     try:
         result = _call(surface, kwargs)
         if inv.calls is not None:
@@ -337,6 +339,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
             if inv.calls is not None:
                 inv.calls.close()
         finally:
+            TELLING.reset(telling)
             CURRENT.reset(context)
             _current.reset(token)
             handles.__exit__(*sys.exc_info())
@@ -388,14 +391,8 @@ def run_prepared(
         writes=inv.writes,
     )
     record.attribution.stages.update(prepared.stages)
-
-    def aside(name: str, ms: float) -> None:
-        record.attribution.stage(name, ms)
-        record.emit("stage", name, round(ms, 3))
-
     try:
-        with asides(aside):
-            return invoke(prepared, inv, record), SUCCEEDED, record
+        return invoke(prepared, inv, record), SUCCEEDED, record
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
@@ -403,6 +400,8 @@ def run_prepared(
         unwind(exc)
         return None, outcome, record
     finally:
+        # Its loads and compiles still open end here, their rows in its record before it goes.
+        _phases.finish(record)
         if record._stall_watch is not None:
             record._stall_watch.stop()
         record.closed = True
