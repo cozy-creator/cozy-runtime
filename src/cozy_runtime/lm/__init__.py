@@ -159,6 +159,10 @@ BUCKETS = (1, 2, 4, 8, 16)
 #: after each of its tokens (Qwen3.5-9B: 24 x 3 x 2 MiB a row), and with more rows the model's
 #: own step is compute-bound enough that drafts save little; larger buckets decode undrafted.
 DRAFT_ROWS = 4
+#: The most the draft head's prompt pass holds of attention scores at once (`_drafted_prompt`).
+DRAFT_SCORES = 256 << 20
+#: The most prompt tokens a gated-delta-net layer's prefill computes at once (`_prefill_pieces`).
+PREFILL_TOKENS = 4096
 
 
 #: Generation-config fields that add a logits processor to greedy decoding, and their no-op values.
@@ -448,6 +452,10 @@ def install(plan: Plan, model: torch.nn.Module) -> str:
     if ABSENT:
         return _report(plan, ABSENT)
     spaces = {sys.modules.get(type(module).__module__) for module in model.modules()}
+    for space in spaces:  # the prefill's pieces need no kernel: every device, from now on
+        current = getattr(space, "torch_chunk_gated_delta_rule", None)
+        if space is not None and callable(current) and not getattr(current, "_cozy_slot", False):
+            vars(space)["torch_chunk_gated_delta_rule"] = _prefill_pieces(current)
     slots = [
         (space, name)
         for space in spaces
@@ -583,6 +591,49 @@ def _conv_slot(original: _ConvUpdate, launch: Launch) -> _ConvUpdate:
 
     slot._cozy_slot = True  # type: ignore[attr-defined]  # a marker on the function object
     return slot
+
+
+def _prefill_pieces(original: _DeltaRule) -> _DeltaRule:
+    """A gated-delta-net layer's prompt in pieces of `PREFILL_TOKENS`, each starting from the
+    recurrent state the one before ended on: the torch path holds several fp32 copies of a
+    piece's queries, keys, values and decays, so a long prompt's held all at once (Qwen3.5's
+    upsampler at 31,804 tokens, 6.3 GiB live under an 8 GiB cap, run 46625). Pieces end on its
+    chunk boundaries, so each chunk is computed as in the whole call."""
+
+    def pieces(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        chunk_size: int = 64,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        length = int(query.shape[1])
+        piece = max(chunk_size, PREFILL_TOKENS // chunk_size * chunk_size)
+        if length <= piece or kwargs.get("cu_seqlens") is not None:
+            return original(
+                query, key, value, g, beta, chunk_size=chunk_size, initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **kwargs,
+            )  # fmt: skip
+        outs: list[torch.Tensor] = []
+        state = initial_state
+        for at in range(0, length, piece):
+            part = slice(at, at + piece)
+            out, state = original(
+                query[:, part], key[:, part], value[:, part], g[:, part], beta[:, part],
+                chunk_size=chunk_size, initial_state=state, output_final_state=True,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **kwargs,
+            )  # fmt: skip
+            outs.append(out)
+        return torch.cat(outs, 1), state if output_final_state else None
+
+    vars(pieces)["_cozy_slot"] = True
+    return cast("_DeltaRule", pieces)
 
 
 def _recurrent_slot(original: _DeltaRule, launch: Launch) -> _DeltaRule:
@@ -2155,7 +2206,10 @@ class _Engine:
         ):
             try:
                 self._pool(True)
-            except Exhausted as exc:  # no row decodes (else the pool is held): nothing ran
+            except Exhausted as exc:  # nothing of it ran
+                if occupied:  # the pool is held while rows decode: a refusal here waits for them
+                    request.waits = True
+                    return False
                 # The graphs are only speed: they go, the call decodes eagerly, and a later step
                 # captures again where its pool finds room.
                 why = no_room(_set(self.domain).device, "its graphs' pool", 0, exc)
@@ -2175,6 +2229,9 @@ class _Engine:
         if placed:
             card = self._card(device) + self.held
             if _never(self._need(*alone, position), card):
+                if self.draft is not None and occupied:
+                    request.waits = True  # the head goes once the rows drafting with it leave
+                    return False
                 if self._undraft(request, "its keys do not fit on this card"):
                     return False
                 raise DoesNotFit(self._refused(request, alone, position, card))
@@ -2328,16 +2385,9 @@ class _Engine:
         """The head's keys for the prompt and the first token, as it attends to them while
         drafting: slot j from token j and the model's state for the token before it, so drafts
         read the whole context the head was trained on; and its state for the token after."""
-        prompt = int(ids.shape[1])
+        prompt, rows = int(ids.shape[1]), int(ids.shape[0])
         tokens = torch.cat([ids[:, 1:], token[:, None]], dim=1)
         slots = torch.arange(prompt + 1, device=ids.device)
-        allowed = (slots[None, :] >= 1) & (slots[None, :] <= slots[1:, None])
-        mask = (
-            allowed
-            if self.closed is False
-            else torch.where(allowed, self.open, self.closed).to(self.model.dtype)
-        )
-        mask = mask[None, None].expand(int(ids.shape[0]), 1, prompt, prompt + 1)
         if position is not None:
             following = position[..., -1:] + 1
             at = torch.cat([position[..., 1:], following], dim=-1)
@@ -2348,8 +2398,24 @@ class _Engine:
         keys.cumulative_length = torch.ones((), dtype=torch.long, device=ids.device)
         embed = self.model.get_input_embeddings()
         rotary = _lm(self.model).get_decoder().rotary_emb
-        drafted: torch.Tensor = _set(self.draft)(embed(tokens), hidden, at, cache, mask, rotary)
-        last = drafted[:, -1:]
+        # Its mask is explicit, so attention may materialize each query's scores over every slot:
+        # queries go in pieces whose scores stay within DRAFT_SCORES, each writing its keys before
+        # the next attends to them (a 23,388-token prompt asked 17.5 GB whole: 16 heads x L x L+1).
+        heads = int(getattr(self.text, "num_attention_heads", 1))
+        piece = max(1, DRAFT_SCORES // (rows * heads * (prompt + 1) * 4))
+        drafted: torch.Tensor | None = None
+        for start in range(0, prompt, piece):
+            end = min(start + piece, prompt)
+            allowed = (slots[None, :] >= 1) & (slots[None, :] <= slots[start + 1 : end + 1, None])
+            mask = (
+                allowed
+                if self.closed is False
+                else torch.where(allowed, self.open, self.closed).to(self.model.dtype)
+            )
+            mask = mask[None, None].expand(rows, 1, end - start, prompt + 1)
+            these = embed(tokens[:, start:end]), hidden[:, start:end], at[..., start:end]
+            drafted = _set(self.draft)(*these, cache, mask, rotary)
+        last = _set(drafted)[:, -1:]
         return keys, last
 
     def _splice(self, request: _Request, fresh: _Prefill, free: list[int]) -> None:
