@@ -9,8 +9,11 @@ resolution; a video an animated WebP of its latent frames. The newest wins: noth
 a preview.
 
 `x0` is a tensor, `[C, H, W]` or `[B, C, H, W]` for a picture and `[C, T, H, W]` or
-`[B, C, T, H, W]` for a video (the first of a batch shows), or a function of none returning one,
-called only when a preview is due. `vae` names the latent space (`FAMILIES`).
+`[B, C, T, H, W]` for a video (the first of a batch shows); or a sequence of tokens, `[N, C]` or
+`[B, N, C]`, laid out row by row on `grid`, `(h, w)` or `(t, h, w)`; or a function of none
+returning one, called only when a preview is due. Channels that carry each 2x2 patch (four times
+the VAE's, as FLUX.2's, Qwen-Image's and H3's tokens do) are unpacked. `vae` names the latent
+space (`FAMILIES`).
 """
 
 from __future__ import annotations
@@ -44,14 +47,12 @@ type RGB = tuple[float, float, float]
 @dataclass(frozen=True, slots=True)
 class Family:
     """A VAE's latent space: its channels, whether it holds frames, and its linear map to RGB
-    in -1..1 (ComfyUI's `latent_rgb_factors` and bias). `packed` latents carry each 2x2 patch
-    in their channels (FLUX.2's 128 at /16): they are unpacked to `channels` first."""
+    in -1..1 (ComfyUI's `latent_rgb_factors` and bias)."""
 
     channels: int
     factors: tuple[RGB, ...]
     bias: RGB = (0.0, 0.0, 0.0)
     video: bool = False
-    packed: bool = False
 
 
 #: SDXL's 4-channel space (ComfyUI `SDXL`).
@@ -66,8 +67,8 @@ SDXL = Family(
     (0.1084, -0.0175, -0.0011),
 )
 
-#: FLUX.2's 32 channels at /8, or packed as 128 at /16 (ComfyUI `Flux2`): FLUX.2, FLUX.3 Klein,
-#: Fibo 2, Ideogram 4 and MOSS-Image.
+#: FLUX.2's 32 channels at /8 (ComfyUI `Flux2`): FLUX.2, FLUX.3 Klein, Fibo 2, Ideogram 4 and
+#: MOSS-Image.
 FLUX2 = Family(
     32,
     (
@@ -84,7 +85,6 @@ FLUX2 = Family(
         (-0.0076, 0.0003, -0.0043), (-0.0111, -0.0460, -0.0614),
     ),
     (-0.0329, -0.0718, -0.0851),
-    packed=True,
 )  # fmt: skip
 
 #: Qwen-Image's 16 channels at /8, normalized (Wan 2.1's space, ComfyUI `Wan21`): Qwen-Image,
@@ -167,13 +167,15 @@ FAMILIES: dict[str, Family] = {
 }
 
 
-def preview(x0: Tensor | Callable[[], Tensor], vae: str) -> None:
-    """Show `x0`, a loop's latents in `vae`'s space, to a client watching this run. Optional;
-    a no-op when no client watches, outside a run, or on a group's other GPUs."""
+def preview(
+    x0: Tensor | Callable[[], Tensor], vae: str, *, grid: tuple[int, ...] | None = None
+) -> None:
+    """Show `x0`, a loop's latents in `vae`'s space (tokens on `grid`), to a client watching
+    this run. Optional; a no-op when no client watches, outside a run, or on a group's other
+    GPUs."""
     ctx = CURRENT.get()
-    previews = ctx._preview if ctx is not None else None
-    if previews is not None:
-        previews.offer(x0, vae, ctx._step if ctx is not None else (0, 0))
+    if ctx is not None and ctx._preview is not None:
+        ctx._preview.offer(x0, vae, grid, ctx._step)
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,8 +206,15 @@ class Previews:
         self._busy = False
         self._said: set[str] = set()
         self._pinned: dict[tuple[int, ...], Tensor] = {}
+        self._factors: dict[tuple[int, str], tuple[Tensor, Tensor]] = {}
 
-    def offer(self, x0: Tensor | Callable[[], Tensor], vae: str, step: tuple[int, int]) -> None:
+    def offer(
+        self,
+        x0: Tensor | Callable[[], Tensor],
+        vae: str,
+        grid: tuple[int, ...] | None,
+        step: tuple[int, int],
+    ) -> None:
         now = time.monotonic()
         if self._busy or now - self._last < INTERVAL_S or not self._wanted():
             return
@@ -215,7 +224,7 @@ class Previews:
             return self._misuse(f"no VAE family {vae!r}: one of {', '.join(sorted(FAMILIES))}")
         try:
             latents = x0() if callable(x0) else x0
-            shot = self._shoot(latents, family)
+            shot = self._shoot(latents, family, grid)
         except Exception as exc:  # a preview never fails the run it shows
             return self._misuse(f"{type(exc).__name__}: {exc}"[:300])
         if isinstance(shot, str):
@@ -223,44 +232,43 @@ class Previews:
         self._busy = True
         _ENCODER.put(lambda: self._encode(*shot, step))
 
-    def _shoot(self, latents: Tensor, family: Family) -> tuple[Tensor, object] | str:
+    def _shoot(
+        self, latents: Tensor, family: Family, grid: tuple[int, ...] | None
+    ) -> tuple[Tensor, object] | str:
         """`latents` as uint8 RGB `[T, H, W, 3]` on the host, and what to wait on before reading
         it; or why they can't show."""
         import torch
 
-        x = latents.detach()
-        image = 3 if not family.video else 4
-        if x.dim() == image + 1:
-            x = x[0]
-        if not family.video and x.dim() == 4 and x.shape[1] == 1:  # an image VAE's one frame
-            x = x[:, 0]
-        if x.dim() != image:
-            shape = "[C, T, H, W]" if family.video else "[C, H, W]"
-            return f"latents of shape {tuple(latents.shape)} are not {shape}, batched or not"
-        channels = x.shape[0]
-        if family.packed and channels == family.channels * 4:
-            h, w = x.shape[-2:]
-            x = x.reshape(family.channels, 2, 2, h, w).permute(0, 3, 1, 4, 2).reshape(family.channels, h * 2, w * 2)
-        elif channels != family.channels:
-            return f"{channels} channels, where this VAE's latents have {family.channels}"
+        x = _frames(latents.detach(), family, grid)
+        if isinstance(x, str):
+            return x
+        if x.shape[0] == family.channels * 4:  # each 2x2 patch in the channels
+            c, t, h, w = family.channels, *x.shape[1:]
+            x = x.reshape(c, 2, 2, t, h, w).permute(0, 3, 4, 1, 5, 2).reshape(c, t, h * 2, w * 2)
+        if x.shape[0] != family.channels:
+            return f"{x.shape[0]} channels, where this VAE's latents have {family.channels}"
         with torch.no_grad():
-            x = x.float() if family.video else x.float()[:, None]
+            x = x.float()
             if x.shape[1] > FRAMES:
                 x = x[:, torch.linspace(0, x.shape[1] - 1, FRAMES, device=x.device).round().long()]
             longest = max(x.shape[-2:])
             if longest > LONGEST:
-                k = math.ceil(longest / LONGEST)
-                x = torch.nn.functional.avg_pool2d(x, k, ceil_mode=True)
-            factors = torch.tensor(family.factors, device=x.device)
-            bias = torch.tensor(family.bias, device=x.device)
+                x = torch.nn.functional.avg_pool2d(x, math.ceil(longest / LONGEST), ceil_mode=True)
+            key = (id(family), str(x.device))
+            if key not in self._factors:  # copied to the device once: a copy waits on its queue
+                self._factors[key] = (
+                    torch.tensor(family.factors, device=x.device),
+                    torch.tensor(family.bias, device=x.device),
+                )
+            factors, bias = self._factors[key]
             rgb = torch.einsum("cthw,cr->thwr", x, factors).add_(bias)
             rgb = rgb.add_(1.0).mul_(127.5).clamp_(0.0, 255.0).to(torch.uint8)
             if rgb.device.type != "cuda":
                 return rgb.cpu(), None
             pinned = self._pinned.get(tuple(rgb.shape))
             if pinned is None:
-                self._pinned = {tuple(rgb.shape): torch.empty(rgb.shape, dtype=torch.uint8, pin_memory=True)}
-                pinned = self._pinned[tuple(rgb.shape)]
+                pinned = torch.empty(rgb.shape, dtype=torch.uint8, pin_memory=True)
+                self._pinned = {tuple(rgb.shape): pinned}
             pinned.copy_(rgb, non_blocking=True)
             done = torch.cuda.Event()
             done.record()
@@ -292,6 +300,23 @@ class Previews:
         if why not in self._said:
             self._said.add(why)
             self._say(f"preview: {why}")
+
+
+def _frames(x: Tensor, family: Family, grid: tuple[int, ...] | None) -> Tensor | str:
+    """`x` as `[C, T, H, W]` (T 1 for a picture), or why it isn't one."""
+    shape = tuple(x.shape)
+    if grid is not None:
+        x = x[0] if x.dim() == 3 else x
+        if len(grid) not in (2, 3) or x.dim() != 2 or x.shape[0] != math.prod(grid):
+            return f"latents of shape {shape} are not [B,] N, C tokens on a grid {grid}"
+        x = x.reshape(*grid, x.shape[-1]).movedim(-1, 0)
+        return x if x.dim() == 4 else x[:, None]
+    if family.video:
+        x = x[0] if x.dim() == 5 else x
+        return x if x.dim() == 4 else f"latents of shape {shape} are not [B,] C, T, H, W"
+    x = x[0] if x.dim() == 5 or (x.dim() == 4 and x.shape[1] != 1) else x
+    x = x[:, 0] if x.dim() == 4 else x  # an image VAE's one frame
+    return x[:, None] if x.dim() == 3 else f"latents of shape {shape} are not [B,] C, H, W"
 
 
 class _Encoder:
