@@ -36,7 +36,7 @@ from torch.utils.hooks import RemovableHandle
 from cozy_runtime import graphs
 from cozy_runtime.author import _retained
 from cozy_runtime.author._errors import DoesNotFit, Fault, fault, is_capacity
-from cozy_runtime.author._model import WARNINGS, WarningRow
+from cozy_runtime.author._model import WARNINGS, WarningRow, recovered
 from cozy_runtime.internal import cache_owners, pacing, proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
@@ -1533,12 +1533,12 @@ class Memory:
         stats = self._tier().stats()
         rows: list[WarningRow] = []
         if stats["pin_failed"]:
-            rows.append(("a host page did not pin: its refills stay on the store", {}))
+            rows.append(recovered("a host page did not pin: its refills stay on the store"))
         if stats["refused"] is not None:
             rows.append(
-                (
+                recovered(
                     "weights stream from the store: pinning host memory failed",
-                    {"reason": stats["refused"][:300]},
+                    reason=stats["refused"][:300],
                 )
             )
         for row in rows:

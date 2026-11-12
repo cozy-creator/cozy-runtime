@@ -70,7 +70,7 @@ from cozy_runtime.accel.kernels import KernelsUnavailable, Launch, Plan, TritonK
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import Cancelled, DoesNotFit, is_capacity
-from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
+from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, recovered
 from cozy_runtime.author._services import counting, stage_tokens
 from cozy_runtime.graphs import (
     BYPASS,
@@ -300,7 +300,7 @@ def generate(
         say(
             type(model).__name__, f"[lm] {type(model).__name__} decodes through Transformers: {why}"
         )
-        row: WarningRow = ("decode ran through Transformers' loop", {"why": why})
+        row: WarningRow = recovered("decode ran through Transformers' loop", why=why)
         if row not in WARNINGS:
             WARNINGS.append(row)
         with contract.owned():  # the Runtime's own use of Transformers' loop and caches
@@ -1038,7 +1038,7 @@ class _Tell:
         except Exception as exc:  # the decode (perhaps other calls' too) outlives its report
             self.progress = None
             WARNINGS.append(
-                ("decode progress stopped: its report failed", {"error": str(exc)[:200]})
+                recovered("decode progress stopped: its report failed", error=str(exc)[:200])
             )
         finally:
             counting.reset(unit)
@@ -1690,7 +1690,9 @@ class _Engine:
                 f"lm:{type(self.model).__name__}:{request.fallback[:30]}",
                 f"[lm] {request.fallback}",
             )
-            WARNINGS.append(("decode ran through Transformers' loop", {"why": request.fallback}))
+            WARNINGS.append(
+                recovered("decode ran through Transformers' loop", why=request.fallback)
+            )
             return _transformers(
                 self.model,
                 request.inputs,
@@ -2033,7 +2035,7 @@ class _Engine:
         if request.draft is not None and id(request.draft) in self.unfit:
             request.draft = None
             request.warnings.append(
-                ("decoded without drafting", {"why": "the draft head does not fit"})
+                recovered("decoded without drafting", why="the draft head does not fit")
             )
         if request.draft is not None and request.draft is not self.draft:
             if len(free) < len(self.slots):
@@ -2094,9 +2096,6 @@ class _Engine:
                 # captures again where its pool finds room.
                 why = no_room(_set(self.domain).device, "its graphs' pool", 0, exc)
                 safeguard("no_room", f"{type(self.model).__name__}: {why}")
-                request.warnings.append(
-                    ("a CUDA graph was not used", {"module": type(self.model).__name__, "why": why})
-                )
                 self._forget()
             return True
         if occupied + rows > BUCKETS[-1]:
@@ -2142,7 +2141,7 @@ class _Engine:
         self._drop()
         self.draft, self.rehold = None, True
         request.draft = None
-        request.warnings.append(("decoded without drafting", {"why": why}))
+        request.warnings.append(recovered("decoded without drafting", why=why))
         return True
 
     def _shed(self, request: _Request, what: str, exc: BaseException) -> None:
@@ -2893,24 +2892,13 @@ class _Engine:
         self.pooled = hold
 
     def _unrecorded(self, key: _Key, why: str, code: str | None = "capture_refused") -> None:
-        """That step runs eagerly from now on, with a warning on the calls it serves, unless
-        `code` is None: a property of the code, in the record alone (`decode.refused`)."""
+        """That step runs eagerly from now on, counted in the record (`safeguard`: said once,
+        quietly) unless `code` is None: a property of the code, in the record alone
+        (`decode.refused`)."""
         self.unrecorded[key] = why
         if code is None:
             return
         safeguard(code, f"{type(self.model).__name__}: {why}")
-        warning: WarningRow = (
-            "a CUDA graph was not used",
-            {"module": type(self.model).__name__, "why": why},
-        )
-        for request in {id(r.request): r.request for r in self.slots if r is not None}.values():
-            if warning not in request.warnings:
-                request.warnings.append(warning)
-        for row in self.slots:
-            if row is not None:
-                row.request.warnings.append(
-                    ("a CUDA graph was not used", {"module": type(self.model).__name__, "why": why})
-                )
 
     def _drafting(self, size: int) -> bool:
         return (
