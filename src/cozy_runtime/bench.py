@@ -74,15 +74,18 @@ def attention_quality(
         return _run(lambda: attention.quality(kernel, seed, ctx, corpus))
 
 
-def gemm_speed(ctx: Context, *, lanes: str = "", shapes: str = "", seed: int = 177) -> Measured:
+def gemm_speed(
+    ctx: Context, tel: Telemetry, *, lanes: str = "", shapes: str = "", seed: int = 177
+) -> Measured:
     """Every GEMM candidate of each lane (`lanes`, comma-separated; empty is every one) at our packages' shapes
     (`shapes`: shape ids or model names, comma-separated; empty is every one), interleaved a sample at a time, beside the
-    pick the Runtime's rule makes (xs-177)."""
+    pick the Runtime's rule makes (xs-177). Its progress counts shapes under the stage "measure"."""
     from cozy_runtime.internal.bench import gemm
 
     chosen = [n for n in lanes.split(",") if n]
     wanted = [n for n in shapes.split(",") if n]
-    return _run(lambda: gemm.speed(chosen, wanted, seed, ctx))
+    with tel.stage("measure"):
+        return _run(lambda: gemm.speed(chosen, wanted, seed, ctx))
 
 
 def host_calibrate(ctx: Context) -> Measured:
@@ -93,12 +96,14 @@ def host_calibrate(ctx: Context) -> Measured:
     return _run(gemm.calibrate)
 
 
-def gemm_tiles(ctx: Context, *, seed: int = 177) -> Measured:
+def gemm_tiles(ctx: Context, tel: Telemetry, *, seed: int = 177) -> Measured:
     """Two of the Runtime's Triton kernels (nvfp4's weight decode and GEMV) over the tile settings that keep every output
-    bit, at our shapes: whether one card of a class wants another tile than its sibling (xs-177)."""
+    bit, at our shapes: whether one card of a class wants another tile than its sibling (xs-177). Its progress counts
+    tile sets under the stage "measure"."""
     from cozy_runtime.internal.bench import gemm
 
-    return _run(lambda: gemm.tiles(seed, ctx))
+    with tel.stage("measure"):
+        return _run(lambda: gemm.tiles(seed, ctx))
 
 
 def kernels_inventory(ctx: Context) -> Measured:
