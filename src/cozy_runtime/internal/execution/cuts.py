@@ -51,11 +51,17 @@ def install(module: nn.Module) -> int:
     cuts at the projection, whose [tokens, inner] intermediate is the widest), row bands for its
     channel RMS norms, and image or output-channel bands for its 2-D and 3-D convs (at the
     conv itself, so a subclass's forward around it, a causal pad, is untouched). Each site is
-    the module's path. A Transformers vision tower that reads packed patches and each picture's
+    the module's path. A Transformers gated MLP cuts by tokens as Diffusers' FFNs do, and a
+    Transformers vision tower that reads packed patches and each picture's
     grid (`forward(hidden_states, grid_thw)`: Qwen2.5-VL, Qwen3-VL, Qwen3.5) runs its pictures in
     groups. Returns how many it cut."""
     count = 0
     for path, sub in module.named_modules():
+        if _gated_mlp(sub) and "_cozy_cut" not in vars(sub):
+            sub.forward = catch.transparent(_ffn(f"{path}:tokens", sub, _forward(sub)))
+            vars(sub)["_cozy_cut"] = True
+            count += 1
+            continue
         if _tower(sub) and "_cozy_cut" not in vars(sub):
             sub.forward = catch.transparent(_pictures(f"{path}:pictures", sub, _forward(sub)))
             vars(sub)["_cozy_cut"] = True
@@ -208,7 +214,7 @@ def _ffn(site: str, module: nn.Module, forward: Forward) -> Forward:
             or x.dim() < 2
             or module.training
             or torch.is_grad_enabled()
-            or not type(module).forward.__module__.startswith("diffusers.")
+            or not type(module).forward.__module__.startswith(("diffusers.", "transformers."))
             or not _token_local(module)
         ):
             return forward(x, *args, **kwargs)
@@ -326,6 +332,15 @@ class _Whole(Exception):
 #: Qwen3.5-9B's tower (4.6 GiB live for 129,600 patches of width 1152, bf16, run 46568), and
 #: the rotary table it was refused growing
 _TOWER_WIDTHS = 24
+
+
+def _gated_mlp(module: nn.Module) -> bool:
+    """A Transformers gated MLP (`down(act(gate(x)) * up(x))`, every Llama-, Qwen- and
+    Mistral-style text encoder and LM): token by token, its [tokens, inner] intermediates the
+    widest a long prompt's prefill holds."""
+    if "forward" in vars(module) or not type(module).forward.__module__.startswith("transformers."):
+        return False
+    return {"gate_proj", "up_proj", "down_proj"} <= {name for name, _ in module.named_children()}
 
 
 def _tower(module: nn.Module) -> bool:

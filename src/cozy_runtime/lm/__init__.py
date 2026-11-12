@@ -161,6 +161,8 @@ BUCKETS = (1, 2, 4, 8, 16)
 DRAFT_ROWS = 4
 #: The most the draft head's prompt pass holds of attention scores at once (`_drafted_prompt`).
 DRAFT_SCORES = 256 << 20
+#: The most prompt tokens a gated-delta-net layer's prefill computes at once (`_prefill_pieces`).
+PREFILL_TOKENS = 4096
 
 
 #: Generation-config fields that add a logits processor to greedy decoding, and their no-op values.
@@ -450,6 +452,10 @@ def install(plan: Plan, model: torch.nn.Module) -> str:
     if ABSENT:
         return _report(plan, ABSENT)
     spaces = {sys.modules.get(type(module).__module__) for module in model.modules()}
+    for space in spaces:  # the prefill's pieces need no kernel: every device, from now on
+        current = getattr(space, "torch_chunk_gated_delta_rule", None)
+        if space is not None and callable(current) and not getattr(current, "_cozy_slot", False):
+            vars(space)["torch_chunk_gated_delta_rule"] = _prefill_pieces(current)
     slots = [
         (space, name)
         for space in spaces
@@ -585,6 +591,49 @@ def _conv_slot(original: _ConvUpdate, launch: Launch) -> _ConvUpdate:
 
     slot._cozy_slot = True  # type: ignore[attr-defined]  # a marker on the function object
     return slot
+
+
+def _prefill_pieces(original: _DeltaRule) -> _DeltaRule:
+    """A gated-delta-net layer's prompt in pieces of `PREFILL_TOKENS`, each starting from the
+    recurrent state the one before ended on: the torch path holds several fp32 copies of a
+    piece's queries, keys, values and decays, so a long prompt's held all at once (Qwen3.5's
+    upsampler at 31,804 tokens, 6.3 GiB live under an 8 GiB cap, run 46625). Pieces end on its
+    chunk boundaries, so each chunk is computed as in the whole call."""
+
+    def pieces(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        chunk_size: int = 64,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        length = int(query.shape[1])
+        piece = max(chunk_size, PREFILL_TOKENS // chunk_size * chunk_size)
+        if length <= piece or kwargs.get("cu_seqlens") is not None:
+            return original(
+                query, key, value, g, beta, chunk_size=chunk_size, initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **kwargs,
+            )  # fmt: skip
+        outs: list[torch.Tensor] = []
+        state = initial_state
+        for at in range(0, length, piece):
+            part = slice(at, at + piece)
+            out, state = original(
+                query[:, part], key[:, part], value[:, part], g[:, part], beta[:, part],
+                chunk_size=chunk_size, initial_state=state, output_final_state=True,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **kwargs,
+            )  # fmt: skip
+            outs.append(out)
+        return torch.cat(outs, 1), state if output_final_state else None
+
+    vars(pieces)["_cozy_slot"] = True
+    return cast("_DeltaRule", pieces)
 
 
 def _recurrent_slot(original: _DeltaRule, launch: Launch) -> _DeltaRule:
