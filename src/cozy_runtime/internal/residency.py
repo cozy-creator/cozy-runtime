@@ -2588,6 +2588,7 @@ class RequestStats(TypedDict):
     working_splits: list[SplitRecord]
     escaped: list[EscapeRecord]
     retries: int
+    reruns: list[Rerun]
     regrown: int
     swallowed_ooms: int
     retained_bytes: int
@@ -2620,6 +2621,19 @@ class SplitChoice(TypedDict):
 class SplitRefusal(TypedDict):
     level: int
     pure: bool
+
+
+class Rerun(TypedDict):
+    """A forward the driver's own allocation failed, run again (`execution.catch.rerun`): its
+    site, the error's first line, the reserve varena then left the driver, what it released for it,
+    the card's free bytes after, and the pause before (ms)."""
+
+    site: str
+    error: str
+    reserve: int
+    released: int
+    free: int
+    paused_ms: int
 
 
 class SplitRecord(TypedDict):
@@ -2795,8 +2809,11 @@ class Request:
         #: the attempt failed (its executor says): a refused allocation in its last pass is learned
         self.failed = False
         #: refusals the Runtime answered by running again another way (a pure op's finer split, an LM
-        #: token decoded eagerly for a capture its pool couldn't hold): zero in a normal run
+        #: token decoded eagerly for a capture its pool couldn't hold, a forward the driver's own
+        #: allocation failed): zero in a normal run
         self.retries = 0
+        #: of those, the forwards run again (`execution.catch.rerun`)
+        self.reruns: list[Rerun] = []
         #: refusals a CUDA graph capture answered by recording again with room for them
         #: (`graphs.capture`): what runs is the same
         self.regrown = 0
@@ -2947,6 +2964,7 @@ class Request:
             "working_splits": list(self.working_splits.values()),
             "escaped": list(self.escaped),
             "retries": self.retries,
+            "reruns": list(self.reruns),
             "regrown": self.regrown,
             "swallowed_ooms": self.swallowed_ooms,
             "retained_bytes": self.retained_bytes,

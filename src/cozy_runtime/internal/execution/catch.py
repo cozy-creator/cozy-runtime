@@ -4,14 +4,21 @@ A site lists its levels' shape estimates (`sizing`); native selection chooses on
 and observes it, all before a piece runs. A level nothing can make room for is refused there
 (`DoesNotFit`), naming the next step. An allocation refused inside the leaf is varena's to answer:
 it learns the level's need and says whether a Runtime-owned pure op runs again finer (Retry) or the
-refusal stands (Final). Nothing here decides that; package code never runs twice.
+refusal stands (Final). Nothing here decides that.
+
+The driver's own allocation (a kernel's code at its first launch, local memory, a library's handle)
+fails a launch, not an allocation of ours, so no reclaim answered it: a named forward (a block, a
+component) that it failed runs again once varena has given the driver room (`rerun`), where its
+operands show it wrote none of them.
 """
 
 from __future__ import annotations
 
+import enum
 import functools
 import sys
 import threading
+import time
 import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -24,10 +31,10 @@ from tensorfs import varena
 from torch import Tensor, nn
 
 from cozy_runtime.author._context import CURRENT as ATTEMPT
-from cozy_runtime.author._errors import ROOM, DoesNotFit, is_capacity
+from cozy_runtime.author._errors import RERAN, ROOM, DoesNotFit, from_driver, is_capacity
 from cozy_runtime.author._model import TRANSPARENT
 from cozy_runtime.internal.execution import phase, sizing
-from cozy_runtime.internal.residency import Model, Request
+from cozy_runtime.internal.residency import Model, Request, Rerun
 
 if TYPE_CHECKING:
     from tensorfs.varena._facts import SplitSelection
@@ -55,6 +62,13 @@ _SMALL = 64 << 20
 LEAF = threading.Lock()
 #: each key's last native choice, for a capture (which may not select) to record the same pieces
 LEVELS: dict[str, int] = {}
+#: A forward the driver's own allocation failed runs again at most this often, and waits at most
+#: this long all told for memory other programs took (varena's `OUTSIDE_WAIT`), once nothing of
+#: ours is left to give.
+_RERUNS = 16
+_RERUN_WAIT_S = 300.0
+#: set on a failure a named forward gave up running again: its enclosing ones do not try
+_FINAL = "cozy_rerun_final"
 
 
 class _Local(threading.local):
@@ -119,7 +133,7 @@ def _gib(n: int) -> str:
     return f"{n / (1 << 30):.1f} GiB"
 
 
-def _room_line() -> str:
+def _room_line(failure: BaseException) -> str:
     """The card's room now, for a device OOM's line (`_errors.ROOM`): read where the failure is
     classified, its frames still held."""
     try:
@@ -127,12 +141,17 @@ def _room_line() -> str:
             return "a card this process has not started"
         device = torch.cuda.current_device()
         room = vt.room(device)
+        offered = (
+            f"{_gib(room['driver_reserve'])} kept free for the driver"
+            if from_driver(failure)
+            else "every evictable byte offered"
+        )
     except Exception as exc:  # the line only describes the failure; it never replaces it
         return f"a room that could not be read ({type(exc).__name__})"
     return (
         f"{_gib(room['working_live'])} live and {_gib(room['pinned'])} of weights in use, "
         f"{_gib(room['weights_resident'])} resident, of {_gib(room['capacity'])} on GPU {device}, "
-        "every evictable byte offered"
+        f"{offered}"
     )
 
 
@@ -394,21 +413,137 @@ def passing(module: nn.Module, args: Args, kwargs: Kwargs) -> Iterator[None]:
             observation.complete()
 
 
+def _alone() -> bool:
+    """No other process runs this forward beside this one: a group's ranks meet in collectives,
+    so one running a forward again alone would wait for the others forever."""
+    return not (torch.distributed.is_available() and torch.distributed.is_initialized()) or (
+        torch.distributed.get_world_size() == 1
+    )
+
+
+#: operands a forward cannot change: anything else (a list, a dict, an object) might change unseen
+_PLAIN = (type(None), bool, int, float, str, bytes, slice, enum.Enum, torch.dtype, torch.device)
+
+
+def _untouched(args: Args, kwargs: Kwargs) -> Callable[[], bool] | None:
+    """A check that the forward has written none of its operands since, by their version counters;
+    None where it could not tell: an inference tensor keeps no version, and a list, a dict or an
+    object can change unseen. A forward that wrote one cannot run again."""
+    kept: list[tuple[Tensor, int]] = []
+
+    def plain(value: object, depth: int) -> bool:
+        if isinstance(value, Tensor):
+            if value.is_inference():
+                return False
+            kept.append((value, value._version))
+            return True
+        if isinstance(value, tuple):
+            return depth > 0 and all(plain(item, depth - 1) for item in value)
+        return isinstance(value, _PLAIN)
+
+    if not (plain(tuple(args), 3) and all(plain(v, 2) for v in kwargs.values())):
+        return None
+    return lambda: all(t._version == version for t, version in kept)
+
+
+def _note(exc: BaseException, key: str, value: object) -> None:
+    try:
+        setattr(exc, key, value)
+    except AttributeError:  # an exception type with no instance attributes
+        pass
+
+
+def rerun(
+    request: Request, name: str, exc: BaseException, untouched: bool, attempt: int, waited: float
+) -> float | None:
+    """Whether the named forward `exc` ended runs again, and after how long a pause. A failure of
+    the driver's own allocation (`from_driver`): its frames and tensors go, varena grows the reserve
+    its maps leave the driver and gives up what it can (`vt.driver_short`), and it runs again; with
+    nothing of ours left to give, after a pause, while memory other programs took may come back.
+    None: the failure stands. A forward that wrote an operand in place leaves it to the forward
+    around it, as one whose operands it could not check; past the last lever the failure is final
+    for every enclosing one."""
+    if getattr(exc, _FINAL, False) or not from_driver(exc) or not untouched:
+        return None
+    _unwind(exc)  # the failed attempt's tensors go before varena counts the room
+    try:
+        short = vt.driver_short(request.memory.device.index or 0)
+    except Exception as refused:  # the failure stands, and says why nothing could run again
+        why = f"{type(refused).__name__}: {refused}"
+        _note(exc, RERAN, f"varena could not give the driver room ({why})")
+        return None
+    line = str(exc).partition("\n")[0][:200]
+    gave = bool(short["released"] or short["grew"])
+    if attempt >= _RERUNS or not (gave or (short["others"] and waited < _RERUN_WAIT_S)):
+        tried = f"ran again {attempt} times, nothing more to give"
+        _note(exc, RERAN, tried if attempt else "nothing to give")
+        _note(exc, _FINAL, True)
+        return None
+    pause = 0.0 if gave else min(0.25 * 2**attempt, 8.0, _RERUN_WAIT_S - waited)
+    if pause:
+        print(
+            f"cozy-runtime: {name}: {line}: waiting {pause:.2f} s for the "
+            f"{_gib(short['others'])} other programs took",
+            file=sys.stderr,
+        )
+        end = time.monotonic() + pause
+        while (left := end - time.monotonic()) > 0:
+            checkpoint()
+            time.sleep(min(left, 0.25))
+    request.retries += 1
+    request.reruns.append(
+        Rerun(
+            site=name,
+            error=line,
+            reserve=short["reserve"],
+            released=short["released"],
+            free=short["free"],
+            paused_ms=int(pause * 1000),
+        )
+    )
+    print(
+        f"cozy-runtime: {name}: {line}: varena leaves the driver {_gib(short['reserve'])} and gave "
+        f"up {_gib(short['released'])} for it: running it again",
+        file=sys.stderr,
+    )
+    return pause
+
+
 def wrap(
     module: nn.Module,
     name: str,
     around: Callable[[nn.Module, Args, Kwargs], AbstractContextManager[None]] | None = None,
 ) -> None:
-    """Name a block's execution sites and invoke its forward exactly once."""
+    """Name a block's execution sites and invoke its forward: once, or again after a failure of the
+    driver's own allocation (`rerun`)."""
     forward: Forward = vars(module).get("forward") or current(module)
 
     def named(*args: object, **kwargs: object) -> object:
         outer = _local.named, _local.ordinals
-        _local.named, _local.ordinals = name, {}
+        attempt, waited = 0, 0.0
         try:
-            checkpoint()
-            with nullcontext() if around is None else around(module, args, kwargs):
-                return forward(*args, **kwargs)
+            while True:
+                _local.named, _local.ordinals = name, {}
+                request = CURRENT.get()
+                rerunnable = (
+                    request is not None
+                    and request.memory.cuda
+                    and not request.idle
+                    and not _capturing()
+                    and _alone()
+                )
+                untouched = _untouched(args, kwargs) if rerunnable else None
+                try:
+                    checkpoint()
+                    with nullcontext() if around is None else around(module, args, kwargs):
+                        return forward(*args, **kwargs)
+                except BaseException as exc:
+                    if request is None or untouched is None:
+                        raise
+                    pause = rerun(request, name, exc, untouched(), attempt, waited)
+                    if pause is None:
+                        raise
+                    attempt, waited = attempt + 1, waited + pause
         finally:
             _local.named, _local.ordinals = outer
 
