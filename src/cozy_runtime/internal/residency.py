@@ -2508,8 +2508,8 @@ class Memory:
         if any(b.retained for b in model.groups()):
             # Held blocks are in the pass's held bytes already: the floor is what still streams
             # (a decode keeping what fits, `keep`).
-            common = model.common
-            floor = (common.allocation_bytes if common is not None and not common.retained else 0) + max(
+            shared = model.common
+            floor = (shared.allocation_bytes if shared and not shared.retained else 0) + max(
                 (b.allocation_bytes for b in model.blocks.values() if not b.retained), default=0
             )
         device = self.device.index or 0
