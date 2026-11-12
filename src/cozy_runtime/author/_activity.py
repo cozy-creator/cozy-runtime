@@ -1,6 +1,6 @@
-"""A call's clocks: its waits for a turn and its asides are off its stage and step timers, and a
-stage ends with its device work. `ThreadPoolExecutor` runs submitted work in its submitter's
-context.
+"""A call's clocks: its waits for a turn and the Runtime's phases (`_phases`: a weight load, a
+compile) are off its stage and step timers, and a stage ends with its device work.
+`ThreadPoolExecutor` runs submitted work in its submitter's context.
 """
 
 from __future__ import annotations
@@ -13,13 +13,8 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor as PythonThreadPoolExecutor
 from contextlib import AbstractContextManager
-from contextvars import ContextVar
 
 _WAITED = threading.local()
-#: Records a named span on the running attempt (its stage row), set where the attempt runs.
-_ASIDE: ContextVar[Callable[[str, float], None] | None] = ContextVar(
-    "cozy_attempt_aside", default=None
-)
 #: Waits for the device work this process queued; none without a device.
 _SETTLE: Callable[[], None] | None = None
 #: Bound only after Runtime initializes its device. Called on the submitting thread to
@@ -42,29 +37,15 @@ def work_clock() -> float:
     return time.perf_counter() - getattr(_WAITED, "seconds", 0.0)
 
 
-@contextlib.contextmanager
-def asides(record: Callable[[str, float], None]) -> Iterator[None]:
-    """Where an attempt runs: `aside` spans inside are recorded through `record(name, ms)`."""
-    token = _ASIDE.set(record)
-    try:
-        yield
-    finally:
-        _ASIDE.reset(token)
+def off_clock(seconds: float) -> None:
+    """`seconds` of this thread's time went to work outside the stage open around it (a phase,
+    `_phases`): off the stage and step clocks."""
+    _WAITED.seconds = getattr(_WAITED, "seconds", 0.0) + seconds
 
 
-@contextlib.contextmanager
-def aside(name: str) -> Iterator[None]:
-    """Work the running attempt does outside the stage open around it (a wait for its
-    weights): off the stage and step clocks, and in the record as its own stage."""
-    start = time.perf_counter()
-    try:
-        yield
-    finally:
-        elapsed = time.perf_counter() - start
-        _WAITED.seconds = getattr(_WAITED, "seconds", 0.0) + elapsed
-        record = _ASIDE.get()
-        if record is not None and elapsed >= 1e-3:  # a wait that was none is not a row
-            record(name, elapsed * 1000)
+def waited() -> float:
+    """This thread's seconds off the clocks so far: what a step's device time leaves out."""
+    return float(getattr(_WAITED, "seconds", 0.0))
 
 
 def settles(wait: Callable[[], None]) -> None:

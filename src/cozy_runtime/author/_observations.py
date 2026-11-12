@@ -337,8 +337,9 @@ class Track:
     ended_unix_ms: int = 0
     series: list[tuple[int, float]] | None = None
     series_dropped: int = 0
-    #: a step track's device marks around each step (its device time, read at the end)
-    marks: list[tuple[object, object]] | None = None
+    #: a step track's device marks around each step (its device time, read at the end), and the
+    #: ms of it the host spent off the clocks (a phase: a first read of the weights)
+    marks: list[tuple[object, object, float]] | None = None
     #: a step track's `(first step, plans)` rows: each change of the plans its steps ran
     plans: list[tuple[int, str]] | None = None
 
@@ -379,7 +380,8 @@ class Track:
         if self.plans:
             document["plans"] = [[step, plans] for step, plans in self.plans]
         if self.marks and DEVICE:
-            device = [round(DEVICE[0].between(a, b), 3) for a, b in self.marks]
+            clock = DEVICE[0]
+            device = [round(max(clock.between(a, b) - off, 0.0), 3) for a, b, off in self.marks]
             document["device"] = {
                 "count": len(device),
                 "total_ms": round(sum(device), 3),
@@ -407,7 +409,7 @@ class Attribution:
     def stage(self, name: str, ms: float) -> None:
         self._track(self.stages, name).add(ms)
 
-    def step(self, name: str, ms: float, marks: tuple[object, object] | None = None) -> None:
+    def step(self, name: str, ms: float, marks: tuple[object, object, float] | None = None) -> None:
         track = self._track(self.steps, name, series=True)
         track.add(ms)
         if PLANS:

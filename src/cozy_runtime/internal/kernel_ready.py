@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Protocol, cast
 
+from cozy_runtime.author import _phases
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, Building, Yielded
@@ -175,10 +176,11 @@ def prime[T](name: str, opener: Opener[T]) -> None:
 
 
 def _primed(name: str) -> None:
-    """Waits for `name`'s `prime`d opener to end."""
+    """Waits for `name`'s `prime`d opener to end: a call's phase, `opening <kernel>`."""
     slot = _SLOTS.get(name)
-    if slot is not None and slot.primed is not None:
-        slot.primed.wait()
+    if slot is not None and slot.primed is not None and not slot.primed.is_set():
+        with _phases.phase(f"opening {name}"):
+            slot.primed.wait()
 
 
 def settle() -> None:
@@ -186,8 +188,11 @@ def settle() -> None:
     states (`pending`) is what its first request's boundary can agree on."""
     with _LOCK:
         primes = [slot.primed for slot in _SLOTS.values() if slot.primed is not None]
-    for primed in primes:
-        primed.wait()
+    if all(primed.is_set() for primed in primes):
+        return
+    with _phases.phase("opening kernels"):
+        for primed in primes:
+            primed.wait()
 
 
 def opened[T](name: str) -> T | None:

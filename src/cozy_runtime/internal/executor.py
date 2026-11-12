@@ -101,7 +101,7 @@ from cozy_runtime.accel import stepcache
 from cozy_runtime.accel.attention import _close as close_producer_states
 from cozy_runtime.accel.kernels import _SETS as KERNEL_SETS
 from cozy_runtime.accel.kernels import Launch, Plan, TritonKernels
-from cozy_runtime.author import _activity, _split
+from cozy_runtime.author import _activity, _phases, _split
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._artifacts import ModelChoice
@@ -436,6 +436,54 @@ def _env_document() -> Reply:
 #: The call the current thread serves ("" outside every call): its requests and its compile
 #: waits' progress name it.
 _CALL: contextvars.ContextVar[str] = contextvars.ContextVar("cozy_call", default="")
+#: This thread serves a command the machine is shown the phases of (`_phases`): GPU 0's, past
+#: an import-only start (a process that may still fork starts no thread).
+_TELLS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_tells", default=False)
+
+
+class _CommandTeller:
+    """A command's phases outside any attempt (`_phases`): the executor's start, a load, a
+    construction, told to the machine as its call's stage."""
+
+    __slots__ = ("_channel", "owner")
+    base = ""
+
+    def __init__(self, channel: Channel, call: str) -> None:
+        self._channel, self.owner = channel, call
+
+    def tell(self, stage: str, position: int | None, total: int | None, unit: str) -> bool:
+        with contextlib.suppress(SeamError):
+            self._channel.send(
+                {
+                    "event": "progress",
+                    "request_id": self.owner,
+                    "kind": "progress",
+                    "stage": stage,
+                    "stage_fraction": round(min(position / total, 1.0), 6)
+                    if position is not None and total
+                    else None,
+                    "position": position,
+                    "total": total,
+                    "unit": unit,
+                    "advance": 0,
+                }
+            )
+        return True
+
+    def back(self) -> None:
+        """The next command or attempt says its own stage."""
+
+    def row(self, name: str, ms: float) -> None:
+        """Its record has its legs (`stage`): no row here."""
+
+
+def _command_teller(channel: Channel) -> _CommandTeller | None:
+    return _CommandTeller(channel, _CALL.get()) if _TELLS.get() else None
+
+
+def _package(application: str) -> str:
+    """How a phase names the package an `<module>:<app>` application is: its module."""
+    return application.partition(":")[0] or "the package"
 
 
 @contextlib.contextmanager
@@ -2065,8 +2113,9 @@ class Executor:
                         refuse=self._refuse_start,
                     )
                 if not self.group.followers:
-                    self.group.spawn()
-                    self.group.dial_back(_SEALED)
+                    with _phases.phase("starting the group's GPUs"):
+                        self.group.spawn()
+                        self.group.dial_back(_SEALED)
                 # TensorD's lease listeners admit only its tenants: it registers each follower
                 # from this frame, before the follower's Start opens its memory, pairing them
                 # with GPUs by position (rank 1 first).
@@ -2074,7 +2123,8 @@ class Executor:
                 self.group.start(commands.encode(command))
                 stage("followers_spawned")
             if device:
-                import torch
+                with _phases.phase("importing PyTorch"):
+                    import torch
 
                 if command.import_only:
                     driverless.enter_context(zygote.driverless(torch, len(_sealed_entries())))
@@ -2083,7 +2133,8 @@ class Executor:
                 if not command.import_only:
                     self.torch = torch
                     try:
-                        refused = self._initialize_device(torch)
+                        with _phases.phase("starting the GPU"):
+                            refused = self._initialize_device(torch)
                     except RuntimeError as exc:
                         # No room for a context is the device's memory, not its absence: the
                         # worker starts again once a call beside it has given the room.
@@ -2100,11 +2151,15 @@ class Executor:
                         return self._close_after(refused)
                     stage("cuda_init")
                 if constructs and not imported:
-                    for name in _CONSTRUCTION_MODULES:
-                        importlib.import_module(name)
+                    with _phases.phase("importing the Runtime"):
+                        for name in _CONSTRUCTION_MODULES:
+                            importlib.import_module(name)
                     stage("runtime_imports")
             if self.discovered is None:
-                self._discover_provisioned(command.application, str(command.package_interface))
+                with _phases.phase(f"importing {_package(command.application)}"):
+                    self._discover_provisioned(
+                        command.application, str(command.package_interface)
+                    )
                 stage("package_import")
             # A fork's own Start names them again; its import-only parent installed them.
             self.call_interfaces = tuple(command.call_interfaces) or self.call_interfaces
@@ -2120,10 +2175,12 @@ class Executor:
                         self._refusal("cuda_initialized_before_runtime", self.poisoned)
                     )
             else:
-                warmup_error = self._warm_package()
+                with _phases.phase(f"warming {_package(command.application)}"):
+                    warmup_error = self._warm_package()
                 stage("package_warmup")
             if self.group is not None:
-                replies = self.group.collect("start")
+                with _phases.phase("starting the group's GPUs"):
+                    replies = self.group.collect("start")
                 stage("group_start")
                 self.follower_stages = [list(reply.get("stages") or []) for reply in replies]
                 for follower, reply in zip(self.group.followers, replies, strict=True):
@@ -2137,11 +2194,12 @@ class Executor:
                     self.pg = self.group.form(cast("ModuleType", self.torch), _SEALED)  # opened above
                     stage("group_form")
                 elif not command.import_only:
-                    measured = links.measured(
-                        links.directory(_SEALED),
-                        _sealed_entries()[:degree],
-                        functools.partial(_waiting, self.channel),
-                    )
+                    with _phases.phase("measuring the links between GPUs"):
+                        measured = links.measured(
+                            links.directory(_SEALED),
+                            _sealed_entries()[:degree],
+                            functools.partial(_waiting, self.channel),
+                        )
                     stage("group_links")
                     self.transport = links.Transport(
                         degree, _gpu_numbers(degree), "nccl", measured.nccl(), measured
@@ -2543,8 +2601,20 @@ class Executor:
         return reply
 
     def _prepare_first(self, command: Load, forwarded: Forwarded) -> Reply:
-        """Construct and fill one construction (or one model of a many-model one)."""
-        with self._device_work():
+        """Construct and fill one construction (or one model of a many-model one), its model's
+        phase while it does (`constructing <parameter>`; a many-model one's are its models')."""
+        models = command.models
+        one = (
+            len(models) == 1
+            and bool(models[0].model_class)
+            and not (self._group_parent is None and self._deferred(models[0]))
+        )
+        named = f"constructing {models[0].model_parameter_name}" if one else ""
+        # The record has its legs (`on_demand`, `construction`): no row of its own.
+        with (
+            self._device_work(),
+            _phases.phase(named, row=False) if named else contextlib.nullcontext(),
+        ):
             return self._prepare(command, forwarded)
 
     def _prepare(self, command: Load, forwarded: Forwarded) -> Reply:
@@ -2646,7 +2716,8 @@ class Executor:
         # Kernel integration imports may query the CUDA device (for example,
         # Diffusers importing TorchAO's optional Triton kernels). Runtime must
         # establish the selected device before loading those modules.
-        refused = self._initialize_device(torch)
+        with _phases.phase("starting the GPU"):
+            refused = self._initialize_device(torch)
         if refused is not None:
             self.poisoned = f"prepare refused: {refused['code']}"
             return refused
@@ -2692,7 +2763,8 @@ class Executor:
             stage("group_broadcast")
 
         if self.discovered is None:
-            self._discover_provisioned(binding.application, binding.package_interface)
+            with _phases.phase(f"importing {_package(binding.application)}"):
+                self._discover_provisioned(binding.application, binding.package_interface)
         stage("package_import")
 
         # The header ref identifies stored weights and metadata. Runtime opens it through
@@ -5382,6 +5454,7 @@ def serve(executor: Executor, channel: Channel) -> int:
     as does any other command that is first and not a call's."""
     kernel_compile.waiting = functools.partial(_compiling, channel)
     request_path.told = functools.partial(_waiting, channel)
+    _phases.command = functools.partial(_command_teller, channel)
     # Runtime-owned workers, none before the first is needed.
     pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=crash.arm)
     order = executor.order = _Order()
@@ -5462,6 +5535,10 @@ def _reply(executor: Executor, frame: Frame) -> Frame | None:
         # process is poisoned before it answers anything, and the worker's next
         # command reads `poisoned_generation` and rebuilds the whole cgroup.
         executor.poisoned = f"group: {executor.group.broken}"[:200]
+    tells = executor.rank == 0 and (
+        executor.started or (name == "start" and not frame.get("import_only"))
+    )
+    told = _TELLS.set(tells)
     try:
         with executor._execution_context():
             reply = answer(executor, frame)
@@ -5480,6 +5557,8 @@ def _reply(executor: Executor, frame: Frame) -> Frame | None:
         }
         if name in _TRACED_COMMANDS:
             reply["traceback"] = prepare_diagnostics.exception_trace(exc)
+    finally:
+        _TELLS.reset(told)
     reply["reply"] = name
     return reply
 
