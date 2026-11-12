@@ -360,11 +360,12 @@ class _Broker:
                 row = (
                     "a package call passed media its callee has no use for; it was left out"
                     if change.kind == "ignored"
-                    else "a package call passed a value over its callee's limit; it was clamped",
+                    else "a package call passed a value its callee adjusted",
                     {
                         "callee": f"{module}:{export}",
                         "field": change.field,
                         "applied": str(change.applied),
+                        "reason": change.reason,
                     },
                 )
                 if row not in WARNINGS:

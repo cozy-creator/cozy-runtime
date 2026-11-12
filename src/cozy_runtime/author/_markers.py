@@ -525,3 +525,42 @@ def Placeholder(text: str) -> msgspec.Meta:
 def Advanced() -> msgspec.Meta:
     """Under More, in the collapsed Advanced section: expert settings such as steps."""
     return _meta({"advanced": True})
+
+
+def When(field: str, *values: str | int | float | bool) -> msgspec.Meta:
+    """Applies only while the sibling `field` is truthy, or equals one of `values`; else the box
+    dulls it and a run takes its default, with a warning: `When("prompt_upsampling")`,
+    `When("mode", "edit", "inpaint")`."""
+    if not isinstance(field, str) or not field.isidentifier():
+        raise ConformanceError("When(field, *values) names a field beside it", code="tool_marker")
+    for value in values:
+        finite = type(value) is not float or math.isfinite(value)
+        if type(value) not in (str, int, float, bool) or not finite:
+            raise ConformanceError(
+                f"When values are words, numbers or booleans, not {value!r}", code="tool_marker"
+            )
+    return _meta({"when": {"field": field, **({"values": list(values)} if values else {})}})
+
+
+def applies(when: Mapping[str, object], value: object) -> bool:
+    """Whether a `When` holds for its field's wire `value`: truthy, or one of its values."""
+    values = when.get("values")
+    if not isinstance(values, list) or not values:
+        return bool(value)
+    numbers = (int, float)
+    return any(
+        v == value and (type(v) is type(value) or (type(v) in numbers and type(value) in numbers))
+        for v in values
+    )
+
+
+def condition(when: Mapping[str, object], toggle: bool = True) -> str:
+    """A `When` in words, its field a `toggle` or not: `only with prompt_upsampling on`,
+    `only with batch_size set`, `only when mode is edit or inpaint`."""
+    field, values = when.get("field"), when.get("values")
+    if not isinstance(values, list) or not values:
+        return f"only with {field} {'on' if toggle else 'set'}"
+    if len(values) == 1 and type(values[0]) is bool:
+        return f"only with {field} {'on' if values[0] else 'off'}"
+    said = (str(v).lower() if type(v) is bool else str(v) for v in values)
+    return f"only when {field} is {' or '.join(said)}"

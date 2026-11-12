@@ -208,6 +208,12 @@ def bind(
         if given is not None
         else {key: spec.dtype for key, spec in artifact.tensor_schema.items()}
     )
+    stated = artifact.config._tensor_shapes
+    shapes = (
+        dict(stated)
+        if stated is not None
+        else {key: spec.shape for key, spec in artifact.tensor_schema.items()}
+    )
     magnitudes: dict[str, str] = {}
     for row in graph.layers:
         prefix = row.component + "." + row.target
@@ -215,20 +221,24 @@ def bind(
             key = prefix + ".base_layer." + role
             if key in dtypes:
                 dtypes[prefix + "." + role] = dtypes.pop(key)
+            if key in shapes:
+                shapes[prefix + "." + role] = shapes.pop(key)
         for role in ("A", "B"):
             dtypes.pop(prefix + f".lora_{role}.{row.adapter}.weight", None)
+            shapes.pop(prefix + f".lora_{role}.{row.adapter}.weight", None)
         if row.dora:
             key = prefix + f".lora_magnitude_vector.{row.adapter}.weight"
             if key not in dtypes:
                 raise _refuse("graph", f"{key}: a DoRA layer the view stores no magnitude of")
             stored = str(dtypes.pop(key))
+            shapes.pop(key, None)
             magnitudes[key] = canonical_dtype(TENSORFS_DTYPES.get(stored, stored))
     return replace(
         artifact,
         snapshot=prepared_snapshot or artifact.snapshot,
         variant=prepared_snapshot or artifact.variant,
         _selection_snapshot=artifact._selection_snapshot or artifact.snapshot,
-        config=ModelConfig(artifact.config.mapping(), tensor_dtypes=dtypes),
+        config=ModelConfig(artifact.config.mapping(), tensor_dtypes=dtypes, tensor_shapes=shapes),
         _prepare=composer(graph, magnitudes),
         _adapters=graph.adapters,
     )

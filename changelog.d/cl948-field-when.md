@@ -1,0 +1,1 @@
+`When(field, *values)` (`cozy_runtime.fields`): a field applies only while a sibling field is truthy, or equals one of `values`. The interface carries it as `extra.when`; a request that sets an inactive field gets its default, with an `adjusted` row naming the condition. Optional; nothing a package already writes changes.

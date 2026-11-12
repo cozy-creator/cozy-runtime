@@ -71,7 +71,9 @@ def generate(ctx: Context, payload: Request, model: Flow, out: Outputs, tel: Tel
 - `ctx.progress(i, n)`: step `i` of `n` is done.
 - `rng.noise`, `rng.counter_noise`, `rng.generator`: seeded noise, the same on every device.
 - `split(fn, x, Cut(dim))`, `retained(nbytes)`: fit a big op, keep tensors across steps.
-- `cozy_runtime.image`: `ImageRequest`, `ImageResult`, `Steps`, `Guidance`, `Sizes`, `held`.
+- `cozy_runtime.image`: `ImageRequest`, `ImageResult`, `Steps`, `Guidance`, `Sizes`, `held`;
+  `Control[Literal[...]]`, a control map of the kinds the function has adapters for (others are
+  dropped with a row).
 - `cozy_runtime.fields`: `Prompt`, `AspectRatio`, `Advanced`, `Label`, `Range`, `Ratios`.
 - `cozy_runtime.media`: `ImageFile`, `VideoFile`, `AudioFile`, and video and audio decoding.
 - `cozy_runtime.attention.Attention`: an attention call the Runtime picks the kernel for;
