@@ -18,6 +18,7 @@ from cozy_runtime.author._markers import (
     Spans,
     Total,
     VideoPreparation,
+    When,
 )
 from cozy_runtime.author._tool import (
     MENTION,
@@ -55,5 +56,6 @@ __all__ = [
     "Total",
     "Video",
     "VideoPreparation",
+    "When",
     "name_key",
 ]
