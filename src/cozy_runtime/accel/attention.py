@@ -145,7 +145,7 @@ class ProducerCall:
 
 
 @dataclass(frozen=True, slots=True)
-class AttentionProducer:
+class AttentionProducer:  # type: ignore[explicit-any]  # `produce`'s (below)
     """A package's own attention call, selectable by `name` like any Runtime backend.
 
     Runtime serves it through `base`, one of its sparse (Sol-family) backends: the base's
@@ -172,7 +172,7 @@ class AttentionProducer:
 
     name: str
     base: str
-    produce: Callable[Concatenate[ProducerCall, ...], Tensor]
+    produce: Callable[Concatenate[ProducerCall, ...], Tensor]  # type: ignore[explicit-any]  # each model's processor arguments
     """`produce(call, *args, **kwargs)`: the site's call, with its Diffusers processor's own
     arguments (each model's differ)."""
     validate: Callable[[object], None]

@@ -55,17 +55,21 @@ def cards(devices: str) -> dict[int, str]:
 
 
 def boot(row: arch.Row) -> list[attention.Candidate]:
-    """What a card builds ahead of any request: the first kernel the row runs at each level of
-    its cells, dense and sparse, and the dense kernels those compute with. Every installed
-    package's declared levels are among them; a later kernel builds when a site reaches it."""
-    found: list[attention.Candidate] = []
-    for cells in (attention.DENSE, attention.SPARSE):
-        for names in cells.get(row.family, {}).values():
-            for candidate in (attention.BY_NAME[n] for n in names):
+    """What a card builds ahead of any request: in each cell of its class (`attention.TABLE`),
+    the first kernel the row runs in each token bucket, and the dense kernels those compute
+    with, exact rows included. Every installed package's declared levels are among them; a later
+    kernel builds when a site reaches it."""
+    found: dict[str, attention.Candidate] = {}
+    klass = arch.klass(row)
+    for cell in attention.TABLE.document.cells:
+        for ranking in cell.order if cell.klass == klass else ():
+            for candidate in (attention.BY_NAME[n] for n in ranking):
                 if not attention._off_row(candidate, row):
-                    found += [candidate, *(attention.BY_NAME[n] for n in candidate.dense)]
+                    for name in (candidate.name, *candidate.dense, candidate.exact_rows):
+                        if name:
+                            found.setdefault(name, attention.BY_NAME[name])
                     break
-    return found
+    return list(found.values())
 
 
 def triton_sets(row: arch.Row) -> list[TritonKernels]:
@@ -90,12 +94,22 @@ def _job(artifact: str, sm: int, device: str) -> kernel_compile.Job | None:
     return dataclasses.replace(job, env={"CUDA_VISIBLE_DEVICES": device})
 
 
-def jobs(present: Mapping[int, str]) -> list[kernel_compile.Job]:
-    """Each card architecture's attention (`boot`), once per key, none the wheel serves; its
-    LoRA bake set; and its Runtime Triton sets (`triton_sets`)."""
+def rows(present: Mapping[int, str]) -> dict[int, arch.Row]:
+    """Each card architecture's row, with its half-rate accumulation (NVML's brand), read before
+    this process hides its GPUs."""
+    return {
+        sm: dataclasses.replace(arch.row(sm), half_accumulate=accel.half_accumulate(device))
+        for sm, device in present.items()
+    }
+
+
+def jobs(present: Mapping[int, str], held: Mapping[int, arch.Row]) -> list[kernel_compile.Job]:
+    """Each card architecture's attention (`boot`, by its row in HELD), once per key, none the
+    wheel serves; its LoRA bake set; and its Runtime Triton sets (`triton_sets`)."""
     found: dict[str, kernel_compile.Job] = {}
     for sm, device in sorted(present.items()):
-        for candidate in boot(arch.row(sm)):
+        row = held[sm]
+        for candidate in boot(row):
             if candidate.artifact and not prebuilt.serves(candidate.name, sm):
                 job = _job(candidate.artifact, sm, device)
                 if job is not None:
@@ -103,7 +117,7 @@ def jobs(present: Mapping[int, str]) -> list[kernel_compile.Job]:
         if lora_bake.KERNELS.entries and not triton_kernels.TRITON_ABSENT:
             bake = triton_kernels.job(lora_bake.KERNELS, sm)
             found.setdefault(bake.key.digest, bake)
-        for kernels in triton_sets(arch.row(sm)):
+        for kernels in triton_sets(row):
             job = triton_kernels.job(kernels, sm)
             found.setdefault(job.key.digest, job)
     return list(found.values())
@@ -131,6 +145,7 @@ def main() -> int:
     store = kernel_cache.from_sealed(environment)
     devices = config.parse_visible_devices(environment.get("CUDA_VISIBLE_DEVICES")) or ()
     present = cards(",".join(devices))
+    held = rows(present)
     if store is not None and len(devices) > 1 and all(map(accel.device_capability, devices)):
         began = time.perf_counter()
         measured = links.measured(links.directory(environment), devices)
@@ -151,7 +166,7 @@ def main() -> int:
     if store is not None and present:
         kernel_cache.configure(store)
         kernel_compile.waiting = progress
-        built = jobs(present)
+        built = jobs(present, held)
         for job in built:
             kernel_compile.submit(store, job)
         sources = [job for job in built if job.key.kernel == kernel_sources.PYTHON]

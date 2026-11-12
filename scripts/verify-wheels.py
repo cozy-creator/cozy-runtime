@@ -42,6 +42,7 @@ def main() -> None:
             "_gemm.abi3.so",
             "_norm.abi3.so",
             "_attn4.abi3.so",
+            "_crash.abi3.so",
             *(("_fa3.abi3.so", "_sage3.abi3.so") * (arch == "x86_64")),
         ),
     }

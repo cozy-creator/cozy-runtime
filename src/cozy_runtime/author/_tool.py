@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Annotated, Generic, NewType, TypeVar
+from typing import TYPE_CHECKING, Annotated, Generic, NewType
 
 import msgspec
 
@@ -41,10 +41,12 @@ def spoken(text: str) -> str:
 
 class Image(msgspec.Struct, frozen=True, kw_only=True, tag_field="type", tag="image"):
     """A picture and what it shows: what a mention of a picture box gives, or a slot holds. Read
-    upright and scaled down to 16 MP at most; `file.read(max_pixels=)` reads it smaller."""
+    upright and scaled down to 16 MP at most; `file.read(max_pixels=)` reads it smaller.
+    `metadata` is what its version's file says of itself (`File.with_metadata`)."""
 
     file: Annotated[ImageFile, ImagePreparation(max_pixels=16 << 20)]
     description: str = ""
+    metadata: dict[str, object] = msgspec.field(default_factory=dict)
 
 
 class Video(msgspec.Struct, frozen=True, kw_only=True, tag_field="type", tag="video"):
@@ -53,6 +55,8 @@ class Video(msgspec.Struct, frozen=True, kw_only=True, tag_field="type", tag="vi
 
     file: VideoFile
     description: str = ""
+    #: `{"orbit": {"degrees": 360, "direction": "cw", "loops": True}}` for an orbit.
+    metadata: dict[str, object] = msgspec.field(default_factory=dict)
 
 
 class Audio(msgspec.Struct, frozen=True, kw_only=True, tag_field="type", tag="audio"):
@@ -60,10 +64,18 @@ class Audio(msgspec.Struct, frozen=True, kw_only=True, tag_field="type", tag="au
 
     file: AudioFile
     description: str = ""
+    metadata: dict[str, object] = msgspec.field(default_factory=dict)
 
 
-#: What a prompt's references may be: `Prompt[Image]` narrows it.
-T = TypeVar("T", bound=Image | Video | Audio)
+if TYPE_CHECKING:
+    from typing_extensions import TypeVar
+
+    #: What a prompt's references may be: `Prompt[Image]` narrows it; bare `Prompt` takes all three.
+    T = TypeVar("T", bound=Image | Video | Audio, default=Image | Video | Audio)
+else:
+    from typing import TypeVar
+
+    T = TypeVar("T", bound=Image | Video | Audio)
 
 
 # msgspec resolves this module's string annotations without a class's type parameters.

@@ -30,7 +30,6 @@ from fnmatch import fnmatchcase
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
-    Any,
     Concatenate,
     Literal,
     ParamSpec,
@@ -73,8 +72,11 @@ from cozy_runtime.author._stage_memo import StageMemo, is_memoized, memoized
 
 if TYPE_CHECKING:
     import torch
+    from torch.nn import Module
 
     from cozy_runtime.accel.kernels import Plan
+    from cozy_runtime.graphs.domain import Domain, Pool
+    from cozy_runtime.internal.residency import Binding, Region
 
 _LOG = logging.getLogger(__name__)
 
@@ -192,7 +194,8 @@ class Serving:
       encoding (the code reaches its components through their forward only). False refuses.
     - `min_bits`: the lowest weight precision the lane rules pick by themselves (`MIN_BITS`).
     - `attention_bits`: the lowest attention precision its sites tolerate, whole or per
-      component-qualified module prefix.
+      component-qualified module prefix. 4 serves 8-bit kernels until a measured quality pass
+      and an eye check list 4-bit ones (Paul, 11-11); a 4-bit kernel serves by pin.
     - `phase`: "decode" for an LM's token loop, else "compute" (`PHASES`).
     - `unloaded` / `derived`: component-qualified key patterns a load does not warn about.
     - `loras`: the components that take LoRAs.
@@ -329,12 +332,12 @@ class Residency(Protocol):
         """An attempt begins on this placement."""
         ...
 
-    def retain(self, component: str, paths: tuple[str, ...]) -> Any:
+    def retain(self, component: str, paths: tuple[str, ...]) -> Binding:
         """Retain ordinary weight storage after prepare(), until the binding closes."""
         ...
 
     def represent(
-        self, component: str, dtype: Any, *, resident_only: bool = False
+        self, component: str, dtype: torch.dtype, *, resident_only: bool = False
     ) -> Callable[[], None]:
         """Validate a final representation and return its pre-capture metadata transition."""
         ...
@@ -343,30 +346,30 @@ class Residency(Protocol):
         """Whether per-process driver/context bytes can be included in graph admission."""
         ...
 
-    def graph_domain(self, component: str) -> Any:
+    def graph_domain(self, component: str) -> Domain:
         """Shared capture stream and library workspace, serialized across component graphs."""
         ...
 
     def region(
-        self, owner: str, kind: str, sets: Any, *, release: Callable[[], None] | None = None,
-        shrink: Callable[[], bool] | None = None,
-    ) -> Any:
+        self, owner: str, kind: str, sets: Module | Sequence[Module], *,
+        release: Callable[[], None] | None = None, shrink: Callable[[], bool] | None = None,
+    ) -> Region:
         """An explicitly owned cache, released only while it has no active user."""
         ...
 
-    def graph_pool(self, component: str) -> Any:
+    def graph_pool(self, component: str) -> Pool:
         """`component`'s ordinary Torch graph pool, owned with its cached recordings."""
         ...
 
-    def graph_pass(self, component: str, entry: str) -> Any:
+    def graph_pass(self, component: str, entry: str) -> AbstractContextManager[object]:
         """Open the ordinary model pass before capture; nested regions share it."""
         ...
 
-    def graph_idle(self) -> Any:
+    def graph_idle(self) -> AbstractContextManager[object]:
         """An idle capture's memory request: free bytes only, never an eviction."""
         ...
 
-    def graph_held(self, component: str) -> Any:
+    def graph_held(self, component: str) -> torch.cuda.Stream | None:
         """The stream `component`'s blocks were held bound on for its plan step, or None."""
         ...
 
@@ -374,7 +377,7 @@ class Residency(Protocol):
         """A local scope of `components` (`method`'s call): their memory passes and holds."""
         ...
 
-    def graph_resident(self, binding: Any) -> bool:
+    def graph_resident(self, binding: Binding) -> bool:
         """Every page a retained region covers is on the device now."""
         ...
 
@@ -433,11 +436,20 @@ class Yielded(Exception):
 
 
 type WarningRow = tuple[str, dict[str, str | bool | int | float | None]]
+#: The field that marks a row as a failure the Runtime caught and recovered from (`recovered`).
+RECOVERED = "recovered"
+
+
+def recovered(message: str, **fields: str | bool | int | float | None) -> WarningRow:
+    """A row for a failure the Runtime caught and served past (a graph refused at capture, a
+    slower kernel, a step cache off): the record keeps it and counts it, and the run says it once,
+    as one quiet line, never as a warning. A row that is no `recovered` one is a warning."""
+    return message, {**fields, RECOVERED: True}
 
 
 class _Warnings:
-    """Warnings Runtime's speed mechanisms raise (a graph that would not record or replayed
-    wrong), as (message, fields). Each lands in the attempt whose context raised it; one raised
+    """What Runtime's mechanisms raise, as (message, fields): warnings, and the failures they
+    recovered from (`recovered`). Each lands in the attempt whose context raised it; one raised
     outside every attempt lands in the next attempt to end."""
 
     def __init__(self) -> None:

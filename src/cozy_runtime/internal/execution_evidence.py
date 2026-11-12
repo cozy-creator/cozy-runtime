@@ -3,11 +3,17 @@
 The executor reports one record per process of its group, in process order, as `gpus`:
 
     {"gpu": int, "pid": int, "uuid": str, "arch": str, "start_us": int, "end_us": int,
-     "attention": {"requested": str, "observed": str, "impl": str, "kernels"?: [kernel],
-                   "segments"?: [segment]}}
-    kernel = {"kernel": str, "state": str, "line": str, "served": bool,
+     "attention": {"requested": str, "observed": str, "impl": str, "class"?: str,
+                   "sites"?: {component: [site group]}, "kernels"?: [kernel],
+                   "segments"?: [segment]},
+     "kernels": [package set]}
+    site group = {"layout": "dense"|"sparse", "level": int, "head_dim": int, "sites": int,
+                  "bands": {band: kernel}, "producers"?: {producer: base kernel}}
+    kernel = {"kernel": str, "state": str, "line": str, "served": bool, "bands"?: [band],
               "progress"?: float, "compile_ms"?: float, "detail"?: str}
     segment = {"stage": str, "step": int, "at_us": int, "observed": str, "dense": str}
+    package set = {"kernel": str, "arch": str, "source": "shipped"|"compiled"|"store",
+                   "compile_ms"?: float}
 
 `gpu` is the number nvidia-smi shows (NVML's index for the card's UUID, else the seal's
 `CUDA_VISIBLE_DEVICES` entry; -1 off CUDA), `uuid` the NVML `GPU-…` identity and `arch` its
@@ -16,12 +22,19 @@ GPU's work for the attempt, 0 for one that did none: nanoseconds since the epoch
 ±2^53 integer range canonical JSON (and every JSON reader) admits. `attention.requested` is
 the request's pin ("" = automatic), `observed` what the process's processors held, in the
 pin grammar, and `impl` the kernel implementation under that backend when one was observed.
+`class` is the hardware class its kernels were selected for (`arch.klass`; a group's, in a group).
+`sites` groups each component's sites by layout, level and head dimension, with the kernel each
+token band of `min(Lq, Lk)` was served by (`attention_table.Table.band`: `<2048`, `2048-12287`,
+`>=65536`; "" where a site's selection has one band); a kernel's `bands` are where its calls fell.
 `kernels` is every compiled kernel this GPU knows of: `state` ready, compiling (with its
 `progress`), failed or absent, whether it `served` this attempt, and how long its compile
 took. `segments` is present when the run took a kernel that finished compiling mid-run: each
 selection from the step of its stage it first served (`stage` "" is the run's start), in the
 pin grammar, with Sol's dense reference (`dense`, "" without Sol). `observed` and `kernels`
 then cover every selection the run served.
+The outer `kernels` is where each package Triton set loaded on the GPU came from
+(`triton_kernels.sources`): `shipped` in its package's `_triton/`, `compiled` on this machine for
+this executor (`compile_ms`), or already in the machine's `store` from an earlier build.
 """
 
 from __future__ import annotations
@@ -29,9 +42,12 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Mapping, Sequence
-from typing import Any, NotRequired, TypedDict
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 from cozy_runtime.internal import accel
+
+if TYPE_CHECKING:
+    from types import ModuleType
 
 
 class RuntimeGPU(TypedDict):
@@ -48,6 +64,21 @@ class AttentionFallback(TypedDict):
     preferred: str
     selected: str
     reason: str
+    #: the token bands it happened in (`attention_table.Table.band`), when not every one
+    band: NotRequired[str]
+
+
+class SiteGroup(TypedDict):
+    """A component's sites that are alike, and the kernel each token band serves them on: the
+    boot record's by selection (one band of one kernel is ""), a run's by its calls."""
+
+    layout: str
+    level: int
+    head_dim: int
+    sites: int
+    bands: dict[str, str]
+    #: a package producer among the bands' kernels -> the Runtime kernel it serves through
+    producers: NotRequired[dict[str, str]]
 
 
 class Boot(TypedDict):
@@ -61,18 +92,27 @@ class Boot(TypedDict):
     artifacts: NotRequired[dict[str, object]]
     skipped: NotRequired[dict[str, str]]
     fallbacks: NotRequired[list[AttentionFallback]]
+    #: component -> its sites by kind, each band's kernel
+    sites: NotRequired[dict[str, list[SiteGroup]]]
+    #: the kernel table selection read (`attention_table.Table.identity`)
+    table: NotRequired[str]
     line: str
 
 
-class RankAttention(TypedDict):
-    """A process's `attention` (the shape above)."""
-
-    requested: str
-    observed: str
-    impl: str
-    kernels: NotRequired[list[dict[str, object]]]
-    segments: NotRequired[list[dict[str, object]]]
-    fallbacks: NotRequired[list[AttentionFallback]]
+#: A process's `attention` (the shape above); functional, for its `class` key.
+RankAttention = TypedDict(
+    "RankAttention",
+    {
+        "requested": str,
+        "observed": str,
+        "impl": str,
+        "class": NotRequired[str],
+        "sites": NotRequired[dict[str, list[SiteGroup]]],
+        "kernels": NotRequired[list[dict[str, object]]],
+        "segments": NotRequired[list[dict[str, object]]],
+        "fallbacks": NotRequired[list[AttentionFallback]],
+    },
+)
 
 
 class GpuEvidence(TypedDict):
@@ -86,9 +126,19 @@ class GpuEvidence(TypedDict):
     start_us: int
     end_us: int
     attention: RankAttention
+    kernels: list[dict[str, object]]
 
 
-def identity(torch: Any, cuda: bool, local: int, sealed: Sequence[str]) -> dict[str, Any]:
+class Identity(TypedDict, total=False):
+    """Who ran a call: its process, and its GPU's number, UUID and architecture."""
+
+    pid: int
+    gpu: int
+    uuid: str
+    arch: str
+
+
+def identity(torch: ModuleType, cuda: bool, local: int, sealed: Sequence[str]) -> Identity:
     """This process's `pid`, `gpu`, `uuid` and `arch` for device `local` of its seal."""
     if not cuda:
         return {"pid": os.getpid(), "gpu": -1, "uuid": "", "arch": ""}
@@ -111,8 +161,14 @@ def attention(
     kernels: Sequence[Mapping[str, object]] = (),
     segments: Sequence[Mapping[str, object]] = (),
     fallbacks: Sequence[AttentionFallback] = (),
+    klass: str = "",
+    sites: Mapping[str, list[SiteGroup]] | None = None,
 ) -> RankAttention:
     row = RankAttention(requested=requested, observed=observed, impl=impl)
+    if klass:
+        row["class"] = klass
+    if sites:
+        row["sites"] = dict(sites)
     if kernels:
         row["kernels"] = [dict(kernel) for kernel in kernels]
     if segments:
@@ -145,10 +201,11 @@ def now_us() -> int:
 
 
 def record(
-    who: Mapping[str, Any],
+    who: Identity,
     start_us: int,
     end_us: int,
     seen: RankAttention | None = None,
+    kernels: Sequence[dict[str, object]] = (),
 ) -> GpuEvidence:
     return {
         "gpu": int(who.get("gpu", -1)),
@@ -158,6 +215,7 @@ def record(
         "start_us": start_us,
         "end_us": end_us,
         "attention": (seen or attention()).copy(),
+        "kernels": list(kernels),
     }
 
 
@@ -171,6 +229,7 @@ def widen(held: dict[int, GpuEvidence], process: int, row: GpuEvidence) -> None:
     current["start_us"] = min(current["start_us"], row["start_us"])
     current["end_us"] = max(current["end_us"], row["end_us"])
     current["attention"] = row["attention"]
+    current["kernels"] = row["kernels"]
 
 
 def gpu_name(devices: Sequence[str], rank: int) -> str:

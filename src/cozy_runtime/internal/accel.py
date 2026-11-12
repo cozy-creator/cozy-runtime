@@ -176,6 +176,25 @@ def device_capability(device: str) -> int:
     return major.value * 10 + minor.value if answer == _NVML_SUCCESS else 0
 
 
+#: NVML's brands (`nvmlBrandType_t`) whose FP32-accumulating MMA runs at half rate: GeForce,
+#: TITAN, GeForce RTX, TITAN RTX.
+_HALF_RATE_BRANDS = frozenset({5, 6, 15, 16})
+
+
+def half_accumulate(device: str) -> bool:
+    """Whether one envelope entry's card runs FP16/BF16/FP8 MMA with FP32 accumulation at half
+    rate, by its NVML brand (GeForce, TITAN): no CUDA attribute says it, and the cc does not
+    (sm89 is the 4090 and the L40S). False where NVML cannot say."""
+    library = _nvml_library()
+    handle = _nvml_handle(library, device) if library is not None else None
+    brand = ctypes.c_int()
+    if library is None or handle is None:
+        return False
+    if library.nvmlDeviceGetBrand(handle, ctypes.byref(brand)) != _NVML_SUCCESS:
+        return False
+    return brand.value in _HALF_RATE_BRANDS
+
+
 _NVML_NOT_SUPPORTED = 3
 
 

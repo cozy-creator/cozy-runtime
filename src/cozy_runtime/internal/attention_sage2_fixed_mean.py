@@ -1,5 +1,6 @@
 """Fixed token reduction for Sage K means (Sage2's K, Sage3's Q and K): one compile per card,
-whatever the length (`ENTRIES`), on the machine's compile manager (`triton_kernels`)."""
+whatever the length (`ENTRIES`), on the machine's compile manager (`triton_kernels`). Sage2's set
+also merges a sparse kernel's rows with its protected keys' rows by log-sum-exp (`merge`)."""
 
 from __future__ import annotations
 
@@ -91,7 +92,65 @@ ENTRIES = (
         for shift in range(REDUCE_MAX.bit_length())
     ),
 )  # fmt: skip
-KERNELS = TritonKernels("cozy-sage2-fixed-kmean", ENTRIES)
+
+
+@triton.jit  # type: ignore[untyped-decorator]
+def merge_keys(  # type: ignore[no-untyped-def]
+    ROWS,
+    LSE,
+    KEYED,
+    RAW,
+    Q,
+    KM,
+    rows,
+    heads,
+    stride_rows,
+    stride_keyed,
+    stride_q,
+    scale,
+    D: tl.constexpr,
+    BR: tl.constexpr,
+):
+    """BR rows of one head: ROWS (log-sum-exp LSE, natural, [rows, heads]) and KEYED, the same
+    queries over other keys from Sage2 (its kernel's RAW log2-sum-exp, [heads, rows], over keys
+    smoothed by KM: `scale * q . km` restores it), merged in place in ROWS."""
+    tile = tl.program_id(0)
+    head = tl.program_id(1).to(tl.int64)
+    row = (tile * BR + tl.arange(0, BR)).to(tl.int64)
+    live = row < rows
+    dims = tl.arange(0, D)
+    q = tl.load(
+        Q + row[:, None] * stride_q + head * D + dims[None, :], mask=live[:, None], other=0.0
+    )
+    km = tl.load(KM + head * D + dims)
+    shift = tl.sum(q.to(tl.float32) * km.to(tl.float32)[None, :], axis=1) * scale
+    lse_keyed = tl.load(RAW + head * rows + row, mask=live, other=0.0) / 1.44269504 + shift
+    lse_rows = tl.load(LSE + row * heads + head, mask=live, other=0.0)
+    top = tl.maximum(lse_rows, lse_keyed)
+    w_rows = tl.exp(lse_rows - top)
+    w_keyed = tl.exp(lse_keyed - top)
+    at_rows = ROWS + row[:, None] * stride_rows + head * D + dims[None, :]
+    own = tl.load(at_rows, mask=live[:, None], other=0.0).to(tl.float32)
+    keyed = tl.load(
+        KEYED + row[:, None] * stride_keyed + head * D + dims[None, :],
+        mask=live[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    merged = (own * w_rows[:, None] + keyed * w_keyed[:, None]) / (w_rows + w_keyed)[:, None]
+    tl.store(at_rows, merged.to(tl.bfloat16), mask=live[:, None])
+
+
+MERGE_ROWS = 32
+MERGE = TritonEntry(
+    merge_keys,
+    {"ROWS": "*bf16", "LSE": "*fp32", "KEYED": "*bf16", "RAW": "*fp32", "Q": "*bf16", "KM": "*bf16",
+     "rows": "i32", "heads": "i32", "stride_rows": "i32", "stride_keyed": "i32", "stride_q": "i32",
+     "scale": "fp32", "D": "constexpr", "BR": "constexpr"},
+    {"D": DIM, "BR": MERGE_ROWS},
+    ("ROWS", "LSE", "KEYED", "RAW", "Q", "KM"),
+    num_warps=4,
+)  # fmt: skip
+KERNELS = TritonKernels("cozy-sage2-fixed-kmean", (*ENTRIES, MERGE))
 #: Device index -> its loaded launcher (`serve`).
 _LAUNCH: dict[int, Launch] = {}
 
@@ -124,3 +183,28 @@ def mean(k: Tensor) -> Tensor:
     """Sage2's fixed K mean, on the launcher its kernel opened (`serve`)."""
     _, tokens, heads, dim = k.shape
     return fixed_mean(_LAUNCH[k.device.index or 0], k, tokens).view(1, 1, heads, dim)
+
+
+def merge(
+    rows: Tensor, lse: Tensor, keyed: Tensor, raw: Tensor, query: Tensor, km: Tensor, scale: float
+) -> None:
+    """ROWS ([1, n, heads, D], log-sum-exp LSE [1, n, heads] F32) merged in place with KEYED,
+    QUERY's Sage2 rows over other keys (`merge_keys`)."""
+    _, count, heads, dim = rows.shape
+    if (
+        dim != DIM
+        or lse.shape != (1, count, heads)
+        or raw.shape != (1, heads, count)
+        or not (lse.is_contiguous() and raw.is_contiguous() and km.is_contiguous())
+        or any(
+            t.shape != rows.shape or t.stride(2) != dim or t.stride(3) != 1 for t in (keyed, query)
+        )
+        or rows.stride(2) != dim
+        or rows.stride(3) != 1
+    ):
+        raise ValueError("a Sage2 keys merge needs [1, n, heads, 128] rows and their log-sum-exps")
+    _LAUNCH[rows.device.index or 0](
+        merge_keys, (triton.cdiv(count, MERGE_ROWS), heads),
+        rows, lse, keyed, raw, query, km, count, heads, rows.stride(1), keyed.stride(1),
+        query.stride(1), float(scale), dim, MERGE_ROWS,
+    )  # fmt: skip

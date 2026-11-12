@@ -41,7 +41,7 @@ from tensorfs.executor import Answer, MemoSettings, Request, StageMemoLookup, St
 
 from cozy_runtime.author._files import File
 from cozy_runtime.author._handler import Handler
-from cozy_runtime.author._model import WARNINGS, deterministic
+from cozy_runtime.author._model import WARNINGS, deterministic, recovered
 from cozy_runtime.author._observations import Scalar
 from cozy_runtime.author._stage_memo import exactness
 from cozy_runtime.internal import attention, hostfacts, installed, memo_implementation
@@ -809,9 +809,10 @@ def install(
     except Exception as exc:  # the memo is an optimization: this load serves without it
         _LOG.warning("stage memo off for %s: %s", type(model).__qualname__, exc)
         WARNINGS.append(
-            (
+            recovered(
                 "a model's stage memo is off: its stages run on every request",
-                {"model": type(model).__qualname__, "reason": str(exc)[:300]},
+                model=type(model).__qualname__,
+                reason=str(exc)[:300],
             )
         )
         return

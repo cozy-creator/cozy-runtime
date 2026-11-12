@@ -1,0 +1,1 @@
+The release gate's kernels suite runs inside the Runtime: `cozy_runtime.bench.kernels_inventory` and `kernel_check` (unstable, for the gate only) are built-in calls of the Runtime's App, so the suite needs no package that imports Runtime internals, which machines refuse since 0.43.1. Every Runtime Triton set is checked, now including counter noise and Ulysses' int8 wire.

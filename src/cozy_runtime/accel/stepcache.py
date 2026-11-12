@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, cast
 
 from cozy_runtime.accel.kernels import Plan
-from cozy_runtime.author._model import WARNINGS, WarningRow
+from cozy_runtime.author._model import WARNINGS, WarningRow, recovered
 
 if TYPE_CHECKING:
     import torch
@@ -453,7 +453,7 @@ def running(policy: Policy, steps: int, device: torch.device | str) -> Iterator[
     run = Run(policy, steps, torch.zeros(SLOTS, 4, dtype=torch.int32, device=device))
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
         # Each rank's verdict would differ (its sums are not all-reduced): every step computes.
-        row: WarningRow = ("step cache: off across ranks", {})
+        row: WarningRow = recovered("step cache: off across ranks")
         if row not in WARNINGS:
             WARNINGS.append(row)
         yield run

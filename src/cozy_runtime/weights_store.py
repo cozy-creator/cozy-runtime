@@ -3,8 +3,8 @@
 A checkpoint opens by its header ref (`sha256:<hex>`) from the shared store (the executor's
 `TENSORFS_HOME`). A derived checkpoint is written with TensorFS's `Writer` straight into the
 store, only its new chunks written. Its replay key names the work (who asked, what code and
-request, which output, from what): each replay key has one local repository, so the same work
-in any process reopens its latest commit and an interrupted one resumes its keyed writer.
+request, which output, from what): each replay key has one local model, so the same work
+in any process reopens its latest checkpoint and an interrupted one resumes its keyed writer.
 """
 
 from __future__ import annotations
@@ -217,16 +217,16 @@ def replay_key(actor: str, code: str, slot: str, work: Mapping[str, object]) -> 
     return "sha256:" + hashlib.sha256(f"{actor}\0{code}\0{slot}\0{body}".encode()).hexdigest()
 
 
-def repository(transaction: str) -> str:
-    """One immutable derivation's local commit history, keyed by its existing replay identity."""
+def derived_model_id(transaction: str) -> str:
+    """One immutable derivation's local checkpoint history, keyed by its existing replay identity."""
     return "local/derived-" + transaction.removeprefix("sha256:")
 
 
 def finished(store: Path, transaction: str, slot: str) -> Checkpoint | None:
-    """The finished commit for this replay key and output lane, if the store has one."""
+    """The finished checkpoint for this replay key and output lane, if the store has one."""
     try:
         return tensorfs.open(
-            repository(transaction),
+            derived_model_id(transaction),
             lane=slot,
             cache_dir=store,
             local_files_only=True,
@@ -262,7 +262,8 @@ class Output:
             if self.done is not None
             else tensorfs.Writer(
                 base=derivation.base,
-                repo_id=repository(transaction),
+                # Published TensorFS 0.24 names its model-identity keyword repo_id.
+                repo_id=derived_model_id(transaction),
                 lane=slot,
                 resume=transaction.removeprefix("sha256:"),
                 cache_dir=store,
@@ -577,7 +578,7 @@ class Output:
         )
 
     def commit(self) -> Checkpoint:
-        """The finished checkpoint, kept in its replay key's local repository: once committed,
+        """The finished checkpoint, kept in its replay key's local model: once committed,
         every later commit of the same work answers this one."""
         if self.done is None:
             if self._writer is None:
@@ -602,7 +603,7 @@ class Output:
 
 class Outputs:
     """One attempt's weights outputs in `store`. Each opens under its replay key; adopting one
-    commits it and shows it to the run (`show(slot, repo_id, commit)`). TensorD owns uploads."""
+    commits it and shows it to the run (`show(slot, model_id, checkpoint)`). TensorD owns uploads."""
 
     def __init__(
         self,
@@ -627,7 +628,7 @@ class Outputs:
     def adopt(self, output: Output) -> ModelArtifact:
         ck = output.commit()
         assert ck.tree is not None
-        self.show(output.slot, repository(output.transaction), ck.tree)
+        self.show(output.slot, derived_model_id(output.transaction), ck.tree)
         return ModelArtifact(self.request_id, output.slot, ck.id, output.transaction)
 
 

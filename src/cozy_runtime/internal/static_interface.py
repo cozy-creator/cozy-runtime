@@ -173,8 +173,9 @@ _VOCAB_MODULES = {
     "enum": "enum",
     **dict.fromkeys(author.MODULES, "author"),
 }
-#: Runtime modules a package builds its surface from: followed for types, models and constants.
-_TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.vlm")
+#: Runtime modules a package builds its surface from: followed for types, models and constants. The release gate's
+#: exercisers (`cozy_runtime.bench`) take models defined in `internal/bench`, which packages still can't import.
+_TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.vlm", "cozy_runtime.bench", "cozy_runtime.internal.bench")
 
 
 _ARITHMETIC: dict[type[ast.operator], Callable[[float, float], object]] = {
@@ -333,6 +334,8 @@ _AUTHOR_TYPES = (
     "EncodingRule",
     "Box",
     "Region",
+    "Control",
+    "ControlKind",
     "AspectRatio",
     "Seed",
     "Steps",
@@ -363,6 +366,7 @@ _AUTHOR_VALUES = (
     "Label",
     "Placeholder",
     "Advanced",
+    "When",
     "data_values",
     "QuantizationPlan",
     "SelectionPlan",
@@ -1273,11 +1277,11 @@ class Reader:
                 self.refuse(module, value, str(exc), "static_unsupported")
         return None
 
-    def declared(
+    def declared(  # type: ignore[explicit-any]  # factory: any author factory, its own TypeError judging the call
         self,
         module: Module,
         call: ast.Call,
-        factory: Callable[..., object],  # any author factory: its own TypeError judges the call
+        factory: Callable[..., object],
     ) -> None:
         """Refuse a declaration its author factory refuses: the import-time rule, applied to
         the folded arguments."""
@@ -2032,13 +2036,33 @@ def _check_locked(reader: Reader, modules: Sequence[Module], pinned: locked.Lock
                 if package is not None and (
                     locked.distribution(package.distribution) not in pinned.names
                 ):
+                    named = locked.distribution(package.distribution) in _declared(reader.project)
                     reader.refuse(
                         module,
                         stmt,
                         f"{top} is the cozy package {package.distribution}, which uv.lock doesn't "
-                        "lock: add it to [project].dependencies and run `uv lock`",
+                        + (
+                            "lock: there is no uv.lock, or it is older than [project].dependencies; "
+                            "`cozy run` locks it (or run `uv lock`)"
+                            if named
+                            else "lock: add it to [project].dependencies; `cozy run` then locks it"
+                        ),
                         "unlocked_dependency",
                     )
+
+
+def _declared(project: Path) -> frozenset[str]:
+    """The distributions `project`'s [project].dependencies names, normalized."""
+    try:
+        table = tomllib.loads((project / "pyproject.toml").read_text()).get("project", {})
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return frozenset()
+    requirements = table.get("dependencies", []) if isinstance(table, dict) else []
+    return frozenset(
+        locked.distribution(re.split(r"[\s\[(<>=!~;@]", requirement.strip(), maxsplit=1)[0])
+        for requirement in requirements
+        if isinstance(requirement, str) and requirement.strip()
+    )
 
 
 def _visible(reader: Reader, top: str) -> Path | None:

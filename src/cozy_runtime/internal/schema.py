@@ -60,7 +60,7 @@ _ASSET_KINDS: tuple[tuple[type[File], str], ...] = (
 _INPUTS: dict[object, str] = {AspectRatio: "aspect_ratio", Seed: "seed"}
 _MEDIA = (Image, Video, Audio)
 #: A media value's own members; a subclass's others are extras of the version it holds.
-_MEDIA_MEMBERS = frozenset({"file", "description"})
+_MEDIA_MEMBERS = frozenset({"file", "description", "metadata"})
 
 
 def wire(value: object) -> object:
@@ -341,6 +341,26 @@ def _struct(
     nested = seen | {tp}
     config = tp.__struct_config__
     fields = [_field(f, nested, decoded_bounds=decoded_bounds) for f in msgspec.structs.fields(tp)]
+    names = [f["name"] for f in fields if isinstance(f, dict)]
+    for rendered in (f for f in fields if isinstance(f, dict)):
+        extra, name = rendered.get("extra"), rendered["name"]
+        when = extra.get("when") if isinstance(extra, dict) else None
+        if not isinstance(when, dict):
+            continue
+        if when.get("field") == name or when.get("field") not in names:
+            raise ConformanceError(
+                f"{tp.__name__}.{name}: When names {when.get('field')!r}, "
+                f"no other field of {tp.__name__}",
+                code="tool_marker",
+                fields=[str(name)],
+            )
+        if "wire" not in rendered:
+            raise ConformanceError(
+                f"{tp.__name__}.{name}: When needs a default, "
+                "which a run gives it while it doesn't apply",
+                code="tool_marker",
+                fields=[str(name)],
+            )
     if config.tag is not None and (not isinstance(config.tag_field, str) or not config.tag_field):
         raise ConformanceError(
             f"tagged struct {tp.__name__} declares no string tag field",

@@ -1,0 +1,1 @@
+Each GPU of a run record says where every package Triton set it loaded came from (`kernels`): `shipped` in the package's `_triton/`, `compiled` on this machine for this executor (with `compile_ms`), or already in the machine's `store`. A build that only copied shipped kernels no longer reads "compiled in".

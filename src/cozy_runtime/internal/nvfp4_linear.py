@@ -55,6 +55,9 @@ DECODE_ROWS = 16
 _DECODE_CHUNK = 256 << 20
 #: The GEMV's tile: 64 output rows by 32 int32 words (256 weights) of each.
 GEMV_N, GEMV_W = 64, 32
+#: The decode's tile: 64 rows by 256 weights. xs-177 (release gates 43052732700, 43049887505, 43054702894): 5-12%
+#: faster than 128 weights on an RTX 4090, 4060 Ti and 5090, within 1.2% of the best of 27 tiles on each.
+DECODE_N, DECODE_K = 64, 256
 #: The kernels a leaf serves besides comfy-kitchen's W4A4 (`gemm.selected`).
 DECODE, EAGER = "cozy-nvfp4-decode", "torch-decode"
 #: comfy-kitchen's W4A4 by its `kernel_ready` name's head.
@@ -277,7 +280,9 @@ def _entries() -> list[TritonEntry]:
         for split in (2, 4)
     ]
     entries.append(
-        TritonEntry(_dequant, signature(_dequant), {"BLOCK_N": 64, "BLOCK_K": 128}, num_warps=4)
+        TritonEntry(
+            _dequant, signature(_dequant), {"BLOCK_N": DECODE_N, "BLOCK_K": DECODE_K}, num_warps=4
+        )
     )
     return entries
 
@@ -450,8 +455,8 @@ def _decoded(
     scales, tiles = blocked_scale.view(torch.uint8), int(blocked_scale.shape[1]) // 4
     decoded: Tensor = torch.empty(rows_out, cols, dtype=torch.bfloat16, device=weight.device)
     launch(
-        _dequant, (-(-rows_out // 64), -(-cols // 128), 1),
-        weight, scales, scale_2, decoded, rows_out, cols, tiles, 64, 128,
+        _dequant, (-(-rows_out // DECODE_N), -(-cols // DECODE_K), 1),
+        weight, scales, scale_2, decoded, rows_out, cols, tiles, DECODE_N, DECODE_K,
     )  # fmt: skip
     return decoded
 

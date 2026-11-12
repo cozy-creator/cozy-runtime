@@ -115,6 +115,13 @@ innermost `tel.stage(name)`. The machine places the whole run's bar from its own
 Invalid progress is omitted and diagnosed on the same bounded lossy lane; it cannot route,
 settle, bill, or otherwise control an attempt.
 
+Previews are one optional call too: `preview(x0, "flux2")` (`cozy_runtime.author`) after a step,
+with the loop's estimate of the clean latents (or its latents) in a named VAE's space. While a
+client watches the run, the Runtime projects them to RGB with that VAE's linear factors on their
+device, at most twice a second, and encodes a small WebP (an animated one for video) off the
+loop's thread; the machine keeps the newest for the client. With no client watching it returns at
+once. A shape or VAE it can't show is said once in the run's log and never fails the run.
+
 The machine owns durable run outcomes and output custody. Runtime returns
 structured executor facts and consumes the native capabilities it is granted.
 The former Python worker triage ledger, destination-grant table and worker
@@ -428,6 +435,16 @@ only. An `Image`'s file reads upright and scaled down to 16 MP at most, as `Pict
 `File`, `ImageFile`, `VideoFile` and `AudioFile`; a `Latents` result field stays on the machine
 that made it.
 
+A file can carry metadata beside its type: a small JSON map stored with it. An output declares it
+with `file.with_metadata({...})`, a copy of the handle; a reader gets it as `Image`, `Video` or
+`Audio`'s `metadata`. The platform acts on the keys it knows and keeps the rest. An orbit video
+(a video node turns it instead of playing it) is every frame a keyframe:
+
+```python
+clip = out.save_video(frames, fps=24, keyframe_interval=1)
+return Turned(video=clip.with_metadata({"orbit": {"degrees": 360, "direction": "cw", "loops": True}}))
+```
+
 Image inputs can separately opt into preparation on a field or an `Files` argument:
 
 ```python
@@ -515,8 +532,10 @@ list of one), the package's own structs as groups (nested; `| None` for one, a l
 and `Seed`. `Pickup(take, out_frame)` is filled only by Pick up from here; a package subclasses
 it. Markers are `msgspec.Meta`, so they stack: `Range(min, max, step=, unit=)`, `Count(min, max)`,
 `Total()`, `Ratios(*allowed, min=, max=)`, `Snap(every, offset, first)`, `Spans(rows)`,
-`Label(text, options={value: words | (words, description)})`, `Placeholder(text)` and
-`Advanced()`. Publish refuses, statically: a required field a box can't draw (an unbounded number,
+`Label(text, options={value: words | (words, description)})`, `Placeholder(text)`,
+`Advanced()` and `When(field, *values)`: a field that applies only while a sibling field is truthy,
+or one of `values`; the box dulls it otherwise, and a run takes its default with a warning.
+Publish refuses, statically: a required field a box can't draw (an unbounded number,
 `list[str]`), two shapes or one in a group, a group holding itself, a result with no file or
 `str` for the box to show, and an imported cozy package `uv.lock` doesn't lock. An optional
 field a box can't draw keeps its default, off the box, and so does an optional group with a

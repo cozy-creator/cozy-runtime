@@ -81,18 +81,32 @@ class Processor:
         self.original._parallel_config = value
 
     @property
-    def serving(self) -> AttentionProducer | None:
-        """The producer while the site's backend is its own (`author.producer_sites`)."""
+    def _site(self) -> str:
+        """The backend the site dispatches to: the producer's, or a ladder's."""
         selected = self._attention_backend
-        return self.producer if getattr(selected, "value", str(selected)) == self.backend else None
+        return str(getattr(selected, "value", selected))
+
+    @property
+    def serving(self) -> AttentionProducer | None:
+        """The producer while the site's backend is its own, or a ladder with a band it serves
+        (`author.producer_sites`)."""
+        return self.producer if self.backend in attention_ulysses.serves(self._site) else None
 
     def __call__(self, attn: Module, *args: object, **kwargs: object) -> Tensor:
-        if self.serving is None:
+        if self.serving is None or attention_ulysses.CAPTURE.get() is not None:
+            # Under a dev-only attention capture the site's own dispatch serves, its base Sol
+            # kernel with the layout, so `_call` counts and captures every call, sparse steps
+            # included: the attention table measures bases, never producers.
             return self.original(attn, *args, **kwargs)
         layout, state = _ACTIVE_LAYOUT.get(), self.producer.request_state()
         if layout is None or state is None:
             # Outside an `attention_scope` (or a request) the model's default layout holds: dense.
             attention_sol._count("dense_default")
+            return self.original(attn, *args, **kwargs)
+        # A ladder's band by the layout's whole length (every rank's): another band's kernel
+        # takes the call through the site's ordinary dispatch.
+        taken, band = attention_ulysses.rung(self._site, layout.live_tokens)
+        if taken != self.backend:
             return self.original(attn, *args, **kwargs)
         if attention_sol.outlier_keys(getattr(attn, "norm_k", None)):
             # Its dense rows are exact on Runtime's route: the producer leaves it, as an exact path.
@@ -117,7 +131,7 @@ class Processor:
             )
 
         def served(implementation: str) -> None:
-            attention_ulysses.record(self.backend, implementation)
+            attention_ulysses.record(self.backend, implementation, self._site, band)
             attention_sol._count("sparse")
             if layout.protected_prefix:
                 attention_sol._count("dense_prefix")

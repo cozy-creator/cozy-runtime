@@ -58,13 +58,12 @@ if TYPE_CHECKING:
     from av.rational import AVRational
     from av.stream import Stream
     from av.video.frame import VideoFrame
-    from numpy.typing import NDArray
     from torch import Tensor
 
     from cozy_runtime.canonical_json import JsonValue
 
 #: What frames and waveforms save from: a torch tensor (on any device) or a numpy array.
-type Samples = Tensor | NDArray[np.generic]
+type Samples = Tensor | np.ndarray[tuple[int, ...], np.dtype[np.generic[object]]]
 
 #: Raw-snapshot ceiling as a multiple of the attempt's output ceiling. H3's largest launch
 #: product (124 frames of 1344x768 RGB) is ~1.45x the 256 MiB output cap; 16x admits an
@@ -378,7 +377,26 @@ def encode_flac(planar: Planar, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
-def encode_mp4(video: Planar, fps: float, audio: Planar | None, sample_rate: int | None) -> bytes:
+def keyframes(interval: object) -> int | None:
+    """`keyframe_interval` as the encoder takes it: None (its default) or frames between keyframes,
+    1 for every frame a keyframe, so any frame shows at once when scrubbed."""
+    if interval is None:
+        return None
+    if isinstance(interval, bool) or not isinstance(interval, int) or interval < 1:
+        raise OutputError(
+            f"keyframe_interval {interval!r} is not a whole number of frames, 1 or more",
+            code="keyframe_interval",
+        )
+    return interval
+
+
+def encode_mp4(
+    video: Planar,
+    fps: float,
+    audio: Planar | None,
+    sample_rate: int | None,
+    keyframe_interval: int | None = None,
+) -> bytes:
     av = _av()
     t, h, w, _ = video.shape
     rate = Fraction(fps).limit_denominator(65535)
@@ -390,6 +408,8 @@ def encode_mp4(video: Planar, fps: float, audio: Planar | None, sample_rate: int
         vstream.pix_fmt = "yuv420p"
         vcodec = vstream.codec_context
         vcodec.thread_count = x264_threads()
+        if keyframe_interval is not None:
+            vcodec.gop_size = keyframe_interval
         vcodec.options = dict(_X264)
 
         astream = None
@@ -455,6 +475,7 @@ class _FrameFacts(TypedDict, total=False):
     audio_channels: int
     audio_samples: int
     fps: float
+    keyframe_interval: int
 
 
 def encode_frame(codec: str, frame_facts: Mapping[str, JsonValue], raw: bytes) -> bytes:
@@ -482,7 +503,9 @@ def encode_frame(codec: str, frame_facts: Mapping[str, JsonValue], raw: bytes) -
                 view[split:], (int(facts["audio_channels"]), int(facts["audio_samples"]))
             )
             sample_rate = int(facts["sample_rate"])
-        return encode_mp4(video, float(facts["fps"]), audio, sample_rate)
+        keys = facts.get("keyframe_interval")
+        interval = None if keys is None else int(keys)
+        return encode_mp4(video, float(facts["fps"]), audio, sample_rate, interval)
     raise OutputError(f"{codec!r} is not a registered-frame codec", code="encoder_unavailable")
 
 
@@ -719,6 +742,7 @@ class StreamingMP4Encoder:
         audio_channels: int = 0,
         audio_sample_rate: int = 0,
         copy: VideoCopy | None = None,
+        keyframe_interval: int | None = None,
     ) -> None:
         if width <= 0 or height <= 0 or width % 2 or height % 2:
             raise OutputError(
@@ -789,9 +813,9 @@ class StreamingMP4Encoder:
                     # Keep recoverable fragments while encoding, then have libavformat
                     # write a normal indexed MP4 at close. Empty movie headers alone
                     # make desktop players misreport duration and seek into delta frames.
-                    "movflags": (
-                        "+hybrid_fragmented+empty_moov+default_base_moof+frag_keyframe+skip_sidx"
-                    )
+                    # Every frame a keyframe: a fragment a second, not one per frame.
+                    "movflags": "+hybrid_fragmented+empty_moov+default_base_moof+skip_sidx"
+                    + ("" if keyframe_interval == 1 else "+frag_keyframe")
                     + ("+delay_moov" if audio_channels else ""),
                     "use_editlist": "1" if audio_channels else "0",
                 },
@@ -809,7 +833,7 @@ class StreamingMP4Encoder:
                 self._video.sample_aspect_ratio = pixel_aspect_ratio
                 vcodec = self._video.codec_context
                 vcodec.thread_count = x264_threads()
-                vcodec.gop_size = max(1, round(float(frame_rate)))
+                vcodec.gop_size = keyframe_interval or max(1, round(float(frame_rate)))
                 vcodec.max_b_frames = 0
                 vcodec.color_primaries = color_primaries
                 vcodec.color_trc = color_transfer

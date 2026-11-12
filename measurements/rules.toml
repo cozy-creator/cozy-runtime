@@ -1,0 +1,43 @@
+# How scripts/attention_table.py turns measurements/attention.json into src/cozy_runtime/internal/attention_table.json
+# (xs-171, measurement-design §4). The bars move only in a commit of their own, which Paul signs; never in a table PR.
+
+[bars]
+# Provisional: measurement-design §3.2's starting points, until the calibration round (xs-171 F) sets them.
+provisional = true
+# Worst-head relative L2 against FP32 attention, by the kernel's own precision, on every site at or below its level.
+level = { 16 = 0.01, 8 = 0.04, 4 = 0.10 }
+# Where a kernel was measured on captured sites, those decide; synthetic sites are notes in the report.
+# A sparse kernel is judged against the exact computation of its own route, not dense FP32: its level's bar on that
+# error, and a quantized one at most this many times the 16-bit sparse kernel's error against the same computation.
+# The sparse approximation's own loss against dense FP32 is the model's choice and a note in the report.
+sparse_vs_fp32 = 1.2
+# The ratio applies only past this error: the 16-bit bar, below which both errors are BF16 rounding (BF16 SDPA against
+# FP32 reads 0.002-0.004 on our captures) and their ratio is noise (kitchen-sol 0.0020 against BF16 Sol's 0.0017).
+sparse_floor = 0.01
+# Every dense kernel beats the best answer it could give without computing (V, V's mean, zero) by this factor.
+trivial = 3.0
+
+[noise]
+# Two kernels tie within max(floor, spread x the largest round-to-round spread at the bucket's points).
+floor = 0.03
+spread = 2.0
+
+[edges]
+# Bucket edges on min(Lq, Lk), in the gaps between our models' lengths (xs-171 decisions). Adjacent buckets whose every
+# cell has one head merge.
+candidates = [2048, 12288, 24576, 65536]
+max = 4
+
+[preference]
+# A tie goes to the kernel listed first: higher precision first, then today's choice.
+order = [
+  "flash-attn3", "cudnn", "flash-attn4", "sdpa",
+  "kitchen-int8", "sageattention", "flash-attn4-fp8", "sageattention-fixed-kmean",
+  "sageattention3-fp4", "sageattention3-fp4-fixed-means", "sageattention3-fp4-global-lowmem", "kitchen-int4qk",
+  "sol-attn", "kitchen-sol", "sol-attn-sage2-fixed-kmean",
+  "kitchen-sol-fp4-fixed-means", "kitchen-sol-fp4-lowmem", "kitchen-sol-int4qk",
+]
+
+# A kernel left out of classes ("*": every one), with the evidence. A kernel that did not run on a class's reference
+# card needs an entry here.
+[excluded]

@@ -24,7 +24,7 @@ from typing import Protocol
 
 from cozy_runtime.accel.kernels import INT8_CONVROT, PreQuantized
 from cozy_runtime.author._errors import Fault, fault
-from cozy_runtime.author._model import WARNINGS, Building, Yielded
+from cozy_runtime.author._model import WARNINGS, Building, Yielded, recovered
 from cozy_runtime.internal import (
     arch,
     kernel_cache,
@@ -89,12 +89,7 @@ def failed(op: str, device: int, exc: Exception) -> None:
     if isinstance(exc, Yielded) or fault(exc) is not Fault.OTHER:
         raise exc
     reason = f"{type(exc).__name__}: {exc}"[:300]
-    fields: dict[str, str | bool | int | float | None] = {
-        "op": op,
-        "device": device,
-        "reason": reason,
-    }
-    row = ("encoded GEMM failed, a slower path served", fields)
+    row = recovered("encoded GEMM failed, a slower path served", op=op, device=device, reason=reason)
     if row not in WARNINGS:
         WARNINGS.append(row)
         print(

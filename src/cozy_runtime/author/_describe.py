@@ -193,12 +193,19 @@ def _fields(
 
 
 def _undrawable(tp: object, markers: Sequence[object], listed: bool) -> str:
-    """Why a box can't draw a field of `tp` ("" when it can), or "group" or "shape"."""
+    """Why a box can't draw a field of `tp` ("" when it can), or "group" or "shape". A generic
+    struct is a group of its arguments' fields (`Control[Literal["pose"]]`)."""
+    if isinstance(tp, typing.TypeVar) and tp.__bound__ is not None:
+        tp = tp.__bound__
     slot = (
         isinstance(tp, type) and issubclass(tp, (*_FILES, *_MEDIA)) and not issubclass(tp, Latents)
     )
+    cls = get_origin(tp) or tp
     struct = (
-        isinstance(tp, type) and is_struct(tp) and not slot and not issubclass(tp, (Pickup, Prompt))
+        isinstance(cls, type)
+        and is_struct(cls)
+        and not slot
+        and not issubclass(cls, (Pickup, Prompt))
     )
     if listed:
         return "" if slot else "group" if struct else "a list of anything but slots or groups"

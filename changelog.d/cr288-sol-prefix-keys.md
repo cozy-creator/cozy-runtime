@@ -1,0 +1,1 @@
+On H100 (SM90), a Sol sparse step takes its protected prefix's keys on Sage2 and merges them by log-sum-exp, and runs Sol only from the prefix's last block on: an H3 continuation segment, whose carried frames make the prefix ~19% of the sequence, no longer pays for that prefix in BF16 64x64 tiles twice.

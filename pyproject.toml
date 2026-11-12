@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.45.2"
+version = "0.46.0"
 description = "Cozy author surface and device executor"
 # The native wheels carry the kernels (`kernels/`): derived from comfy-kitchen, vLLM and SGLang
 # (Apache-2.0, comfy-kitchen's NOTICE), with CUTLASS and FlashAttention-3 (BSD-3-Clause). The
@@ -13,7 +13,7 @@ license-files = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "tensorfs>=0.24.2,<0.25",
+    "tensorfs>=0.25.0,<0.26",
     "msgspec>=0.19",
     "numpy>=1.26",
     "packaging>=24",
@@ -100,7 +100,6 @@ ignore_missing_imports = true
 # for the whole module (mypy has no per-function setting); every other check applies there.
 [[tool.mypy.overrides]]
 module = [
-    "cozy_runtime.accel.fusion._kernels",
     "cozy_runtime.accel.kernels",
     "cozy_runtime.accel.moe._kernels",
     "cozy_runtime.internal.attention_fp8",
@@ -123,6 +122,14 @@ disallow_any_decorated = false
 # A def line's own `# type: ignore` is part of its cache key too, so one these settings make unused stays.
 warn_unused_ignores = false
 
+# The same for the fusion kernels, whose bodies also call `.to` on what a kernel's `range` yields: a Triton
+# tensor there, an int to mypy, and the body is the cache key, so it cannot carry an ignore.
+[[tool.mypy.overrides]]
+module = ["cozy_runtime.accel.fusion._kernels"]
+disable_error_code = ["no-untyped-def", "no-any-unimported", "untyped-decorator", "attr-defined"]
+disallow_any_decorated = false
+warn_unused_ignores = false
+
 [project.optional-dependencies]
 assessment = ["cozy-eval>=0.7"]
 # The derivation harness and the serving executor.
@@ -132,7 +139,7 @@ media = [
 ]
 # Executors read and place weights through TensorFS (`tensorfs`, `tensorfs.varena`). Local
 # package environments select this capability; worker images provide the same range.
-model-execution = ["tensorfs>=0.24.2,<0.25"]
+model-execution = ["tensorfs>=0.25.0,<0.26"]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.
 adapters = [

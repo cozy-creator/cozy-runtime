@@ -11,6 +11,23 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
+from cozy_runtime.bench import (
+    attention_inventory,
+    attention_quality,
+    attention_speed,
+    child_wire,
+    gemm_speed,
+    gemm_tiles,
+    host_calibrate,
+    kernel_check,
+    kernel_ready,
+    kernels_inventory,
+    lora_overlay_refill,
+    offload_in_executor,
+    overlay_replay,
+    quantize_reuse,
+    varena_core,
+)
 from cozy_runtime.author import (
     MAX_WEIGHTS_NEW_BYTES,
     App,
@@ -277,6 +294,39 @@ app.entrypoint(
     quantize,
     weights=(WeightsOutput("model", max_new_bytes=MAX_QUANTIZED_BYTES),),
     accelerator=False,
+)
+# The release gate's exercisers (`cozy_runtime.bench`, unstable): the attention bench (xs-171), the GEMM bench (xs-177),
+# the kernels suite and the varena and execution suites' Runtime cells (xs-174), the Runtime's own code from inside it.
+app.entrypoint(attention_inventory, accelerator=True)
+app.entrypoint(attention_speed, accelerator=True)
+app.entrypoint(attention_quality, accelerator=True)
+app.entrypoint(host_calibrate, accelerator=True)
+app.entrypoint(gemm_speed, accelerator=True)
+app.entrypoint(gemm_tiles, accelerator=True)
+app.entrypoint(kernels_inventory, accelerator=True)
+app.entrypoint(kernel_check, accelerator=True)
+app.entrypoint(kernel_ready, accelerator=False)
+app.entrypoint(child_wire, accelerator=False)
+app.entrypoint(varena_core, accelerator=True)
+app.entrypoint(offload_in_executor, accelerator=True)
+app.entrypoint(quantize_reuse, accelerator=False)
+app.entrypoint(
+    overlay_replay,
+    defaults={
+        "model": "qwen/qwen-image-edit-2511@0.1.0",
+        "turbo_lora": "lightx2v/qwen-image-edit-2511-lightning-lora@0.1.0",
+    },
+    components={"model": ("transformer",)},
+    accelerator=True,
+)
+app.entrypoint(
+    lora_overlay_refill,
+    defaults={
+        "model": "qwen/qwen-image-edit-2511@0.1.0",
+        "turbo_lora": "lightx2v/qwen-image-edit-2511-lightning-lora@0.1.0",
+    },
+    components={"model": ("transformer",)},
+    accelerator=True,
 )
 
 

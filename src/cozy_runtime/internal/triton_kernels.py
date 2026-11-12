@@ -32,6 +32,7 @@ import json
 import os
 import sys
 import sysconfig
+import threading
 from collections.abc import Callable, Iterable, Mapping
 from importlib import import_module
 from pathlib import Path
@@ -49,6 +50,7 @@ from cozy_runtime.accel.kernels import (
     entry_key,
     readable,
 )
+from cozy_runtime.author import _phases
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._model import LANDED
 from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_ready, tools, verify
@@ -569,6 +571,26 @@ class _Launcher:
 
 #: Loaded sets by (name, device index).
 _LOADED: dict[tuple[str, int], _Launcher] = {}
+#: Each loaded package set's build, by (name, device index): its arch, whether the build only
+#: copied what the package ships, its compile and when it was published (`sources`).
+_BUILT: dict[tuple[str, int], tuple[int, bool, float, float]] = {}
+
+
+def sources(index: int, since_unix_ms: float) -> list[dict[str, object]]:
+    """Where each package set loaded on GPU `index` came from: `shipped` (its package's
+    `_triton/`) or `compiled` on this machine (`compile_ms`) when built since `since_unix_ms`
+    (this executor's start), else `store` (an earlier build on this machine, `compile_ms` if
+    that one compiled). The Runtime's own sets are its wheel's and the machine's boot's."""
+    rows: list[dict[str, object]] = []
+    for (name, at), (arch, prebuilt, ms, built) in sorted(_BUILT.items()):
+        if at != index:
+            continue
+        source = "store" if built < since_unix_ms else "shipped" if prebuilt else "compiled"
+        row: dict[str, object] = {"kernel": name, "arch": f"sm{arch}", "source": source}
+        if not prebuilt:
+            row["compile_ms"] = round(ms, 1)
+        rows.append(row)
+    return rows
 
 
 def load(kernels: TritonKernels, *, device: DeviceLike) -> Launch:
@@ -615,6 +637,9 @@ def load(kernels: TritonKernels, *, device: DeviceLike) -> Launch:
     aligned = {entry.key: entry.aligned for entry in kernels.entries}
     launcher = _Launcher(arch, compiled, names, found.key.digest, index, aligned)
     _LOADED[(kernels.name, index)] = launcher
+    if home(kernels) != "cozy_runtime":
+        facts, built = kernel_compile.produced(Path(state.path))
+        _BUILT[(kernels.name, index)] = (arch, bool(facts.get("prebuilt")), state.ms, built)
     return launcher
 
 
@@ -667,11 +692,47 @@ def _compiled(*, src: _Source, times: _Times, cache_hit: bool, **_: object) -> N
 
 
 def _tuned(*, fn: JitKernel, duration: float | None, cache_hit: bool, **_: object) -> None:
-    """Triton timing an autotuned kernel's configurations to choose one."""
+    """Triton timing an autotuned kernel's configurations to choose one; a configuration whose
+    compile raised left its spell open (`_compiling`)."""
+    spells = _spells()
+    while spells:
+        _phases.drop(spells.pop())
     if not cache_hit and duration:
         request_path.note(f"triton autotune: {fn.__name__}", duration * 1000)
+
+
+#: This thread's Triton compile in flight (`_compiling`).
+_JIT = threading.local()
+
+
+def _spells() -> list[_phases.Spell | None]:
+    spells: list[_phases.Spell | None] | None = getattr(_JIT, "spells", None)
+    if spells is None:
+        spells = _JIT.spells = []
+    return spells
+
+
+def _compiling(**hooked: object) -> None:
+    """Triton about to compile a kernel at a launch (`jit_cache_hook`, its `fn` the kernel's
+    `JitFunctionInfo`; None lets it compile): on a call's thread, a spell of its compiles,
+    `compiling <kernel>`, with how many so far. An autotune's are its configurations' compiles."""
+    spells = _spells()
+    while spells:  # a compile that raised (an autotune's config past the card's resources)
+        _phases.drop(spells.pop())
+    kernel = getattr(hooked.get("fn"), "name", None)
+    named = f"compiling {kernel}" if isinstance(kernel, str) and kernel else "compiling kernels"
+    spells.append(_phases.begin("triton", named, row="compiling triton kernels", nests=False))
+
+
+def _compiled_now(**_: object) -> None:
+    """Triton's compile done (`jit_post_compile_hook`): one more of the spell's kernels."""
+    spells = _spells()
+    if spells:
+        _phases.end(spells.pop(), 1)
 
 
 if not TRITON_ABSENT:
     triton.knobs.compilation.listener = _compiled
     triton.knobs.autotuning.listener = _tuned
+    triton.knobs.runtime.jit_cache_hook = _compiling
+    triton.knobs.runtime.jit_post_compile_hook = _compiled_now

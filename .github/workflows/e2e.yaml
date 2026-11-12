@@ -7,10 +7,23 @@ on:
   pull_request:
   merge_group:
   workflow_dispatch:
+    inputs:
+      select:
+        description: Test suites to run
+        required: false
+        type: string
+        default: ''
 jobs:
   e2e:
-    uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@master
+    uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@f85096b9d6a97a623515526ece6940b6635b3200
+    secrets:
+      TENSORHUB_READ_KEY: ${{ secrets.TENSORHUB_READ_KEY }}
     with:
       repo: cozy-runtime
       ref: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha || github.sha }}
       base: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+      select: ${{ inputs.select }}
+      creator_ref: f85096b9d6a97a623515526ece6940b6635b3200
+      stack_ref: rc/0.25.0
+      runtime_ref: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha || github.sha }}
+      packages_ref: rc/0.25.0

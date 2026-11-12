@@ -76,6 +76,23 @@ class SparseRows(Protocol):
     ) -> Tensor: ...
 
 
+class KeyRows(Protocol):
+    """A row's protected keys: `(query, key, value, scale, rows, lse)` merges QUERY's attention
+    over KEY/VALUE into ROWS, its attention over the other keys (log-sum-exp LSE, natural,
+    [1, n, heads] F32), in place."""
+
+    def __call__(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        scale: float | None,
+        rows: Tensor,
+        lse: Tensor,
+        /,
+    ) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class Site:
     component: str
@@ -107,11 +124,21 @@ def outlier_keys(norm: object) -> bool:
     return bool(vars(norm)["_cozy_outlier_keys"])
 
 
+def outlier_refusal() -> str:
+    """Why a quantizing dense kernel's row refuses the call at hand: its site's key gain has
+    outlier channels (`outlier_keys`), which no coarse scale carries; empty elsewhere. The call
+    walks its band's next kernels: the 8-bit ones whose rows carry such keys, else 16-bit ones."""
+    site = _SITE.get()
+    if site is None or not outlier_keys(site.keys):
+        return ""
+    return f"outlier keys at {site.component}/{site.path}"
+
+
 _SITE: ContextVar[Site | None] = ContextVar("cozy_sol_site", default=None)
+#: The 16-bit dense rows a sparse kernel's undeclared rows run on (`attention.Candidate.dense`,
+#: `exact_rows`): the table's 16-bit dense ladder for this card (`attention._bind_dense`).
 _DENSE: DenseRows | None = None
 _DENSE_IDENTITY = ""
-#: The BF16 kernel the model's exact paths take when the dense one quantizes; else `_DENSE`.
-_EXACT: DenseRows | None = None
 _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", default=None)
 _RANK_COUNTS: ContextVar[dict[int, dict[str, int]] | None] = ContextVar(
     "cozy_sol_rank_counts", default=None
@@ -122,7 +149,7 @@ _KERNEL_ROWS: ContextVar[list[dict[str, Scalar]] | None] = ContextVar(
 #: This request's word on each object it asked for, by key digest: building, served or failed.
 _SAID: ContextVar[dict[str, str] | None] = ContextVar("cozy_sol_said", default=None)
 #: What a step serves in place of a sparse one, by count; `dense_default` a call outside any
-#: `attention_scope`.
+#: `attention_scope`; `prefix_keys` a sparse call whose protected keys took its row's keys kernel.
 COUNTS = (
     "sparse",
     "dense_step",
@@ -131,6 +158,7 @@ COUNTS = (
     "dense_prefix",
     "prefix_heavy",
     "dense_default",
+    "prefix_keys",
 )
 
 
@@ -188,32 +216,31 @@ def record_rank(rank: int, counts: dict[str, int]) -> None:
         total[name] += value
 
 
-def bind_dense(call: DenseRows, identity: str, exact: DenseRows | None = None) -> None:
-    """Install the dense reference a selection resolved, and the BF16 kernel the model's exact
-    paths take when that one quantizes. Selection runs at preparation and at a run's step and
-    stage boundaries, so a rebind never changes a running step."""
-    if not callable(call) or not identity or not (exact is None or callable(exact)):
+def bind_dense(call: DenseRows, identity: str) -> None:
+    """Install the 16-bit dense rows a selection resolved. Selection runs at preparation and at
+    a run's step and stage boundaries, so a rebind never changes a running step."""
+    if not callable(call) or not identity:
         raise ValueError("Sol requires a resolved dense attention reference and its identity")
-    global _DENSE, _DENSE_IDENTITY, _EXACT
-    _DENSE, _DENSE_IDENTITY, _EXACT = call, identity, exact
+    global _DENSE, _DENSE_IDENTITY
+    _DENSE, _DENSE_IDENTITY = call, identity
 
 
-#: A bound dense reference: (dense, its identity, exact).
-type Binding = tuple[DenseRows | None, str, DenseRows | None]
+#: A bound dense reference: (its rows, its identity).
+type Binding = tuple[DenseRows | None, str]
 
 
 def binding() -> Binding:
     """The dense reference bound now, for `rebind` after a request changes it."""
-    return _DENSE, _DENSE_IDENTITY, _EXACT
+    return _DENSE, _DENSE_IDENTITY
 
 
 def rebind(held: Binding) -> None:
-    global _DENSE, _DENSE_IDENTITY, _EXACT
-    _DENSE, _DENSE_IDENTITY, _EXACT = held
+    global _DENSE, _DENSE_IDENTITY
+    _DENSE, _DENSE_IDENTITY = held
 
 
 def dense_identity() -> str:
-    """The dense reference bound for a sparse kernel whose site's walk supplies one."""
+    """The 16-bit dense rows bound now (`bind_dense`)."""
     return _DENSE_IDENTITY
 
 
@@ -314,14 +341,6 @@ def _dense(query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Te
     if _DENSE is None:
         raise RuntimeError("Sol dense reference was not resolved before execution")
     output = _DENSE(query=query, key=key, value=value, scale=scale)
-    _validate_result(output, query)
-    return output
-
-
-def _exact(query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Tensor:
-    if _EXACT is None:
-        return _dense(query=query, key=key, value=value, scale=scale)
-    output = _EXACT(query=query, key=key, value=value, scale=scale)
     _validate_result(output, query)
     return output
 
@@ -800,6 +819,62 @@ def _native(
     return out
 
 
+def _native_from(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    scale: float | None,
+    prefix: int,
+    start: int,
+    tau: float,
+    loaded: Loaded,
+    keys: KeyRows,
+) -> Tensor:
+    """SM90's sparse rows from `start` (the protected prefix's last block boundary) on, as one
+    call over the whole document routes them: upstream's preprocess of the whole document, its
+    thresholds and block means from `start`'s block, the object compiled for the rows from there,
+    and the prefix's rows in that block a sink. The keys before `start` go to the row's keys kernel
+    (`keys`), merged by log-sum-exp. Rows before `start` are left for the protected prefix's own
+    dense rows: upstream would compute them sparse only to have them replaced, and its sink would
+    take every protected key in BF16 64x64 tiles."""
+    import torch
+
+    _pin_preprocess()
+    interface = import_module("sol_attn.interface")
+    to_cute = import_module("sol_attn.common").to_cute_tensor
+    softmax = _SCALE if scale is None else float(scale)
+    q, k, v = (t.contiguous() for t in (query, key, value))
+    batch, tokens, heads, _ = q.shape
+    block, tail = start // _BLOCK, prefix - start
+    output = torch.empty_like(v)
+    rows = output[:, start:]
+    lse = torch.empty((batch, tokens - start, heads), device=q.device, dtype=torch.float32)
+    with torch.cuda.device(q.device):
+        kc, vc, threshold = import_module("sol_attn.preprocess").prepare(
+            q, k, v, scale=softmax, tau=tau, thresh_type="exact"
+        )
+        # The thresholds' slice starts at `block * heads * 4` bytes, which a head group of 2 or 3
+        # heads (Ulysses' finest level) leaves off the kernel's 16-byte alignment: a fresh copy.
+        operands = (
+            q[:, start:], k[:, start:], v[:, start:], rows,
+            kc[:, block:], vc[:, block:], threshold[:, block:].clone(), lse,
+        )  # fmt: skip
+        sink = -(-tail // _BLOCK) << 16 if tail else 0  # upstream's packed range: blocks [0, 1)
+        loaded(*(to_cute(t) for t in operands), softmax, sink, stream=interface._stream(q.device))
+    keys(q[:, start:], k[:, :start], v[:, :start], scale, rows, lse)
+    return output
+
+
+def _from(layout: AttentionLayout, query: Tensor, keys: KeyRows | None) -> int:
+    """Where a sparse call's Sol rows start (`_native_from`): the protected prefix's last block
+    boundary, on SM90's route with a keys kernel; else 0, the whole document."""
+    card = _card(query.device)
+    if keys is None or card is None or route(card) != "sm90" or query.shape[0] != 1:
+        return 0
+    start = layout.protected_prefix // _BLOCK * _BLOCK
+    return start if start < layout.live_tokens else 0
+
+
 def sol_attention(
     query: Tensor,
     key: Tensor,
@@ -846,11 +921,15 @@ def _attention(
     dense: DenseRows = _dense,
     prefix_dense: DenseRows | None = None,
     exact: DenseRows | None = None,
+    keys: KeyRows | None = None,
+    fp8: bool = False,
 ) -> Tensor:
     """Shared input and model-policy boundary for the opt-in sparse implementations. What a
     sparse kernel admits (one BF16 document, head dimension 128, equal Q/K/V, no mask or
     causality) is its row's (`attention.Candidate`), asserted before this runs. A row that
-    declares its dense kernels gives `exact` too: the BF16 kernel its model's exact paths take."""
+    declares its dense kernels gives `exact` too: the BF16 kernel its model's exact paths take.
+    `fp8`: FA4's exact tiles in e4m3 (`sol-attn-fa4-fp8`), else BF16. `keys`: the row's protected
+    keys kernel (`KeyRows`), on SM90's route (`_native_from`)."""
     import torch
 
     if torch.compiler.is_compiling():
@@ -885,6 +964,8 @@ def _attention(
         dense=dense,
         prefix_dense=prefix_dense,
         exact=exact,
+        keys=keys,
+        fp8=fp8,
     )
 
 
@@ -908,6 +989,41 @@ def backend(device: Device | int) -> str:
 SOL = Local(sol_attention, lambda query, *_: backend(query.device))
 
 
+def sol_attention_fp8(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    *,
+    dense: DenseRows,
+    prefix_dense: DenseRows,
+    exact: DenseRows | None = None,
+    attn_mask: Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> Tensor:
+    """`sol_attention` on FA4's route with e4m3 exact tiles, its row's declared dense rows
+    (`attention.Candidate.dense`) for the dense ones."""
+    return _attention(
+        query,
+        key,
+        value,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
+        dense=dense,
+        prefix_dense=prefix_dense,
+        exact=exact,
+        fp8=True,
+    )
+
+
+SOL_FP8 = Local(sol_attention_fp8, lambda query, *_: f"{backend(query.device)}(e4m3 tiles)")
+
+
 def _execute(
     query: Tensor,
     key: Tensor,
@@ -920,12 +1036,15 @@ def _execute(
     dense: DenseRows = _dense,
     prefix_dense: DenseRows | None = None,
     exact: DenseRows | None = None,
+    keys: KeyRows | None = None,
+    fp8: bool = False,
 ) -> Tensor:
     """Apply the model's explicit policy after hardware/operand validation. An exact path's
     dense rows (its dense steps, its protected prefix, a dense path) take the exact kernel on
-    every route: the walked reference's (`_exact`), or the one a declaring row gives; on a
-    declaring row's quantizing sparse kernel, its sparse steps run dense on it too. A layer whose
-    key gain has outlier channels (`outlier_keys`) is an exact path too."""
+    every route: the 16-bit rows (`_dense`), or the one a declaring row gives; on a declaring
+    row's quantizing sparse kernel, its sparse steps run dense on it too, and FA4's exact tiles
+    stay BF16. A layer whose key gain has outlier channels (`outlier_keys`) is an exact path
+    too, and keeps Sol's own BF16 sink for its protected keys."""
     import torch
 
     def on(paths: tuple[str, ...]) -> bool:
@@ -937,9 +1056,8 @@ def _execute(
         if said is not None and "exact:" + site.path not in said:
             said["exact:" + site.path] = "exact"
             _kernel_row({"source": "exact", "site": site.path})  # the receipt names each exact site
-        if dense is _dense:
-            dense = _exact
-        elif exact is not None:
+        fp8, keys = False, None
+        if dense is not _dense and exact is not None:
             dense = prefix_dense = exact
             # A quantizing sparse kernel (Kitchen's INT8) cannot carry these keys on its sparse
             # rows either: the whole call is dense on the exact kernel. H3 block 49 on an RTX 4090,
@@ -953,6 +1071,7 @@ def _execute(
     if layout.live_tokens > query.shape[1]:
         raise ValueError("attention layout exceeds Q/K/V sequence length")
     q, k, v = (t[:, : layout.live_tokens] for t in (query, key, value))
+    start = 0 if sparse is not None or dense_path else _from(layout, query, keys)
     card = _card(query.device)
     fa4 = sparse is None and card is not None and route(card) == FA4
     loaded: object = None
@@ -966,7 +1085,9 @@ def _execute(
         # The first sight of this length starts its kernels opening off the request (a CuTe
         # route's object, upstream's preprocess), and the dense steps run while they build.
         unbuilt = "" if card is None else _preprocessed(query)
-        ready, waiting = (FA4, "") if fa4 else _ready(layout.live_tokens, query.device, layout.step)
+        ready, waiting = (
+            (FA4, "") if fa4 else _ready(layout.live_tokens - start, query.device, layout.step)
+        )
         if ready is not None and unbuilt:
             ready, waiting = None, unbuilt
         if layout.sparse:
@@ -977,7 +1098,7 @@ def _execute(
         live_output = dense(query=q, key=k, value=v, scale=scale)
         _count(instead)
     elif fa4:
-        # The exact tiles take the dense rows' precision; the model's exact paths stay BF16.
+        # The exact tiles take the kernel's precision (`fp8`); the model's exact paths stay BF16.
         # The protected prefix's query tiles attend every key inside the same call.
         from cozy_runtime.internal import attention_sol_fa4
 
@@ -988,13 +1109,20 @@ def _execute(
             scale,
             layout.protected_prefix,
             layout.tau,
-            fp8=_EXACT is not None and dense is _dense,
+            fp8=fp8,
         )
         _validate_result(live_output, q)
         _count("sparse")
     else:
         if sparse is not None:
             live_output = sparse(q, k, v, scale, layout.protected_prefix, layout.tau)
+        elif start:
+            assert loaded is not None and keys is not None
+            live_output = _native_from(
+                q, k, v, scale, layout.protected_prefix, start, layout.tau,
+                cast("Loaded", loaded), keys,
+            )  # fmt: skip
+            _count("prefix_keys")
         else:
             assert loaded is not None
             live_output = _native(

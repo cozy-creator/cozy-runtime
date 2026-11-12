@@ -35,8 +35,19 @@ not in the walk.
 |---|---|---|---|
 | 16 | SDPA | FA3 | cuDNN |
 | 8 | kitchen-int8, Sage2 (fp8 rows) | Sage2 | FA4 fp8 |
-| 4 | Sage3 fp4 (fp4 rows), Kitchen int4-QK (int4 rows), else 8 | 8 | 8 |
-| sparse 16 / 8 / 4 | Sol / Kitchen Sol / Kitchen fp4 Sol (fp4 rows), Kitchen int4-QK Sol (int4 rows) | Sol / Sol + fixed-Kmean Sage2 / 8 | Sol (its exact tiles at its dense rows' precision) / 16 / 16 |
+| 4 | 8 | 8 | 8 |
+| sparse 16 / 8 / 4 | Sol / Kitchen Sol / 8 | Sol / Sol + fixed-Kmean Sage2 / 8 | Sol (its exact tiles at its dense rows' precision) / 16 / 16 |
+
+No cell lists a 4-bit kernel (Paul, 11-11: in H3 it loses small details and gains little speed), so a
+site at 4 serves the 8-bit cells. The 4-bit kernels (Sage3 fp4, Kitchen int4-QK and their Sol forms)
+serve by pin, until a measured quality pass and an eye check list them for a class (xs-171).
+
+A site whose key RMSNorm gain has outlier channels (`attention_sol.outlier_keys`: a peak at 3x its
+RMS or more) puts those channels in every key, which no coarse scale carries. On the sparse route
+its dense rows take the exact kernel; at a dense site every quantizing kernel but Kitchen INT8 (the
+sparse route's exact rows, `attention.KEYS_EXACT`) refuses the call, which walks its band's next
+kernels: Kitchen INT8 where the class runs it, else the 16-bit ones. The refusal names the site in
+the run record. Read from the weights on the site's first call, so every rank and step agree.
 
 A card no row names takes the newest family whose 8-bit op builds for its own target and says
 so on every run (`arch.inherited`).

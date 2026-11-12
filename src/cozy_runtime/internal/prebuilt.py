@@ -8,7 +8,8 @@ producer's norm, modulation and activation into the quantization, and `*_gemm` m
 quantized operand. It allocates with torch and
 launches on torch's current stream. A GEMM tile that cannot take a shape hands that call to
 cuBLASLt (`_int_mm`, `_scaled_mm`), said once; a card the wheel has no fp8 GEMM for (Ada) is
-cuBLASLt's by design. `torch` is the torch module: this module imports no torch.
+cuBLASLt's by design, and so is Hopper's fp8 from `FP8_CUBLASLT`'s shapes. `torch` is the torch
+module: this module imports no torch.
 """
 
 from __future__ import annotations
@@ -46,6 +47,11 @@ KERNELS = {"int8": "prebuilt-int8", "fp8": "prebuilt-fp8"}
 #: 0.55-1.13x against the fused mma.sync 0.26-0.53x, which keeps only the 16-row tile there.
 UNPACK = 3
 UNPACK_ROWS = {arch.MMA_SYNC: 2048, arch.WGMMA: 32, arch.TCGEN05: 32}
+#: From these rows and output columns, Hopper's fp8 GEMM is cuBLASLt's (`_scaled_mm`), not the wheel's wgmma tiles.
+#: xs-177, the GEMM bench on two H100 SXMs (release gates 43056478357, 43065023645): cuBLASLt is 3-23% faster on
+#: every shape from 4,608 rows and 3,072 columns (H3, Qwen-Image 4 MP, Klein); at SDXL's 640 columns and 2,048 rows the
+#: tiles are as fast or faster. Fewer rows (an LM's token loop) keep the tiles.
+FP8_CUBLASLT = {arch.WGMMA: (4096, 2048)}
 #: The probe's budget for the relative L2 error against the exact law (the op tests' bound).
 BUDGET = 1e-2
 #: Attention's, against fp32 attention: an exact kernel's bf16 output, and a quantized one's
@@ -315,8 +321,13 @@ class Prebuilt:
         )
         if rows == 0:
             return _landed(result, out)
+        floor = FP8_CUBLASLT.get(self.family)
+        cublaslt = f.fp8 and (
+            not self.cutlass_fp8
+            or (config < 0 and floor is not None and rows >= floor[0] and n >= floor[1])
+        )
         code = _kernels._gemm.NOT_SUPPORTED
-        if not f.fp8 or self.cutlass_fp8:
+        if not cublaslt:
             code = _kernels._gemm.gemm(
                 self.index, FAMILIES.index(self.family), f.fp8, q.data_ptr(), scales.data_ptr(),
                 data.data_ptr(), scale.data_ptr(), _ptr(bias), result.data_ptr(),
@@ -329,8 +340,8 @@ class Prebuilt:
             self._check(code, "the GEMM")
         if config >= 0:
             raise ValueError(f"{f.name}_gemm: config {config} cannot take {rows}x{width}")
-        if f.fp8 and not self.cutlass_fp8:
-            pass  # cuBLASLt is this card's fp8 GEMM
+        if cublaslt:
+            pass  # cuBLASLt is this card's fp8 GEMM at this shape
         elif f.name not in _SAID:
             _SAID.add(f.name)
             print(f"[{f.name}] the prebuilt GEMM did not run (M={rows} N={data.shape[0]} "

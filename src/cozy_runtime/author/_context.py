@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._loader import Scheduler
     from cozy_runtime.author._model import Model
+    from cozy_runtime.author._preview import Previews
     from cozy_runtime.author._recipes import DeclaredRecipe
     from cozy_runtime.author._weights import Weights
     from cozy_runtime.graphs import Finite
@@ -163,6 +164,9 @@ class Context:
     #: `progress(step, total)`'s frame, and a model method call's (`uses_components`) activity
     _progress: Callable[[int, int], None] | None = field(default=None, repr=False)
     _called: Callable[[str], None] | None = field(default=None, repr=False)
+    #: `preview`'s, where a client may watch this run; and the last step `progress` told
+    _preview: Previews | None = field(default=None, repr=False)
+    _step: tuple[int, int] = field(default=(0, 0), repr=False)
 
     def tensorfs_source(self, weights: Weights[Model[object]]) -> Checkpoint:
         """An admitted `Weights` argument's checkpoint: its pipeline, components and stored
@@ -219,6 +223,8 @@ class Context:
         """Step `step` (0-based) of `total` is done: the run shows step+1/total and its step time,
         under the enclosing `tel.stage` (else "denoise"). Optional; also a cancellation point."""
         self.raise_if_cancelled()
+        if isinstance(step, int) and isinstance(total, int):
+            self._step = (step + 1, total)
         if self._progress is not None:
             self._progress(step, total)
 

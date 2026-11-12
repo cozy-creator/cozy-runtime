@@ -12,7 +12,7 @@ on:
         type: string
         default: master
       build:
-        description: "wheels: release files; pure: sdist and pure wheel"
+        description: "wheels: release files; pure: sdist and pure wheel; model-sdk: published SDK identity/replay protocol checks"
         type: string
         default: wheels
       runner:
@@ -26,6 +26,24 @@ on:
         default: ''
       nonce:
         description: Caller's id, shown in the run name so the caller can find its run
+        type: string
+        default: ''
+  # rc-dev.yaml's builds.
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+      build:
+        type: string
+        default: wheels
+      runner:
+        type: string
+        default: ubuntu-latest
+      billed_runner:
+        type: string
+        default: ''
+      nonce:
         type: string
         default: ''
 run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.nonce }}
@@ -45,7 +63,7 @@ jobs:
 
   dev:
     needs: modules
-    if: ${{ !cancelled() && needs.modules.result != 'failure' }}
+    if: ${{ inputs.build != 'model-sdk' && !cancelled() && needs.modules.result != 'failure' }}
     runs-on: ${{ inputs.billed_runner || inputs.runner }}
     # Hang bound, not a work budget.
     timeout-minutes: 60
@@ -120,3 +138,49 @@ jobs:
           path: source/dist/
           if-no-files-found: error
           retention-days: 7
+
+  model-sdk:
+    if: inputs.build == 'model-sdk'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ['0.24.0', '0.24.1']
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: Normal registry-locked and strict source checks
+        run: |
+          uv sync --locked
+          uv run --locked ruff check --select E9,F63,F7,F82 .
+          uv run --locked python -m compileall -q src
+          uv run --locked python -c 'import cozy_runtime'
+          scripts/typecheck.sh
+      - name: Install the actual Runtime candidate and selected published SDK
+        env:
+          SDK_VERSION: ${{ matrix.sdk }}
+        run: |
+          set -euo pipefail
+          mkdir -p proof
+          uv build --wheel --out-dir "$RUNNER_TEMP/runtime-wheel"
+          uv pip install --python .venv-typecheck/bin/python --no-deps "$RUNNER_TEMP"/runtime-wheel/*.whl "tensorfs==$SDK_VERSION"
+          .venv-typecheck/bin/python -c 'import importlib.metadata as m; import os; assert m.version("tensorfs") == os.environ["SDK_VERSION"]'
+      - name: Actual installed output, replay and executor frame
+        run: |
+          .venv-typecheck/bin/python -I checks/model_identity_consumer.py --out proof/model-identity.json
+          .venv-typecheck/bin/mypy --python-executable .venv-typecheck/bin/python --no-error-summary --no-pretty --show-error-codes > proof/typecheck.txt || status=$?
+          test "${status:-0}" -le 1
+          .venv-typecheck/bin/python scripts/typecheck.py check < proof/typecheck.txt
+          sha256sum "$RUNNER_TEMP"/runtime-wheel/*.whl > proof/runtime-wheel.sha256
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-model-identity-sdk-${{ matrix.sdk }}-${{ github.sha }}
+          path: proof/
+          if-no-files-found: warn
+          retention-days: 14

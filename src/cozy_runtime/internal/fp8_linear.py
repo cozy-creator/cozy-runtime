@@ -132,8 +132,11 @@ def linear(
 def serving(index: int) -> str:
     """The GEMM this card's fp8 leaves serve now: a run's `gemm.selected`, read once a run. A
     prebuilt library with no fp8 GEMM for the card (Ada; RTX 50 on Windows) quantizes, and
-    `_scaled_mm` multiplies."""
+    `_scaled_mm` multiplies; on Hopper `_scaled_mm` multiplies from `prebuilt.FP8_CUBLASLT`'s shapes."""
     if _OPS.get(index) is None:
         return SCALED_MM
     library = int8_linear.library(index)
-    return SCALED_MM if isinstance(library, prebuilt.Prebuilt) and not library.cutlass_fp8 else OP
+    if not isinstance(library, prebuilt.Prebuilt) or not library.cutlass_fp8:
+        return SCALED_MM
+    floor = prebuilt.FP8_CUBLASLT.get(library.family)
+    return OP if floor is None else f"{OP} under {floor[0]} rows or {floor[1]} columns, else {SCALED_MM}"

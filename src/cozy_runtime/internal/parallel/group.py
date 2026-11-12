@@ -4,17 +4,20 @@ Each follower has a framed JSON command socket and joins the group's distributed
 collectives. A follower whose handler failed ends the attempt on every GPU (`interrupt`); a lost
 follower or a device fault breaks the group and terminates its remaining followers, allowing
 blocked collectives to unwind. A wait ends with the reply or the
-follower's death, and one that blocks says which GPU it waits on; only a store meeting has a clock
-(`gather`), since a GPU that left the call sets no key. A group forms only after every follower
+follower's death, and one that blocks says which GPU it waits on. No wait has a clock: a store
+meeting (`gather`) waits for a GPU computing toward it for as long as that GPU lives, however long
+its work takes, and names the GPUs it waits on. A group forms only after every follower
 said it is ready; a follower that fails while GPU 0 is inside group init (which nothing can
 interrupt) ends GPU 0's process, so TensorD sees the exit at
-once. torch's own deadlines (`NEVER`) never end a group. A formation still unfinished after
-`FORMATION` names the GPUs that never formed and ends the attempt (cr-263).
+once. torch's own deadlines (`NEVER`) never end a group. A formation attempt still unfinished after
+`ATTEMPT` prints every GPU's stacks, is ended on every GPU and tried again, up to `ATTEMPTS`; then
+the group is refused naming each GPU and its step (cr-263).
 """
 
 from __future__ import annotations
 
 import contextlib
+import faulthandler
 import os
 import queue
 import signal
@@ -26,11 +29,12 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 
 import msgspec
 
 from cozy_runtime.internal import execution_evidence, spawn
+from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.config import inherited_environment, update_environment
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.parallel.plan import GroupRefusal
@@ -52,19 +56,28 @@ ENDED = "group_call_ended"
 #: its members instead: a follower's death or refusal (`RankGroup._break`), or a GPU fault TensorD
 #: sees. Longer than any run, and within what torch's clocks hold.
 NEVER = timedelta(days=36500)
-#: How long a GPU waits at a store meeting for the others (`gather`). They run the same call, so one
-#: arrives within its peers' work on that call; past this the GPUs no longer run the same calls.
-GATHER = timedelta(minutes=5)
-#: How long a meeting waits for a GPU that said it computes what the meeting crosses (`gather`)
-WORKING = timedelta(minutes=30)
-#: How long the GPUs may take to form the group, from the join to every GPU's proof. Each runs the
-#: same few steps (reach the store, group init, one barrier, one of each collective), so a GPU still
-#: forming past what a store meeting allows (`GATHER`) never will: 2x A40 sat in formation until
-#: cancelled, both GPUs alive, billing (cr-263).
-FORMATION = GATHER
+#: A store meeting waited this long names the GPUs it waits on (`gather`); a step's meetings take
+#: milliseconds, a hosted call's result as long as its home GPU computes it.
+TOLD = timedelta(seconds=10)
+#: One formation attempt, from the join to every GPU's proof: the same few short steps on every GPU
+#: (reach the store, group init, one barrier, one of each collective, the exchange's check). 0.35 s
+#: on 2x A40 (run 46368), under 1 s in 27 more there. A GPU still in a step after this will not
+#: leave it: 2x A40 sat in formation until cancelled, both GPUs alive, billing (cr-263).
+ATTEMPT = timedelta(seconds=60)
+#: Attempts before the group is refused. A stalled attempt is aborted on every GPU and the group
+#: forms again on a new store; NCCL keeps its route for the process (`route`).
+ATTEMPTS = 3
+#: How long a stalled attempt's GPUs get to leave it once aborted. GPU 0 still in it then is in
+#: group init, which no abort reaches, or waits on a follower that cannot answer.
+UNWIND = timedelta(seconds=10)
 #: Rank 0's formation steps that wait in Python on followers' replies, which a follower's death
 #: ends; every other step waits inside torch, where an abort may not reach.
 _REPLY_STEPS = frozenset({"join", "proof"})
+#: A follower's abort byte that asks for its threads' stacks first (a stalled formation). Never a
+#: signal: one lands on any thread, and faulthandler's dump from a CUDA thread crashed a follower.
+STACKS = b"\2"
+#: Steps whose stall is the GPUs' link failing them: NCCL connects and moves its first bytes here.
+LINK_STEPS = frozenset({"barrier", "warm", "exchange", "proof"})
 #: A store wait's slice: how soon an ended formation ends it.
 _SLICE = timedelta(seconds=1)
 #: This process's formation ended (`abort_process_group`); cleared as the next one forms.
@@ -127,13 +140,15 @@ class Follower:
     #: how people name the GPU this process drives (`execution_evidence.gpu_name`)
     gpu: str = ""
     #: routed replies; the body stays a mapping because its readers index it by key
-    replies: queue.Queue[tuple[Frame, dict[str, Any]] | None] = field(default_factory=queue.Queue)
+    replies: queue.Queue[tuple[Frame, dict[str, Json]] | None] = field(default_factory=queue.Queue)
     #: the seam-closed verdict once the reader saw EOF or a torn frame; "" while live
     gone: str = ""
     #: a byte here aborts its collectives (its watcher thread; `RankGroup.interrupt`)
     abort: socket.socket | None = None
     #: the formation step it last answered: "" none, "joined" its store, "formed" with its proof
     forming: str = ""
+    #: the formation command it was sent and has not answered ("join", "form"), else ""
+    owed: str = ""
 
     @property
     def pid(self) -> int:
@@ -213,11 +228,10 @@ def ready_rank(torch: ModuleType, spec: RankSpec, sealed: Mapping[str, str]) -> 
     return store
 
 
-def form_rank(torch: Any, spec: RankSpec, store: Any) -> Any:
+def form_rank(torch: ModuleType, spec: RankSpec, store: Store) -> ProcessGroup:
     """A follower's half of the group, on the store `ready_rank` reached. Returns the group
     handle every collective is given explicitly."""
     dist = torch.distributed
-    formed()
     dist.init_process_group(
         spec.backend,
         store=store,
@@ -226,9 +240,11 @@ def form_rank(torch: Any, spec: RankSpec, store: Any) -> Any:
         device_id=_device(torch, spec.backend),
         timeout=NEVER,
     )
+    if _ENDED.is_set():  # GPU 0 ended this attempt; init ran so GPU 0 could leave its own
+        raise GroupRefusal(f"GPU {spec.rank}: GPU 0 ended this formation", code=ENDED)
     dist.barrier()
     warm(torch, spec.backend, spec.rank, spec.world)
-    return dist.group.WORLD
+    return cast("ProcessGroup", dist.group.WORLD)  # cast: torch passed in as a module
 
 
 def _device(torch: ModuleType, backend: str) -> object:
@@ -266,20 +282,20 @@ def gather(
     keys: Sequence[str],
     what: str,
     ended: Sequence[str] = (),
-    working: Sequence[str] = (),
+    told: Callable[[list[int]], None] | None = None,
 ) -> list[bytes]:
-    """Every key's value, once every GPU has set its own. The store's own read waits for a missing
-    key for as long as the store lives; this ends (code `ENDED`) when the formation ends
-    (`abort_process_group`: an interrupt, or a GPU that failed) or a missing GPU's `ended` key says
-    it failed; a missing GPU that returned is a divergence, named; and after `GATHER` it names the
-    GPUs that never arrived, unless each still missing set its `working` key (it computes what
-    this meeting crosses, a hosted call's result): those are waited for up to `WORKING` (`keys`,
-    `ended` and `working` are in GPU order)."""
+    """Every key's value, once every GPU has set its own. A GPU still computing toward this meeting
+    is waited for as long as it lives, however long its work takes (a hosted call's result on a
+    slow host, a long decode): no clock judges it (xs-172). The wait ends (code `ENDED`) when the
+    formation ends (`abort_process_group`: an interrupt, or a GPU that failed or died) or a missing
+    GPU's `ended` key says it failed; a missing GPU that returned is a divergence, named; GPUs at
+    different calls both arrive, and the caller names them. The store's own connection ends it
+    once GPU 0, which holds the store, is gone. A wait past `TOLD` calls `told` once with the
+    missing GPUs (`keys` and `ended` are in GPU order)."""
     import torch.distributed as dist
 
     keys = list(keys)
-    began = time.monotonic()
-    deadline = began + GATHER.total_seconds()
+    shown = time.monotonic() + TOLD.total_seconds() if told is not None else None
     while True:
         if _ENDED.is_set():
             raise GroupRefusal(f"{what}: another GPU ended this call", code=ENDED)
@@ -295,25 +311,27 @@ def gather(
                         "same calls",
                         code="group_diverged",
                     ) from None
-            now = time.monotonic()
-            if now < deadline:
-                continue
-            absent = [rank for rank, key in enumerate(keys) if not store.check([key])]
-            busy = working and all(store.check([working[rank]]) for rank in absent)
-            if busy and now < began + WORKING.total_seconds():
-                continue
-            waited = int(now - began)
-            raise GroupRefusal(
-                f"{what}: {', '.join(f'GPU {rank}' for rank in absent)} did not arrive in "
-                f"{waited} s; the GPUs no longer run the same calls",
-                code="group_diverged",
-            ) from None
+            if told is not None and shown is not None and time.monotonic() >= shown:
+                shown = None
+                told([rank for rank, key in enumerate(keys) if not store.check([key])])
+            continue
         return list(store.multi_get(keys))
 
 
-def formed() -> None:
-    """A formation begins: the last one's end no longer ends this process's waits."""
+def rejoined() -> None:
+    """A formation attempt begins, once the last one's abort is done: that abort no longer ends
+    this process's waits. An abort of this attempt that comes early still counts (`form_rank`)."""
     _ENDED.clear()
+
+
+def aborted() -> bool:
+    """This process's group was aborted (`abort_process_group`) since its formation began: set
+    before the abort runs, so a collective that raised for it reads it."""
+    return _ENDED.is_set()
+
+
+class _Stalled(Exception):
+    """A formation attempt that `RankGroup._watch` ended on every GPU; it forms again."""
 
 
 def abort_process_group() -> None:
@@ -345,6 +363,8 @@ class RankGroup:
         launch: Callable[[list[str], int], ChildProcess] | None = None,
         devices: Iterable[str] = (),
         waiting: Callable[[str], None] = lambda what: None,
+        stalled: Callable[[str, str], None] = lambda step, why: None,
+        refuse: Callable[[str], bool] = lambda why: False,
     ) -> None:
         if degree < 2:
             raise ValueError("a rank group is degree >= 2; degree 1 is a plain executor")
@@ -359,6 +379,10 @@ class RankGroup:
         self.forward = forward
         #: told what rank 0 waits on as it starts to block: the call's stage, for people
         self.waiting = waiting
+        #: told each stalled formation attempt's step and verdict (the route it formed on failed)
+        self.on_stall = stalled
+        #: refuses the call this group forms for before GPU 0's process ends; True: it was (`_end`)
+        self.refuse = refuse
         #: how a follower's program is started: the trampoline's `inherit` backend under
         #: rank 0's own environment, or the suite's launcher for the gloo arms
         self._launch = launch or self._spawn_follower
@@ -371,8 +395,10 @@ class RankGroup:
         self.formed = False
         #: GPU 0 is inside group init, which no abort reaches: a follower's failure ends it
         self.initializing = False
-        #: rank 0's formation step while a formation runs (`_overdue`), "" otherwise
+        #: rank 0's formation step while a formation runs (`_watch`), "" otherwise
         self.forming = ""
+        #: this attempt's stall verdict once `_watch` ended it, else ""
+        self.stalled = ""
         #: the first fault, latched: a broken group never heals, it is rebuilt
         self.broken = ""
         #: `interrupt` ended this formation's collectives; `form(again=...)` clears it
@@ -457,7 +483,8 @@ class RankGroup:
             follower.replies.put((head, frame))
             if head.reply in ("join", "form") and head.ok:
                 follower.forming = "joined" if head.reply == "join" else "formed"
-            if head.reply == "form" and not head.ok:
+            # A follower that could not form breaks the group, unless GPU 0 aborted it (ENDED).
+            if head.reply == "form" and not head.ok and head.code != ENDED:
                 self._break(
                     f"{follower.gpu} could not form the group: {head.code}: {head.detail}"[:600]
                 )
@@ -485,11 +512,19 @@ class RankGroup:
         if self.initializing:
             # GPU 0 waits inside group init for a member that will never arrive, and init has
             # no abort: this process ends, saying why, and TensorD fails the call on its exit.
-            sys.stderr.write(
-                f"group_unformed: {why}; GPU 0 cannot leave group init, so its process ends\n"
-            )
-            sys.stderr.flush()
-            os._exit(int(Exit.failed))
+            self._end(f"{why}; GPU 0 cannot leave group init, so its process ends")
+
+    def _end(self, why: str) -> NoReturn:
+        """GPU 0 cannot leave the step it is in. The line goes to stderr, the call it forms for is
+        refused with it (`refuse`) and the machine, which ends a refused group, is given `UNWIND`
+        to end this process: one that also ends itself races that and reads as an executor that
+        died. Then it ends anyway, so its GPUs are freed and the idle rules apply."""
+        sys.stderr.write(f"group_unformed: {why}\n")
+        sys.stderr.flush()
+        with contextlib.suppress(Exception):  # a report: the process ends regardless
+            if self.refuse(why):
+                time.sleep(UNWIND.total_seconds())
+        os._exit(int(Exit.failed))
 
     def _abort_collectives(self) -> None:
         """A dead follower must not park rank 0 on a collective that cannot complete:
@@ -498,9 +533,10 @@ class RankGroup:
         if self.pg is not None:
             abort_process_group()
 
-    def interrupt(self) -> None:
+    def interrupt(self, stacks: bool = False) -> None:
         """End the collective in flight on every GPU and keep the group whole: each
-        follower's watcher aborts its communicator, and this process aborts its own. The group
+        follower's watcher aborts its communicator (`stacks`: after writing its threads' stacks,
+        `STACKS`), and this process aborts its own. The group
         forms again (`form(again=...)`) before its next call. Once per formation: a second
         caller (the reader thread and the call's own thread both may) returns only once the
         first one's abort is done, so the group is never formed again under an abort still
@@ -517,7 +553,7 @@ class RankGroup:
             for follower in self.followers:
                 if follower.abort is not None:
                     with contextlib.suppress(OSError):
-                        follower.abort.send(b"\1")
+                        follower.abort.send(STACKS if stacks else b"\1")
             self._abort_collectives()
         finally:
             self._ended.set()
@@ -548,7 +584,7 @@ class RankGroup:
 
     def form(
         self,
-        torch: Any,
+        torch: ModuleType,
         sealed: Mapping[str, str],
         again: bool = False,
         nccl: Mapping[str, str] | None = None,
@@ -558,35 +594,86 @@ class RankGroup:
         """Form the process group in two steps, so a partial group never forms. `join`: every
         follower reaches the store on a kernel-chosen loopback port and says it is ready (or
         refuses, or dies), each followed by the socket its watcher reads (`interrupt`). `form`:
-        only then do all GPUs enter group init, rank 0 last, with one barrier as the proof. All of
-        it within `FORMATION`, or it ends naming the GPUs that never formed (`_overdue`).
+        only then do all GPUs enter group init, rank 0 last, with one barrier as the proof.
+        Each attempt gets `ATTEMPT`; a stalled one is ended on every GPU and tried again on a new
+        store, up to `ATTEMPTS`, then refused naming each GPU and its step (`_watch`).
         `again` forms it AGAIN after an `interrupt`: every follower joins a new store.
         `nccl` is the route every GPU forms under; `formed` runs on rank 0 right after the
         barrier, while each follower runs its half before it answers `form`: there, every GPU
         maps `exchange` (`copy_engine.form`)."""
-        dist = torch.distributed
-
         self.check_alive()
         require_nvls_off(sealed, self.backend)
         abortable(self.backend)
         if nccl is not None:
             self.nccl = dict(nccl)
             route(self.nccl)
+        stalls: list[str] = []
+        for attempt in range(1, ATTEMPTS + 1):
+            if stalls:
+                self.waiting(
+                    f"forming the group again, attempt {attempt} of {ATTEMPTS}: {stalls[-1]}"
+                )
+            try:
+                return self._attempt(torch, again or bool(stalls), exchange, formed, attempt)
+            except _Stalled:
+                stalls.append(self.stalled)
+                self._settle()
+        seconds = int(ATTEMPT.total_seconds())
+        raise GroupRefusal(
+            f"the group did not form in {ATTEMPTS} attempts of {seconds} s: {'; '.join(stalls)}"[
+                :900
+            ],
+            code="group_unformed",
+        )
+
+    def _attempt(
+        self,
+        torch: ModuleType,
+        again: bool,
+        exchange: str,
+        formed: Callable[[ProcessGroup], None] | None,
+        attempt: int,
+    ) -> ProcessGroup | None:
+        dist = torch.distributed
         if again and dist.is_initialized():
             dist.destroy_process_group()
-        self.pg, self.formed = None, False
-        _ENDED.clear()  # as `formed()`, which this method's `formed` argument shadows
+        self.pg, self.formed, self.stalled = None, False, ""
+        with self._lock:
+            self.interrupted = False  # this attempt's collectives are this attempt's to abort
+        _ENDED.clear()  # as `rejoined()`
         self.store = dist.TCPStore(
             "127.0.0.1", 0, self.degree, is_master=True, wait_for_workers=False, timeout=NEVER
         )
         self.port = int(self.store.port)
         done = threading.Event()
-        threading.Thread(target=self._watch, args=(done,), name="formation", daemon=True).start()
+        threading.Thread(
+            target=self._watch, args=(done, attempt), name="formation", daemon=True
+        ).start()
         try:
-            return self._form(torch, again, exchange, formed)
+            pg = self._form(torch, again, exchange, formed)
+        except Exception as exc:
+            if not self.stalled:
+                raise
+            if self.broken:  # a GPU could not leave the stalled attempt (`_watch`)
+                raise GroupRefusal(self.verdict(), code="group_unformed") from exc
+            self._end_attempt()
+            raise _Stalled from exc
         finally:
             self.forming = ""
             done.set()
+        if self.stalled:  # it formed as `_watch` aborted it
+            self._end_attempt()
+            raise _Stalled
+        self.formed = True
+        return pg
+
+    def _end_attempt(self) -> None:
+        """GPU 0's communicator of a stalled attempt ends before the next one destroys it: one
+        made after `_watch` aborted the attempt's collectives is aborted here, once that abort
+        is done (`interrupt` waits for it)."""
+        self.interrupt()
+        if self.pg is not None:
+            abort_process_group()
 
     def _form(
         self,
@@ -603,6 +690,7 @@ class RankGroup:
         for follower in self.followers:
             if again:
                 self.send_one(follower.rank, {**join, "again": True})
+                follower.owed = "join"
                 continue
             follower.abort, watcher = socket.socketpair()
             try:
@@ -614,10 +702,14 @@ class RankGroup:
                 ) from exc
             finally:
                 watcher.close()
+            follower.owed = "join"
         self._unformed(self.collect("join"), "join")
+        self._unstalled()
         self.initializing, self.forming = True, "init"
         try:
             self.broadcast({"cmd": "form", "exchange": exchange})
+            for follower in self.followers:
+                follower.owed = "form"
             self.waiting(f"forming the group: {self.gpu(0)} and {len(self.followers)} more in init")
             dist.init_process_group(
                 self.backend,
@@ -632,6 +724,7 @@ class RankGroup:
             self.initializing = False
         if self.broken:
             raise GroupRefusal(self.broken, code="group_unformed")
+        self._unstalled()
         try:
             self.forming = "barrier"
             dist.barrier()
@@ -646,19 +739,22 @@ class RankGroup:
             raise
         self.forming = "proof"
         self._unformed(self.collect("form"), "form")
-        self.formed, self.interrupted = True, False
         return self.pg
 
-    def _watch(self, done: threading.Event) -> None:
-        """End a formation that is not done within `FORMATION`."""
-        if not done.wait(FORMATION.total_seconds()):
-            self._overdue(done)
+    def _unstalled(self) -> None:
+        """A step that ended after `_watch` stalled its attempt goes no further."""
+        if self.stalled:
+            raise _Stalled
 
-    def _overdue(self, done: threading.Event) -> None:
-        """The formation outlived `FORMATION`: name each GPU that never formed and the step it
-        last answered, and end it. Followers are killed; a wait on their replies then refuses,
-        and a wait inside torch, where an abort may not reach, ends GPU 0's process, so TensorD
-        fails the call on its exit and the machine's idle rules apply."""
+    def _watch(self, done: threading.Event, attempt: int) -> None:
+        """End an attempt still forming after `ATTEMPT`: every GPU's stacks to stderr, the verdict
+        naming each GPU that never formed and GPU 0's step, then every GPU's collectives aborted,
+        so `form` tries again. A GPU that cannot leave it within `UNWIND` ends the formation: the
+        followers are killed, a wait on their replies then refuses, and GPU 0 inside torch (group
+        init, where no abort reaches) ends its process, so TensorD fails the call on its exit and
+        the machine's idle rules apply (cr-263)."""
+        if done.wait(ATTEMPT.total_seconds()):
+            return
         step = self.forming
         if not step or done.is_set():
             return
@@ -669,13 +765,38 @@ class RankGroup:
         ]
         if step not in _REPLY_STEPS:
             never.append(f"{self.gpu(0)} (in {step})")
-        seconds = int(FORMATION.total_seconds())
-        why = f"the group did not form in {seconds} s: {', '.join(never)}"[:600]
-        self._break(why)  # GPU 0's process ends here when it is in group init
-        if step not in _REPLY_STEPS:
-            sys.stderr.write(f"group_unformed: {why}; GPU 0 cannot leave {step}, so it ends\n")
+        seconds = int(ATTEMPT.total_seconds())
+        why = f"attempt {attempt} stalled {seconds} s: {', '.join(never)}"[:400]
+        with contextlib.suppress(OSError, ValueError):  # GPU 0's threads; each follower's follow
+            sys.stderr.write(f"group_stalled: {why}; GPU 0's threads:\n")
             sys.stderr.flush()
-            os._exit(int(Exit.failed))
+            faulthandler.dump_traceback(sys.stderr, all_threads=True)
+        self.stalled = why
+        self.interrupt(stacks=True)
+        with contextlib.suppress(Exception):  # a report: it never keeps the attempt from ending
+            self.on_stall(step, why)
+        if done.wait(UNWIND.total_seconds()):
+            return
+        self._break(f"the group did not form: {why}")  # GPU 0 in group init ends here
+        if self.forming not in _REPLY_STEPS:
+            self._end(f"{self.broken}; GPU 0 cannot leave {self.forming}, so its process ends")
+
+    def _settle(self) -> None:
+        """After a stalled attempt: each follower's answer to the command it was in, which the
+        abort lets it give. One that gives none within `UNWIND` cannot leave it: refused."""
+        for follower in self.followers:
+            while follower.owed:
+                try:
+                    frame = follower.replies.get(timeout=UNWIND.total_seconds())
+                except queue.Empty:
+                    self._break(
+                        f"the group did not form: {self.stalled}; {follower.gpu} did not leave it"
+                    )
+                    raise GroupRefusal(self.verdict(), code="group_unformed") from None
+                if frame is None:
+                    raise GroupRefusal(self.verdict(), code="group_unformed")
+                if frame[0].reply == follower.owed:
+                    follower.owed = ""
 
     def _unformed(self, replies: Sequence[Mapping[str, object]], step: str) -> None:
         """Refuse the group on any follower's refusal of `step`."""
@@ -704,7 +825,7 @@ class RankGroup:
         """Hand every follower rank 0's Start."""
         self.broadcast(command)
 
-    def collect(self, name: str, shown: bool = True) -> list[dict[str, Any]]:
+    def collect(self, name: str, shown: bool = True) -> list[dict[str, Json]]:
         """One reply named `name` from every follower, in rank order. Each wait ends with the
         reply or the follower's death, observed through its seam, never inferred from silence.
         A call's replies follow its collectives every step, so those waits are not `shown`."""
@@ -719,10 +840,10 @@ class RankGroup:
                 f"{self.gpu(rank)} cannot be commanded: {exc}", code="group_broken"
             ) from exc
 
-    def reply_one(self, rank: int, name: str, shown: bool = True) -> dict[str, Any]:
+    def reply_one(self, rank: int, name: str, shown: bool = True) -> dict[str, Json]:
         return self._reply(self.followers[rank - 1], name, shown)
 
-    def _reply(self, follower: Follower, name: str, shown: bool = True) -> dict[str, Any]:
+    def _reply(self, follower: Follower, name: str, shown: bool = True) -> dict[str, Json]:
         if shown and follower.replies.empty():
             self.waiting(f"waiting on {follower.gpu}: {name}")
         frame = follower.replies.get()
@@ -733,9 +854,11 @@ class RankGroup:
             refused = f": {head.code}: {head.detail}"[:600] if head.ok is False else ""
             self._break(f"{follower.gpu} answered {head.reply!r} to {name!r}{refused}")
             raise GroupRefusal(self.broken, code="group_broken")
+        if follower.owed == name:
+            follower.owed = ""
         return body
 
-    def call(self, command: Mapping[str, object]) -> list[dict[str, Any]]:
+    def call(self, command: Mapping[str, object]) -> list[dict[str, Json]]:
         self.broadcast(command)
         return self.collect(str(command["cmd"]))
 
