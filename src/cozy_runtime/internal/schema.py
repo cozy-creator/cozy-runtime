@@ -98,7 +98,7 @@ def _defaults(rendered: Json, annotation: object) -> None:
     if get_origin(inner) in (list, Sequence) and "list" in rendered:
         _defaults(rendered["list"], get_args(inner)[0])
         return
-    if not (is_struct(inner) and inner is not AssetInputValue):
+    if not (is_struct(get_origin(inner) or inner) and inner is not AssetInputValue):
         return
     rendered = rendered.get("pickup", rendered)
     if not isinstance(rendered, dict) or not isinstance(rendered.get("fields"), list):
