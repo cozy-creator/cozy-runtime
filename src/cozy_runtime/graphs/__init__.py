@@ -318,7 +318,7 @@ def _capture(
     reserve: int,
 ) -> tuple[CUDAGraph | None, str]:
     """One capture into `pool`, prepared with `reserve`."""
-    graph: CUDAGraph = torch.cuda.CUDAGraph()
+    graph = domain.cuda_graph()
     current: Stream = torch.cuda.current_stream()
     # cast: an initialized domain's streams and events (`Domain.initialize`), as each capture's
     stream, work = cast("Stream", owner.control), cast("Stream", owner.stream)
