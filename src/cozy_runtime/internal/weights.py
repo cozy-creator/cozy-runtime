@@ -1258,6 +1258,9 @@ class Placement:
         """The region's address ownership, independent of its physical replay lease."""
         return self.models[component].retain(paths)
 
+    def keep(self, component: str, since_ns: int, reserve: int) -> tuple[Binding, int, int] | None:
+        return self.models[component].keep(since_ns, reserve)
+
     def represent(
         self, component: str, dtype: torch.dtype, *, resident_only: bool = False
     ) -> Callable[[], None]:

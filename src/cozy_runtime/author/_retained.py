@@ -21,7 +21,9 @@ class State(Protocol):
     """What one `put` holds."""
 
     def get(self) -> tuple[Tensor, ...]:
-        """The tensors `put` was given, as read-only views valid while they live."""
+        """The tensors `put` was given, as read-only views valid while they live. They hold the
+        state on the card while they live: read each state where it is used, so a step holds
+        only those (qwen-image-2 read 32 layers' prefix K/V at once, 24 GB, run 47471)."""
         ...
 
 
