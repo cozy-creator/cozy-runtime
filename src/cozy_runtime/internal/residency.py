@@ -2440,7 +2440,7 @@ class RequestStats(TypedDict):
     working_phases: list[dict[str, Any]]  # type: ignore[explicit-any]  # phase.observing's rows (typing-runtime types them)
     working_splits: list[SplitRecord]
     escaped: list[EscapeRecord]
-    finer_splits: int
+    retries: int
     swallowed_ooms: int
     retained_bytes: int
     gathered: int
@@ -2642,8 +2642,9 @@ class Request:
         self.heads: dict[Model, tuple[set[int], int]] = {}
         #: the attempt failed (its executor says): a refused allocation in its last pass is learned
         self.failed = False
-        #: pure ops varena told to run again finer after refusing their leaf: zero in a normal run
-        self.finer_splits = 0
+        #: refusals the Runtime answered by running again another way (a pure op's finer split, an LM
+        #: token decoded eagerly for a capture its pool couldn't hold): zero in a normal run
+        self.retries = 0
         #: refusals a package scope returned past (`contract._Scopes`): zero in a conforming run
         self.swallowed_ooms = 0
         #: cross-step state its loops declared (`author.retained`)
@@ -2783,7 +2784,7 @@ class Request:
             "working_phases": list(self.working_phases),
             "working_splits": list(self.working_splits.values()),
             "escaped": list(self.escaped),
-            "finer_splits": self.finer_splits,
+            "retries": self.retries,
             "swallowed_ooms": self.swallowed_ooms,
             "retained_bytes": self.retained_bytes,
             "gathered": self.gathered,
