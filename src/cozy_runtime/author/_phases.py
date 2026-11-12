@@ -270,8 +270,11 @@ def begin(
         parent = None
     index = (id(teller.owner), teller.base, id(parent) if parent is not None else 0, key)
     run = _RUNS.get(index)
-    # Its total is read before the lock: it may walk a model's blocks.
-    whole = total() if total is not None and (run is None or run.ended) else None
+    whole: int | None = None
+    if total is not None and (run is None or run.ended):
+        # Read before the lock (it may walk a model's blocks); a phase never fails its call.
+        with contextlib.suppress(Exception):
+            whole = total()
     with _LOCK:
         run = _RUNS.get(index)
         if run is None or run.ended:
