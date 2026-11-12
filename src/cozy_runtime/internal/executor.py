@@ -976,6 +976,12 @@ def _construction_record(prepare: Mapping[str, object]) -> Reply:
     }
 
 
+def _unbound(command: Invoke) -> dict[str, tuple[str, str]]:
+    """The on-demand slots TensorD bound no checkpoint, each with why (xs-186). A TensorFS
+    before it sends none."""
+    return dict(getattr(command, "unbound", None) or {})
+
+
 class _OnDemand:
     """An `on_demand=` model argument: built, and its weights fetched, when the function first
     reads it. Until then the runtime's probes see no model, and a request that never reads it
@@ -1741,6 +1747,7 @@ class Executor:
                             cancel=self.host._interrupted.is_set,
                             # An on-demand proxy stands for its model (`_OnDemand.__getattr__`).
                             models=cast("Mapping[str, Model[object]]", self.models),
+                            unbound=_unbound(command),
                             recipes=self.discovered.recipes,
                             trees=command.trees,
                             assets=_granted_inputs(command),
@@ -3925,6 +3932,7 @@ class Executor:
                         ),
                         # An on-demand proxy stands for its model (`_OnDemand.__getattr__`).
                         models=cast("Mapping[str, Model[object]]", self.models),
+                        unbound=_unbound(command),
                         recipes=cast("Discovered", self.discovered).recipes,  # started
                         progress=boundary,
                         # cr-012: the inputs the WORKER already fetched, verified and spooled.
