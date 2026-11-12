@@ -358,7 +358,7 @@ def _graph_snapshot(
             "active_graphs": len(engine.graphs),
             "capture_attempts": int(engine.captured[0]),
             "captures": engine.recorded,
-            "regrown": engine.regrown,
+            "regrown": [list(pair) for pair in engine.regrown],
             "retired_graphs": engine.retired_graphs,
             "replays": engine.replayed,
             "eager_steps": engine.eager,
@@ -1604,8 +1604,9 @@ class _Engine:
         self.captured = [0, 0.0]
         self.eager = 0
         self.recorded = 0
-        #: of those, the ones that took more than their warm-up's guess (`graphs.capture`)
-        self.regrown = 0
+        #: of those, each that took more than its warm-up's guess: the guess, and the room it
+        #: was recorded in (`graphs.capture`)
+        self.regrown: list[tuple[int, int]] = []
         self.replayed = 0
         self.retired_graphs = 0
         #: `LANDED` when a capture met a kernel still building (none records until one lands),
@@ -2778,7 +2779,7 @@ class _Engine:
                             alone=not self.graphs,
                         )
                         if graph is not None and pool.prepared > reserve:
-                            self.regrown += 1
+                            self.regrown.append((reserve, pool.prepared))
                     except Exception as exc:  # no room for its pool, or short outside it
                         if not is_capacity(exc):
                             raise
