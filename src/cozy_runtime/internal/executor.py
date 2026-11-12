@@ -5056,6 +5056,11 @@ def answer(executor: Executor, frame: Frame) -> Frame | None:
         return {**reply, "kernels": kernel_ready.pending(), "began": began}
     if name not in commands.NAMES:
         return {"ok": False, "code": "unknown_command", "detail": name}
+    if name == "hello" and "transport_challenge" in frame:
+        challenge = frame["transport_challenge"]
+        if not isinstance(challenge, str) or len(challenge) != 64 or any(c not in "0123456789abcdef" for c in challenge):
+            raise SeamError("seam_descriptor", "invalid inherited transport challenge")
+        return {**executor.hello(), "transport_challenge": challenge}
     command, forwarded = commands.decode(frame)
     if isinstance(command, Shutdown):
         return None
@@ -5103,7 +5108,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.transport_capabilities:
         # Semantic feature probe, carrying no model, project or authored invocation bytes.
-        print(json.dumps({"inherited_local_stream": sys.platform == "linux"}))
+        print(json.dumps({"inherited_local_stream": sys.platform == "linux", "transport_challenge": True}))
         return 0
     if not args.root:
         parser.error("--root is required")
