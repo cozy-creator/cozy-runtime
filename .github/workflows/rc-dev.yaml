@@ -66,7 +66,7 @@ jobs:
         with:
           name: cozy-runtime-${{ github.sha }}
           path: dist
-      # New files first, SHA256SUMS next (a reader sees the old build or this one, whole), stale native files last.
+      # New files first, SHA256SUMS next (a reader sees the old build or this one, whole), native files an hour stale last.
       - name: The RC's prerelease holds this build
         working-directory: dist
         run: |
@@ -83,7 +83,9 @@ jobs:
               --title "$BRANCH dev builds" --notes "The newest build of $BRANCH, for dev homes (cl-922). Replaced by each push."
           fi
           gh api -X PATCH "repos/$REPO/git/refs/tags/$tag" -f sha="$SHA" -F force=true >/dev/null
-          stale=$(gh release view "$tag" -R "$REPO" --json assets --jq '.assets[].name')
+          # A native wheel goes an hour after the push that replaced it: a SHA256SUMS a reader holds (GitHub's CDN serves the old
+          # one for minutes; Calcifer keeps a read for a minute) still names files that are there (e2e 43206615800 read a 404).
+          stale=$(gh release view "$tag" -R "$REPO" --json assets --jq '.assets[] | select(.updatedAt < (now - 3600 | todate)) | .name')
           gh release upload "$tag" -R "$REPO" --clobber "${wheels[@]}"
           gh release upload "$tag" -R "$REPO" --clobber SHA256SUMS
           # A pure wheel stays: a lock takes it by URL (cl-952).
