@@ -375,10 +375,16 @@ def restore_flags(torch: ModuleType) -> list[str]:
 REFUSALS: list[Callable[[], tuple[int, Request | None] | None] | None] = [None]
 
 
+def _answered(request: object) -> int:
+    """The refusals `request`'s Runtime answered: by running again another way, or by a capture
+    recording again with room for them."""
+    return int(getattr(request, "retries", 0)) + int(getattr(request, "regrown", 0))
+
+
 class _Scopes:
     """Each local component scope (`author/_model.py`): at its exit the flags are put back and
     checked, and a refusal varena counted while it ran (`vt.ooms`) that the scope returned past,
-    and that no Runtime Retry answered (`retries`), is a swallowed OOM: a run warning
+    and that no Runtime Retry answered (`retries`, `regrown`), is a swallowed OOM: a run warning
     (`oom_swallowed`) and the request's `swallowed_ooms`. Scopes overlapping on two threads are
     not judged for it: varena's count is the device's. A scope that ran on a thread the package
     started is a run warning (`contract_thread`): a package's thread launches no device work."""
@@ -400,7 +406,7 @@ class _Scopes:
         read = REFUSALS[0]() if REFUSALS[0] is not None else None
         if read is None:
             return None
-        return read[0], getattr(read[1], "retries", 0), shared
+        return read[0], _answered(read[1]), shared
 
     def leave(self, entered: tuple[int, int, int] | None, method: str, ok: bool) -> None:
         thread = threading.get_ident()
@@ -426,7 +432,7 @@ class _Scopes:
             assert entered is not None
             ooms, request = read
             since = max(entered[0], self._accounted.get())
-            swallowed = ooms - since - (getattr(request, "retries", 0) - entered[1])
+            swallowed = ooms - since - (_answered(request) - entered[1])
             self._accounted.set(ooms)
             if swallowed > 0:
                 if request is not None and hasattr(request, "swallowed_ooms"):
