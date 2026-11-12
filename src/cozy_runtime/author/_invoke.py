@@ -73,6 +73,7 @@ from cozy_runtime.author._markers import FileBound, ImagePreparation
 from cozy_runtime.author._media import KIND_MEDIA, admits, slot_kind
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation, Track
+from cozy_runtime.author._preview import PreviewFrame, Previews
 from cozy_runtime.author._recipes import DeclaredRecipe
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
@@ -134,6 +135,10 @@ class Invocation:
     calls: _Broker | None = None
     publish: Callable[[Publish], Answer] | None = None
     """`Outputs.publish`'s exchange with the machine, which journals the run's output log."""
+    previewing: Callable[[], bool] | None = None
+    """Whether a client watches this attempt's previews now (`preview`), and `preview` where
+    each encoded one goes."""
+    preview: Callable[[PreviewFrame], None] | None = None
     #: No worker settles this attempt's frames (the fakes), so each encodes at its save.
     settle_at_save: bool = False
     #: False on a group's other GPUs: a save records its asset and writes nothing (`Attempt`).
@@ -307,6 +312,10 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel)
     ctx._recipes = inv.recipes
     ctx._progress, ctx._called = Telemetry(record, ctx).loop_progress()
+    if inv.previewing is not None and inv.preview is not None:
+        ctx._preview = Previews(
+            inv.previewing, inv.preview, lambda why: record.emit("log", why, "warning")
+        )
     handles = ExitStack()
     _bind_tensorfs(ctx, record, inv, surface, handles)
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)

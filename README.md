@@ -115,6 +115,13 @@ innermost `tel.stage(name)`. The machine places the whole run's bar from its own
 Invalid progress is omitted and diagnosed on the same bounded lossy lane; it cannot route,
 settle, bill, or otherwise control an attempt.
 
+Previews are one optional call too: `preview(x0, "flux2")` (`cozy_runtime.author`) after a step,
+with the loop's estimate of the clean latents (or its latents) in a named VAE's space. While a
+client watches the run, the Runtime projects them to RGB with that VAE's linear factors on their
+device, at most twice a second, and encodes a small WebP (an animated one for video) off the
+loop's thread; the machine keeps the newest for the client. With no client watching it returns at
+once. A shape or VAE it can't show is said once in the run's log and never fails the run.
+
 The machine owns durable run outcomes and output custody. Runtime returns
 structured executor facts and consumes the native capabilities it is granted.
 The former Python worker triage ledger, destination-grant table and worker

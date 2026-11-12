@@ -19,6 +19,7 @@ from cozy_runtime.author._context import Context, Device, device
 from cozy_runtime.author._errors import InvalidRequest, OutputError, UnsupportedInput
 from cozy_runtime.author._loader import Config, DerivedCache, Loader, ModelAssets
 from cozy_runtime.author._model import Model, Serving, memoize, uses_components
+from cozy_runtime.author._preview import preview
 from cozy_runtime.author._recipes import (
     DerivationHook,
     EncodingRule,
@@ -83,6 +84,7 @@ __all__ = [
     "device",
     "memoize",
     "prefetch",
+    "preview",
     "retained",
     "split",
     "uses_components",

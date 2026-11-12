@@ -144,6 +144,7 @@ from cozy_runtime.author._model import (
     component_use,
 )
 from cozy_runtime.author._observations import DEVICE, PLANS, Attribution, Observation
+from cozy_runtime.author._preview import PreviewFrame
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._signature import analyze
@@ -1225,6 +1226,8 @@ class Executor:
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
+            # TensorD may send `preview` (a client watches a call's previews): `author.preview`.
+            "previews": 1,
         }
 
     # ------------------------------------------------------------- the group (cr-068)
@@ -3866,6 +3869,8 @@ class Executor:
                         ),
                         publish=exchange,
                         calls=self.host._call_broker(command.request_id, self.host.call_interfaces),
+                        previewing=functools.partial(self.host.mux.previewing, command.request_id),
+                        preview=self._preview_sink(command.request_id),
                     ),
                 )
                 if group_attempt is not None:
@@ -4764,6 +4769,30 @@ class Executor:
                     )
 
         return progress
+
+    def _preview_sink(self, request_id: str) -> Callable[[PreviewFrame], None]:
+        """The lossy lane's previews for one attempt: each one's bytes, base64, with its step."""
+
+        def preview(frame: PreviewFrame) -> None:
+            with contextlib.suppress(SeamError):
+                self.channel.send(
+                    {
+                        "event": "progress",
+                        "request_id": request_id,
+                        "kind": "preview",
+                        "preview": {
+                            "position": frame.position,
+                            "total": frame.total,
+                            "media_type": frame.media_type,
+                            "width": frame.width,
+                            "height": frame.height,
+                            "frames": frame.frames,
+                            "data": base64.b64encode(frame.data).decode(),
+                        },
+                    }
+                )
+
+        return preview
 
     def _result_schema_digest(self, surface: Surface) -> str:
         """The identity of the DECLARED annotated result surface — never of the value.
