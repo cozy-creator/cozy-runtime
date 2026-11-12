@@ -1385,8 +1385,10 @@ _LINE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
 
 def _segment(lines: Sequence[str], node: ast.AST) -> str | None:
     """`ast.get_source_segment` over a module's lines split once (`_LINE`)."""
-    lineno, end = getattr(node, "lineno", None), getattr(node, "end_lineno", None)
-    col, end_col = getattr(node, "col_offset", None), getattr(node, "end_col_offset", None)
+    lineno: int | None = getattr(node, "lineno", None)
+    end: int | None = getattr(node, "end_lineno", None)
+    col: int | None = getattr(node, "col_offset", None)
+    end_col: int | None = getattr(node, "end_col_offset", None)
     if lineno is None or end is None or col is None or end_col is None:
         return None
     first, last = lineno - 1, end - 1
