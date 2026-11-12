@@ -649,6 +649,36 @@ class Model:
         finally:
             self.memory._close(self, executing=executing)
 
+    def keep(self, since_ns: int, reserve: int) -> tuple[Binding, int, int] | None:
+        """For a loop of its forwards that can't hold it whole (an LM decoding streamed): of its
+        blocks used since `since_ns`, as many as fit beside its live working memory, `reserve`
+        bytes and room for the largest of the rest to stream through twice. A binding over them,
+        which the caller prepares and holds while the loop runs, so each forward reads only the
+        others again; with the bytes kept and those still read a forward. None when none fits.
+        An embedding table is no block a forward reads whole (`_Block.table`)."""
+        if self.memory.native is None:
+            return None
+        used = [b for b in self.groups() if b.last >= since_ns and not b.table]
+        if not used:
+            return None
+        room = vt.room(self.memory.device.index or 0)
+        budget = room["capacity"] - room["working_live"] - reserve
+        budget -= 2 * max(b.least_bytes for b in used)
+        kept: list[_Block] = []
+        held = 0
+        for block in used:
+            if held + block.least_bytes <= budget:
+                kept.append(block)
+                held += block.least_bytes
+        if not kept:
+            return None
+        self._claim()
+        try:
+            self.memory._declare(self)
+            return Binding(self, kept), held, sum(b.least_bytes for b in used) - held
+        finally:
+            self._release()
+
     def retain(self, paths: Collection[str] = ("",)) -> Binding:
         self._claim()
         try:

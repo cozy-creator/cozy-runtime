@@ -981,7 +981,8 @@ def _transformers(
     if sampling.temperature > 0:
         processors.append(_Draw(prompt, sampling))
     context = CURRENT.get()
-    with _PLANE, torch.inference_mode():
+    with _PLANE, torch.inference_mode(), ExitStack() as held:
+        cancel = _Cancel(context, tell, _Keeper(model, held))
         out = _lm(model).generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -989,17 +990,69 @@ def _transformers(
             eos_token_id=stops,
             pad_token_id=pad,
             logits_processor=LogitsProcessorList(processors),
-            stopping_criteria=StoppingCriteriaList([_Cancel(context, tell)]),
+            stopping_criteria=StoppingCriteriaList([cancel]),
         )
+        cancel.keeper.report(prompt, cancel.steps)
     return out[:, prompt:]
 
 
-class _Cancel(StoppingCriteria):
-    """Transformers' loop raises the attempt's cancellation between tokens and tells its
-    progress."""
+#: What a streamed decode step needs beyond its kept weights and live memory (its cache's growth,
+#: the logits): the room `_Keeper` leaves.
+KEEP_RESERVE = 512 << 20
 
-    def __init__(self, context: Context | None, tell: _Tell) -> None:
-        self.context, self.tell, self.steps = context, tell, 0
+
+class _Keeper:
+    """Transformers' loop over a model whose decode set doesn't fit: after its first decode step,
+    as many of the blocks that step read as fit stay held to the end of the call, so each later
+    token reads only the others again, not the whole model (cr-286: Qwen3.5-9B int8 at an 8 GiB
+    cap decoded about 1 s a token, every weight read again for each). The prompt's prefill runs
+    before any is held: its working memory is the call's largest."""
+
+    def __init__(self, model: torch.nn.Module, held: ExitStack) -> None:
+        self.placed = PLACED.get(model)
+        self.held, self.since, self.began = held, 0, time.perf_counter()
+        self.decoded = 0.0
+        self.kept = self.read = 0
+
+    def step(self, steps: int) -> None:
+        if self.placed is None or steps > 2:
+            return
+        if steps == 1:  # the prompt's token: the decode begins
+            self.since, self.decoded = time.monotonic_ns(), time.perf_counter()
+            return
+        try:
+            found = self.placed[0].keep(self.placed[1], self.since, KEEP_RESERVE)
+            if found is None:
+                return
+            binding, self.kept, self.read = found
+            self.held.callback(binding.close)
+            self.held.enter_context(binding.prepare())
+        except Exception as exc:  # holding is only speed: the decode streams as it did
+            if not is_capacity(exc):
+                raise
+            _unwind(exc)
+            self.kept = 0
+
+    def report(self, prompt: int, steps: int) -> None:
+        """Its tokens a second, and the bytes kept and read again a token, in the run record."""
+        if self.placed is None or steps < 2:
+            return
+        seconds = time.perf_counter() - self.decoded
+        text = (
+            f"{steps} tokens after {prompt} through Transformers' loop: "
+            f"{(steps - 1) / max(seconds, 1e-9):.2f} tokens/s decoding, "
+            f"{_gib(self.kept)} of its weights held, {_gib(self.read)} read again a token"
+        )
+        print(f"[lm] {text}", file=sys.stderr)
+        self.placed[0].note(f"{self.placed[1]}.lm", text)
+
+
+class _Cancel(StoppingCriteria):
+    """Transformers' loop raises the attempt's cancellation between tokens, tells its progress
+    and, after the first decode step, keeps what of the model fits (`_Keeper`)."""
+
+    def __init__(self, context: Context | None, tell: _Tell, keeper: _Keeper) -> None:
+        self.context, self.tell, self.keeper, self.steps = context, tell, keeper, 0
 
     def __call__(
         self, input_ids: torch.Tensor, scores: tuple[torch.Tensor] | None, **kwargs: object
@@ -1007,6 +1060,7 @@ class _Cancel(StoppingCriteria):
         if self.context is not None:
             self.context.raise_if_cancelled()
         self.steps += 1  # one token a step: this loop drafts none
+        self.keeper.step(self.steps)
         self.tell(lambda: self.steps)
         flags = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         return cast("torch.BoolTensor", flags)  # cast: Transformers types its flags as BoolTensor

@@ -336,6 +336,12 @@ class Residency(Protocol):
         """Retain ordinary weight storage after prepare(), until the binding closes."""
         ...
 
+    def keep(self, component: str, since_ns: int, reserve: int) -> tuple[Binding, int, int] | None:
+        """Of a component a loop of forwards can't hold whole, a binding over the blocks used since
+        `since_ns` that fit beside `reserve` and the rest streaming, the bytes kept and those still
+        read a forward; None when none fits."""
+        ...
+
     def represent(
         self, component: str, dtype: torch.dtype, *, resident_only: bool = False
     ) -> Callable[[], None]:
