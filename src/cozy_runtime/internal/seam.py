@@ -419,7 +419,7 @@ class _Asked:
 class Mux:
     """One seam shared by every thread of the process. Whoever needs a frame reads the next
     one and routes it: an answer to the request waiting on its `seq`, a `cancel` to its call's
-    mark and to `cancelled`, a frame that may carry a capability (`SUPPLYING`) to `bearer` as it
+    mark and to `cancelled`, a `preview` to its call's watch, a frame that may carry a capability (`SUPPLYING`) to `bearer` as it
     is read, anything else to the commands, in order. No
     reader thread exists, so a process that has served no call stays single-threaded and
     forkable (`zygote`)."""
@@ -436,6 +436,8 @@ class Mux:
         self._asked: dict[int, _Asked] = {}
         self._commands: deque[Frame] = deque()
         self._cancels: dict[str, None] = {}
+        #: Until when (monotonic) a client watches each call's previews (`preview`).
+        self._previews: dict[str, float] = {}
         self._wakes: dict[str, list[Callable[[], None]]] = {}
         self._reading = False
         self._ended: SeamError | None = None
@@ -494,6 +496,17 @@ class Mux:
         with self._changed:
             return request_id in self._cancels
 
+    def watch_previews(self, request_id: str, for_ms: int) -> None:
+        """A client watches `request_id`'s previews for the next `for_ms` (TensorD's `preview`)."""
+        with self._changed:
+            self._previews[request_id] = time.monotonic() + max(0, min(for_ms, 600_000)) / 1000
+            while len(self._previews) > CANCELS_KEPT:
+                del self._previews[next(iter(self._previews))]
+
+    def previewing(self, request_id: str) -> bool:
+        with self._changed:
+            return self._previews.get(request_id, 0.0) > time.monotonic()
+
     @contextlib.contextmanager
     def watch(self, request_id: str, wake: Callable[[], None]) -> Iterator[None]:
         """While it lasts, `wake` is called when a cancel names `request_id`, at once if one
@@ -514,6 +527,7 @@ class Mux:
     def forget(self, request_id: str) -> None:
         with self._changed:
             self._cancels.pop(request_id, None)
+            self._previews.pop(request_id, None)
 
     def _pump(self, done: Callable[[], bool]) -> None:
         while True:
@@ -557,6 +571,11 @@ class Mux:
         elif frame.get("cmd") == "cancel":
             self.cancel(str(frame.get("request_id", "")))
             self._cancelled(str(frame.get("request_id", "")))
+        elif frame.get("cmd") == "preview":
+            for_ms = frame.get("for_ms")
+            self.watch_previews(
+                str(frame.get("request_id", "")), for_ms if type(for_ms) is int else 0
+            )
         else:
             if frame.get("cmd") in SUPPLYING:
                 self._bearer(frame)

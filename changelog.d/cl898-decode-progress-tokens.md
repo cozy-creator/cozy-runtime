@@ -1,0 +1,1 @@
+A decode's progress says tokens, never steps: `lm.generate`'s progress, and a package's `ctx.progress` called from it (Qwen Image 2's prompt rewriter), go out as a count of tokens (`unit: "tokens"`) whose total is only the decode's cap, so a client shows `65 tokens`, not `Denoise steps: 65/2176`, and times no step by it.

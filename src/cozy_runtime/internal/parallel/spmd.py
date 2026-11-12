@@ -214,18 +214,26 @@ def seed(entropy: int) -> None:
 def install_call_check(component: torch.nn.Module, name: str) -> None:
     """Before each call of a sharded root, every GPU meets at it: a GPU at another call, or one
     whose handler already returned, is named instead of hanging a collective. Arguments may
-    differ: a GPU's own rows of a table the plan splits are its own."""
+    differ: a GPU's own rows of a table the plan splits are its own. There each GPU states the
+    kernels it has landed, and every GPU serves those landed on all of them from this call on
+    (`kernel_ready.landed`): a sparse kernel built during the attempt serves its next steps."""
     if getattr(component, "_cozy_spmd_check", None) is not None:
         return
 
     def check(module: torch.nn.Module, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
+        from cozy_runtime.internal import kernel_ready
+
         ranks = current()
         if ranks is None:
             raise UngatedShardedForward(
                 f"sharded component {name!r} was called outside a group attempt: every GPU "
                 "of its group joins its collectives, and none is running one"
             )
-        ranks.meet({}, f"{name} call")
+        rows = ranks.meet({"landed": kernel_ready.landed()}, f"{name} call")
+        states = [set(cast("list[str]", row.get("landed") or [])) for row in rows]
+        common = set.intersection(*states)
+        if common:
+            kernel_ready.boundary(common)
 
     handle: RemovableHandle = component.register_forward_pre_hook(check, with_kwargs=True)
     with contextlib.suppress(Exception):

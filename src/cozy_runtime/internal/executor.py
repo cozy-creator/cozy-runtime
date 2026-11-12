@@ -144,6 +144,7 @@ from cozy_runtime.author._model import (
     component_use,
 )
 from cozy_runtime.author._observations import DEVICE, PLANS, Attribution, Observation
+from cozy_runtime.author._preview import PreviewFrame
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._signature import analyze
@@ -1225,6 +1226,8 @@ class Executor:
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
+            # TensorD may send `preview` (a client watches a call's previews): `author.preview`.
+            "previews": 1,
         }
 
     # ------------------------------------------------------------- the group (cr-068)
@@ -2288,7 +2291,17 @@ class Executor:
             "warmup_error": warmup_error,
             "rss_bytes": _rss(),
             **({"compiles": compiles} if compiles else {}),
+            **({"kernels_absent": absent} if (absent := self._kernels_absent()) else {}),
         }
+
+    def _kernels_absent(self) -> str:
+        """Why this Runtime serves a CUDA device none of its native kernels (cl-913: the pure wheel, or kernels that
+        don't load), which TensorD says on every run; empty with them, or on another device."""
+        if self.device_kind != "cuda":
+            return ""
+        from cozy_runtime._kernels import ABSENT
+
+        return ABSENT
 
     def serving(self) -> str:
         """The active construction's execution plans applied now (`Plan.report`), by name, or
@@ -3763,8 +3776,9 @@ class Executor:
             if frame.position is not None:
                 steps[frame.stage] = frame.position
             at = point[0] = {"stage": frame.stage, "step": steps.get(frame.stage, 0), **here}
-            # A group's kernels change only between attempts: its followers took this attempt's
-            # set with its `run` and meet no boundary of GPU 0's, so GPU 0 decides nothing new here.
+            # A group's kernels change between attempts (its followers took this attempt's set with
+            # its `run`) and at its sharded calls' meetings (`spmd.install_call_check`), never at
+            # a boundary of GPU 0's alone: GPU 0 decides nothing new here.
             agreed = kernel_ready.agreed() if self.group is not None else None
             swapped.extend((name, at) for name in kernel_ready.boundary(agreed))
             if pin or served_attention is None or self.group is not None:
@@ -3866,6 +3880,8 @@ class Executor:
                         ),
                         publish=exchange,
                         calls=self.host._call_broker(command.request_id, self.host.call_interfaces),
+                        previewing=functools.partial(self.host.mux.previewing, command.request_id),
+                        preview=self._preview_sink(command.request_id),
                     ),
                 )
                 if group_attempt is not None:
@@ -4747,6 +4763,7 @@ class Executor:
                             "step_ms": frame.step_ms,
                             "call_request": frame.call_request,
                             "call_attempt": frame.call_attempt,
+                            "unit": frame.unit,
                         }
                     )
                 else:
@@ -4764,6 +4781,30 @@ class Executor:
                     )
 
         return progress
+
+    def _preview_sink(self, request_id: str) -> Callable[[PreviewFrame], None]:
+        """The lossy lane's previews for one attempt: each one's bytes, base64, with its step."""
+
+        def preview(frame: PreviewFrame) -> None:
+            with contextlib.suppress(SeamError):
+                self.channel.send(
+                    {
+                        "event": "progress",
+                        "request_id": request_id,
+                        "kind": "preview",
+                        "preview": {
+                            "position": frame.position,
+                            "total": frame.total,
+                            "media_type": frame.media_type,
+                            "width": frame.width,
+                            "height": frame.height,
+                            "frames": frame.frames,
+                            "data": base64.b64encode(frame.data).decode(),
+                        },
+                    }
+                )
+
+        return preview
 
     def _result_schema_digest(self, surface: Surface) -> str:
         """The identity of the DECLARED annotated result surface — never of the value.
