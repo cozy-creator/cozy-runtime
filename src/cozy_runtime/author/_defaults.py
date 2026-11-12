@@ -21,13 +21,14 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Literal, cast
+from typing import Literal, cast, get_origin
 
 import msgspec
 import msgspec.inspect as mi
 
 from cozy_runtime.author._errors import DefaultResolutionError, InvalidRequest
 from cozy_runtime.author._files import asset_dec_hook
+from cozy_runtime.author._image import Control
 from cozy_runtime.author._markers import _ModelDefaultMarker, applies, condition
 from cozy_runtime.author._services import AdjustmentRow
 from cozy_runtime.author._walker import MISSING, Node, walk
@@ -283,6 +284,7 @@ def _prune(
         if isinstance(info, mi.TupleType):
             items = info.item_types
         else:
+            value = _usable_controls(info.item_type, value, path, rows)
             most = info.max_length
             if most is not None and len(value) > most:
                 rows.append(
@@ -369,6 +371,32 @@ def _applying(
         given = kept.pop(field.encode_name)
         said = condition(when, _toggle(peer.type))
         rows.append(AdjustmentRow("adjusted", where, given, _default(field), said, "policy"))
+    return kept
+
+
+def _usable_controls(
+    info: mi.Type, value: list[object], path: str, rows: list[AdjustmentRow]
+) -> list[object]:
+    """A `Control[...]` list without the controls of a kind its function has no adapter for, each
+    dropped with a row (Paul, 11-12: an input a model can't use is ignored, never refused)."""
+    while isinstance(info, mi.Metadata):
+        info = info.type
+    if not isinstance(info, mi.StructType):
+        return value
+    if not issubclass(get_origin(info.cls) or info.cls, Control):
+        return value
+    kinds: tuple[object, ...] = ()
+    for field in info.fields:
+        if field.name == "kind" and isinstance(field.type, mi.LiteralType):
+            kinds = field.type.values
+    kept: list[object] = []
+    for i, item in enumerate(value):
+        kind = item.get("kind") if isinstance(item, dict) else None
+        if isinstance(kind, str) and kind not in kinds:
+            reason = f"no {kind} control here: ignored"
+            rows.append(AdjustmentRow("warn", f"{path}[{i}]", kind, None, reason, "policy"))
+            continue
+        kept.append(item)
     return kept
 
 

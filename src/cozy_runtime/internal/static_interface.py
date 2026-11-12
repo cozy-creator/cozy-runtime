@@ -334,6 +334,8 @@ _AUTHOR_TYPES = (
     "EncodingRule",
     "Box",
     "Region",
+    "Control",
+    "ControlKind",
     "AspectRatio",
     "Seed",
     "Steps",

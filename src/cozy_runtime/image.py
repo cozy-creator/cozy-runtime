@@ -3,6 +3,8 @@
 from cozy_runtime.author._image import (
     MEGAPIXEL,
     Box,
+    Control,
+    ControlKind,
     Guidance,
     ImageRequest,
     ImageResult,
@@ -18,6 +20,8 @@ from cozy_runtime.author._image import (
 __all__ = [
     "MEGAPIXEL",
     "Box",
+    "Control",
+    "ControlKind",
     "Guidance",
     "ImageRequest",
     "ImageResult",
