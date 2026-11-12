@@ -123,6 +123,9 @@ _DTYPES = {
     )
 }
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
+#: The shape key of the component forward running now (`execution.catch.passing`), its passes'
+#: shape where its blocks mark them (`_entered`): 0 where none runs.
+PASS_SHAPE: ContextVar[int] = ContextVar("cozy_pass_shape", default=0)
 #: TensorFS tallies working memory by the pass and site it was born in (`vt.pass_mark`); an older
 #: one has no tally, and nothing is marked.
 _ESCAPES = hasattr(vt, "pass_mark")
@@ -2488,7 +2491,7 @@ class Memory:
         seen, last = request.heads.get(model, (None, None))
         if seen is None or (block.index in seen and block.index != last):
             request.heads[model] = ({block.index}, block.index)
-            self._pass(model, request, 0)
+            self._pass(model, request, PASS_SHAPE.get())
             self._born(block.escape_site)
         elif block.index != last:
             seen.add(block.index)
