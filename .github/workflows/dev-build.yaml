@@ -1,7 +1,8 @@
 name: dev-build
 # Builds runtime-publish.yaml's release files for any ref, off the dev box:
 #   gh workflow run dev-build.yaml -R cozy-creator/cozy-runtime -f ref=<sha> [-f build=pure]
-# The artifact is cozy-runtime-<sha>[-aarch64]. The files are <pyproject version>+dev.g<sha8>, as
+# The artifact is cozy-runtime-<sha>[-aarch64]. The files are <pyproject version>+dev.g<sha8>, or the `version` a
+# caller names (rc-dev.yaml: the open RC's 0.47.0.dev<n>+g<sha8>, cl-952), as
 # cozy's dev builds are, so a release always replaces one (xs-129); the commit is stamped in
 # cozy_runtime._build_provenance.
 on:
@@ -28,6 +29,10 @@ on:
         description: Caller's id, shown in the run name so the caller can find its run
         type: string
         default: ''
+      version:
+        description: "The files' version in place of <pyproject version>+dev.g<sha8> (rc-dev.yaml: 0.47.0.dev<n>+g<sha8>)"
+        type: string
+        default: ''
   # rc-dev.yaml's builds.
   workflow_call:
     inputs:
@@ -44,6 +49,9 @@ on:
         type: string
         default: ''
       nonce:
+        type: string
+        default: ''
+      version:
         type: string
         default: ''
 run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.nonce }}
@@ -100,10 +108,16 @@ jobs:
         working-directory: source
         env:
           COZY_RUNTIME_BUILD_COMMIT: ${{ steps.pin.outputs.sha }}
+          VERSION: ${{ inputs.version }}
         run: |
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
-          sed -i "0,/^version = \"\(.*\)\"$/s//version = \"\1+dev.g${COZY_RUNTIME_BUILD_COMMIT:0:8}\"/" pyproject.toml
-          grep -m1 '^version = ".*+dev\.g[0-9a-f]\{8\}"$' pyproject.toml
+          if [ -n "$VERSION" ]; then
+            sed -i "0,/^version = \"\(.*\)\"$/s//version = \"$VERSION\"/" pyproject.toml
+            grep -m1 -F "version = \"$VERSION\"" pyproject.toml
+          else
+            sed -i "0,/^version = \"\(.*\)\"$/s//version = \"\1+dev.g${COZY_RUNTIME_BUILD_COMMIT:0:8}\"/" pyproject.toml
+            grep -m1 '^version = ".*+dev\.g[0-9a-f]\{8\}"$' pyproject.toml
+          fi
           uv build --out-dir dist
       - if: env.WHEELS == 'true'
         uses: actions/download-artifact@v4
