@@ -820,6 +820,17 @@ class LoRASource(Protocol):
     def lora_factors(self) -> tuple[str, Tensor, Tensor, float] | None: ...
 
 
+class KronLayer(Protocol):
+    """A LoKr'd linear (`lora_composition._Kron`): each adapter's scale and rows of the product."""
+
+    terms: Mapping[str, tuple[float, tuple[tuple[int, int], ...]]]
+    _cozy_baked: bool
+
+
+#: A LoKr factor's stored names: the whole matrix, or its `_a`, `_b` pair.
+Factor = tuple[str] | tuple[str, str]
+
+
 class LoRALayer(Protocol):
     active_adapters: Sequence[str]
     scaling: Mapping[str, float]
@@ -841,6 +852,11 @@ class _Bake:
     #: each DoRA pair's magnitude and (s, t), by its place in `factors` (`lora_bake.dora`)
     dora: dict[int, tuple[str, float, float]] = field(default_factory=dict)
     hooks: list[LoRASource] = field(default_factory=list)
+    #: A LoKr'd linear and each adapter's (W1, W2, scale, rows): a dense delta (`lora_bake.Kron`)
+    kron: KronLayer | None = None
+    krons: list[tuple[Factor, Factor, float, tuple[tuple[int, int], ...]]] = field(
+        default_factory=list
+    )
     #: An svdq.nvfp4 leaf: its LoRAs join its low-rank branch as more ranks when it runs
     #: (`SvdqLinear.adopt`), never its bytes, so no page refills for them.
     leaf: _Adopting | None = None
@@ -888,7 +904,12 @@ class _Bakes:
             if any(site.startswith(block + ".") for block in blocks):
                 bake.hooks = [hook for hook in hooks if isinstance(hook, LoRASource)]
             target = site.removesuffix(".base_layer")
-            if target != site:
+            kron = cast("KronLayer | None", root.get_submodule(target) if target != site else None)
+            if kron is not None and getattr(type(kron), "_cozy_kron", False):
+                # An svdq leaf adds its LoRAs as more ranks: a LoKr's dense delta stays per step.
+                if leaf is None and (krons := _krons(names, target, kron)) is not None:
+                    bake.kron, bake.krons = kron, krons
+            elif target != site:
                 layer = cast(LoRALayer, root.get_submodule(target))
                 dora = getattr(layer, "_cozy_dora", {})
                 for adapter in getattr(layer, "active_adapters", ()):
@@ -909,7 +930,7 @@ class _Bakes:
                         "its own low-rank branch",
                         code="adapter_dora_target",
                     )
-            if bake.layer is not None or bake.hooks:
+            if bake.layer is not None or bake.hooks or bake.kron is not None:
                 self.bakes[stored] = bake
         held = {b.weight for b in self.bakes.values() if b.dora}
         for path, module in root.named_modules():
@@ -963,6 +984,8 @@ class _Bakes:
         for bake in self.bakes.values():  # each LoRA'd linear told whether its bytes carry it
             if bake.layer is not None:
                 bake.layer._cozy_baked = baked
+            if bake.kron is not None:
+                bake.kron._cozy_baked = baked
             for hook in bake.hooks:
                 hook._cozy_baked = baked
             if bake.leaf is not None:
@@ -1016,6 +1039,7 @@ class _Bakes:
                 (a, b, repr(scale), *map(repr, bake.dora.get(i, ())))
                 for i, (a, b, scale) in enumerate(bake.factors)
             ]
+            deltas += [(w1, w2, repr(scale), rows) for w1, w2, scale, rows in bake.krons]
             for hook in bake.hooks if armed else ():
                 delta = self._delta(hook)
                 if delta is None:
@@ -1058,7 +1082,8 @@ class _Bakes:
     def _held(bake: _Bake) -> list[str]:
         """The stored factor tensors (and magnitudes) a bake of `bake` reads."""
         factors = [n for a, b, _ in bake.factors for n in (a, b)]
-        return factors + [m for m, _, _ in bake.dora.values()]
+        krons = [n for w1, w2, _, _ in bake.krons for n in (*w1, *w2)]
+        return factors + krons + [m for m, _, _ in bake.dora.values()]
 
     def __call__(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> bool:
         """Bake `block`'s LoRA'd weights in place; whether any was baked."""
@@ -1093,12 +1118,19 @@ class _Bakes:
                     assert got is not None
                     downs.append(got[1])
                     ups.append(got[2] * got[3])
-                delta = bool(downs)
-                if delta:
+                terms = [_kron(torch, parts, *k) for k in bake.krons]
+                more = lora_bake.dense(terms)
+                delta = bool(downs or terms)
+                if downs:
                     kind = downs[0].dtype
                     down = torch.cat([d.to(kind) for d in downs])
                     up = torch.cat([u.to(kind) for u in ups], dim=1)
-                del named, got, downs, ups  # no view of a source outlives its piece's bind
+                elif terms:  # a LoKr alone: rank-0 factors beside its dense rows
+                    first = terms[0]
+                    inner = first.w1.shape[1] * first.w2.shape[1]
+                    down = torch.zeros(0, inner, device=first.w1.device)
+                    up = torch.zeros(first.index.numel(), 0, device=first.w1.device)
+                del named, got, downs, ups, terms  # no view of a source outlives its piece's bind
             if not delta:
                 continue
             lora_bake.bake(
@@ -1109,9 +1141,51 @@ class _Bakes:
                 seed=zlib.crc32(f"{identity}\0{stored}".encode()),
                 how=self.how,
                 gain=gain,
+                more=more,  # type: ignore[possibly-undefined]  # set with `delta`
             )
             self.baked += 1
         return self.baked > baked
+
+
+def _krons(
+    names: Mapping[str, str], target: str, layer: KronLayer
+) -> list[tuple[Factor, Factor, float, tuple[tuple[int, int], ...]]] | None:
+    """A LoKr'd linear's stored factors by adapter, as `_Bake.krons`; None where one is missing."""
+    out: list[tuple[Factor, Factor, float, tuple[tuple[int, int], ...]]] = []
+    for adapter, (scale, rows) in layer.terms.items():
+        factors: list[Factor] = []
+        for w in ("w1", "w2"):
+            whole = names.get(f"{target}.lokr_{w}.{adapter}.weight")
+            a = names.get(f"{target}.lokr_{w}_a.{adapter}.weight")
+            b = names.get(f"{target}.lokr_{w}_b.{adapter}.weight")
+            if whole is not None:
+                factors.append((whole,))
+            elif a is not None and b is not None:
+                factors.append((a, b))
+            else:
+                return None
+        out.append((factors[0], factors[1], scale, rows))
+    return out
+
+
+def _kron(
+    torch: ModuleType,
+    parts: Mapping[str, Mapping[str, Tensor]],
+    w1: Factor,
+    w2: Factor,
+    scale: float,
+    rows: tuple[tuple[int, int], ...],
+) -> lora_bake.Kron:
+    """One LoKr adapter's dense delta from its stored factors (a pair multiplied in f32)."""
+
+    def factor(names: Factor) -> Tensor:
+        held = [parts[n]["value"] for n in names]
+        return held[0] if len(held) == 1 else held[0].float() @ held[1].float()
+
+    first, second = factor(w1), factor(w2)
+    every = ((0, first.shape[0] * second.shape[0]),)
+    index = torch.cat([torch.arange(a, b, device=first.device) for a, b in rows or every])
+    return lora_bake.Kron(first, second, scale, index)
 
 
 def _deltas(bake: _Bake) -> list[tuple[object, Tensor, Tensor, float]]:

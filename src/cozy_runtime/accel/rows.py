@@ -64,6 +64,15 @@ class _Composed(Protocol):
     scaling: dict[str, float]
 
 
+class _Kron(Protocol):
+    """A LoKr'd layer `lora_composition` built (`_Kron`): its base, and its dense update."""
+
+    _cozy_baked: bool
+    base_layer: nn.Module
+
+    def update(self, x: Tensor) -> Tensor: ...
+
+
 #: Encoded leaves whose rows compute alone: their stored roles, and the output rows a tile of
 #: their scales holds (a window takes whole tiles; nvfp4's are `formats.to_blocked`'s).
 _ROWWISE: dict[str, tuple[frozenset[str], int]] = {
@@ -85,6 +94,12 @@ def rows(linear: nn.Module) -> Rows | None:
         if base is None:
             return None
         return lambda x, a, b, out=None: _adapted(linear, x, base(x, a, b, out), a, b)
+    if getattr(type(linear), "_cozy_kron", False):
+        kron = cast("_Kron", linear)
+        base = rows(kron.base_layer)
+        if base is None:
+            return None
+        return lambda x, a, b, out=None: _kron(kron, x, base(x, a, b, out), a, b)
     if type(linear) is nn.Linear:
         return lambda x, a, b, out=None: _hooked(linear, x, _plain(linear, x, a, b, out), a, b)
     provider: str | None = getattr(linear, "provider", None)
@@ -164,6 +179,15 @@ def _adapted(
         down = cast("nn.Linear", layer.lora_A[name]).weight
         lora.accumulate(x, out, down, up[start:stop], layer.scaling[name])
     return out
+
+
+def _kron(layer: _Kron, x: Tensor | PreQuantized, out: Tensor, start: int, stop: int) -> Tensor:
+    """A LoKr'd layer's update over rows [start, stop) of its whole update; none once baked."""
+    if layer._cozy_baked:
+        return out
+    if not isinstance(x, Tensor):
+        raise ValueError("an unbaked LoKr update needs the float input, not its operand")
+    return out.add_(layer.update(x)[..., start:stop].to(out.dtype))
 
 
 def _hooked(

@@ -5,9 +5,9 @@ The view's base weights are `<path>.base_layer.*` and its factors `<path>.lora_{
 names, by stored names, the PEFT layers (linear and 2-D convolution) this module builds before the
 ordinary census, fill and residency own them.
 
-A LoKr layer (LyCORIS' Kronecker adapter) adds `s * x @ kron(W1, W2).T` each step, never the
-product: `x` as `[.., b, d]`, then `W1 · x · W2ᵀ` (`[.., a, c]`), its target's rows. It isn't baked
-(the update is dense, and costs about `1/a` of its linear's GEMM).
+A LoKr layer (LyCORIS' Kronecker adapter) bakes `s * kron(W1, W2)` into its linear where a LoRA
+bakes (`weights._Bakes`, a dense delta); else it adds `s * x @ kron(W1, W2).T` each step, never the
+product: `x` as `[.., b, d]`, then `W1 · x · W2ᵀ` (`[.., a, c]`), its target's rows.
 
 A DoRA term is PEFT's, `D = m * V / ||V||` per output channel with `V = W + s * B @ A`
 (s = alpha / r), at strength t: `W' = W + t * (D - W)` (`lora_bake.dora_weight`), the identity at 0
@@ -122,6 +122,8 @@ def composer(graph: Graph, magnitudes: Mapping[str, str]) -> Callable[[object], 
 
         #: what `attention._base` unwraps to read the base's output dtype
         _cozy_kron = True
+        #: the weight plane baked the update into the base weight's resident bytes
+        _cozy_baked = False
 
         def __init__(self, base: nn.Linear, rows: list[Layer]) -> None:
             super().__init__()
@@ -150,6 +152,13 @@ def composer(graph: Graph, magnitudes: Mapping[str, str]) -> Callable[[object], 
 
         def forward(self, x: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
             result: torch.Tensor = self.base_layer(x, *args, **kwargs)
+            if self._cozy_baked:
+                return result
+            return result + self.update(x).to(result.dtype)
+
+        def update(self, x: torch.Tensor) -> torch.Tensor:
+            """Every adapter's `scale * x @ kron(W1, W2).T` (its rows), at x's precision."""
+            result: torch.Tensor | None = None
             for adapter, (scale, rows) in self.terms.items():
                 w1 = self._factor("w1", adapter).to(x.dtype)
                 w2 = self._factor("w2", adapter).to(x.dtype)
@@ -158,7 +167,8 @@ def composer(graph: Graph, magnitudes: Mapping[str, str]) -> Callable[[object], 
                 y = torch.matmul(w1, x.reshape(-1, b, d) @ w2.t()).reshape(*x.shape[:-1], a * c)
                 if rows:
                     y = torch.cat([y[..., start:stop] for start, stop in rows], -1)
-                result = result + (y * scale).to(result.dtype)
+                result = y * scale if result is None else result.add_(y, alpha=scale)
+            assert result is not None  # a _Kron holds at least one adapter
             return result
 
     class _Conv2d(PeftConv2d):
