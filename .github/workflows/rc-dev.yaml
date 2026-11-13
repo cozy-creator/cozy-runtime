@@ -2,10 +2,9 @@ name: rc-dev
 # The open RC's Runtime for dev homes (cl-922): each push to rc/<x.y.z> builds dev-build.yaml's wheels, with their
 # kernels, as the minor it makes, a dev release (cl-952): pyproject 0.47.0.dev0 (set when 0.46.0 froze) builds
 # 0.47.0.dev<n>+g<sha8>, n the RC branch's first-parent commit count, and a release version (0.45.2) the next minor's; so a
-# package's floor can name it (`cozy-runtime>=0.47.0.dev2260`). They go on the rolling
-# GitHub prerelease `rc-<x.y.z>`, never latest, in place of the last push's native ones; each push's pure wheel stays
-# there, for the locks that take it by URL. Its SHA256SUMS names this push's; a dev home's Calcifer reads it and brings
-# its rentals to it. By hand: gh workflow run rc-dev.yaml -R cozy-creator/cozy-runtime --ref rc/<x.y.z>
+# package's floor can name its minor (`cozy-runtime>=0.47.0.dev0`), never a build. They go on the rolling
+# GitHub prerelease `rc-<x.y.z>`, never latest, in place of the last push's: nothing names an RC wheel by URL (xs-194), as
+# each lock takes the newest. Its SHA256SUMS names this push's; a dev home's Calcifer reads it and brings its rentals to it. By hand: gh workflow run rc-dev.yaml -R cozy-creator/cozy-runtime --ref rc/<x.y.z>
 on:
   push:
     branches: ['rc/*']
@@ -83,14 +82,13 @@ jobs:
               --title "$BRANCH dev builds" --notes "The newest build of $BRANCH, for dev homes (cl-922). Replaced by each push."
           fi
           gh api -X PATCH "repos/$REPO/git/refs/tags/$tag" -f sha="$SHA" -F force=true >/dev/null
-          # A native wheel goes an hour after the push that replaced it: a SHA256SUMS a reader holds (GitHub's CDN serves the old
-          # one for minutes; Calcifer keeps a read for a minute) still names files that are there (e2e 43206615800 read a 404).
+          # A wheel goes an hour after the push that replaced it: a SHA256SUMS a reader holds (GitHub's CDN serves the old one
+          # for minutes; Calcifer keeps a read for a minute) still names files that are there (e2e 43206615800 read a 404).
           stale=$(gh release view "$tag" -R "$REPO" --json assets --jq '.assets[] | select(.updatedAt < (now - 3600 | todate)) | .name')
           gh release upload "$tag" -R "$REPO" --clobber "${wheels[@]}"
           gh release upload "$tag" -R "$REPO" --clobber SHA256SUMS
-          # A pure wheel stays: a lock takes it by URL (cl-952).
           for name in $stale; do
-            case " ${wheels[*]} SHA256SUMS " in *" $name "*) ;; *-py3-none-any.whl) ;; *) gh release delete-asset "$tag" "$name" -R "$REPO" -y ;; esac
+            case " ${wheels[*]} SHA256SUMS " in *" $name "*) ;; *) gh release delete-asset "$tag" "$name" -R "$REPO" -y ;; esac
           done
           gh release edit "$tag" -R "$REPO" --notes "$BRANCH at $SHA, for dev homes (cl-922). Replaced by each push."
           echo "$tag: $BRANCH at $SHA" >> "$GITHUB_STEP_SUMMARY"
