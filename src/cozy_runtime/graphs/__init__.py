@@ -5,9 +5,10 @@ replays; it neither times competing paths nor compiles kernels. A component's re
 root call; nothing inside a root is a region, so a streamed component runs as written. A root
 has one graph per signature: the path its call takes, keyed by its inputs' layout, the values
 of the attributes its package declares steer its forward (`Model.__graph_keys__`), its modules'
-classes, hooks and attributes (`_fingerprint`, read again whenever one is set), the LoRA
-overlays its hooks arm, the plain context variables a package set, and the Runtime's choices
-(the kernels serving, `LANDED`; the attention layout's band). A signature's first call runs as
+classes and hooks, the LoRA overlays its hooks arm, the plain context variables a package set,
+and the Runtime's choices (the kernels serving, `LANDED`; the attention layout's band). A
+graph also holds the module attributes its capture read (`_reading`): it replays only while
+each still has the value it had, so one path may keep a few graphs, one per such state. A signature's first call runs as
 written and is measured (`_first`). Its next records in the call when the first was
 launch-bound (`_capture_call`): the graph replays once on that call's inputs, the call runs as
 written and serves, and the graph is kept when the two match bit for bit (outputs, the inputs
@@ -407,6 +408,10 @@ class _Recording:
         self.writes = list(observed.writes.values())
         #: its region's attempt count at its last replay: the least recent goes first (`_admit`)
         self.used = 0
+        #: the module attributes its capture read (`_reading`): (module, name, value, plain)
+        self.reads: tuple[tuple[Module, str, object, bool], ...] = ()
+        #: the region generation its read guards last held at
+        self.guarded = -1
         #: bytes the last replay copied in and out
         self.copied = 0
         self.done: Event | None = None
@@ -486,7 +491,7 @@ class _Recording:
 
     def close(self) -> None:
         """After last use: release static tensors and executable before their pool."""
-        self.inputs, self.outputs, self.writes, self.foreign = [], None, [], []
+        self.inputs, self.outputs, self.writes, self.foreign, self.reads = [], None, [], [], ()
         cast("CUDAGraph", self.graph).reset()  # cast: it closes once
         self.graph = self.pool = None
 
@@ -608,7 +613,10 @@ class _Recorder:
         #: the attribute paths the package declares steer its forward (`Model.__graph_keys__`)
         self.keys = keys
         self.lock = threading.Lock()
+        #: its graphs by handle (`key`, serial), and each key's handles (`_find`)
         self.recordings: dict[tuple[object, ...], _Recording] = {}
+        self.paths: dict[tuple[object, ...], list[tuple[object, ...]]] = {}
+        self.serial = 0
         #: each signature waiting for an idle period to record (`capture_idle`)
         self.queued: dict[tuple[object, ...], _Pending] = {}
         #: why a signature runs as written until its graphs are dropped (a refusal)
@@ -628,16 +636,15 @@ class _Recorder:
         self.idle_failed: dict[tuple[object, ...], str] = {}
         #: its modules' classes and hooks (`_structure`), read at each attempt's first call and
         #: whenever a hook was registered since; and why a package hook keeps it as written
-        self.structure: tuple[int, int, str] | None = None
+        self.structure: tuple[int, tuple[int, int], str] | None = None
         #: its LoRA overlay hooks (`_loras`), found with its structure
         self.loras = _Loras((), ())
-        #: bumped by an attribute set on any of its modules (`_watching`); the fingerprint of
-        #: their attributes when it last moved, each distinct one numbered (`_fingerprint`)
+        #: bumped by an attribute set on any of its modules (`_watching`), which a graph's
+        #: read guards are checked again for; `structural`, by a class or submodule set
         self.generation = 0
-        self.fingerprinted = -1
-        self.fingerprint = 0
-        self.fingerprints: dict[tuple[int, int], int] = {}
-        self.numbered = 0
+        self.structural = 0
+        #: the last module attribute whose value kept a graph from replaying
+        self.moved = ""
         self.binding: Binding | None = None
         #: its graphs' capture pool (`domain.Pool`), made at its first capture
         self.pool: domain.Pool | None = None
@@ -700,6 +707,7 @@ class _Recorder:
         for entry in self.recordings.values():
             entry.close()
         self.recordings.clear()
+        self.paths.clear()
         if self.binding is not None:
             self.binding.close()
             self.binding = None
@@ -1229,8 +1237,8 @@ def _region_call(
         else hooked
         or _unplain(torch, leaves)
     )
-    state: tuple[int, tuple[object, ...]] = (0, ())
-    if not why:  # a guarded call reads neither its modules nor its overlays
+    state: tuple[object, ...] = ()
+    if not why:  # a guarded call reads no overlays
         state, why = _state(torch, recorder, module)
     if why:
         recorder.gap = why
@@ -1258,13 +1266,14 @@ def _region_call(
         _changed(torch, module, recorder, key, (args, kwargs), len(leaves))
     recorder.last = key
     recorder.attempts += 1
-    if key in recorder.recordings:
+    if key in recorder.paths:
         result = _replay_call(torch, module, recorder, key, leaves, placed)
         if result is _EAGER:
             return recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
         if result is not _STALE:
             return result
-        # What it read outside the call is gone (a new loop's tables): this call records again.
+        # No graph of this path holds now (what it read outside the call is gone, or a module
+        # attribute it read has another value): this call records one.
     if (seen := recorder.seen.get(key)) is not None and key not in recorder.failed:
         if key not in recorder.judged:
             result = _capture_call(
@@ -1290,8 +1299,8 @@ class _Parts(NamedTuple):
     autocast: tuple[bool, object]
     attention: tuple[object, ...] | None
     structure: int
-    #: its modules' attributes (`_fingerprint`) and the LoRA overlays its hooks arm now
-    state: tuple[int, tuple[object, ...]]
+    #: the LoRA overlays its hooks arm now (`_overlays`)
+    state: tuple[object, ...]
     context: tuple[tuple[str, object], ...]
 
 
@@ -1306,6 +1315,8 @@ class _Seen:
     start: Event
     end: Event
     peak: int | None
+    #: its region's first call: autotuning, library setup and page-in make it no measure
+    cold: bool = False
 
     def device_ms(self) -> float | None:
         """Read once the device passed its end; None before (never a wait)."""
@@ -1346,7 +1357,7 @@ def _first[T](
         peak = last.peak
     elif peak is not None and last is not None and last.peak is not None:
         peak = max(peak, last.peak)
-    recorder.seen[key] = _Seen(submit, host, start, end, peak)
+    recorder.seen[key] = _Seen(submit, host, start, end, peak, cold=recorder.eager.calls == 1)
     return result
 
 
@@ -1384,6 +1395,13 @@ def _capture_call(
         return _EAGER
     if seen.peak is None:  # its pass was observed inside another's: a later call may be
         recorder.gap = "its calls' working memory is not measured"
+        return _EAGER
+    if seen.cold:  # a region's first call autotunes and pages in: measure it once more
+        return _EAGER
+    if len(recorder.paths.get(key, ())) >= _VARIANTS:
+        why = f"a module attribute it reads changes between calls: {recorder.moved or '?'}"
+        with recorder.lock:
+            recorder.judged[key] = recorder.gap = why
         return _EAGER
     owner = _owner(torch, module, recorder, placed)
     recorder.capture_attempts += 1
@@ -1426,7 +1444,7 @@ def _capture_call(
                     f"no gain: replay {replay:.3f} ms a call against {cost:.3f} ms as written"
                 )
                 return result
-            if recorder.landed != LANDED[0] or key in recorder.recordings:
+            if recorder.landed != LANDED[0] or _find(recorder, key) is not None:
                 return result  # a kernel landed meanwhile: its graphs go
             _admit(recorder, key, recording)
             kept = True
@@ -1604,13 +1622,16 @@ def _structure(recorder: _Recorder, module: Module) -> tuple[int, str]:
     per request, and a graph of the base UNet must never serve it."""
     from torch.utils.hooks import RemovableHandle
 
-    registered = RemovableHandle.next_id
+    registered = RemovableHandle.next_id, recorder.structural
     held = recorder.structure
     if held is not None and held[1] == registered:
         return held[0], held[2]
+    watch = weakref.ref(recorder)
+    for sub in module.modules():
+        sub.__dict__[_WATCH] = watch  # its sets move the region's generation (`_watching`)
     number = hash(
         tuple(
-            (type(sub), tuple(sub._forward_pre_hooks), tuple(sub._forward_hooks))
+            (type(sub), id(sub), tuple(sub._forward_pre_hooks), tuple(sub._forward_hooks))
             for sub in module.modules()
         )
     )
@@ -1636,9 +1657,10 @@ _WATCH = "_cozy_graph_region"
 
 @functools.cache
 def _watching(torch: ModuleType) -> None:
-    """Every attribute set on a module of a region moves the region's generation: a call then
-    reads its modules' fingerprint again (`_fingerprint`). Tensors are the observer's
-    (`observe`), and the Runtime's own `_cozy` attributes steer no path."""
+    """Every attribute set on a module of a region moves the region's generation: its graphs'
+    read guards are checked again (`_holds`). A class or submodule set moves its structure too
+    (`_structure`). Tensors are the observer's (`observe`), and the Runtime's own `_cozy`
+    attributes steer no path."""
     module = torch.nn.Module
     original = module.__setattr__
 
@@ -1650,51 +1672,97 @@ def _watching(torch: ModuleType) -> None:
         recorder = watch()
         if recorder is not None:
             recorder.generation += 1
+            if name == "__class__" or isinstance(value, module):
+                recorder.structural += 1
 
     module.__setattr__ = __setattr__  # one patch per process
 
 
-def _fingerprint(torch: ModuleType, recorder: _Recorder, root: Module) -> int:
-    """Its modules' attributes as one number: plain values by value, anything else (a turbo
-    head armed, a processor swapped, a submodule replaced) by identity; tensors are not here.
-    Read again only when an attribute was set since (`generation`). Each distinct one gets a
-    number never given to another (`_FINGERPRINTS` of them are remembered)."""
-    if recorder.fingerprinted == recorder.generation:
-        return recorder.fingerprint
-    watch = weakref.ref(recorder)
-    parts: list[object] = []
-    for sub in root.modules():
-        sub.__dict__[_WATCH] = watch
-        parts.append((type(sub), id(sub)))
-        for name, value in sub.__dict__.items():
-            if name in _INTERNAL or name.startswith("_cozy"):
-                continue
-            if type(value) in _PLAIN:
-                parts.append((name, value))
-            elif not isinstance(value, torch.Tensor):
-                parts.append((name, id(value)))
-    found = tuple(parts)
-    digest = (hash(found), hash(found[::-1]))  # 128 bits: two orders, two mixes
-    number = recorder.fingerprints.get(digest)
-    if number is None:
-        while len(recorder.fingerprints) >= _FINGERPRINTS:
-            recorder.fingerprints.pop(next(iter(recorder.fingerprints)))
-        recorder.numbered += 1
-        number = recorder.fingerprints[digest] = recorder.numbered
-    recorder.fingerprinted, recorder.fingerprint = recorder.generation, number
-    return number
+#: each thread whose capture records the module attributes it reads (`_reading`): its reads
+_READER: dict[int, dict[tuple[int, str], tuple[Module, str, object, bool]]] = {}
+_READING = threading.Lock()
+_MISSING = object()
 
 
-#: distinct module states a region remembers by number
-_FINGERPRINTS = 64
+@contextmanager
+def _reading(
+    torch: ModuleType,
+) -> Iterator[dict[tuple[int, str], tuple[Module, str, object, bool]]]:
+    """The module attributes this thread's code reads inside, by (module, name): plain values by
+    value, other objects (a turbo head armed, a processor) by identity. Submodules are the
+    structure's and tensors the observer's. Only a capture runs under it: while one is open,
+    every module attribute read in the process goes through a Python function."""
+    reads: dict[tuple[int, str], tuple[Module, str, object, bool]] = {}
+    me = threading.get_ident()
+    with _READING:
+        _READER[me] = reads
+        if len(_READER) == 1:
+            torch.nn.Module.__getattribute__ = _reader(torch)  # removed below
+    try:
+        yield reads
+    finally:
+        with _READING:
+            del _READER[me]
+            if not _READER:
+                del torch.nn.Module.__getattribute__
+
+
+@functools.cache
+def _reader(torch: ModuleType) -> Callable[[Module, str], object]:
+    module, tensor = torch.nn.Module, torch.Tensor
+    get, ident = object.__getattribute__, threading.get_ident
+
+    def __getattribute__(self: Module, name: str) -> object:
+        value = get(self, "__dict__").get(name, _MISSING)
+        if value is not _MISSING and (reads := _READER.get(ident())) is not None:
+            if name not in _INTERNAL and not name.startswith(("_cozy", "__")):
+                if type(value) in _PLAIN:
+                    reads.setdefault((id(self), name), (self, name, value, True))
+                elif not isinstance(value, tensor | module):
+                    reads.setdefault((id(self), name), (self, name, value, False))
+        return get(self, name)
+
+    return __getattribute__
+
+
+def _holds(recorder: _Recorder, entry: _Recording) -> bool:
+    """Whether every module attribute `entry`'s capture read still has its value: checked again
+    only when an attribute was set on the region's modules since it last held."""
+    if entry.guarded == recorder.generation:
+        return True
+    for module, name, value, plain in entry.reads:
+        now = module.__dict__.get(name, _MISSING)
+        if now is value or (plain and type(now) is type(value) and now == value):
+            continue
+        recorder.moved = f"{type(module).__name__}.{name}"
+        what = f"module state {recorder.moved}"
+        recorder.changes[what] = recorder.changes.get(what, 0) + 1
+        return False
+    entry.guarded = recorder.generation
+    return True
+
+
+def _find(
+    recorder: _Recorder, key: tuple[object, ...]
+) -> tuple[tuple[object, ...], _Recording] | None:
+    """`key`'s graph whose read guards hold now, and its handle."""
+    for handle in recorder.paths.get(key, ()):
+        entry = recorder.recordings[handle]
+        if _holds(recorder, entry):
+            return handle, entry
+    return None
+
+
+#: graphs one path keeps, one per state of the module attributes it reads; a path that needs
+#: another runs as written for the process (a step counter its forward reads)
+_VARIANTS = 4
 
 
 def _state(
     torch: ModuleType, recorder: _Recorder, module: Module
-) -> tuple[tuple[int, tuple[object, ...]], str]:
-    """The key's modules-and-overlays part, and why the call runs as written ("" when none)."""
-    overlays, why = _overlays(recorder.loras)
-    return (_fingerprint(torch, recorder, module), overlays), why
+) -> tuple[tuple[object, ...], str]:
+    """The key's overlays part, and why the call runs as written ("" when none)."""
+    return _overlays(recorder.loras)
 
 
 def _context() -> tuple[tuple[str, object], ...]:
@@ -1777,26 +1845,37 @@ _STALE = object()
 _MAX_GRAPHS = 16
 
 
-def _expire(recorder: _Recorder, key: tuple[object, ...], owner: domain.Domain) -> None:
-    """`key`'s graph goes: storage it read outside the call is gone (held: the region's lock)."""
-    entry = recorder.recordings.pop(key)
+def _remove(recorder: _Recorder, handle: tuple[object, ...]) -> None:
+    """A graph goes, its executable and static buffers with it (held: the region's lock)."""
+    entry = recorder.recordings.pop(handle)
+    key = cast("tuple[object, ...]", handle[0])  # a handle is (key, serial)
+    held = recorder.paths.get(key)
+    if held is not None:
+        held.remove(handle)
+        if not held:
+            del recorder.paths[key]
     entry.finish()
     entry.close()
     recorder.retired += 1
+
+
+def _expire(recorder: _Recorder, handle: tuple[object, ...], owner: domain.Domain) -> None:
+    """A graph goes: storage it read outside the call is gone (held: the region's lock)."""
+    _remove(recorder, handle)
     recorder.expired += 1
     _drop_unused(recorder, owner)
 
 
 def _admit(recorder: _Recorder, key: tuple[object, ...], entry: _Recording) -> None:
-    """`entry` serves `key`; past `_MAX_GRAPHS` the least recently replayed goes (held: lock)."""
-    entry.used = recorder.attempts
+    """`entry` serves `key` while its read guards hold; past `_MAX_GRAPHS` the least recently
+    replayed goes (held: lock)."""
+    entry.used, entry.guarded = recorder.attempts, recorder.generation
     while len(recorder.recordings) >= _MAX_GRAPHS:
-        oldest = min(recorder.recordings, key=lambda k: recorder.recordings[k].used)
-        dropped = recorder.recordings.pop(oldest)
-        dropped.finish()
-        dropped.close()
-        recorder.retired += 1
-    recorder.recordings[key] = entry
+        _remove(recorder, min(recorder.recordings, key=lambda h: recorder.recordings[h].used))
+    recorder.serial += 1
+    handle = (key, recorder.serial)
+    recorder.recordings[handle] = entry
+    recorder.paths.setdefault(key, []).append(handle)
 
 
 def sweep(root: Module) -> None:
@@ -1806,8 +1885,8 @@ def sweep(root: Module) -> None:
     if recorder is None or recorder.domain is None or not recorder.recordings:
         return
     with recorder.domain.using(), recorder.lock:
-        for key in [k for k, entry in recorder.recordings.items() if not entry.live()]:
-            _expire(recorder, key, recorder.domain)
+        for handle in [h for h, entry in recorder.recordings.items() if not entry.live()]:
+            _expire(recorder, handle, recorder.domain)
 
 
 def _replay_call(
@@ -1830,12 +1909,15 @@ def _replay_call(
         if stale:
             recorder.forget()  # in flight, it goes at a later call; as written meanwhile
             return _EAGER
-        entry = recorder.recordings.get(key)
         attempt = placed[0].attempts if placed is not None else recorder.attempts
-        if entry is None or recorder.waiting.get(key) == attempt:
+        if recorder.waiting.get(key) == attempt:
             return _EAGER
+        found = _find(recorder, key)
+        if found is None:
+            return _STALE  # no graph of this path holds now: this call records one
+        handle, entry = found
         if not entry.live():
-            _expire(recorder, key, owner)
+            _expire(recorder, handle, owner)
             return _STALE
         entry.used = recorder.attempts
         if placed is not None and recorder.binding is None:
@@ -2096,6 +2178,7 @@ def _build(
     statics: list[Tensor | None] = []
     outputs: list[object] = []
     observed: list[observe.Observed] = []
+    reads: list[tuple[Module, str, object, bool]] = []
     weights = _weights(torch, module, recorder.binding)
 
     def step() -> None:
@@ -2104,8 +2187,9 @@ def _build(
             sargs, skwargs = _arguments(torch, spec, layout, statics)
             mode, seen = observe.observer(torch, statics, weights)
             observed[:] = [seen]
-            with cast("AbstractContextManager[object]", mode):
+            with cast("AbstractContextManager[object]", mode), _reading(torch) as read:
                 outputs.append(call(module, *sargs, **skwargs))
+            reads[:] = read.values()
         except BaseException:  # a short capture's go before it runs again
             statics.clear()
             outputs.clear()
@@ -2133,7 +2217,9 @@ def _build(
         graph.reset()
         (recorder.idle_failed if idle else recorder.judged)[key] = recorder.gap = why
         return None
-    return _Recording(torch, graph, pool, statics, outputs[0], key, served, owner, seen)
+    entry = _Recording(torch, graph, pool, statics, outputs[0], key, served, owner, seen)
+    entry.reads = tuple(reads)
+    return entry
 
 
 def _weights(
@@ -2504,7 +2590,7 @@ def _changed(
         before, now = cast("_Parts", last[-1]), cast("_Parts", key[-1])
         what = next(n for n in _Parts._fields if getattr(before, n) != getattr(now, n))
         if what == "state":
-            what = "module state" if before.state[0] != now.state[0] else "LoRA overlay"
+            what = "LoRA overlay"
         elif what == "context":
             moved = sorted(set(before.context) ^ set(now.context))
             what = f"context {moved[0][0]}"
