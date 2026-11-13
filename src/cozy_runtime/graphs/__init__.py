@@ -1229,8 +1229,9 @@ def _region_call(
         else hooked
         or _unplain(torch, leaves)
     )
-    state, applied = _state(torch, recorder, module)
-    why = why or applied
+    state: tuple[int, tuple[object, ...]] = (0, ())
+    if not why:  # a guarded call reads neither its modules nor its overlays
+        state, why = _state(torch, recorder, module)
     if why:
         recorder.gap = why
         if placed is not None:
