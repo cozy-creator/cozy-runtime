@@ -5,13 +5,17 @@ replays; it neither times competing paths nor compiles kernels. A component's re
 root call; nothing inside a root is a region, so a streamed component runs as written. A root
 has one graph per signature: the path its call takes, keyed by its inputs' layout, the values
 of the attributes its package declares steer its forward (`Model.__graph_keys__`), its modules'
-classes and hooks, the plain context variables a package set, and the Runtime's choices (the
-kernels serving, `LANDED`; the attention layout's band). A signature's first call runs as
+classes, hooks and attributes (`_fingerprint`, read again whenever one is set), the LoRA
+overlays its hooks arm, the plain context variables a package set, and the Runtime's choices
+(the kernels serving, `LANDED`; the attention layout's band). A signature's first call runs as
 written and is measured (`_first`). Its next records in the call when the first was
 launch-bound (`_capture_call`): the graph replays once on that call's inputs, the call runs as
-written and serves, and the graph is kept when the two match bit for bit and the replay is
-faster; every later call replays. Recording changes no state of the model. An idle period
-records the signatures seen once, under their call's context (`capture_idle`), as the backup.
+written and serves, and the graph is kept when the two match bit for bit (outputs, the inputs
+it writes and the state it writes outside the call) and the replay is faster; every later call
+replays. What the capture reads outside its inputs, pool and weights (`observe`) must still be
+there at each replay, or the graph goes and the call records again. Recording changes no state
+of the model. An idle period records the signatures seen once, under their call's context
+(`capture_idle`), as the backup.
 Every graph has its own static buffers in its region's capture pool (`domain`), opened only for
 a capture that may keep it. A cached binding owns virtual addresses only; its physical lease
 covers preparation through output copies, and a completion event orders reuse across streams.
@@ -54,7 +58,7 @@ from cozy_runtime.author._errors import (
     unwind,
 )
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded, recovered
-from cozy_runtime.graphs import domain
+from cozy_runtime.graphs import domain, observe
 from cozy_runtime.internal import attention_ulysses, kernel_ready
 from cozy_runtime.internal.accel import StaleBinding
 
@@ -388,12 +392,21 @@ class _Recording:
         layout: object,
         served: Seen,
         owner: domain.Domain,
+        observed: observe.Observed,
     ) -> None:
         self.torch, self.graph, self.pool, self.owner = torch, graph, pool, owner
         self.inputs, self.outputs, self.layout = inputs, outputs, layout
         self.served = [(b, i) for b, impls in served.items() for i in impls]
         self.refused = dict(served.refused)
         self.bands = [(site, band, b) for (site, band), held in served.bands.items() for b in held]
+        #: the storages outside the call it reads (`observe`): each must live for it to replay
+        self.foreign = observed.foreign
+        #: the static inputs it writes, copied back to the caller's tensors after each replay
+        self.arg_writes = sorted(observed.arg_writes)
+        #: the foreign views it writes, held only until its check ends (`_capture_call`)
+        self.writes = list(observed.writes.values())
+        #: its region's attempt count at its last replay: the least recent goes first (`_admit`)
+        self.used = 0
         #: bytes the last replay copied in and out
         self.copied = 0
         self.done: Event | None = None
@@ -414,8 +427,17 @@ class _Recording:
             lambda v: torch.empty_like(v) if isinstance(v, torch.Tensor) else v, self.outputs
         )
 
-    def __call__(self, leaves: Sequence[object], out: object) -> object:
-        """Replays, copying its outputs into `out`."""
+    def live(self) -> bool:
+        """Whether every storage outside the call it reads is still the one it captured."""
+        return not any(ref.expired() for ref in self.foreign)
+
+    def __call__(
+        self, leaves: Sequence[object], out: object, *, written: list[Tensor] | None = None
+    ) -> object:
+        """Replays, copying its outputs into `out` and what it wrote into its static inputs
+        back into the caller's (the call as written wrote those); with `written`, into that
+        list instead (its check, which runs the call as written on the caller's next). Nothing
+        of the pool is read once it returns: its pages may go while it is idle."""
         stream: Stream
         torch, stream = self.torch, self.torch.cuda.current_stream()
         if self.done is None:
@@ -448,6 +470,13 @@ class _Recording:
                 if isinstance(src, torch.Tensor):
                     dst.copy_(src)
                     copied += src.nbytes
+            for index in self.arg_writes:
+                static = cast("Tensor", self.inputs[index])  # cast: a written leaf is a tensor
+                if written is None:
+                    cast("Tensor", leaves[index]).copy_(static)
+                else:
+                    written.append(static.clone())
+                copied += static.nbytes
             return out
         finally:
             self.copied = copied
@@ -457,7 +486,7 @@ class _Recording:
 
     def close(self) -> None:
         """After last use: release static tensors and executable before their pool."""
-        self.inputs, self.outputs = [], None
+        self.inputs, self.outputs, self.writes, self.foreign = [], None, [], []
         cast("CUDAGraph", self.graph).reset()  # cast: it closes once
         self.graph = self.pool = None
 
@@ -561,6 +590,7 @@ class _Timing:
 _COUNTERS = (
     "attempts",
     "replays",
+    "expired",
     "capture_attempts",
     "captures",
     "retired",
@@ -599,10 +629,21 @@ class _Recorder:
         #: its modules' classes and hooks (`_structure`), read at each attempt's first call and
         #: whenever a hook was registered since; and why a package hook keeps it as written
         self.structure: tuple[int, int, str] | None = None
+        #: its LoRA overlay hooks (`_loras`), found with its structure
+        self.loras = _Loras((), ())
+        #: bumped by an attribute set on any of its modules (`_watching`); the fingerprint of
+        #: their attributes when it last moved, each distinct one numbered (`_fingerprint`)
+        self.generation = 0
+        self.fingerprinted = -1
+        self.fingerprint = 0
+        self.fingerprints: dict[tuple[int, int], int] = {}
+        self.numbered = 0
         self.binding: Binding | None = None
         #: its graphs' capture pool (`domain.Pool`), made at its first capture
         self.pool: domain.Pool | None = None
         self.replays = 0
+        #: graphs dropped because storage they read outside the call was gone
+        self.expired = 0
         self.attempts = 0
         self.capture_attempts = 0
         self.captures = 0
@@ -876,6 +917,7 @@ def install(torch: ModuleType, model: object, roots: Mapping[str, Module]) -> li
     """Each component root is a region, keyed by the attributes the model declares steer it
     (`__graph_keys__`: component -> attribute paths). Nothing inside a root is a region: a
     streamed component runs as written."""
+    _watching(torch)
     skipped = set(getattr(type(model), "__uncaptured__", ()))
     declared: Mapping[str, tuple[str, ...]] = getattr(type(model), "__graph_keys__", {})
     installed = []
@@ -944,6 +986,7 @@ def release(torch: ModuleType, root: Module) -> None:
 
 def mark(root: Module) -> None:
     """A new attempt of `root`'s component opens: its receipts count from here."""
+    sweep(root)
     recorder = _RECORDERS.get(root)
     if recorder is not None:
         with recorder.lock:
@@ -990,6 +1033,7 @@ def describe(root: Module) -> dict[str, object]:
                 capture_attempts=since("capture_attempts"),
                 captures=since("captures"),
                 retired_graphs=since("retired"),
+                expired_graphs=since("expired"),
                 replay_copy_bytes=since("copy_bytes"),
                 capture_ms=round(since("capture_ms"), 3),
                 call_ms=round(since("call_ms"), 3),
@@ -1181,12 +1225,12 @@ def _region_call(
         if layout is not None and layout.sparse
         else "under an attention layout its producer keeps state for"
         if layout is not None and _stateful(module, layout)
-        else "under an armed LoRA overlay"
-        if _overlaid(module)
         # A package hook runs Python at every call, which a replay would skip.
         else hooked
         or _unplain(torch, leaves)
     )
+    state, applied = _state(torch, recorder, module)
+    why = why or applied
     if why:
         recorder.gap = why
         if placed is not None:
@@ -1205,7 +1249,7 @@ def _region_call(
     declared = tuple(functools.reduce(getattr, p.split("."), module) for p in recorder.keys)
     key = (
         *_signature(torch, leaves, spec),
-        _Parts(declared, addresses, autocast, _dense(layout), structure, _context()),
+        _Parts(declared, addresses, autocast, _dense(layout), structure, state, _context()),
     )
     if layout is not None:  # an idle recording runs outside the caller's scope: under its own
         call = functools.partial(_under, layout, call)
@@ -1215,9 +1259,11 @@ def _region_call(
     recorder.attempts += 1
     if key in recorder.recordings:
         result = _replay_call(torch, module, recorder, key, leaves, placed)
-        if result is not _EAGER:
+        if result is _EAGER:
+            return recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
+        if result is not _STALE:
             return result
-        return recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
+        # What it read outside the call is gone (a new loop's tables): this call records again.
     if (seen := recorder.seen.get(key)) is not None and key not in recorder.failed:
         if key not in recorder.judged:
             result = _capture_call(
@@ -1243,6 +1289,8 @@ class _Parts(NamedTuple):
     autocast: tuple[bool, object]
     attention: tuple[object, ...] | None
     structure: int
+    #: its modules' attributes (`_fingerprint`) and the LoRA overlays its hooks arm now
+    state: tuple[int, tuple[object, ...]]
     context: tuple[tuple[str, object], ...]
 
 
@@ -1349,9 +1397,21 @@ def _capture_call(
     result = recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
     kept = False
     try:
-        if differs := vt.replay_differs(result, out):
-            if vt.replay_differs(result, call(module, *args, **kwargs)):
-                differs += "; the call as written differs run to run too"
+        written = [cast("Tensor", leaves[i]) for i in recording.arg_writes]
+        differs = vt.replay_differs(result, out)
+        if not differs and (state := vt.replay_differs(recording.writes, replayed.wrote)):
+            differs = f"the state it writes outside the call: {state}"
+        if not differs and (inputs := vt.replay_differs(written, replayed.inputs)):
+            differs = f"the inputs it writes: {inputs}"
+        if differs:
+            if not written:  # a second run would write its caller's inputs twice
+                served = [t.clone() for t in recording.writes]
+                for tensor, saved in zip(recording.writes, replayed.saved, strict=True):
+                    tensor.copy_(saved)  # as the call found it
+                if vt.replay_differs(result, call(module, *args, **kwargs)):
+                    differs += "; the call as written differs run to run too"
+                for tensor, saved in zip(recording.writes, served, strict=True):
+                    tensor.copy_(saved)  # as the call that serves left it
             with recorder.lock:
                 _failed(module, recorder, key, differs, "replay_mismatch")
             return result
@@ -1367,7 +1427,8 @@ def _capture_call(
                 return result
             if recorder.landed != LANDED[0] or key in recorder.recordings:
                 return result  # a kernel landed meanwhile: its graphs go
-            recorder.recordings[key], kept = recording, True
+            _admit(recorder, key, recording)
+            kept = True
             recorder.queued.pop(key, None)
             recorder.short.pop(key, None)
             recorder.captures += 1
@@ -1376,6 +1437,7 @@ def _capture_call(
         return result
     finally:
         recorder.capture_ms += (time.perf_counter() - began) * 1e3
+        recording.writes, replayed.saved, replayed.wrote, replayed.inputs = [], [], [], []
         if not kept:
             with recorder.lock:
                 recording.finish()
@@ -1391,6 +1453,10 @@ class _Replayed:
         self.first = torch.cuda.Event(enable_timing=True)
         self.last = torch.cuda.Event(enable_timing=True)
         self.host_ms = 0.0
+        #: the foreign state it writes before and after the replay, and its written inputs
+        self.saved: list[Tensor] = []
+        self.wrote: list[Tensor] = []
+        self.inputs: list[Tensor] = []
 
     def synchronize(self) -> None:
         self.last.synchronize()
@@ -1463,12 +1529,18 @@ def _capture_verified(
                 return None
             out = entry.output()
             replayed = _Replayed(torch, current)
+            # The state it writes outside the call, as the call found it: put back after the
+            # check's replay, so the call as written starts where the replay did.
+            replayed.saved = [t.clone() for t in entry.writes]
             with _lease(torch, placed, recorder.binding):
                 replayed.first.record(current)
                 began = time.perf_counter()
-                entry(leaves, out)
+                entry(leaves, out, written=replayed.inputs)
                 replayed.host_ms = (time.perf_counter() - began) * 1e3
                 replayed.last.record(current)
+            replayed.wrote = [t.clone() for t in entry.writes]
+            for tensor, saved in zip(entry.writes, replayed.saved, strict=True):
+                tensor.copy_(saved)
             found = (entry, out, replayed)
             return found
     except Exception as exc:
@@ -1541,9 +1613,87 @@ def _structure(recorder: _Recorder, module: Module) -> tuple[int, str]:
             for sub in module.modules()
         )
     )
-    why = _hooked(module, armed=False)
+    why = _hooked(module)
     recorder.structure = (number, registered, why)
+    recorder.loras = _loras(module)
     return number, why
+
+
+#: a module's own bookkeeping, which steers no forward (hooks are the structure's)
+_INTERNAL = frozenset(
+    {
+        "_parameters", "_buffers", "_non_persistent_buffers_set", "_modules",
+        "_backward_pre_hooks", "_backward_hooks", "_is_full_backward_hook",
+        "_forward_hooks", "_forward_hooks_with_kwargs", "_forward_hooks_always_called",
+        "_forward_pre_hooks", "_forward_pre_hooks_with_kwargs", "_state_dict_hooks",
+        "_state_dict_pre_hooks", "_load_state_dict_pre_hooks", "_load_state_dict_post_hooks",
+    }
+)
+#: a watched module's region (a weak reference), in its `__dict__`
+_WATCH = "_cozy_graph_region"
+
+
+@functools.cache
+def _watching(torch: ModuleType) -> None:
+    """Every attribute set on a module of a region moves the region's generation: a call then
+    reads its modules' fingerprint again (`_fingerprint`). Tensors are the observer's
+    (`observe`), and the Runtime's own `_cozy` attributes steer no path."""
+    module = torch.nn.Module
+    original = module.__setattr__
+
+    def __setattr__(self: Module, name: str, value: object) -> None:
+        original(self, name, value)
+        watch = self.__dict__.get(_WATCH)
+        if watch is None or name.startswith("_cozy") or isinstance(value, torch.Tensor):
+            return
+        recorder = watch()
+        if recorder is not None:
+            recorder.generation += 1
+
+    module.__setattr__ = __setattr__  # one patch per process
+
+
+def _fingerprint(torch: ModuleType, recorder: _Recorder, root: Module) -> int:
+    """Its modules' attributes as one number: plain values by value, anything else (a turbo
+    head armed, a processor swapped, a submodule replaced) by identity; tensors are not here.
+    Read again only when an attribute was set since (`generation`). Each distinct one gets a
+    number never given to another (`_FINGERPRINTS` of them are remembered)."""
+    if recorder.fingerprinted == recorder.generation:
+        return recorder.fingerprint
+    watch = weakref.ref(recorder)
+    parts: list[object] = []
+    for sub in root.modules():
+        sub.__dict__[_WATCH] = watch
+        parts.append((type(sub), id(sub)))
+        for name, value in sub.__dict__.items():
+            if name in _INTERNAL or name.startswith("_cozy"):
+                continue
+            if type(value) in _PLAIN:
+                parts.append((name, value))
+            elif not isinstance(value, torch.Tensor):
+                parts.append((name, id(value)))
+    found = tuple(parts)
+    digest = (hash(found), hash(found[::-1]))  # 128 bits: two orders, two mixes
+    number = recorder.fingerprints.get(digest)
+    if number is None:
+        while len(recorder.fingerprints) >= _FINGERPRINTS:
+            recorder.fingerprints.pop(next(iter(recorder.fingerprints)))
+        recorder.numbered += 1
+        number = recorder.fingerprints[digest] = recorder.numbered
+    recorder.fingerprinted, recorder.fingerprint = recorder.generation, number
+    return number
+
+
+#: distinct module states a region remembers by number
+_FINGERPRINTS = 64
+
+
+def _state(
+    torch: ModuleType, recorder: _Recorder, module: Module
+) -> tuple[tuple[int, tuple[object, ...]], str]:
+    """The key's modules-and-overlays part, and why the call runs as written ("" when none)."""
+    overlays, why = _overlays(recorder.loras)
+    return (_fingerprint(torch, recorder, module), overlays), why
 
 
 def _context() -> tuple[tuple[str, object], ...]:
@@ -1620,6 +1770,43 @@ def _queue(
 
 #: `_replay`'s answer when the call runs as written
 _EAGER = object()
+#: `_replay_call`'s answer when its graph read storage outside the call that is gone
+_STALE = object()
+#: graphs a region keeps; one more drops the least recently replayed (`_admit`)
+_MAX_GRAPHS = 16
+
+
+def _expire(recorder: _Recorder, key: tuple[object, ...], owner: domain.Domain) -> None:
+    """`key`'s graph goes: storage it read outside the call is gone (held: the region's lock)."""
+    entry = recorder.recordings.pop(key)
+    entry.finish()
+    entry.close()
+    recorder.retired += 1
+    recorder.expired += 1
+    _drop_unused(recorder, owner)
+
+
+def _admit(recorder: _Recorder, key: tuple[object, ...], entry: _Recording) -> None:
+    """`entry` serves `key`; past `_MAX_GRAPHS` the least recently replayed goes (held: lock)."""
+    entry.used = recorder.attempts
+    while len(recorder.recordings) >= _MAX_GRAPHS:
+        oldest = min(recorder.recordings, key=lambda k: recorder.recordings[k].used)
+        dropped = recorder.recordings.pop(oldest)
+        dropped.finish()
+        dropped.close()
+        recorder.retired += 1
+    recorder.recordings[key] = entry
+
+
+def sweep(root: Module) -> None:
+    """At an attempt's start: graphs whose outside storage is gone go now, their static inputs
+    with them (a loop's graphs, once its tables are freed)."""
+    recorder = _RECORDERS.get(root)
+    if recorder is None or recorder.domain is None or not recorder.recordings:
+        return
+    with recorder.domain.using(), recorder.lock:
+        for key in [k for k, entry in recorder.recordings.items() if not entry.live()]:
+            _expire(recorder, key, recorder.domain)
 
 
 def _replay_call(
@@ -1646,6 +1833,10 @@ def _replay_call(
         attempt = placed[0].attempts if placed is not None else recorder.attempts
         if entry is None or recorder.waiting.get(key) == attempt:
             return _EAGER
+        if not entry.live():
+            _expire(recorder, key, owner)
+            return _STALE
+        entry.used = recorder.attempts
         if placed is not None and recorder.binding is None:
             recorder.binding = placed[0].retain(placed[1], ("",))
         return _replay(torch, leaves, placed, recorder, key, entry, attempt)
@@ -1765,6 +1956,10 @@ def _record(
         if why := _hooked(module):
             recorder.idle_failed[key] = why
             return True
+        parts, why = _state(torch, recorder, module)
+        if why or parts != cast("_Parts", key[-1]).state:
+            recorder.idle_failed[key] = why or "its modules or overlay at idle are not its call's"
+            return True
         if placed is not None and not placed[0].graph_accounted():
             _failed(module, recorder, key, "driver/context memory is unmeasured", idle=True)
             return True
@@ -1836,7 +2031,8 @@ def _record(
                 if why:
                     recorder.idle_failed[key] = why
                     return True
-        recorder.recordings[key], entry = entry, None
+        _admit(recorder, key, entry)
+        entry = None
         recorder.short.pop(key, None)
         recorder.captures += 1
         recorder.capture_each.append(round((time.perf_counter() - began) * 1e3, 3))
@@ -1898,12 +2094,17 @@ def _build(
     # so their storage stays owned with the graph.
     statics: list[Tensor | None] = []
     outputs: list[object] = []
+    observed: list[observe.Observed] = []
+    weights = _weights(torch, module, recorder.binding)
 
     def step() -> None:
         try:
             statics.extend(_static(torch, v) if isinstance(v, _Leaf) else None for v in layout)
             sargs, skwargs = _arguments(torch, spec, layout, statics)
-            outputs.append(call(module, *sargs, **skwargs))
+            mode, seen = observe.observer(torch, statics, weights)
+            observed[:] = [seen]
+            with cast("AbstractContextManager[object]", mode):
+                outputs.append(call(module, *sargs, **skwargs))
         except BaseException:  # a short capture's go before it runs again
             statics.clear()
             outputs.clear()
@@ -1921,7 +2122,29 @@ def _build(
         graph.reset()
         _failed(module, recorder, key, "captured output is not a tensor tree", None, idle=idle)
         return None
-    return _Recording(torch, graph, pool, statics, outputs[0], key, served, owner)
+    seen = observed[0]
+    why = seen.refusal() or (
+        "it writes its inputs or state outside its call: a call records it"
+        if idle and (seen.arg_writes or seen.writes)
+        else ""
+    )
+    if why:
+        graph.reset()
+        (recorder.idle_failed if idle else recorder.judged)[key] = recorder.gap = why
+        return None
+    return _Recording(torch, graph, pool, statics, outputs[0], key, served, owner, seen)
+
+
+def _weights(
+    torch: ModuleType, module: Module, binding: Binding | None
+) -> list[tuple[int, int]]:
+    """The address ranges of what a capture of `module` may read as its weights: its binding's
+    Regions and computed tensors, and its own parameters and buffers bound now."""
+    spans = observe.ranges((*module.parameters(), *module.buffers()))
+    if binding is not None:
+        spans += observe.ranges(binding.computed)
+        spans += [(r.ptr, r.ptr + r.allocated_bytes) for r in binding.regions or () if r.ptr]
+    return observe.merge(spans)
 
 
 @contextmanager
@@ -1945,44 +2168,72 @@ def _capture_state(
             _SETTLING.reset(settling)
 
 
-def _hooked(module: Module, *, armed: bool = True) -> str:
+def _hooked(module: Module) -> str:
     """Why a component's forward is no graph: a package hook on one of its modules runs Python
     at every call, which a replay would skip (Runtime's binding and scope hooks are served). A
-    LoRA overlay hook (`lora.Hook`) asks the package at every call which overlay is armed, and
-    the bound pages follow that answer: a replay would keep the captured one. `lora.Sites`'
-    hooks say it without asking the package (`_overlaid`, `armed`): its calls replay while none
-    is armed."""
-    if armed and _overlaid(module):
-        return "an armed LoRA overlay"
+    LoRA overlay's hook (`lora.Hook`, `weights.LoRASource`) is the key's (`_loras`)."""
     for sub in module.modules():
         for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
             for hook in hooks.values():
-                if isinstance(getattr(hook, "sites", None), lora.Sites):
-                    continue
                 if callable(getattr(hook, "lora_factors", None)):
-                    return f"a LoRA overlay hook on {type(sub).__name__}"
+                    continue
                 if not getattr(hook, "__module__", "").startswith(("tensorfs.", "cozy_runtime.")):
                     return f"a package forward hook on {type(sub).__name__}"
     return ""
 
 
-#: Each component root's overlay sites (`lora.Sites`), found at its first call.
-_SITES: weakref.WeakKeyDictionary[Module, tuple[lora.Sites, ...]] = weakref.WeakKeyDictionary()
+class _Loras(NamedTuple):
+    """A component's LoRA overlay hooks: `lora.Sites` (each asked once a call) and the rest."""
+
+    sites: tuple[tuple[lora.Sites, tuple[object, ...]], ...]
+    hooks: tuple[tuple[str, object], ...]
 
 
-def _overlaid(module: Module) -> bool:
-    """Whether an overlay is armed on `module`'s sites: its pages hold the overlay's bake, and a
-    replay would add nothing for a hook it skips."""
-    sites = _SITES.get(module)
-    if sites is None:
-        found = {
-            id(held): held
-            for sub in module.modules()
-            for hook in sub._forward_hooks.values()
-            if isinstance(held := getattr(hook, "sites", None), lora.Sites)
-        }
-        sites = _SITES[module] = tuple(found.values())
-    return any(held.armed is not None for held in sites)
+def _loras(module: Module) -> _Loras:
+    sites: dict[int, tuple[lora.Sites, list[object]]] = {}
+    hooks: list[tuple[str, object]] = []
+    for path, sub in module.named_modules():
+        for hook in sub._forward_hooks.values():
+            if not callable(getattr(hook, "lora_factors", None)):
+                continue
+            held = getattr(hook, "sites", None)
+            if isinstance(held, lora.Sites):
+                sites.setdefault(id(held), (held, []))[1].append(hook)
+            else:
+                hooks.append((path, hook))
+    return _Loras(tuple((s, tuple(h)) for s, h in sites.values()), tuple(hooks))
+
+
+def _armed_now(hook: object) -> object | None:
+    """The factors a LoRA hook adds now (None: none)."""
+    armed = getattr(hook, "armed", None)
+    if callable(armed):
+        return cast("object | None", armed())
+    answer = hook.lora_factors()  # type: ignore[attr-defined]  # `_loras` kept LoRA sources
+    return None if answer is None else cast("tuple[object, ...]", answer)[0]
+
+
+def _overlays(loras: _Loras) -> tuple[tuple[object, ...], str]:
+    """What the LoRA hooks arm now, as a key part, and why the call runs as written: factors a
+    hook adds per call read another component's pages, which a replay does not hold. Baked
+    factors are in the call's own pages, under the overlay they were filled with, so a graph
+    keyed by them reads the right ones."""
+    part: list[object] = []
+    for sites, hooks in loras.sites:
+        if sites.armed is None:
+            continue
+        for hook in hooks:
+            if _armed_now(hook) is not None and not getattr(hook, "_cozy_baked", False):
+                return (), "under a LoRA overlay applied per call"
+        part.append((id(sites), id(sites.armed)))
+    for path, hook in loras.hooks:
+        factors = _armed_now(hook)
+        if factors is None:
+            continue
+        if not getattr(hook, "_cozy_baked", False):
+            return (), f"under a LoRA overlay applied per call at {path}"
+        part.append((path, id(factors)))
+    return tuple(part), ""
 
 
 class _State:
@@ -2251,7 +2502,9 @@ def _changed(
     else:
         before, now = cast("_Parts", last[-1]), cast("_Parts", key[-1])
         what = next(n for n in _Parts._fields if getattr(before, n) != getattr(now, n))
-        if what == "context":
+        if what == "state":
+            what = "module state" if before.state[0] != now.state[0] else "LoRA overlay"
+        elif what == "context":
             moved = sorted(set(before.context) ^ set(now.context))
             what = f"context {moved[0][0]}"
     recorder.changes[what] = recorder.changes.get(what, 0) + 1
