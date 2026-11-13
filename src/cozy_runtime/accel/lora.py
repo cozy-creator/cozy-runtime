@@ -6,11 +6,15 @@ precision (never a copy of `x` in the factors' dtype), with no `[rows, out]` tem
 whose rows are split across GPUs (Ulysses) passes `chunk`: fixed-row GEMMs, so a row's bits never
 depend on how many rows a GPU holds. `Hook` is a linear's permanent forward hook for an overlay:
 the Runtime bakes the armed factors into the linear's resident bytes when it can (`_cozy_baked`),
-and the hook adds nothing then."""
+and the hook adds nothing then. `Sites` puts one on every linear of a component and arms an
+overlay's factors (`Pair`, by module path) for a block of calls: an adapter's LoRA, applied only
+while the adapter steers."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from functools import partial
 from typing import Protocol
 
 import torch
@@ -84,3 +88,59 @@ class Hook:
         """The Runtime's bake reads these (`weights.LoRASource`)."""
         factors = self.armed()
         return None if factors is None else (factors, *factors.factors())
+
+
+class Pair(torch.nn.Module):
+    """One linear's factors as most LoRA files store them, `lora_A` [r, in] and `lora_B` [out, r],
+    applied as `scale * B @ A`: the `Factors` an overlay arms on `Sites`."""
+
+    def __init__(self, inputs: int, outputs: int, rank: int, scale: float = 1.0) -> None:
+        super().__init__()
+        self.lora_A = torch.nn.Linear(inputs, rank, bias=False)
+        self.lora_B = torch.nn.Linear(rank, outputs, bias=False)
+        self.scale = scale
+
+    def forward(self, x: torch.Tensor, out: torch.Tensor) -> None:
+        accumulate(x, out, self.lora_A.weight, self.lora_B.weight, self.scale)
+
+    def factors(self) -> tuple[torch.Tensor, torch.Tensor, float]:
+        return self.lora_A.weight, self.lora_B.weight, self.scale
+
+
+class Sites:
+    """Where a component takes an overlay its model owns: a `Hook` on each of its linears, put on
+    as the model is built. `applied` arms factors by module path for a block of calls. Unarmed,
+    the hooks add nothing and the component's calls may replay recorded graphs; armed, its calls
+    run as written, with the factors baked into the pages filled for them, else added per call."""
+
+    def __init__(self, root: torch.nn.Module) -> None:
+        self.armed: Mapping[str, Factors] | None = None
+        linears = [(p, m) for p, m in root.named_modules() if isinstance(m, torch.nn.Linear)]
+        self.paths = frozenset(path for path, _ in linears)
+        for path, module in linears:
+            module.register_forward_hook(_Site(self, path))
+
+    @contextmanager
+    def applied(self, factors: Mapping[str, Factors]) -> Iterator[None]:
+        """`factors`, each by its linear's path under the root, armed while the block runs."""
+        if self.armed is not None:
+            raise ValueError("another overlay is armed on these sites")
+        if unknown := sorted(set(factors) - self.paths):
+            raise ValueError(f"the overlay names {len(unknown)} linears not here: {unknown[0]}")
+        self.armed = factors
+        try:
+            yield
+        finally:
+            self.armed = None
+
+
+class _Site(Hook):
+    __slots__ = ("sites",)
+
+    def __init__(self, sites: Sites, path: str) -> None:
+        super().__init__(partial(_armed, sites, path))
+        self.sites = sites
+
+
+def _armed(sites: Sites, path: str) -> Factors | None:
+    return None if sites.armed is None else sites.armed.get(path)

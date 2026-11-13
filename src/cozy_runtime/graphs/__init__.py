@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 import tensorfs.varena.torch as vt
 from tensorfs import varena
 
-from cozy_runtime.accel import stepcache
+from cozy_runtime.accel import lora, stepcache
 from cozy_runtime.accel.attention import (
     AttentionLayout,
     active_attention_layout,
@@ -1138,6 +1138,8 @@ def _region_call(
         if layout is not None and layout.sparse
         else "under an attention layout its producer keeps state for"
         if layout is not None and _stateful(module, layout)
+        else "under an armed LoRA overlay"
+        if _overlaid(module)
         else _unplain(torch, leaves)
     )
     if why:
@@ -1554,15 +1556,39 @@ def _hooked(module: Module) -> str:
     """Why a component's forward is no graph: a package hook on one of its modules runs Python
     at every call, which a replay would skip (Runtime's binding and scope hooks are served). A
     LoRA overlay hook (`lora.Hook`) asks the package at every call which overlay is armed, and
-    the bound pages follow that answer: a replay would keep the captured one."""
+    the bound pages follow that answer: a replay would keep the captured one. `lora.Sites`'
+    hooks say it without asking the package (`_overlaid`): its calls replay while none is armed."""
+    if _overlaid(module):
+        return "an armed LoRA overlay"
     for sub in module.modules():
         for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
             for hook in hooks.values():
+                if isinstance(getattr(hook, "sites", None), lora.Sites):
+                    continue
                 if callable(getattr(hook, "lora_factors", None)):
                     return f"a LoRA overlay hook on {type(sub).__name__}"
                 if not getattr(hook, "__module__", "").startswith(("tensorfs.", "cozy_runtime.")):
                     return f"a package forward hook on {type(sub).__name__}"
     return ""
+
+
+#: Each component root's overlay sites (`lora.Sites`), found at its first call.
+_SITES: weakref.WeakKeyDictionary[Module, tuple[lora.Sites, ...]] = weakref.WeakKeyDictionary()
+
+
+def _overlaid(module: Module) -> bool:
+    """Whether an overlay is armed on `module`'s sites: its pages hold the overlay's bake, and a
+    replay would add nothing for a hook it skips."""
+    sites = _SITES.get(module)
+    if sites is None:
+        found = {
+            id(held): held
+            for sub in module.modules()
+            for hook in sub._forward_hooks.values()
+            if isinstance(held := getattr(hook, "sites", None), lora.Sites)
+        }
+        sites = _SITES[module] = tuple(found.values())
+    return any(held.armed is not None for held in sites)
 
 
 class _State:

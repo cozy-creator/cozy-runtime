@@ -204,7 +204,7 @@ def merge(
     ):
         raise ValueError("a Sage2 keys merge needs [1, n, heads, 128] rows and their log-sum-exps")
     _LAUNCH[rows.device.index or 0](
-        merge_keys, (triton.cdiv(count, MERGE_ROWS), heads),
+        merge_keys, (triton.cdiv(count, MERGE_ROWS), heads, 1),
         rows, lse, keyed, raw, query, km, count, heads, rows.stride(1), keyed.stride(1),
         query.stride(1), float(scale), dim, MERGE_ROWS,
     )  # fmt: skip
