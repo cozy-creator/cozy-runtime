@@ -675,6 +675,12 @@ class _Recorder:
         self.replayed: _Timing = _Timing()
         #: calls a guard ran as written, by reason (`_region_call`'s `why`)
         self.written: dict[str, _Timing] = {}
+        #: how each call ran (`OUTCOMES`) and the last reason for each; the current call's
+        self.outcomes: dict[str, int] = {}
+        self.reasons: dict[str, str] = {}
+        self.now: tuple[str, str] = ("first_occurrence", "")
+        #: why a signature runs as written for good, by `OUTCOMES` code (`failed`, `judged`)
+        self.codes: dict[tuple[object, ...], str] = {}
         #: the counters when the current attempt opened (`mark`): receipts are per request
         self.base: dict[str, object] = {}
 
@@ -685,6 +691,7 @@ class _Recorder:
             "eager": self.eager.counts(),
             "replayed": self.replayed.counts(),
             "written": {why: timing.counts() for why, timing in self.written.items()},
+            "outcomes": dict(self.outcomes),
         }
 
     def since(self, name: str) -> float:
@@ -718,6 +725,7 @@ class _Recorder:
         self.short.clear()
         self.waiting.clear()
         self.seen.clear()
+        self.codes.clear()
         self.landed = LANDED[0]
 
 
@@ -1060,6 +1068,12 @@ def describe(root: Module) -> dict[str, object]:
                     if timing.calls > written.get(why, _ZERO)[0]
                 },
                 eager_gap=recorder.gap,
+                calls=_since(recorder.outcomes, cast("dict[str, int]", base.get("outcomes", {}))),
+                why={
+                    code: why
+                    for code, why in recorder.reasons.items()
+                    if why and code in recorder.outcomes
+                },
             )
             # A device's shared pool and domain count once.
             if recorder.pool is not None and recorder.recordings:
@@ -1139,14 +1153,21 @@ def _dispatch(
     recorder = _RECORDERS.get(module)
     if recorder is not None:
         _watch(module, recorder)
-    if (
-        recorder is None  # a copy of a root: no region of its own
-        or BYPASS.get()
-        or stepcache._RUN.get() is not None  # its verdicts are host reads in the forward
-        or _WARMING.get()
-        or placed_device().type != "cuda"
-        or torch.cuda.is_current_stream_capturing()
-    ):
+    capturing = torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
+    if recorder is None or _WARMING.get() or capturing:
+        return call(module, *args, **kwargs)  # a copy of a root, or inside a recording
+    bypass = (
+        "graphs are off for this call"
+        if BYPASS.get()
+        else "under a step cache"  # its verdicts are host reads in the forward
+        if stepcache._RUN.get() is not None
+        else "off CUDA"
+        if placed_device().type != "cuda"
+        else ""
+    )
+    if bypass:
+        recorder.outcomes["guard"] = recorder.outcomes.get("guard", 0) + 1
+        recorder.reasons["guard"] = bypass
         return call(module, *args, **kwargs)
     began = time.perf_counter()
     try:
@@ -1200,7 +1221,56 @@ def _name(root: Module) -> str:
     return placed[1] if placed is not None else type(root).__name__
 
 
+#: how a region call ran, as the record counts it (`describe`'s `calls`): replayed, recorded
+#: (this call captured a graph that serves the next; the call as written served it), or as
+#: written for a reason
+OUTCOMES = {
+    "replayed": "its graph replayed",
+    "recorded": "it captured a graph, checked against the call as written, which served",
+    "first_occurrence": "its path's first call: measured for its next",
+    "measuring": "its last call's timing was still on the device",
+    "device_bound": "the device, not the host, sets its pace: a graph saves nothing",
+    "no_gain": "a checked replay was no faster",
+    "no_room": "no room for its graph's pool or weights",
+    "refused": "the code can't be recorded (a capture refusal, state it changes)",
+    "capture_refused": "its capture failed",
+    "replay_mismatch": "its replay differed from the call as written; the graph went",
+    "building": "a kernel is still building, or its weights moved: a later call records",
+    "retired": "its graphs went (a kernel landed, its weights changed)",
+    "waiting": "its graph waits for room after a refusal this attempt",
+    "guard": "a guard keeps it as written",
+}
+
+
+def _note(recorder: _Recorder, code: str, why: str = "") -> None:
+    """How the current call runs (`OUTCOMES`), and why."""
+    recorder.now = (code, why.splitlines()[0][:300] if why else "")
+
+
+def _since(now: Mapping[str, int], base: Mapping[str, int]) -> dict[str, int]:
+    return {code: n - base.get(code, 0) for code, n in now.items() if n > base.get(code, 0)}
+
+
 def _region_call(
+    torch: ModuleType,
+    module: Module,
+    recorder: _Recorder,
+    call: _Call,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> object:
+    """A region call, counted by how it ran (`OUTCOMES`)."""
+    recorder.now = ("first_occurrence", "")
+    try:
+        return _region_path(torch, module, recorder, call, args, kwargs)
+    finally:
+        code, why = recorder.now
+        recorder.outcomes[code] = recorder.outcomes.get(code, 0) + 1
+        if why:
+            recorder.reasons[code] = why
+
+
+def _region_path(
     torch: ModuleType,
     module: Module,
     recorder: _Recorder,
@@ -1242,6 +1312,7 @@ def _region_call(
         state, why = _state(torch, recorder, module)
     if why:
         recorder.gap = why
+        _note(recorder, "guard", why)
         if placed is not None:
             placed[0].note(f"{placed[1]}.graphs", f"eager {why}")
         timing = recorder.written.get(why) or recorder.written.setdefault(why, _Timing())
@@ -1342,7 +1413,10 @@ def _passed() -> tuple[float, int] | None:
 def _first[T](
     torch: ModuleType, recorder: _Recorder, key: tuple[object, ...], run: Callable[[], T]
 ) -> T:
-    """The call as written, measured for its signature's next sight (`_Seen`)."""
+    """The call as written, measured for its signature's next sight (`_Seen`). A signature
+    refused for good says its reason (`codes`)."""
+    if recorder.now[0] == "first_occurrence" and (code := recorder.codes.get(key)) is not None:
+        _note(recorder, code, recorder.failed.get(key) or recorder.judged.get(key, ""))
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -1387,21 +1461,27 @@ def _capture_call(
     Never an error a call as written would not raise."""
     device = seen.device_ms()
     if device is None:
+        _note(recorder, "measuring")
         return _EAGER  # its last call's events are still queued: the next call decides
     if seen.submit_ms < _LAUNCH_BOUND * device:
         recorder.gap = (
             f"device-bound: {seen.submit_ms:.1f} ms to submit against {device:.1f} ms on the device"
         )
+        _note(recorder, "device_bound", recorder.gap)
         return _EAGER
     if seen.peak is None:  # its pass was observed inside another's: a later call may be
         recorder.gap = "its calls' working memory is not measured"
+        _note(recorder, "building", recorder.gap)
         return _EAGER
     if seen.cold:  # a region's first call autotunes and pages in: measure it once more
+        _note(recorder, "measuring", "its region's first call")
         return _EAGER
     if len(recorder.paths.get(key, ())) >= _VARIANTS:
         why = f"a module attribute it reads changes between calls: {recorder.moved or '?'}"
         with recorder.lock:
             recorder.judged[key] = recorder.gap = why
+            recorder.codes[key] = "refused"
+        _note(recorder, "refused", why)
         return _EAGER
     owner = _owner(torch, module, recorder, placed)
     recorder.capture_attempts += 1
@@ -1443,6 +1523,8 @@ def _capture_call(
                 recorder.judged[key] = recorder.gap = (
                     f"no gain: replay {replay:.3f} ms a call against {cost:.3f} ms as written"
                 )
+                recorder.codes[key] = "no_gain"
+                _note(recorder, "no_gain", recorder.gap)
                 return result
             if recorder.landed != LANDED[0] or _find(recorder, key) is not None:
                 return result  # a kernel landed meanwhile: its graphs go
@@ -1453,6 +1535,7 @@ def _capture_call(
             recorder.captures += 1
             recorder.gap = ""
             recorder.capture_each.append(round((time.perf_counter() - began) * 1e3, 3))
+            _note(recorder, "recorded", f"capture and check {recorder.capture_each[-1]:.0f} ms")
         return result
     finally:
         recorder.capture_ms += (time.perf_counter() - began) * 1e3
@@ -1564,6 +1647,7 @@ def _capture_verified(
             return found
     except Exception as exc:
         if isinstance(exc, Building | StaleBinding):
+            _note(recorder, "building", str(exc))
             return None  # a kernel still building, or its weights left: a later call
         if is_capacity(exc):
             need = recorder.pool.prepared if recorder.pool is not None else 0
@@ -1908,9 +1992,11 @@ def _replay_call(
         )
         if stale:
             recorder.forget()  # in flight, it goes at a later call; as written meanwhile
+            _note(recorder, "retired", "a kernel landed or its weights changed")
             return _EAGER
         attempt = placed[0].attempts if placed is not None else recorder.attempts
         if recorder.waiting.get(key) == attempt:
+            _note(recorder, "waiting")
             return _EAGER
         found = _find(recorder, key)
         if found is None:
@@ -1944,12 +2030,14 @@ def _replay(
         lease = _lease(torch, placed, recorder.binding)
         lease.__enter__()
         recorder.prepare_ms += (time.perf_counter() - began) * 1e3
-    except StaleBinding:
+    except StaleBinding as exc:
+        _note(recorder, "building", str(exc))
         return _EAGER
     except varena.Exhausted as exc:  # before the replay
         why = no_room(entry.owner.device, "its weights", 0, exc)
         _refused(recorder, placed, why)
         safeguard("no_room", why)
+        _note(recorder, "no_room", why)
         return _EAGER
     try:
         result = recorder.replayed.run(torch, lambda: entry(leaves, out))
@@ -1957,6 +2045,7 @@ def _replay(
         lease.__exit__(None, None, None)
     recorder.gap = ""
     recorder.replays += 1
+    _note(recorder, "replayed")
     recorder.copy_bytes += entry.copied
     return result
 
@@ -2202,6 +2291,8 @@ def _build(
     if changed := state.restore():
         graph.reset()
         recorder.judged[key] = recorder.gap = f"recording it changed the model's state: {changed}"
+        recorder.codes[key] = "refused"
+        _note(recorder, "refused", recorder.gap)
         return None
     if not _clonable(torch, outputs[0]):
         graph.reset()
@@ -2216,6 +2307,9 @@ def _build(
     if why:
         graph.reset()
         (recorder.idle_failed if idle else recorder.judged)[key] = recorder.gap = why
+        if not idle:
+            recorder.codes[key] = "refused"
+            _note(recorder, "refused", why)
         return None
     entry = _Recording(torch, graph, pool, statics, outputs[0], key, served, owner, seen)
     entry.reads = tuple(reads)
@@ -2532,6 +2626,9 @@ def _failed(
     inputs outside its request."""
     (recorder.idle_failed if idle else recorder.failed)[key] = why
     recorder.gap = why
+    if not idle:
+        recorder.codes[key] = code or "refused"
+        _note(recorder, code or "refused", why)
     if code is not None:
         safeguard(code, f"{_name(module)}: {why}")
 
@@ -2547,6 +2644,8 @@ def _short(
         _failed(module, recorder, key, why, "no_room", idle=idle)
     else:
         recorder.gap = why
+        if not idle:
+            _note(recorder, "no_room", why)
     return True
 
 
