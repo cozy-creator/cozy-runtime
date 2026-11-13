@@ -12,6 +12,7 @@ from __future__ import annotations
 import functools
 import sys
 import threading
+import time
 import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -390,11 +391,17 @@ def passing(module: nn.Module, args: Args, kwargs: Kwargs) -> Iterator[None]:
             request.working_phases,
             key=key,
         ) as observation:
+            began = time.perf_counter()
             yield
+            submitted = (time.perf_counter() - began) * 1e3
             if observation is not None:
                 # An eager observation holds the stream it ran on (`phase.observing`).
                 cast("torch.cuda.Stream", observation.completion_stream).synchronize()
                 observation.complete()
+        if observation is not None and observation.result is not None:
+            from cozy_runtime import graphs  # residency imports graphs: loaded by now
+
+            graphs.passed_at(submitted, int(observation.result["peak_bytes"]))
     finally:
         PASS_SHAPE.reset(shape)
 
