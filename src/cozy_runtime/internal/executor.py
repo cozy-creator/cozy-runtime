@@ -95,6 +95,9 @@ from tensorfs.executor import (
 )
 from tensorfs.varena import _runtime as varena
 
+#: TensorFS's request for a model read now (cl-966); none in a TensorFS before it.
+_MODEL_NEED: Callable[..., Request] | None = getattr(tensorfs.executor, "ModelNeed", None)
+
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
 from cozy_runtime.accel import stepcache
@@ -3440,6 +3443,7 @@ class Executor:
         """An on-demand model's first read: the load its construction deferred, run in the
         attempt that reads it; a pass that never uses it builds none of it."""
         parameter = load.models[0].model_parameter_name
+        self._needing(load)
         try:
             reply = member._prepare_first(load, Forwarded())
         except Exception:
@@ -3456,6 +3460,16 @@ class Executor:
             # An on-demand member's parent serves the many-model composite (`_load_group`).
             cast("_CompositeResidency", self.residency).rows[parameter] = member.residency
         return member.models[parameter]
+
+    def _needing(self, load: Load) -> None:
+        """`load`'s models from TensorD, which fetches what of them isn't on disk before every other download and answers once
+        it has (cl-966): the build then reads them from disk. A machine before it answers unavailable, and the build fetches
+        them itself as before."""
+        context = CURRENT.get()
+        if context is None or _MODEL_NEED is None:
+            return
+        for binding in load.models:
+            self._ask(_MODEL_NEED(manifest=binding.snapshot, components=list(binding.components)), context.request_id)
 
     def _discover_provisioned(self, application: str, path: str) -> None:
         """Import the installed release and bind its PackageInterface (at `path`). No elapsed-time
