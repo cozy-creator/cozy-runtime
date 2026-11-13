@@ -8,9 +8,11 @@ of the attributes its package declares steer its forward (`Model.__graph_keys__`
 classes and hooks, the LoRA overlays its hooks arm, the plain context variables a package set,
 and the Runtime's choices (the kernels serving, `LANDED`; the attention layout's band). A
 graph also holds the module attributes its capture read (`_reading`): it replays only while
-each still has the value it had, so one path may keep a few graphs, one per such state. A signature's first call runs as
-written and is measured (`_first`). Its next records in the call when the first was
-launch-bound (`_capture_call`): the graph replays once on that call's inputs, the call runs as
+each still has the value it had, so one path may keep a few graphs, one per such state. A
+signature's first warm call runs as written and is measured (`_first`), its next with the device
+held back while the host submits it (`_probe`), which measures its launch overhead; a later one
+records in the call when that overhead over the calls ahead beats the capture's cost
+(`_capture_call`): the graph replays once on that call's inputs, the call runs as
 written and serves, and the graph is kept when the two match bit for bit (outputs, the inputs
 it writes and the state it writes outside the call) and the replay is faster; every later call
 replays. What the capture reads outside its inputs, pool and weights (`observe`) must still be
@@ -412,6 +414,8 @@ class _Recording:
         self.reads: tuple[tuple[Module, str, object, bool], ...] = ()
         #: the region generation its read guards last held at
         self.guarded = -1
+        #: its replays in a row that found weights gone and refilled them (`_REFILLS`)
+        self.refilled = 0
         #: bytes the last replay copied in and out
         self.copied = 0
         self.done: Event | None = None
@@ -632,6 +636,9 @@ class _Recorder:
         self.bound: dict[tuple[object, ...], tuple[float, float, float, float | None]] = {}
         #: per signature, its last call as written (`_first`), which decides a capture in a call
         self.seen: dict[tuple[object, ...], _Seen] = {}
+        #: per signature, its launch-overhead probe (`_probe`), and its calls this attempt
+        self.probes: dict[tuple[object, ...], _Probe] = {}
+        self.sights: dict[tuple[object, ...], int] = {}
         #: per signature, why its idle recording failed: a call may still record it
         self.idle_failed: dict[tuple[object, ...], str] = {}
         #: its modules' classes and hooks (`_structure`), read at each attempt's first call and
@@ -725,6 +732,7 @@ class _Recorder:
         self.short.clear()
         self.waiting.clear()
         self.seen.clear()
+        self.probes.clear()
         self.codes.clear()
         self.landed = LANDED[0]
 
@@ -1008,6 +1016,7 @@ def mark(root: Module) -> None:
         with recorder.lock:
             recorder.base = recorder.snapshot()
             recorder.structure = None  # a request may swap classes or hooks before its loop
+            recorder.sights.clear()
 
 
 def capture_domain(torch: ModuleType, root: Module, memory: Memory | None = None) -> domain.Domain:
@@ -1345,11 +1354,14 @@ def _region_path(
             return result
         # No graph of this path holds now (what it read outside the call is gone, or a module
         # attribute it read has another value): this call records one.
+    recorder.sights[key] = recorder.sights.get(key, 0) + 1
     if (seen := recorder.seen.get(key)) is not None and key not in recorder.failed:
         if key not in recorder.judged:
             result = _capture_call(
                 torch, module, recorder, call, key, spec, leaves, (args, kwargs), placed, seen
             )
+            if result is _PROBE:
+                return _probe(torch, recorder, key, seen, lambda: call(module, *args, **kwargs))
             if result is not _EAGER:
                 return result
     elif not any(key in held for held in _settled_by(recorder)):
@@ -1435,10 +1447,69 @@ def _first[T](
     return result
 
 
-#: a signature records in a call when its last call as written took at least this share of its
-#: device time to submit: the host, not the device, set its pace (SDXL's UNet on a 4090: 104 of
-#: 105 ms; H3's DiT: under 0.1)
-_LAUNCH_BOUND = 0.5
+#: the longest call a probe measures (`_probe`): past it, launch overhead (microseconds a kernel)
+#: can't be a share worth capturing in the call
+_PROBE_MS = 1000.0
+#: the least share of a call its launch overhead must be for a capture in the call
+_SAVING = 0.05
+#: `_capture_call`'s answer when the call should run as its probe
+_PROBE = object()
+
+
+class _Probe:
+    """A path's call run with the device held back while the host submitted it (`_probe`): its
+    device time between its events is the work alone, as a graph would run it."""
+
+    __slots__ = ("end", "start")
+
+    def __init__(self, start: Event, end: Event) -> None:
+        self.start, self.end = start, end
+
+    def busy_ms(self) -> float | None:
+        return float(self.start.elapsed_time(self.end)) if self.end.query() else None
+
+
+def _probe[T](
+    torch: ModuleType,
+    recorder: _Recorder,
+    key: tuple[object, ...],
+    seen: _Seen,
+    run: Callable[[], T],
+) -> T:
+    """The call as written, measured for its launch overhead: a spin kernel holds the device
+    for longer than the host takes to submit the call (`seen`'s submission), so every kernel is
+    queued before the device reaches it and runs back to back. Its device time is the work
+    alone; the path's ordinary device time less it is what a replay saves. It costs this call
+    the hold, once per path."""
+    stream = torch.cuda.current_stream()
+    props = torch.cuda.get_device_properties(stream.device)
+    torch.cuda._sleep(int(seen.submit_ms * 1.25 * props.clock_rate))  # clock_rate: kHz
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record(stream)
+    result = recorder.eager.run(torch, run)
+    end.record(stream)
+    recorder.probes[key] = _Probe(start, end)
+    _note(recorder, "measuring", "its launch overhead (probe)")
+    return result
+
+
+def _ahead(recorder: _Recorder, key: tuple[object, ...]) -> int:
+    """The calls of `key` likely still to come in this attempt: what a loop's progress says is
+    left, else as many as it ran already (a loop that ran k times runs about k more)."""
+    context = CURRENT.get()
+    step = getattr(context, "_step", None) if context is not None else None
+    if isinstance(step, tuple) and len(step) == 2 and step[1] > step[0]:
+        return int(step[1] - step[0])
+    return recorder.sights.get(key, 1)
+
+
+def _capture_cost(recorder: _Recorder, submit_ms: float, busy_ms: float) -> float:
+    """What capturing and checking a call costs this one: its region's last such cost, else a
+    capture's submission, a replay and the call as written (SDXL 4090/5090: 0.6-0.7 s)."""
+    if recorder.capture_each:
+        return recorder.capture_each[-1]
+    return 3 * submit_ms + 2 * busy_ms + 250
 
 
 def _capture_call(
@@ -1463,18 +1534,34 @@ def _capture_call(
     if device is None:
         _note(recorder, "measuring")
         return _EAGER  # its last call's events are still queued: the next call decides
-    if seen.submit_ms < _LAUNCH_BOUND * device:
+    if seen.cold:  # a region's first call autotunes and pages in: measure it once more
+        _note(recorder, "measuring", "its region's first call")
+        return _EAGER
+    if device > _PROBE_MS:
+        # Launch overhead is a few microseconds a kernel: a call this long can't owe it a
+        # share worth a capture in the call. Idle capture, off the critical path, decides it.
+        recorder.gap = f"device-bound: a {device:.0f} ms call"
+        _note(recorder, "device_bound", recorder.gap)
+        return _EAGER
+    probe = recorder.probes.get(key)
+    if probe is None:
+        return _PROBE
+    busy = probe.busy_ms()
+    if busy is None:
+        _note(recorder, "measuring", "its probe is still on the device")
+        return _EAGER
+    saving, ahead = max(0.0, device - busy), _ahead(recorder, key)
+    cost = _capture_cost(recorder, seen.submit_ms, busy)
+    if saving < _SAVING * device or saving * ahead <= cost:
         recorder.gap = (
-            f"device-bound: {seen.submit_ms:.1f} ms to submit against {device:.1f} ms on the device"
+            f"launch overhead {saving:.1f} of {device:.1f} ms a call, {ahead} calls ahead, "
+            f"against ~{cost:.0f} ms to capture and check"
         )
         _note(recorder, "device_bound", recorder.gap)
         return _EAGER
     if seen.peak is None:  # its pass was observed inside another's: a later call may be
         recorder.gap = "its calls' working memory is not measured"
         _note(recorder, "building", recorder.gap)
-        return _EAGER
-    if seen.cold:  # a region's first call autotunes and pages in: measure it once more
-        _note(recorder, "measuring", "its region's first call")
         return _EAGER
     if len(recorder.paths.get(key, ())) >= _VARIANTS:
         why = f"a module attribute it reads changes between calls: {recorder.moved or '?'}"
@@ -1798,12 +1885,16 @@ def _reader(torch: ModuleType) -> Callable[[Module, str], object]:
 
     def __getattribute__(self: Module, name: str) -> object:
         value = get(self, "__dict__").get(name, _MISSING)
-        if value is not _MISSING and (reads := _READER.get(ident())) is not None:
-            if name not in _INTERNAL and not name.startswith(("_cozy", "__")):
-                if type(value) in _PLAIN:
-                    reads.setdefault((id(self), name), (self, name, value, True))
-                elif not isinstance(value, tensor | module):
-                    reads.setdefault((id(self), name), (self, name, value, False))
+        if (
+            value is not _MISSING
+            and (reads := _READER.get(ident())) is not None
+            and name not in _INTERNAL
+            and not name.startswith(("_cozy", "__"))
+        ):
+            if type(value) in _PLAIN:
+                reads.setdefault((id(self), name), (self, name, value, True))
+            elif not isinstance(value, tensor | module):
+                reads.setdefault((id(self), name), (self, name, value, False))
         return get(self, name)
 
     return __getattribute__
@@ -1927,6 +2018,8 @@ _EAGER = object()
 _STALE = object()
 #: graphs a region keeps; one more drops the least recently replayed (`_admit`)
 _MAX_GRAPHS = 16
+#: replays in a row that refill weights before a path runs as written for the process
+_REFILLS = 3
 
 
 def _remove(recorder: _Recorder, handle: tuple[object, ...]) -> None:
@@ -2025,9 +2118,10 @@ def _replay(
     admission sees their segments. varena refusing its weights room, this call runs as written
     and its graphs stay; weights that changed retire them at the next call (`_replay_call`)."""
     out = entry.output()
+    missed: list[int] = []
     try:
         began = time.perf_counter()
-        lease = _lease(torch, placed, recorder.binding)
+        lease = _lease(torch, placed, recorder.binding, missed)
         lease.__enter__()
         recorder.prepare_ms += (time.perf_counter() - began) * 1e3
     except StaleBinding as exc:
@@ -2047,6 +2141,17 @@ def _replay(
     recorder.replays += 1
     _note(recorder, "replayed")
     recorder.copy_bytes += entry.copied
+    entry.refilled = entry.refilled + 1 if missed and missed[0] else 0
+    if entry.refilled >= _REFILLS:
+        # Its weights leave between its calls (another component takes their room each step): a
+        # replay refills all of them before it starts, where the call as written streams them
+        # behind its compute. The path runs as written for the process.
+        why = f"its weights leave between calls: {entry.refilled} replays in a row refilled them"
+        recorder.judged[key] = recorder.gap = why
+        recorder.codes[key] = "no_room"
+        for handle in list(recorder.paths.get(key, ())):
+            _remove(recorder, handle)
+        _drop_unused(recorder, entry.owner)
     return result
 
 
@@ -2577,21 +2682,31 @@ def _settled(event: Event) -> None:
 
 
 @contextmanager
-def replaying(stream: Stream, bindings: Iterable[Binding]) -> Iterator[None]:
+def replaying(
+    stream: Stream, bindings: Iterable[Binding], missed: list[int] | None = None
+) -> Iterator[None]:
     """A graph's weights for one replay, back at their addresses if they left, and no longer. All
     of what is still here is pinned before any fill, which can then evict nothing the replay
-    needs; what left comes back in the core's reclaim order. It never reassigns a module slot."""
+    needs; what left comes back in the core's reclaim order. It never reassigns a module slot.
+    `missed` gets how many Regions had left."""
     with ExitStack() as held:
         taken = [held.enter_context(binding.prepare(stream, replay=True)) for binding in bindings]
+        left = 0
         for uses in taken:
             for region, use in uses.items():
                 if use is None:
+                    left += 1
                     uses[region] = region.use(stream.cuda_stream)
+        if missed is not None:
+            missed.append(left)
         yield
 
 
 def _lease(
-    torch: ModuleType, placed: _Placed | None, binding: Binding | None
+    torch: ModuleType,
+    placed: _Placed | None,
+    binding: Binding | None,
+    missed: list[int] | None = None,
 ) -> AbstractContextManager[None]:
     if placed is None or binding is None:
         return nullcontext()
@@ -2599,7 +2714,7 @@ def _lease(
     stream, held = torch.cuda.current_stream(), placed[0].graph_held(placed[1])
     if held is not None and held != stream:
         stream.wait_stream(held)
-    return replaying(stream, (binding,))
+    return replaying(stream, (binding,), missed)
 
 
 def _refused(recorder: _Recorder, placed: _Placed | None, why: str) -> None:
