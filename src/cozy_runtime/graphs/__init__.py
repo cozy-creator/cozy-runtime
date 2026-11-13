@@ -101,7 +101,7 @@ if TYPE_CHECKING:
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
 #: Gates only, never a setting: every path records at its first sight, whatever it would save, so
 #: a gate build proves each model captures and replays (cr-297). False in every release.
-FORCE = False
+FORCE = True
 #: Set while a region warms up its capture: the regions under it run as written.
 _WARMING = contextvars.ContextVar("cozy_graphs_warming", default=False)
 #: The idle period recording on this thread (`capture_idle`): each region boundary checks it.
