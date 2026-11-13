@@ -2765,9 +2765,12 @@ class Retained:
             views.append((end, tensor.nbytes, tensor.dtype, tensor.shape))
             end = (end + tensor.nbytes + 255) // 256 * 256
         region = varena.Retained(memory._device_native(), memory._tier(), end)
-        region.write(memory._cuda_stream().cuda_stream, parts, spill=self.spill)
-        del dense
-        self.states.append(_Kept(memory, region, views))
+        written = region.write(memory._cuda_stream().cuda_stream, parts, spill=self.spill)
+        ptr = written.tensor.data_ptr()
+        del dense, written
+        kept = _Kept(memory, region, views, ptr, end)
+        KEPT.add(kept)
+        self.states.append(kept)
         return self.states[-1]
 
 
@@ -2790,13 +2793,19 @@ type _PhaseSignature = tuple[str, str, str, str, tuple[tuple[str, str, int, int]
 
 
 class _Kept:
+    """One retained state: its Region, the views `put` made of it, and the Region's device
+    address and bytes, which a CUDA graph that reads it pins at each replay (`graphs`)."""
+
     def __init__(
         self,
         memory: Memory,
         region: varena.Retained | None,
         views: list[tuple[int, int, torch.dtype, torch.Size]],
+        ptr: int = 0,
+        nbytes: int = 0,
     ) -> None:
         self.memory, self.region, self.views = memory, region, views
+        self.ptr, self.nbytes = ptr, nbytes
 
     def close(self) -> None:
         # The last reference to its region: it is released now, and views still out keep their pins.
@@ -2815,6 +2824,16 @@ class _Kept:
                 exc.requested_bytes,
             ) from exc
         return tuple(raw[at : at + n].view(dtype).view(shape) for at, n, dtype, shape in self.views)
+
+
+#: every live retained state: a capture that reads one records it (`graphs.observe`)
+KEPT: weakref.WeakSet[_Kept] = weakref.WeakSet()
+
+
+def kept_ranges() -> list[tuple[int, int, _Kept]]:
+    """Each live retained state's device range, by address."""
+    live = [kept for kept in list(KEPT) if kept.region is not None and kept.ptr]
+    return sorted(((kept.ptr, kept.ptr + kept.nbytes, kept) for kept in live), key=lambda row: row[0])
 
 
 class _Retaining:

@@ -162,12 +162,9 @@ class AttentionProducer:  # type: ignore[explicit-any]  # `produce`'s (below)
     `context_parallel` admits Ulysses sequence parallelism;
     one without it steps to the next kernel under a group.
 
-    `stateless(layout)`: whether, for a component call under `layout` made now, `produce`
-    only passes each site's call on to `call.original` and keeps nothing (a dense step that
-    seeds no statistics). The Runtime then records the component call as a CUDA graph with the
-    sites' own processors and replays it, skipping `produce`. It is asked at each call, in the
-    caller's context. Without it every call under a layout at the producer's sites runs as
-    written.
+    `stateless` is no longer read: the Runtime records a component call under a producer like
+    any other, guarded by what it reads (the storages its kernels touch, its producer's request
+    state, the context it runs in), and runs it as written when its Python changes that state.
     """
 
     name: str

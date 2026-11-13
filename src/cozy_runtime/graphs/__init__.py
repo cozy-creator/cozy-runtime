@@ -45,6 +45,7 @@ from tensorfs import varena
 from cozy_runtime.accel import lora, stepcache
 from cozy_runtime.accel.attention import (
     AttentionLayout,
+    AttentionProducer,
     active_attention_layout,
     attention_scope,
     producer_sites,
@@ -98,6 +99,9 @@ if TYPE_CHECKING:
     type _Counts = tuple[int, int, float, float, float]
 
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
+#: Gates only, never a setting: every path records at its first sight, whatever it would save, so
+#: a gate build proves each model captures and replays (cr-297). False in every release.
+FORCE = False
 #: Set while a region warms up its capture: the regions under it run as written.
 _WARMING = contextvars.ContextVar("cozy_graphs_warming", default=False)
 #: The idle period recording on this thread (`capture_idle`): each region boundary checks it.
@@ -404,6 +408,12 @@ class _Recording:
         self.bands = [(site, band, b) for (site, band), held in served.bands.items() for b in held]
         #: the storages outside the call it reads (`observe`): each must live for it to replay
         self.foreign = observed.foreign
+        #: the retained states it reads, each with the address it read it at: pinned there for
+        #: each replay (`_pinned`), or the graph goes
+        self.retained: list[tuple[weakref.ref[object], int]] = [
+            (weakref.ref(state), int(getattr(state, "ptr", 0)))
+            for state in observed.retained.values()
+        ]
         #: the static inputs it writes, copied back to the caller's tensors after each replay
         self.arg_writes = sorted(observed.arg_writes)
         #: the foreign views it writes, held only until its check ends (`_capture_call`)
@@ -437,8 +447,28 @@ class _Recording:
         )
 
     def live(self) -> bool:
-        """Whether every storage outside the call it reads is still the one it captured."""
-        return not any(ref.expired() for ref in self.foreign)
+        """Whether every storage outside the call it reads is still the one it captured, and
+        every retained state it reads still held."""
+        return not any(ref.expired() for ref in self.foreign) and all(
+            (state := ref()) is not None and getattr(state, "region", None) is not None
+            for ref, _ in self.retained
+        )
+
+    def _pinned(self, stream: Stream) -> list[object]:
+        """Each retained state it reads, pinned on `stream` for this replay at the address it
+        was captured at (refilled first if it was evicted); `StaleBinding` when one moved."""
+        uses = []
+        for ref, ptr in self.retained:
+            state = ref()
+            region = getattr(state, "region", None)
+            if region is None:
+                raise StaleBinding("a retained state it reads has ended")
+            use = region.use(stream.cuda_stream)
+            if use.tensor.data_ptr() != ptr:
+                raise StaleBinding("a retained state it reads moved")
+            use.consume_on(stream.cuda_stream)
+            uses.append(use)
+        return uses
 
     def __call__(
         self, leaves: Sequence[object], out: object, *, written: list[Tensor] | None = None
@@ -458,7 +488,9 @@ class _Recording:
             stream.wait_stream(self.stream)
         self.stream, self.fenced = stream, False
         copied = 0
+        held: list[object] = []
         try:
+            held = self._pinned(stream) if self.retained else []
             # cast: a recording is called only until it closes
             vt.prepare_pool(cast("domain.Pool", self.pool).handle, 0, self.owner.device)
             for static, value in zip(self.inputs, leaves, strict=True):
@@ -488,6 +520,7 @@ class _Recording:
                 copied += static.nbytes
             return out
         finally:
+            del held  # each Use releases on the stream it consumed
             self.copied = copied
             cast("Event", self.done).record(stream)  # cast: made above
             vt.record_pool_stream(cast("domain.Pool", self.pool).handle, stream)
@@ -496,6 +529,7 @@ class _Recording:
     def close(self) -> None:
         """After last use: release static tensors and executable before their pool."""
         self.inputs, self.outputs, self.writes, self.foreign, self.reads = [], None, [], [], ()
+        self.retained = []
         cast("CUDAGraph", self.graph).reset()  # cast: it closes once
         self.graph = self.pool = None
 
@@ -643,7 +677,12 @@ class _Recorder:
         self.idle_failed: dict[tuple[object, ...], str] = {}
         #: its modules' classes and hooks (`_structure`), read at each attempt's first call and
         #: whenever a hook was registered since; and why a package hook keeps it as written
-        self.structure: tuple[int, tuple[int, int], str] | None = None
+        self.structure: tuple[int, tuple[int, int, int], str] | None = None
+        #: its modules (read with its structure), and their package hooks (`_package_hooks`)
+        self.subs: list[Module] = []
+        self.hooks: tuple[object, ...] = ()
+        #: the attention producers serving its sites (`_host` keys their request states)
+        self.producers: tuple[AttentionProducer, ...] = ()
         #: its LoRA overlay hooks (`_loras`), found with its structure
         self.loras = _Loras((), ())
         #: bumped by an attribute set on any of its modules (`_watching`), which a graph's
@@ -1295,7 +1334,7 @@ def _region_path(
     spec: TreeSpec
     leaves, spec = torch.utils._pytree.tree_flatten((args, kwargs))
     layout = active_attention_layout()
-    structure, hooked = _structure(recorder, module)
+    structure = _structure(recorder, module)
     why = (
         "with gradients"
         if torch.is_grad_enabled()
@@ -1306,15 +1345,7 @@ def _region_path(
         # A dev-only attention capture sees every call with its own inputs and step.
         else "under an attention capture"
         if attention_ulysses.CAPTURE.get() is not None
-        # A sparse step picks its key blocks from the values, and a package's producer may
-        # keep request state at a call: a replay would freeze one call's.
-        else "under a sparse attention layout"
-        if layout is not None and layout.sparse
-        else "under an attention layout its producer keeps state for"
-        if layout is not None and _stateful(module, layout)
-        # A package hook runs Python at every call, which a replay would skip.
-        else hooked
-        or _unplain(torch, leaves)
+        else _unplain(torch, leaves)
     )
     state: tuple[object, ...] = ()
     if not why:  # a guarded call reads no overlays
@@ -1338,7 +1369,16 @@ def _region_path(
     declared = tuple(functools.reduce(getattr, p.split("."), module) for p in recorder.keys)
     key = (
         *_signature(torch, leaves, spec),
-        _Parts(declared, addresses, autocast, _dense(layout), structure, state, _context()),
+        _Parts(
+            declared,
+            addresses,
+            autocast,
+            _dense(layout),
+            structure,
+            state,
+            _context(),
+            _host(torch, recorder, module),
+        ),
     )
     if layout is not None:  # an idle recording runs outside the caller's scope: under its own
         call = functools.partial(_under, layout, call)
@@ -1355,6 +1395,21 @@ def _region_path(
         # No graph of this path holds now (what it read outside the call is gone, or a module
         # attribute it read has another value): this call records one.
     recorder.sights[key] = recorder.sights.get(key, 0) + 1
+    if (
+        FORCE
+        and key not in recorder.seen
+        and key not in recorder.failed
+        and key not in recorder.judged
+        and recorder.eager.calls  # a region's first call autotunes and pages in
+    ):
+        # Gates only: every path records at its first sight, whatever it would save.
+        peak = max((s.peak or 0 for s in recorder.seen.values()), default=0)
+        warm = _Seen(0.0, 0.0, torch.cuda.Event(), torch.cuda.Event(), peak or None)
+        result = _capture_call(
+            torch, module, recorder, call, key, spec, leaves, (args, kwargs), placed, warm
+        )
+        if result is not _EAGER:
+            return result
     if (seen := recorder.seen.get(key)) is not None and key not in recorder.failed:
         if key not in recorder.judged:
             result = _capture_call(
@@ -1385,6 +1440,9 @@ class _Parts(NamedTuple):
     #: the LoRA overlays its hooks arm now (`_overlays`)
     state: tuple[object, ...]
     context: tuple[tuple[str, object], ...]
+    #: the host state its Python decides by (`_host`): context objects, its attention producers'
+    #: request states, its package hooks' closures
+    host: tuple[object, ...]
 
 
 @dataclass(eq=False, slots=True)
@@ -1496,6 +1554,21 @@ def _probe[T](
     return result
 
 
+def _unpaid(
+    recorder: _Recorder, key: tuple[object, ...], seen: _Seen, probe: _Probe, busy: float
+) -> str:
+    """Why capturing `key` in this call wouldn't pay ("" when it would): its launch overhead
+    over the calls ahead against the capture's cost, and at least `_SAVING` of the call."""
+    saving, ahead = max(0.0, probe.normal - busy), _ahead(recorder, key)
+    cost = _capture_cost(recorder, seen.submit_ms, busy)
+    if saving >= _SAVING * probe.normal and saving * ahead > cost:
+        return ""
+    return (
+        f"launch overhead {saving:.1f} of {probe.normal:.1f} ms a call, {ahead} calls ahead, "
+        f"against ~{cost:.0f} ms to capture and check"
+    )
+
+
 def _ahead(recorder: _Recorder, key: tuple[object, ...]) -> int:
     """The calls of `key` likely still to come in this attempt: what a loop's progress says is
     left, else as many as it ran already (a loop that ran k times runs about k more)."""
@@ -1532,36 +1605,32 @@ def _capture_call(
     finds no room or a kernel still building runs as written and tries again at a later call;
     one the code refuses, or a mismatch, runs as written for the process, and the run says why.
     Never an error a call as written would not raise."""
-    device = seen.device_ms()
+    device = 0.0 if FORCE else seen.device_ms()
     if device is None:
         _note(recorder, "measuring")
         return _EAGER  # its last call's events are still queued: the next call decides
-    if seen.cold:  # a region's first call autotunes and pages in: measure it once more
+    if FORCE:
+        pass  # gates: no measure, no probe, no cost: record it
+    elif seen.cold:  # a region's first call autotunes and pages in: measure it once more
         _note(recorder, "measuring", "its region's first call")
         return _EAGER
-    if device > _PROBE_MS:
+    elif device > _PROBE_MS:
         # Launch overhead is a few microseconds a kernel: a call this long can't owe it a
         # share worth a capture in the call. Idle capture, off the critical path, decides it.
         recorder.gap = f"device-bound: a {device:.0f} ms call"
         _note(recorder, "device_bound", recorder.gap)
         return _EAGER
-    probe = recorder.probes.get(key)
-    if probe is None:
+    elif (probe := recorder.probes.get(key)) is None:
         return _PROBE
-    busy = probe.busy_ms()
-    if busy is None:
+    elif (busy := probe.busy_ms()) is None:
         _note(recorder, "measuring", "its probe is still on the device")
         return _EAGER
-    saving, ahead = max(0.0, probe.normal - busy), _ahead(recorder, key)
-    cost = _capture_cost(recorder, seen.submit_ms, busy)
-    if saving < _SAVING * probe.normal or saving * ahead <= cost:
-        recorder.gap = (
-            f"launch overhead {saving:.1f} of {probe.normal:.1f} ms a call, {ahead} calls ahead, "
-            f"against ~{cost:.0f} ms to capture and check"
-        )
-        _note(recorder, "device_bound", recorder.gap)
+    elif why := _unpaid(recorder, key, seen, probe, busy):
+        recorder.gap = why
+        _note(recorder, "device_bound", why)
         return _EAGER
-    if seen.peak is None:  # its pass was observed inside another's: a later call may be
+    if seen.peak is None and not FORCE:
+        # its pass was observed inside another's: a later call may be
         recorder.gap = "its calls' working memory is not measured"
         _note(recorder, "building", recorder.gap)
         return _EAGER
@@ -1608,7 +1677,7 @@ def _capture_call(
         cost = max(seen.host_ms, device)
         with recorder.lock:
             recorder.bound[key] = (seen.submit_ms, seen.host_ms, device, replay)
-            if cost - replay <= max(_NOISE * cost, 0.05):
+            if cost - replay <= max(_NOISE * cost, 0.05) and not FORCE:
                 recorder.judged[key] = recorder.gap = (
                     f"no gain: replay {replay:.3f} ms a call against {cost:.3f} ms as written"
                 )
@@ -1716,7 +1785,7 @@ def _capture_verified(
                 served = held.enter_context(attention_ulysses.observing())
                 entry = _build(
                     torch, module, recorder, key, owner, placed, call, spec, layout,
-                    vt.pool_bytes(cast("int", seen.peak)), state, served,
+                    vt.pool_bytes(seen.peak or 0), state, served,
                 )
             if entry is None:
                 return None
@@ -1790,30 +1859,35 @@ def _owner(
         return recorder.domain
 
 
-def _structure(recorder: _Recorder, module: Module) -> tuple[int, str]:
-    """Its modules' classes and forward hooks as one number, and why a package hook keeps it as
-    written ("" when none). Read at an attempt's first call and whenever a hook was registered
-    since (`RemovableHandle.next_id`): HiDiffusion swaps SDXL's block classes and adds hooks
-    per request, and a graph of the base UNet must never serve it."""
+def _structure(recorder: _Recorder, module: Module) -> int:
+    """Its modules' classes and forward hooks as one number. Read again when a hook was
+    registered or removed (the registration counter and the hooks held), or a class or submodule
+    set (`structural`): HiDiffusion swaps SDXL's block classes and adds hooks per request, and a
+    graph of the base UNet must never serve it."""
     from torch.utils.hooks import RemovableHandle
 
-    registered = RemovableHandle.next_id, recorder.structural
     held = recorder.structure
-    if held is not None and held[1] == registered:
-        return held[0], held[2]
+    if held is not None:
+        hooks = sum(len(sub._forward_pre_hooks) + len(sub._forward_hooks) for sub in recorder.subs)
+        if held[1] == (RemovableHandle.next_id, recorder.structural, hooks):
+            return held[0]
     watch = weakref.ref(recorder)
-    for sub in module.modules():
+    recorder.subs = list(module.modules())
+    for sub in recorder.subs:
         sub.__dict__[_WATCH] = watch  # its sets move the region's generation (`_watching`)
+    hooks = sum(len(sub._forward_pre_hooks) + len(sub._forward_hooks) for sub in recorder.subs)
     number = hash(
         tuple(
             (type(sub), id(sub), tuple(sub._forward_pre_hooks), tuple(sub._forward_hooks))
-            for sub in module.modules()
+            for sub in recorder.subs
         )
     )
-    why = _hooked(module)
-    recorder.structure = (number, registered, why)
+    recorder.structure = (number, (RemovableHandle.next_id, recorder.structural, hooks), "")
     recorder.loras = _loras(module)
-    return number, why
+    recorder.hooks = _package_hooks(recorder.subs)
+    producers = {id(site.producer): site.producer for site in producer_sites(module)}
+    recorder.producers = tuple(producers.values())
+    return number
 
 
 #: a module's own bookkeeping, which steers no forward (hooks are the structure's)
@@ -1978,13 +2052,6 @@ def _under(
         return call(*args, **kwargs)
 
 
-def _stateful(module: Module, layout: AttentionLayout) -> bool:
-    """Whether a package's attention producer serving a site under `module` now does not state
-    this call stateless (`AttentionProducer.stateless`): its `produce` must run."""
-    producers = {site.producer.name: site.producer for site in producer_sites(module)}
-    return any(p.stateless is None or not p.stateless(layout) for p in producers.values())
-
-
 def _queue(
     torch: ModuleType,
     module: Module,
@@ -2105,7 +2172,10 @@ def _replay_call(
         entry.used = recorder.attempts
         if placed is not None and recorder.binding is None:
             recorder.binding = placed[0].retain(placed[1], ("",))
-        return _replay(torch, leaves, placed, recorder, key, entry, attempt)
+        result = _replay(torch, leaves, placed, recorder, key, entry, attempt)
+        if result is _STALE:
+            _expire(recorder, handle, owner)
+        return result
 
 
 def _replay(
@@ -2139,6 +2209,9 @@ def _replay(
         return _EAGER
     try:
         result = recorder.replayed.run(torch, lambda: entry(leaves, out))
+    except StaleBinding as exc:  # a retained state it reads ended or moved
+        _note(recorder, "building", str(exc))
+        return _STALE
     finally:
         lease.__exit__(None, None, None)
     recorder.gap = ""
@@ -2241,12 +2314,12 @@ def _record(
     began = time.perf_counter()
     stage, need = "its weights", 0
     try:
-        if why := _hooked(module):
-            recorder.idle_failed[key] = why
-            return True
         parts, why = _state(torch, recorder, module)
-        if why or parts != cast("_Parts", key[-1]).state:
-            recorder.idle_failed[key] = why or "its modules or overlay at idle are not its call's"
+        held = cast("_Parts", key[-1])
+        if why or parts != held.state or _host(torch, recorder, module) != held.host:
+            # A call's host state (its overlays, context objects, producers' request states)
+            # is its request's: only a call records it.
+            recorder.idle_failed[key] = why or "its host state at idle is not its call's"
             return True
         if placed is not None and not placed[0].graph_accounted():
             _failed(module, recorder, key, "driver/context memory is unmeasured", idle=True)
@@ -2385,12 +2458,15 @@ def _build(
     observed: list[observe.Observed] = []
     reads: list[tuple[Module, str, object, bool]] = []
     weights = _weights(torch, module, recorder.binding)
+    from cozy_runtime.internal import residency  # loaded by any placement
+
+    retained = residency.kept_ranges()
 
     def step() -> None:
         try:
             statics.extend(_static(torch, v) if isinstance(v, _Leaf) else None for v in layout)
             sargs, skwargs = _arguments(torch, spec, layout, statics)
-            mode, seen = observe.observer(torch, statics, weights)
+            mode, seen = observe.observer(torch, statics, weights, retained)
             observed[:] = [seen]
             with cast("AbstractContextManager[object]", mode), _reading(torch) as read:
                 outputs.append(call(module, *sargs, **skwargs))
@@ -2400,9 +2476,21 @@ def _build(
             outputs.clear()
             raise
 
+    host = _host(torch, recorder, module)
     graph, why = capture(torch, step, pool, owner, reserve, alone=not recorder.recordings)
     if graph is None:
         _failed(module, recorder, key, why, idle=idle)
+        return None
+    if moved := _moved(host, _host(torch, recorder, module)):
+        # Its Python changed host state as it ran (a cache it fills, a counter): a replay
+        # would skip that. Only state it reads and leaves alone is safe to freeze.
+        graph.reset()
+        state.restore()
+        why = f"its forward changes host state as it runs: {moved}"
+        (recorder.idle_failed if idle else recorder.judged)[key] = recorder.gap = why
+        if not idle:
+            recorder.codes[key] = "refused"
+            _note(recorder, "refused", why)
         return None
     if changed := state.restore():
         graph.reset()
@@ -2470,18 +2558,118 @@ def _capture_state(
             _SETTLING.reset(settling)
 
 
-def _hooked(module: Module) -> str:
-    """Why a component's forward is no graph: a package hook on one of its modules runs Python
-    at every call, which a replay would skip (Runtime's binding and scope hooks are served). A
-    LoRA overlay's hook (`lora.Hook`, `weights.LoRASource`) is the key's (`_loras`)."""
-    for sub in module.modules():
+def _package_hooks(subs: Iterable[Module]) -> tuple[object, ...]:
+    """The forward hooks packages put on these modules (not a LoRA overlay's, which
+    `_overlays` keys, nor the Runtime's or TensorFS's own)."""
+    found = []
+    for sub in subs:
         for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
             for hook in hooks.values():
                 if callable(getattr(hook, "lora_factors", None)):
                     continue
                 if not getattr(hook, "__module__", "").startswith(("tensorfs.", "cozy_runtime.")):
-                    return f"a package forward hook on {type(sub).__name__}"
-    return ""
+                    found.append(hook)
+    return tuple(found)
+
+
+def _shallow(torch: ModuleType, value: object, depth: int = 0) -> object:
+    """A host value as a key part, by what a forward can decide or read from it: plain values by
+    value; a CUDA tensor by its address and layout (a graph reads that address), a small host
+    tensor by its values; a function by its code, the object it is bound to and its closure; an
+    object by its type and fields, a small container by its items, both two levels down; past
+    that, or a container too long to read each call, by identity and length. A host decision
+    this misses, the capture's check or a later call catches."""
+    if type(value) in _PLAIN or isinstance(value, torch.dtype | torch.device):
+        return value
+    if isinstance(value, torch.Tensor):
+        try:
+            layout = (tuple(value.shape), value.stride(), value.dtype)
+            if value.is_cuda or value.numel() > _SHALLOW_ITEMS:
+                return ("tensor", value.device, value.data_ptr(), *layout)
+            return ("tensor", *layout, tuple(value.flatten().tolist()))
+        except (RuntimeError, NotImplementedError):  # a wrapper subclass with no storage
+            return ("tensor", id(value))
+    if isinstance(value, functools.partial):
+        return (
+            "partial",
+            _shallow(torch, value.func, depth + 1),
+            tuple(_shallow(torch, a, depth + 1) for a in value.args),
+            tuple((k, _shallow(torch, v, depth + 1)) for k, v in sorted(value.keywords.items())),
+        )
+    function = getattr(value, "__func__", value)
+    code = getattr(function, "__code__", None)
+    if code is not None:
+        cells = getattr(function, "__closure__", None) or ()
+        return (
+            "function",
+            id(code),
+            id(getattr(value, "__self__", None)),
+            tuple(_shallow(torch, c.cell_contents, depth + 1) for c in cells if _filled(c)),
+        )
+    if isinstance(value, list | tuple | set | frozenset | dict):
+        if depth > 1 or len(value) > _SHALLOW_ITEMS or isinstance(value, set | frozenset):
+            return (type(value), id(value), len(value))
+        items = value.items() if isinstance(value, dict) else enumerate(value)
+        return (type(value), tuple((k, _shallow(torch, v, depth + 1)) for k, v in items))
+    if depth > 1:
+        return (type(value), id(value))
+    fields = getattr(value, "__dict__", None)
+    if fields is None:
+        slots = getattr(type(value), "__slots__", ())
+        fields = {n: getattr(value, n) for n in slots if hasattr(value, n)}
+    if not fields:  # nothing to read: what it is
+        return (type(value), id(value))
+    return (
+        type(value),
+        tuple((n, _shallow(torch, v, depth + 1)) for n, v in sorted(fields.items())),
+    )
+
+
+#: the items a container (or a host tensor) may hold for `_shallow` to key each: more, by identity
+#: and length (a host tensor by address)
+_SHALLOW_ITEMS = 8
+
+
+def _moved(before: tuple[object, ...], after: tuple[object, ...]) -> str:
+    """The first part of a `_host` key that differs between two reads ("" when none)."""
+    for a, b in zip(before, after, strict=False):
+        if a != b:
+            if isinstance(a, tuple) and a and isinstance(a[0], str):
+                return a[0]
+            return "a hook's closure"
+    return "" if len(before) == len(after) else "its hooks"
+
+
+def _filled(cell: object) -> bool:
+    try:
+        _ = cell.cell_contents  # type: ignore[attr-defined]  # a closure cell
+    except ValueError:
+        return False
+    return True
+
+
+#: the modules whose objects a context variable may hold without steering a forward: Python's,
+#: the Runtime's (its own context is keyed where it steers) and torch's
+_OURS = frozenset({"builtins", "cozy_runtime", "tensorfs", "torch"})
+
+
+def _host(torch: ModuleType, recorder: _Recorder, module: Module) -> tuple[object, ...]:
+    """What a forward decides by on the host beside its arguments and module attributes, as a
+    key part: the context variables a package set to objects (H3's carry and key-mean slot), the
+    request states of the attention producers serving its sites (H3's carried sites, its rope
+    presentation), and the closures of its package hooks. A step whose host state differs takes
+    another path; one whose state changes every call never records, and says which."""
+    context = tuple(
+        (var.name, _shallow(torch, value))
+        for var, value in contextvars.copy_context().items()
+        if type(value).__module__.partition(".")[0] not in _OURS and not var.name.startswith("cozy")
+    )
+    producers = tuple(
+        (producer.name, _shallow(torch, producer.request_state()))
+        for producer in recorder.producers
+    )
+    hooks = tuple(_shallow(torch, hook) for hook in recorder.hooks)
+    return tuple(sorted(context, key=lambda kv: kv[0])) + producers + hooks
 
 
 class _Loras(NamedTuple):
@@ -2842,11 +3030,6 @@ def _unplain(torch: ModuleType, leaves: list[object]) -> str:
         return "with custom tensor dispatch"
     if not tensors or not all(t.is_cuda for t in tensors):
         return "without CUDA tensor arguments"
-    if any(
-        not isinstance(v, (torch.Tensor, torch.dtype, torch.device)) and type(v) not in _PLAIN
-        for v in leaves
-    ):
-        return "with opaque arguments"
     return ""
 
 
@@ -2858,12 +3041,16 @@ def _clonable(torch: ModuleType, out: object) -> bool:
 
 
 def _signature(torch: ModuleType, leaves: list[object], spec: TreeSpec) -> tuple[object, ...]:
+    """Each argument leaf: a tensor's layout, a plain value by type and value, anything else
+    (a bound method over a K/V store, an object) as `_shallow` keys it."""
     return (
         str(spec),
         *(
             (tuple(v.shape), v.dtype, v.device, v.stride())
             if isinstance(v, torch.Tensor)
             else (type(v), v)
+            if type(v) in _PLAIN or isinstance(v, torch.dtype | torch.device)
+            else ("object", _shallow(torch, v))
             for v in leaves
         ),
     )

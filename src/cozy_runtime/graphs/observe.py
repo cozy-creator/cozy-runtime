@@ -32,6 +32,8 @@ MADE = -1
 WEIGHT = -2
 #: anything else the call reached
 FOREIGN = -3
+#: a retained state's Region (a prefix's K/V): pinned at each replay, like a weight
+RETAINED = -4
 #: the foreign bytes a capture may write before it is refused: saving them around its check
 #: costs that much again
 WRITE_LIMIT = 256 << 20
@@ -47,6 +49,8 @@ class Observed:
         self.writes: dict[tuple[object, ...], Tensor] = {}
         self.weight_writes = 0
         self.foreign_bytes = 0
+        #: the retained states it read, by identity (`residency.kept_ranges`)
+        self.retained: dict[int, object] = {}
 
     def refusal(self) -> str:
         """Why the capture can't be kept ("" when it can)."""
@@ -85,10 +89,13 @@ def merge(spans: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
 
 
 def observer(
-    torch: ModuleType, statics: Sequence[Tensor | None], weights: list[tuple[int, int]]
+    torch: ModuleType,
+    statics: Sequence[Tensor | None],
+    weights: list[tuple[int, int]],
+    retained: Sequence[tuple[int, int, object]] = (),
 ) -> tuple[object, Observed]:
-    """A dispatch mode for one capture over `statics` (by position) and `weights` (address
-    ranges), and what it observes."""
+    """A dispatch mode for one capture over `statics` (by position), `weights` and `retained`
+    states (address ranges), and what it observes."""
     from torch.multiprocessing.reductions import StorageWeakRef
     from torch.utils._python_dispatch import TorchDispatchMode
     from torch.utils._pytree import tree_leaves
@@ -105,12 +112,21 @@ def observer(
         at = bisect.bisect_right(starts, ptr) - 1
         return at >= 0 and ptr < weights[at][1]
 
+    kept_starts = [start for start, _, _ in retained]
+
+    def kept(ptr: int) -> object | None:
+        at = bisect.bisect_right(kept_starts, ptr) - 1
+        return retained[at][2] if at >= 0 and ptr < retained[at][1] else None
+
     def classify(tensor: Tensor) -> tuple[int, int]:
         storage = tensor.untyped_storage()
         ptr = storage.data_ptr()
         if not ptr:  # no bytes of its own (an unbound weight's metadata)
             return ptr, MADE
         found = kind.get(ptr)
+        if found is None and (state := kept(ptr)) is not None:
+            found = kind[ptr] = RETAINED
+            seen.retained[id(state)] = state
         if found is None:
             found = kind[ptr] = WEIGHT if weight(ptr) else FOREIGN
             if found == FOREIGN:
@@ -153,7 +169,7 @@ def observer(
                     continue
                 if found >= 0:
                     seen.arg_writes.add(found)
-                elif found == WEIGHT:
+                elif found in (WEIGHT, RETAINED):
                     seen.weight_writes += 1
                 elif found == FOREIGN:
                     layout = (
