@@ -5180,6 +5180,11 @@ def answer(executor: Executor, frame: Frame) -> Frame | None:
         return {**reply, "kernels": kernel_ready.pending(), "began": began}
     if name not in commands.NAMES:
         return {"ok": False, "code": "unknown_command", "detail": name}
+    if name == "hello" and "transport_challenge" in frame:
+        challenge = frame["transport_challenge"]
+        if not isinstance(challenge, str) or len(challenge) != 64 or any(c not in "0123456789abcdef" for c in challenge):
+            raise SeamError("seam_descriptor", "invalid inherited transport challenge")
+        return {**executor.hello(), "transport_challenge": challenge}
     command, forwarded = commands.decode(frame)
     if isinstance(command, Shutdown):
         return None
@@ -5213,8 +5218,11 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(signal, "SIGUSR1"):  # every thread's Python stack to stderr, the process lives on
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
     parser = argparse.ArgumentParser(description="cozy-runtime device executor")
-    parser.add_argument("--socket", default="")
-    parser.add_argument("--root", required=True)
+    transport = parser.add_mutually_exclusive_group()
+    transport.add_argument("--socket", default="")
+    transport.add_argument("--socket-fd", type=int, default=-1)
+    parser.add_argument("--transport-capabilities", action="store_true")
+    parser.add_argument("--root", default="")
     # A FOLLOWER RANK (cr-068): the same program, told its rank, its world, the inherited
     # seam fd to rank 0 and rank 0's pid. It never has a worker socket of its own.
     parser.add_argument("--rank", type=int, default=0)
@@ -5222,6 +5230,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rank-fd", type=int, default=-1)
     parser.add_argument("--leader", type=int, default=0)
     args = parser.parse_args(argv)
+    if args.transport_capabilities:
+        # Semantic feature probe, carrying no model, project or authored invocation bytes.
+        print(json.dumps({"inherited_local_stream": sys.platform == "linux", "transport_challenge": True}))
+        return 0
+    if not args.root:
+        parser.error("--root is required")
     if args.rank > 0:
         if args.rank_fd < 0 or args.world <= args.rank or not args.leader:
             parser.error("a follower rank needs --rank-fd, --world > rank and --leader")
@@ -5229,8 +5243,8 @@ def main(argv: list[str] | None = None) -> int:
             # pdeathsig was armed before exec and covers FUTURE deaths only; an already
             # orphaned follower never becomes a rank.
             return int(Exit.structural)
-    elif not args.socket:
-        parser.error("--socket is required for rank 0")
+    elif not args.socket and args.socket_fd < 3:
+        parser.error("rank 0 requires --socket or an inherited --socket-fd >= 3")
     if not proctree.PARENT_DEATH_SURVIVES_EXEC:
         # The trampoline's exec ended its guard (darwin): this process watches its parent.
         expected = os.getppid()
@@ -5252,11 +5266,22 @@ def main(argv: list[str] | None = None) -> int:
         also=contract.AUDITED,
         judge=contract.audit,
     )
-    channel = (
-        connect(args.socket)
-        if args.rank == 0
-        else Channel(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=args.rank_fd))
-    )
+    if args.rank == 0 and args.socket_fd >= 3:
+        # The native worker pins this reviewed descriptor across exec. Pair credentials name
+        # its creating parent, not the child: validate that creator and let the worker prove
+        # the exact spawned Birth through Hello on the unforgeable inherited endpoint.
+        inherited = socket.socket(fileno=args.socket_fd)
+        if inherited.family != socket.AF_UNIX or inherited.type != socket.SOCK_STREAM:
+            raise SeamError("seam_descriptor", "the inherited worker channel is not a local stream")
+        if sys.platform != "linux" or not hasattr(socket, "SO_PEERCRED"):
+            raise SeamError("seam_transport_unsupported", "inherited project transport requires Linux")
+        import struct
+        peer, uid, _ = struct.unpack("3i", inherited.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        if peer != os.getppid() or uid != os.geteuid():
+            raise SeamError("seam_descriptor", "the inherited worker channel has another creator")
+        channel = Channel(inherited)
+    else:
+        channel = connect(args.socket) if args.rank == 0 else Channel(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=args.rank_fd))
     executor = Executor(
         channel,
         Path(args.root),
