@@ -1909,14 +1909,19 @@ def _watching(torch: ModuleType) -> None:
     """Every attribute set on a module of a region moves the region's generation: its graphs'
     read guards are checked again (`_holds`). A class or submodule set moves its structure too
     (`_structure`). Tensors are the observer's (`observe`), and the Runtime's own `_cozy`
-    attributes steer no path."""
+    attributes steer no path: a package that sets one is told to rename it (`_reserved`)."""
     module = torch.nn.Module
     original = module.__setattr__
 
     def __setattr__(self: Module, name: str, value: object) -> None:
         original(self, name, value)
         watch = self.__dict__.get(_WATCH)
-        if watch is None or name.startswith("_cozy") or isinstance(value, torch.Tensor):
+        if watch is None or isinstance(value, torch.Tensor):
+            return
+        if name.startswith("_cozy"):
+            caller = sys._getframe(1).f_globals.get("__name__", "")
+            if caller.partition(".")[0] not in _OURS:
+                _reserved(self, name, caller)
             return
         recorder = watch()
         if recorder is not None:
@@ -1925,6 +1930,27 @@ def _watching(torch: ModuleType) -> None:
                 recorder.structural += 1
 
     module.__setattr__ = __setattr__  # one patch per process
+
+
+def _reserved(module: Module, name: str, caller: str) -> None:
+    """A package set a `_cozy` attribute, a name the Runtime reserves: no graph's read guard
+    sees it, so a replay could serve a call it steers. Said once a name."""
+    where = f"{type(module).__name__}.{name}"
+    if where in RESERVED:
+        return
+    RESERVED.add(where)
+    say(
+        f"reserved:{where}",
+        f"[graphs] {caller} set {where}: `_cozy` names are the Runtime's, and graphs don't guard "
+        "them; rename it",
+    )
+    WARNINGS.append(
+        recovered("a package set a Runtime-reserved attribute", attribute=where, by=caller)
+    )
+
+
+#: the `_cozy` attributes packages set (`_reserved`), each said once
+RESERVED: set[str] = set()
 
 
 #: each thread whose capture records the module attributes it reads (`_reading`): its reads

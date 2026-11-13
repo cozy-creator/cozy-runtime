@@ -11,7 +11,8 @@ caller's tensor after each replay (the graph wrote the copy), and one into a for
 (H3's key-mean slots) is saved and put back around the capture's one check, so the replay and
 the call as written each start from the same state. A kernel launched outside torch's
 dispatcher (a ctypes or Triton launch) is not seen: only the capture's one check, replay
-against the call as written, sees what it does.
+against the call as written, sees what it does. An op that reads a host tensor (a pinned copy
+in, a CPU scalar) is refused: the graph would replay the value it read at capture.
 """
 
 from __future__ import annotations
@@ -51,11 +52,16 @@ class Observed:
         self.foreign_bytes = 0
         #: the retained states it read, by identity (`residency.kept_ranges`)
         self.retained: dict[int, object] = {}
+        #: the ops that read a host tensor: a graph replays the value it had at capture
+        self.host: set[str] = set()
 
     def refusal(self) -> str:
         """Why the capture can't be kept ("" when it can)."""
         if self.weight_writes:
             return f"it writes its weights ({self.weight_writes} ops)"
+        if self.host:
+            ops = ", ".join(sorted(self.host)[:3])
+            return f"it reads host tensors, which a replay would freeze ({ops})"
         written = sum(t.nbytes for t in self.writes.values())
         if written > WRITE_LIMIT:
             return f"it writes {written / (1 << 20):.0f} MiB of state outside the call"
@@ -149,6 +155,11 @@ def observer(
             kwargs: dict[str, object] | None = None,
         ) -> object:
             kwargs = kwargs or {}
+            if any(
+                isinstance(v, tensor_type) and v.device.type == "cpu"
+                for v in tree_leaves((args, kwargs))
+            ):
+                seen.host.add(str(func))
             written: set[int] = set()
             for at, argument in enumerate(func._schema.arguments):  # type: ignore[attr-defined]  # an OpOverload
                 alias = argument.alias_info
