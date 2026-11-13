@@ -1479,8 +1479,10 @@ def _capture_verified(
             with recorder.lock:
                 _short(module, recorder, key, no_room(owner.device, "its capture", need, exc))
             return None
-        if not isinstance(exc, domain.Unavailable):
-            raise
+        if fault(exc) in (Fault.STICKY, Fault.DEVICE):
+            raise  # the device itself failed: no call as written runs either
+        # Anything else is the recording's, never the call's: it runs as written, and the run
+        # says why.
         with recorder.lock:
             _failed(module, recorder, key, f"{type(exc).__name__}: {exc}".splitlines()[0][:300])
         return None
