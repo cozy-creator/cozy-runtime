@@ -2167,6 +2167,13 @@ def _capture_pending(pending: _Pending) -> bool:
     submit = recorder.eager.submit_ms()
     if submit is None:
         return False
+    seen = recorder.seen.get(pending.key)
+    if seen is not None and (took := seen.device_ms()) is not None and took > _PROBE_MS:
+        # A warm-up would hold the idle device for the whole call (an H3 DiT step: 34 s) to
+        # find what its length already says: launch overhead is no share of it worth a graph.
+        recorder.idle_failed[pending.key] = f"device-bound: a {took:.0f} ms call"
+        recorder.queued.pop(pending.key, None)
+        return True
     placed, owner = PLACED.get(module), recorder.domain
     assert owner is not None
     device = next(leaf.device for leaf in pending.leaves if isinstance(leaf, _Leaf))
