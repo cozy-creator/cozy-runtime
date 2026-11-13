@@ -1460,10 +1460,12 @@ class _Probe:
     """A path's call run with the device held back while the host submitted it (`_probe`): its
     device time between its events is the work alone, as a graph would run it."""
 
-    __slots__ = ("end", "start")
+    __slots__ = ("end", "normal", "start")
 
-    def __init__(self, start: Event, end: Event) -> None:
-        self.start, self.end = start, end
+    def __init__(self, start: Event, end: Event, normal: float) -> None:
+        #: the path's ordinary device time a call when it was probed: a later call's can carry
+        #: paging stalls a replay would not save
+        self.start, self.end, self.normal = start, end, normal
 
     def busy_ms(self) -> float | None:
         return float(self.start.elapsed_time(self.end)) if self.end.query() else None
@@ -1489,7 +1491,7 @@ def _probe[T](
     start.record(stream)
     result = recorder.eager.run(torch, run)
     end.record(stream)
-    recorder.probes[key] = _Probe(start, end)
+    recorder.probes[key] = _Probe(start, end, seen.device_ms() or 0.0)
     _note(recorder, "measuring", "its launch overhead (probe)")
     return result
 
@@ -1550,11 +1552,11 @@ def _capture_call(
     if busy is None:
         _note(recorder, "measuring", "its probe is still on the device")
         return _EAGER
-    saving, ahead = max(0.0, device - busy), _ahead(recorder, key)
+    saving, ahead = max(0.0, probe.normal - busy), _ahead(recorder, key)
     cost = _capture_cost(recorder, seen.submit_ms, busy)
-    if saving < _SAVING * device or saving * ahead <= cost:
+    if saving < _SAVING * probe.normal or saving * ahead <= cost:
         recorder.gap = (
-            f"launch overhead {saving:.1f} of {device:.1f} ms a call, {ahead} calls ahead, "
+            f"launch overhead {saving:.1f} of {probe.normal:.1f} ms a call, {ahead} calls ahead, "
             f"against ~{cost:.0f} ms to capture and check"
         )
         _note(recorder, "device_bound", recorder.gap)
@@ -1707,7 +1709,9 @@ def _capture_verified(
                 if recorder.binding is not None:
                     held.enter_context(recorder.binding.prepare(current))
                 state = held.enter_context(
-                    _capture_state(torch, module, cast("Stream", owner.stream), weights)
+                    _capture_state(
+                        torch, module, cast("Stream", owner.stream), weights, clone=False
+                    )
                 )
                 served = held.enter_context(attention_ulysses.observing())
                 entry = _build(
@@ -2442,14 +2446,19 @@ def _weights(
 
 @contextmanager
 def _capture_state(
-    torch: ModuleType, module: Module, stream: Stream, weights: frozenset[int]
+    torch: ModuleType,
+    module: Module,
+    stream: Stream,
+    weights: frozenset[int],
+    *,
+    clone: bool = True,
 ) -> Iterator[_State]:
     """Restore warm-up state and join its stream before the prepared weight lease ends."""
     current: Stream
     state: _State | None
     current, state = torch.cuda.current_stream(), None
     try:
-        state = _State(torch, module, immutable_buffers=weights)
+        state = _State(torch, module, immutable_buffers=weights, clone=clone)
         yield state
     finally:
         current.wait_stream(stream)
@@ -2537,13 +2546,21 @@ class _State:
     measuring must never change a later request)."""
 
     def __init__(
-        self, torch: ModuleType, module: Module, *, immutable_buffers: frozenset[int] = frozenset()
+        self,
+        torch: ModuleType,
+        module: Module,
+        *,
+        immutable_buffers: frozenset[int] = frozenset(),
+        clone: bool = True,
     ) -> None:
+        """`clone=False`: a capture alone, which executes nothing, so a buffer it writes keeps its
+        contents and only its version moves (an in-call capture: copying every buffer cost a
+        Klein attempt 1.1 s on an 8 GiB card)."""
         self.torch = torch
         self.modules = list(module.modules())
         self.plain = [{n: v for n, v in vars(m).items() if type(v) in _PLAIN} for m in self.modules]
-        self.buffers = [
-            (name, tensor, tensor._version, tensor.clone())
+        self.buffers: list[tuple[str, Tensor, int, Tensor | None]] = [
+            (name, tensor, tensor._version, tensor.clone() if clone else None)
             for m in self.modules
             for name, tensor in m._buffers.items()
             if tensor is not None and id(tensor) not in immutable_buffers
@@ -2605,10 +2622,11 @@ class _State:
                     if current != geometry:
                         tensor.data = saved
                     table[name] = tensor
-            for name, tensor, version, saved in self.buffers:
+            for name, tensor, version, kept in self.buffers:
                 if tensor._version != version:
                     changed.add(name)
-                    tensor.copy_(saved)
+                    if kept is not None:
+                        tensor.copy_(kept)
             self.torch.random.set_rng_state(self.rng[0])
             self.torch.cuda.set_rng_state(self.rng[1])
             self.changed = ", ".join(sorted(changed))
@@ -2758,16 +2776,16 @@ def _failed(
 def _short(
     module: Module, recorder: _Recorder, key: tuple[object, ...], why: str, *, idle: bool = False
 ) -> bool:
-    """A recording found no room: the signature runs as written and a later call records or
-    queues it again, since each request moves what holds the card (a component's weights leave,
-    a peer ends). `_ROOM_TRIES` such recordings in a row and it is refused for good (`_failed`)."""
+    """A recording found no room: the signature runs as written. At idle a later period tries
+    again, since each request moves what holds the card (a component's weights leave, a peer
+    ends), and `_ROOM_TRIES` in a row refuse it for good (`_failed`). In a call, one try: its
+    weights and pool didn't fit beside what it holds, and the next call holds the same (SDXL at
+    6 GiB on a 4090 tried four times, 85 ms each, and ran as written)."""
     tries = recorder.short[key] = recorder.short.get(key, 0) + 1
-    if tries >= _ROOM_TRIES:
+    if tries >= _ROOM_TRIES or not idle:
         _failed(module, recorder, key, why, "no_room", idle=idle)
     else:
         recorder.gap = why
-        if not idle:
-            _note(recorder, "no_room", why)
     return True
 
 
