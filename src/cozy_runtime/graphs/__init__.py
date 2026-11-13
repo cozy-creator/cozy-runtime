@@ -61,7 +61,7 @@ from cozy_runtime.author._errors import (
     unwind,
 )
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded, recovered
-from cozy_runtime.graphs import domain, observe
+from cozy_runtime.graphs import domain, observe, profiles
 from cozy_runtime.internal import attention_ulysses, kernel_ready
 from cozy_runtime.internal.accel import StaleBinding
 
@@ -954,6 +954,7 @@ def install(torch: ModuleType, model: object, roots: Mapping[str, Module]) -> li
             _RECORDERS[root].keys = tuple(declared.get(name, ()))
         if not getattr(type(root), "_cozy_graphed", False):
             root.__class__ = _graphed(torch, type(root))
+        profiles.hook_children(torch, name, root)
         installed.append(name)
     return installed
 
@@ -1110,6 +1111,7 @@ def describe(root: Module) -> dict[str, object]:
     answer.update(
         idle=IDLE.document(),
         graph_pools=len(pools),
+        profiles=dict(profiles.PROFILES),
         graph_pool_bytes=None,  # stock Torch does not expose a public per-pool byte counter
         domains=len(domains),
     )
@@ -1325,7 +1327,10 @@ def _region_path(
         if placed is not None:
             placed[0].note(f"{placed[1]}.graphs", f"eager {why}")
         timing = recorder.written.get(why) or recorder.written.setdefault(why, _Timing())
-        return timing.run(torch, lambda: call(module, *args, **kwargs))
+        label = f"{_name(module)} as written: {why[:60]}"
+        return timing.run(
+            torch, lambda: profiles.profiled(torch, label, lambda: call(module, *args, **kwargs))
+        )
     addresses = (
         ()
         if placed is not None
@@ -1366,7 +1371,13 @@ def _region_path(
                 return result
     elif not any(key in held for held in _settled_by(recorder)):
         _queue(torch, module, recorder, call, key, spec, leaves, placed)
-    return _first(torch, recorder, key, lambda: call(module, *args, **kwargs))
+    label = f"{_name(module)} as written in its region"
+    return _first(
+        torch,
+        recorder,
+        key,
+        lambda: profiles.profiled(torch, label, lambda: call(module, *args, **kwargs)),
+    )
 
 
 def _settled_by(recorder: _Recorder) -> tuple[Mapping[tuple[object, ...], object], ...]:
