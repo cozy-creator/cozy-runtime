@@ -8,8 +8,7 @@ whatever card it lands on.
 import msgspec
 import torch
 from cozy_runtime import rng
-from cozy_runtime.author import App, Config, Context, Loader, Model, Seed, Telemetry
-from cozy_runtime.media import ImageFile
+from cozy_runtime.author import App, Config, Context, Loader, Model, Outputs, Seed, Telemetry
 
 app = App()
 
@@ -35,10 +34,10 @@ class Flow(Model[FlowGraph]):
 
 
 @app.entrypoint(defaults={"model": "acme/flow@1.0.0"})
-def generate(ctx: Context, payload: Request, model: Flow, tel: Telemetry) -> Result:
+def generate(ctx: Context, payload: Request, model: Flow, out: Outputs, tel: Telemetry) -> Result:
     with tel.stage("generating image"):
         latents = model.denoise(ctx, model.encode(payload.prompt), payload.steps, payload.seed)
-    return Result(ImageFile.from_image(model.decode(latents)))
+    return Result(out.save_image(model.decode(latents), format="png"))
 ```
 
 ## The core
@@ -46,9 +45,6 @@ def generate(ctx: Context, payload: Request, model: Flow, tel: Telemetry) -> Res
 - **`App`**: `@app.entrypoint` publishes a function; `@app.tool` publishes one that is also a canvas
   box. Options: `name`, `defaults`, `memoize`, `on_demand`, `accelerator`, `weights`, `private`,
   `components`, `preflight`.
-  A constructed `Model` parameter selects the GPU by default; other handlers use CPU.
-  Set `accelerator=True` for custom GPU work with only raw `Weights` or ordinary inputs,
-  or `accelerator=False` to keep a model handler on CPU. Explicit settings always win.
 - **Handler parameters** are injected by type: `Context`, a `msgspec.Struct` request, any `Model`,
   and the services `Outputs`, `Telemetry`, `Adjustments`.
 - **`Model`**: `load(loader)` builds the components. `loader.construct(factory)` takes a class or a
@@ -58,43 +54,6 @@ def generate(ctx: Context, payload: Request, model: Flow, tel: Telemetry) -> Res
 - **Errors**: raise `InvalidRequest` (the request is wrong), `UnsupportedInput` (this model can't)
   or `OutputError` (the result is bad). Any other exception fails the run with its first line.
 
-## Calling another package without importing its implementation
-
-Keep managed-only dependencies in the standard `cozy-calls` optional extra in
-`pyproject.toml`, and lock them with the rest of the project:
-
-```toml
-[project.optional-dependencies]
-cozy-calls = ["example-child[cozy-calls]>=1"]
-```
-
-Generate ordinary Python declarations from that locked package's canonical interface:
-
-```sh
-cozy-runtime calls example-child my_package/child_calls.py
-```
-
-Then use the generated request and non-callable operation reference explicitly:
-
-```python
-from cozy_runtime.author import call
-from .child_calls import Request, generate
-
-result = await call(generate, Request(prompt="a lighthouse"))
-```
-
-Model choices remain named arguments to `call`; returned media and `ChildCallError` retain
-their ordinary managed-call behavior. Regenerate declarations after changing the locked
-dependency. Ordinary implementation imports and local function calls remain ordinary Python.
-Each managed requirement requests its callee’s `cozy-calls` extra too, so ordinary wheel
-metadata and uv follow the managed dependency chain recursively. A child without that
-extra still supplies its ordinary dependencies. The platform prepares this closure for
-child execution separately from the caller.
-
-Python environments continue to expose the machine's shared Torch layer. Managed dependency
-separation removes the callee's implementation and its additional dependencies from the
-caller; it does not remove that existing platform layer or imply that available Torch was imported.
-
 ## What the Runtime does for you
 
 - **Memory.** Each component is put on the device at its first forward, and evicted, streamed or
@@ -103,12 +62,6 @@ caller; it does not remove that existing platform layer or imply that available 
   replayed for the same shapes, wherever it is called from.
 - **Cancellation.** Every component call checks for a cancel; `ctx.progress(i, n)` does too.
 - **Kernels.** Linear and attention modules get the best kernel for the card and the lane.
-- **Final images.** Return `ImageFile.from_image(pil_image_or_frame)` in an `ImageFile`
-  result field. The SDK snapshots host pixels, then encodes and stores them through the
-  ordinary output path. It defaults to lossless WebP, using PNG for a side over 16383 pixels;
-  `format="png"` or `format="webp"` keeps an explicit choice. Both keep alpha. Existing
-  result schemas, metadata and output bounds still apply. `Outputs` handles intermediate
-  publication and bounded audio/video streams.
 
 ## Optional
 
