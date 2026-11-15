@@ -2225,8 +2225,10 @@ def _replay_call(
     assert owner is not None
     scope = placed[0].graph_pass(placed[1], "") if placed is not None else nullcontext()
     with scope, owner.using(), recorder.lock:
-        stale = recorder.landed != LANDED[0] or (
-            placed is not None and recorder.binding is not None and not recorder.binding.valid()
+        stale = (
+            recorder.landed != LANDED[0]
+            or (placed is not None and recorder.binding is not None and not recorder.binding.valid())
+            or any(not binding.valid() for binding in recorder.overlay_bindings.values())
         )
         if stale:
             recorder.forget()  # in flight, it goes at a later call; as written meanwhile
