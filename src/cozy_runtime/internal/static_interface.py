@@ -446,7 +446,7 @@ class Reader:
         project: Path,
         *,
         dependency_roots: Sequence[Path] = (),
-        wheels: Mapping[str, locked.LockedWheel] | None = None,
+        pinned: locked.Locked | None = None,
         own: frozenset[str],
     ) -> None:
         self.project = project
@@ -456,8 +456,11 @@ class Reader:
         #: site-packages.
         self.own = own
         self.roots = (*self.project_roots, *dependency_roots)
+        #: The root caller's lock is authoritative for the entire managed dependency graph.
+        #: A nested package's directory (or installed copy) does not select a different lock.
+        self.pinned = pinned
         #: published callees, read from the wheels the project's uv.lock pins when needed
-        self.wheels = locked.Wheels(wheels or {})
+        self.wheels = locked.Wheels(pinned.wheels if pinned is not None else {})
         self.runtime_root = Path(cozy_runtime.__file__).resolve().parent.parent
         self.installed = _installed_packages(_site_packages(self.runtime_root))
         self.modules: dict[str, Module] = {}
@@ -1649,7 +1652,7 @@ def build(
         *dependency_roots,
     )
     own = source_tops(project)
-    reader = Reader(project, dependency_roots=roots, wheels=pinned.wheels, own=own)
+    reader = Reader(project, dependency_roots=roots, pinned=pinned, own=own)
     name = tomllib.loads((project / "pyproject.toml").read_text())["project"]["name"]
     return _build(reader, application, closures=closures, distribution=name, pinned=pinned)
 
@@ -2054,7 +2057,7 @@ def _operation(reader: Reader, found: Assigned) -> tuple[str, str, str, str] | N
 def dependency_interface(reader: Reader, distribution: str) -> dict[str, Json]:
     """Read one locked dependency's actual source, never import its implementation."""
     normalized = locked.distribution(distribution)
-    pinned = locked.read(reader.project)
+    pinned = reader.pinned or locked.Locked()
     top = normalized.replace("-", "_")
     reader._fetched(top)
     roots = (
@@ -2093,7 +2096,7 @@ def build_dependency(project: Path, distribution: str) -> dict[str, Json]:
     if locked.distribution(distribution) not in pinned.names:
         raise StaticRefusal(f"{distribution} is absent from uv.lock", code="unlocked_dependency")
     reader = Reader(
-        project, dependency_roots=pinned.roots, wheels=pinned.wheels, own=source_tops(project)
+        project, dependency_roots=pinned.roots, pinned=pinned, own=source_tops(project)
     )
     return dependency_interface(reader, distribution)
 
@@ -2138,7 +2141,9 @@ def _callee_interface(reader: Reader, package: CozyPackage) -> dict[str, Json] |
     if key in reader.callees:
         return reader.callees[key]
     reader.callees[key] = None  # a package that calls back reads as no calls
-    callee = Reader(package.project, dependency_roots=reader.roots, own=package.own)
+    callee = Reader(
+        package.project, dependency_roots=reader.roots, pinned=reader.pinned, own=package.own
+    )
     callee.wheels, callee.fetched, callee.callees = reader.wheels, reader.fetched, reader.callees
     try:
         interface = _build(
