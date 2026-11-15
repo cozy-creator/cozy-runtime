@@ -51,3 +51,21 @@ python research/h3-request-profile/phase_receipt.py --run-show=run-show.json --s
 The exact 0.0.12 recorder and entrypoint bytes completed ordinary Cozy requests 5089 and 5090 with profiling disabled, followed by full CUDA capture 5091 on public Runtime 0.21.7/TensorFS 0.6.1. All eight steps, the original audiovisual output, and a 260,457,336-byte compressed trace were retained. Correlation analysis accounted for 1,483,599 GPU activities; 1,292 without a captured host API remain explicitly unassociated. The recorder and entrypoint code in this port are unchanged from that capture.
 
 These are diagnostic timings, not clean inference benchmarks. The diagnostic and direct H3 captures had 33 lock-version differences; actual environments included AV 19 versus AV 18. Video streams matched, while audio differed, so audio differences cannot be assigned solely to attention. Their warmup histories and allocator states also differed: model reuse alone does not establish an equivalent warm state. Match dependency locks, request history, GPU identity, served kernels and memory state before making performance claims. Do not add nested phase, sink and device-duration sums; encoding overlaps video decode.
+
+## Bounded activity and the cr-297 measurement helper
+
+The trace tool accepts `--window-start-us` and `--window-end-us` for one trace,
+in its original ChromeTrace timestamp coordinates. Each event is intersected
+with those bounds before aggregation. Per-device busy time unions all streams;
+aggregate event duration stays separate. `unclassified_inactivity_us` includes
+both window tails and does not attribute gaps to CPU dispatch. Without explicit
+bounds, the tool still reports only first-to-last observed spans and interior gaps.
+
+`cr297_profiles.py` is a replacement for the never-merged cr-297 measurement
+helper, not part of the Runtime package. [CR297-PROFILE-FIX.md](CR297-PROFILE-FIX.md)
+records its integration target, schema, reproduced failure and qualification limits.
+Both consumers use `profile_intervals.py`.
+
+```sh
+uv run --no-project python -m unittest discover -s research/h3-request-profile/tests -v
+```
