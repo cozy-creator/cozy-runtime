@@ -1027,9 +1027,13 @@ def _check_result_bounds(surface: Surface, result: object, attempt: Attempt) -> 
                 code="result_bound",
                 fields=[item.input_id],
             )
+        frame = attempt.frames.get(asset.ref)
+        if bound.max_bytes is not None and frame is not None:
+            # Pending frames have no encoded length yet. Keep the authored field bound
+            # with the frame so the shared codec checks it before committing its blob.
+            frame.facts["max_bytes"] = bound.max_bytes
         if bound.max_decoded_bytes is None:
             continue
-        frame = attempt.frames.get(asset.ref)
         if frame is not None:
             decoded = frame.raw_bytes
         elif isinstance(asset, ImageFile) and asset._local is not None:
