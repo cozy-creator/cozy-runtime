@@ -155,10 +155,14 @@ def no_room(device: int, what: str, need: int, error: BaseException) -> str:
         return f"{n / (1 << 30):.1f} GiB"
 
     need = need or getattr(error, "requested_bytes", 0)
+    stats = vt.stats(device)
+    pools, cache = stats.get("pools_bytes", 0), stats.get("cache_mapped_bytes", 0)
     return (
         f"{what} {f'needs {gib(need)}' if need else 'found no room'} beside "
         f"{gib(room['working_live'])} live and {gib(room['pinned'])} of weights in use, of "
-        f"{gib(room['capacity'])} ({error})"
+        f"{gib(room['capacity'])}; {gib(room['weights_resident'] - room['pinned'])} of other "
+        f"weights, {gib(pools)} of graph pools, {gib(cache)} of cache, {gib(room['free'])} free "
+        f"({error})"
     )
 
 
