@@ -1,0 +1,80 @@
+{
+  "scope": "Single GPU, stock Torch storage, synthetic transport event; no NCCL/Varena qualification",
+  "pid": 1937997,
+  "torch": "2.15.0+cu132",
+  "gpu": "_CudaDeviceProperties(name='NVIDIA GeForce RTX 4070 Laptop GPU', major=8, minor=9, total_memory=7807MB, multi_processor_count=36, uuid=3b5ac7cc-b570-e6ad-61c9-8abb87e91f35, pci_bus_id=1, pci_device_id=0, pci_domain_id=0, L2_cache_size=32MB)",
+  "cases": [
+    {
+      "dtype": "torch.bfloat16",
+      "rows": 65,
+      "iteration": 0,
+      "ordered": true
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "rows": 65,
+      "iteration": 1,
+      "ordered": true
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "rows": 65,
+      "iteration": 2,
+      "ordered": true
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "rows": 4103,
+      "iteration": 0,
+      "ordered": true
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "rows": 4103,
+      "iteration": 1,
+      "ordered": true
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "rows": 4103,
+      "iteration": 2,
+      "ordered": true
+    },
+    {
+      "dtype": "torch.float16",
+      "rows": 65,
+      "iteration": 0,
+      "ordered": true
+    },
+    {
+      "dtype": "torch.float16",
+      "rows": 65,
+      "iteration": 1,
+      "ordered": true
+    },
+    {
+      "dtype": "torch.float16",
+      "rows": 65,
+      "iteration": 2,
+      "ordered": true
+    },
+    {
+      "dtype": "torch.float16",
+      "rows": 4103,
+      "iteration": 0,
+      "ordered": true
+    },
+    {
+      "dtype": "torch.float16",
+      "rows": 4103,
+      "iteration": 1,
+      "ordered": true
+    },
+    {
+      "dtype": "torch.float16",
+      "rows": 4103,
+      "iteration": 2,
+      "ordered": true
+    }
+  ]
+}

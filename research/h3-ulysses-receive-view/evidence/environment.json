@@ -1,0 +1,11 @@
+{
+  "python": "3.12.12 (main, Feb 12 2026, 00:42:14) [Clang 21.1.4 ]",
+  "executable": "/home/fidika/.cozy/machine/root/var/lib/cozy/tensord/generations/0d2418dd00e2d69a0782dc9a220c33be/env/bin/python",
+  "torch": "2.15.0+cu132",
+  "tensorfs": "0.23.1",
+  "baseline": "af2a4753cb70598b75405942901e4f8f3b24eda6",
+  "source_sha256": "6c11fee24bc281a9f6e9e6e7473f6b32aa37324957c405283830d5306b0c86a1",
+  "native_multi_gpu_qualified": false,
+  "installed_packages_changed": false,
+  "gpu_compute_processes_after_probe": ""
+}

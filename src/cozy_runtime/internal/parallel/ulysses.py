@@ -143,18 +143,20 @@ def _need(
     """A group of `step` heads: the output held throughout. Whole: its q, k and v sent and
     received, its operands too; then they beside the local attention; then the attended rows and
     their return. Pipelined: beside a group's operands and its attention, the next group's sent,
-    received and operands (allocated with its send) and the last group's return. What crosses
-    is int8 with a scale a row where `narrow`. Every rank's rows are taken as this one's: an
-    estimate."""
+    received and operands (allocated with its send) and the last group's return. Plain batch-one
+    receives are the operands: the current group's three stay live beside attention, but the next
+    group needs no separate operand allocation. What crosses is int8 with a scale a row where
+    `narrow`. Every rank's rows are taken as this one's: an estimate."""
     total, local = rows * world, step // world
     each = batch * rows * step * dim * b
     wire = batch * rows * step * (dim + b) if narrow else each
     attention = sizing.Attention(batch, total, local, local, total, dim, b).need(local, total)
     out = batch * rows * heads * dim * b
+    scratch = () if batch == 1 and not narrow else (each,) * 3
     if step == heads:
-        sent = (*(wire,) * 6, *(each,) * 3)
+        sent = (*(wire,) * 6, *scratch)
         return sizing.peak(out, sent, (each, each, each, *attention), (wire, wire))
-    return sizing.peak(out, (*(each,) * 6, *(wire,) * 8, *attention))
+    return sizing.peak(out, (*(each,) * 3, *scratch, *(wire,) * 8, *attention))
 
 
 def _pipelined(steps: Sequence[int], sizes: Sequence[int], batch: int, dim: int, b: int) -> int:
@@ -364,14 +366,16 @@ def _pack(
 
 class _Arriving:
     """A head group's Q, K, V crossing: its receivers (Q, K, V and their scales, each stacked in
-    one tensor), and the operands its unpacking writes (stacked too: one launch unpacks all)."""
+    one tensor), and the operands its unpacking writes (stacked too: one launch unpacks all).
+    No operands allocation for plain batch-one rows: their received views already have the
+    kernel's layout and own that storage through its last use."""
 
     def __init__(
         self,
         wait: Wait,
         values: Tensor,
         scales: Tensor | None,
-        operands: Tensor,
+        operands: Tensor | None,
         mark: torch.cuda.Event | None,
     ) -> None:
         self.wait, self.values, self.scales, self.operands = wait, values, scales, operands
@@ -406,7 +410,7 @@ def _send(
         scales = [like.new_empty((world * rows, batch, local, 1)) for _ in sources]
         received = like.new_empty((3, total, batch, local, 1))
         receives += received.unbind()
-    operands = like.new_empty((3, batch, total, local, dim))
+    operands = None if batch == 1 and not narrow else like.new_empty((3, batch, total, local, dim))
     mark = packer.mark()
     with packer.on(packer.out, mark):
         for index in (0, 2, 1):  # K last: its shift may still be on its way
@@ -423,7 +427,11 @@ def _unpack(packer: _Packer, group: _Arriving) -> list[Tensor]:
     rows, scales, into = group.values.transpose(1, 2), group.scales, group.operands
     with packer.on(packer.inbound, group.mark):
         group.wait()
-        if scales is None:
+        if into is None:
+            # Only plain batch-one receives omit the allocation. Keep the same inbound
+            # transport wait and caller-stream dependency; each returned view owns `values`.
+            into = rows
+        elif scales is None:
             into.copy_(rows)
         else:
             turn.widen(packer.launch, rows, scales.transpose(1, 2), into)
@@ -722,12 +730,12 @@ def _exchange(
             return _send(handle, engines, packer, *args)
 
         # In flight: the next group's q, k, v, and the last group's output (`_need`).
-        arriving = send(*groups[0])
+        arriving: _Arriving | None = send(*groups[0])
         returning: tuple[Wait, list[Tensor], int] | None = None
         for index, (start, local) in enumerate(groups):
-            current = arriving
-            if index + 1 < len(groups):
-                arriving = send(*groups[index + 1])
+            current = cast(_Arriving, arriving)  # the first or the group sent by the previous turn
+            # `current` owns this group; no second reference keeps the last one's sends alive.
+            arriving = send(*groups[index + 1]) if index + 1 < len(groups) else None
             before = _Clock.mark(query)
             operands = _unpack(packer, current)
             arrived.append((before, _Clock.mark(query)))
