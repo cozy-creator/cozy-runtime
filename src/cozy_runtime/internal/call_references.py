@@ -237,7 +237,38 @@ def _module(
                 )
             return repr(value)
 
-        request_name = expression(entry.request, "request")
+        assets_parameter = "" if entry.assets is msgspec.UNSET else entry.assets.parameter
+        wire_request = "None"
+        if assets_parameter:
+            assert isinstance(entry.request, dict)
+            request_fields = entry.request["fields"]
+            assert isinstance(request_fields, list)
+            payload = {
+                **entry.request,
+                "fields": [
+                    field
+                    for field in request_fields
+                    if isinstance(field, dict) and field["name"] != assets_parameter
+                ],
+            }
+            request_name = expression(payload, "request")
+            original_name = names["request"]
+            names["request"] = f"_{metadata.export}WireRequest"
+            wire_request = struct(
+                {
+                    **entry.request,
+                    "fields": [
+                        field
+                        for field in request_fields
+                        if isinstance(field, dict) and field["name"] == assets_parameter
+                    ],
+                },
+                "request",
+                base=request_name,
+            )
+            names["request"] = original_name
+        else:
+            request_name = expression(entry.request, "request")
         result_name = expression(entry.result, "result")
         export = metadata.export
         if export in exports or export in declarations:
@@ -251,7 +282,8 @@ def _module(
             f"{export}: Operation[{request_name}, {result_name}] = Operation(\n"
             f"    distribution={distribution!r}, module={metadata.module!r}, export={export!r},\n"
             f"    declaration={declaration!r}, request={request_name}, result={result_name},\n"
-            f"    models={model_names!r},\n)\n"
+            f"    models={model_names!r}, assets_parameter={assets_parameter!r},\n"
+            f"    wire_request={wire_request},\n)\n"
         )
     return "\n".join(imports + [item[1] for item in declarations.values()] + functions + [""])
 
