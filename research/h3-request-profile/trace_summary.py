@@ -12,6 +12,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, TextIO
 
+from profile_intervals import interval_summary
+
 
 class JSONStream:
     """Decode one value at a time, so the full raw ChromeTrace need not remain in memory."""
@@ -136,40 +138,11 @@ def event_kind(event: dict[str, Any]) -> str:
     return "other"
 
 
-def interval_summary(intervals: list[tuple[float, float]]) -> dict[str, Any]:
-    """Union occupied intervals; interior gaps exclude unobserved leading/trailing time."""
-    ordered = sorted(intervals)
-    if not ordered:
-        return {"event_count": 0, "busy_union_us": 0.0, "interior_gap_total_us": 0.0}
-    start, end = ordered[0]
-    busy, gaps = 0.0, []
-    for left, right in ordered[1:]:
-        if left > end:
-            busy += end - start
-            gaps.append({"start_us": end, "end_us": left, "duration_us": left - end})
-            start = left
-        end = max(end, right)
-    busy += end - start
-    span = end - ordered[0][0]
-    durations = sorted(row["duration_us"] for row in gaps)
-    return {
-        "event_count": len(ordered),
-        "first_start_us": ordered[0][0],
-        "last_end_us": end,
-        "span_us": span,
-        "duration_sum_us": sum(right - left for left, right in ordered),
-        "busy_union_us": busy,
-        "interior_gap_total_us": span - busy,
-        "interior_gap_count": len(gaps),
-        "interior_gap_p50_us": durations[(len(durations) - 1) // 2] if durations else 0.0,
-        "interior_gap_p95_us": durations[math.ceil(len(durations) * 0.95) - 1]
-        if durations
-        else 0.0,
-        "longest_interior_gaps": sorted(gaps, key=lambda row: -row["duration_us"])[:50],
-    }
-
-
-def summarize(events: Iterator[dict[str, Any]]) -> dict[str, Any]:
+def summarize(
+    events: Iterator[dict[str, Any]], *, window: tuple[float, float] | None = None
+) -> dict[str, Any]:
+    if window is not None:
+        interval_summary([], window=window)  # Validate bounds even for an empty trace.
     groups: dict[tuple[str, str, str], dict[str, Any]] = {}
     device_intervals: dict[str, list[tuple[float, float]]] = defaultdict(list)
     stream_intervals: dict[tuple[str, str], list[tuple[float, float]]] = defaultdict(list)
@@ -197,6 +170,12 @@ def summarize(events: Iterator[dict[str, Any]]) -> dict[str, Any]:
         ):
             invalid += 1
             continue
+        if window is not None:
+            end = min(start + duration, window[1])
+            start = max(start, window[0])
+            duration = end - start
+            if duration <= 0:
+                continue
         kind, name = event_kind(event), str(event.get("name", ""))
         categories[kind] += 1
         args = event.get("args", {})
@@ -233,22 +212,22 @@ def summarize(events: Iterator[dict[str, Any]]) -> dict[str, Any]:
             row["events_with_bytes"] = row.get("events_with_bytes", 0) + 1
     for row in groups.values():
         row["duration_mean_us"] = row["duration_sum_us"] / row["count"]
-    return {
+    result = {
         "trace_event_count": total,
         "trace_phases": dict(phases),
         "complete_event_categories": dict(categories),
         "invalid_complete_events_skipped": invalid,
         "events_by_name": sorted(groups.values(), key=lambda row: -row["duration_sum_us"]),
         "device_activity": [
-            {"device": device, **interval_summary(values)}
+            {"device": device, **interval_summary(values, window=window)}
             for device, values in sorted(device_intervals.items())
         ],
         "stream_activity": [
-            {"device": device, "stream": stream, **interval_summary(values)}
+            {"device": device, "stream": stream, **interval_summary(values, window=window)}
             for (device, stream), values in sorted(stream_intervals.items())
         ],
         "host_launch_activity": [
-            {"pid": pid, "tid": tid, **interval_summary(values)}
+            {"pid": pid, "tid": tid, **interval_summary(values, window=window)}
             for (pid, tid), values in sorted(launches.items())
         ],
         "process_thread_labels": labels,
@@ -260,7 +239,8 @@ def summarize(events: Iterator[dict[str, Any]]) -> dict[str, Any]:
             "Host operator/annotation durations are inclusive and overlap; do not add them.",
             "Device name totals are aggregate kernel/copy duration, not elapsed request time.",
             "Device activity unions all observed kernel/copy streams; streams can overlap.",
-            "Gaps cover only first-to-last observed activity, excluding unobserved tails.",
+            "Interior gaps exclude tails; explicit-window inactivity includes both tails.",
+            "Windowed totals intersect each event with the bounds before aggregation.",
             "A device gap is unoccupied traced time, not proof of CPU launch or paging cause.",
             "Host launch gaps describe API call timing, not GPU execution or queue latency.",
             "Complete X duration events are aggregated; metadata/flows are counted separately.",
@@ -269,10 +249,18 @@ def summarize(events: Iterator[dict[str, Any]]) -> dict[str, Any]:
         ],
     }
 
+    if window is not None:
+        result["measurement_window"] = {
+            "start_us": window[0],
+            "end_us": window[1],
+            "duration_us": window[1] - window[0],
+        }
+    return result
 
-def summarize_file(path: Path) -> dict[str, Any]:
+
+def summarize_file(path: Path, *, window: tuple[float, float] | None = None) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
-    result = summarize(trace_events(path, metadata))
+    result = summarize(trace_events(path, metadata), window=window)
     with path.open("rb") as source:
         digest = hashlib.file_digest(source, "sha256").hexdigest()
     result["source"] = {"path": str(path), "bytes": path.stat().st_size, "sha256": digest}
@@ -280,9 +268,13 @@ def summarize_file(path: Path) -> dict[str, Any]:
     return result
 
 
-def summarize_files(paths: list[Path]) -> dict[str, Any]:
+def summarize_files(
+    paths: list[Path], *, window: tuple[float, float] | None = None
+) -> dict[str, Any]:
     if len(paths) == 1:
-        return summarize_file(paths[0])
+        return summarize_file(paths[0], window=window)
+    if window is not None:
+        raise ValueError("An explicit measurement window requires exactly one trace")
     segments = [summarize_file(path) for path in paths]
     rows: dict[tuple[str, str, str], dict[str, Any]] = {}
     devices: dict[str, dict[str, Any]] = {}
@@ -339,7 +331,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trace", type=Path, nargs="+")
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--window-start-us", type=float)
+    parser.add_argument("--window-end-us", type=float)
     args = parser.parse_args()
+    if (args.window_start_us is None) != (args.window_end_us is None):
+        parser.error("Supply both --window-start-us and --window-end-us")
+    window = None if args.window_start_us is None else (args.window_start_us, args.window_end_us)
+    try:
+        interval_summary([], window=window)
+    except ValueError as exc:
+        parser.error(str(exc))
     paths: list[Path] = []
     for path in args.trace:
         candidates = list(path.glob("trace*.json.gz")) if path.is_dir() else [path]
@@ -353,5 +354,7 @@ if __name__ == "__main__":
     paths = list(dict.fromkeys(paths))
     if not paths:
         parser.error("No trace files found")
-    result = summarize_files(paths)
+    if window is not None and len(paths) != 1:
+        parser.error("An explicit measurement window requires exactly one trace")
+    result = summarize_files(paths, window=window)
     args.out.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
