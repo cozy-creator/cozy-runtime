@@ -1018,6 +1018,7 @@ def install(torch: ModuleType, model: object, roots: Mapping[str, Module]) -> li
     """Each component root is a region, keyed by the attributes the model declares steer it
     (`__graph_keys__`: component -> attribute paths). Nothing inside a root is a region: a
     streamed component runs as written."""
+    return []  # off gate (cr-297 matched baseline, never merged): no region, every call as written
     _watching(torch)
     skipped = set(getattr(type(model), "__uncaptured__", ()))
     declared: Mapping[str, tuple[str, ...]] = getattr(type(model), "__graph_keys__", {})
