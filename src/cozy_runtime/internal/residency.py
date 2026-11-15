@@ -123,6 +123,9 @@ _DTYPES = {
     )
 }
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
+#: The shape key of the component forward running now (`execution.catch.passing`), its passes'
+#: shape where its blocks mark them (`_entered`): 0 where none runs.
+PASS_SHAPE: ContextVar[int] = ContextVar("cozy_pass_shape", default=0)
 #: TensorFS tallies working memory by the pass and site it was born in (`vt.pass_mark`); an older
 #: one has no tally, and nothing is marked.
 _ESCAPES = hasattr(vt, "pass_mark")
@@ -526,11 +529,19 @@ class _Block:
             (p.nbytes + 255) // 256 * 256 for row in self.finals.values() for p in row.values()
         )
 
+    def raw_needed(self) -> bool:
+        return self.aliases is None or any(self.aliases.values()) or not self.finals
+
+    @property
+    def least_bytes(self) -> int:
+        """The fewest device bytes it holds in use: its stored rows where they're read, and its
+        final ones."""
+        return (self.storage_bytes if self.raw_needed() else 0) + self.final_bytes
+
     def cached(self) -> bool:
         if self.final_bytes and (self.final_region is None or not self.final_region.resident):
             return False
-        raw_needed = self.aliases is None or any(self.aliases.values()) or not self.finals
-        return not raw_needed or (self.region is not None and bool(self.region.resident))
+        return not self.raw_needed() or (self.region is not None and bool(self.region.resident))
 
     def final_only(self) -> bool:
         return bool(self.finals) and self.aliases is not None and not any(self.aliases.values())
@@ -640,6 +651,42 @@ class Model:
             yield self
         finally:
             self.memory._close(self, executing=executing)
+
+    def keep(self, since_ns: int, reserve: int) -> tuple[Binding, int, int] | None:
+        """For a loop of its forwards that can't hold it whole (an LM decoding streamed): of its
+        blocks used since `since_ns`, the most bytes that fit beside its live working memory,
+        `reserve` bytes and room for the largest of the rest to stream through, largest first. A
+        binding over them, which the caller prepares and holds while the loop runs, so each
+        forward reads only the others again; with the bytes kept and those still read a forward.
+        None when none fits. An embedding table is no block a forward reads whole (`_Block.table`)."""
+        if self.memory.native is None:
+            return None
+        # The common group (embeddings, the head, final norms) serves every forward, entered
+        # around it rather than block by block.
+        used = sorted(
+            (b for b in self.groups() if (b is self.common or b.last >= since_ns) and not b.table),
+            key=lambda b: b.least_bytes,
+            reverse=True,
+        )
+        room = vt.room(self.memory.device.index or 0)
+        budget = room["capacity"] - room["working_live"] - reserve
+        kept: list[_Block] = []
+        held = streamed = 0
+        for at, block in enumerate(used):
+            after = used[at + 1].least_bytes if at + 1 < len(used) else 0
+            if held + block.least_bytes + max(streamed, after) <= budget:
+                kept.append(block)
+                held += block.least_bytes
+            else:
+                streamed = max(streamed, block.least_bytes)
+        if not kept:
+            return None
+        self._claim()
+        try:
+            self.memory._declare(self)
+            return Binding(self, kept), held, sum(b.least_bytes for b in used) - held
+        finally:
+            self._release()
 
     def retain(self, paths: Collection[str] = ("",)) -> Binding:
         self._claim()
@@ -896,6 +943,22 @@ class Binding:
                         raise torch.OutOfMemoryError(
                             f"{self.model.component}: {missing / (1 << 30):.1f} GiB of float32 "
                             "weights to bind, more than the host can give"
+                        )
+                if (
+                    not replay
+                    and memory.native is not None
+                    and any(b.data is None and not b.cached() for b in self.groups)
+                ):
+                    # Nor on a card that can never hold it: filled partway, it would only evict
+                    # everything else and then wait for memory that can't make it fit (cr-286:
+                    # an 11.1 GiB decode set on an 8 GiB cap waited 300 s, run 47309).
+                    least = sum(b.least_bytes for b in self.groups)
+                    most, said = memory.most_room()
+                    if least > most:
+                        raise Exhausted(
+                            f"{self.model.component}: {_gib(least)} of weights to hold at once, "
+                            f"more than {said} could ever give it",
+                            least,
                         )
                 self.used = True
                 with torch.cuda.stream(stream) if memory.cuda else nullcontext():
@@ -1197,6 +1260,17 @@ class Memory:
                 else:
                     owners.remove(model)
                 model.working_phase_keys.remove(key)
+
+    def most_room(self) -> tuple[int, str]:
+        """The most weight bytes this process could ever hold on its card at once, with every
+        other byte of the card or its cap given back, less its own live working memory; and
+        that in words."""
+        index = self.device.index or 0
+        total = int(torch.cuda.get_device_properties(index).total_memory)
+        card = total if self.budget_bytes is None else min(self.budget_bytes, total)
+        live = int(vt.room(index)["working_live"])
+        said = f"GPU {index}'s {_gib(card)}{' cap' if card < total else ''} less {_gib(live)} live"
+        return max(card - live, 0), said
 
     def _free(self) -> int:
         """Free bytes where no native owner answers (MPS, CPU). A CPU's is what the host can still
@@ -2417,7 +2491,7 @@ class Memory:
         seen, last = request.heads.get(model, (None, None))
         if seen is None or (block.index in seen and block.index != last):
             request.heads[model] = ({block.index}, block.index)
-            self._pass(model, request, 0)
+            self._pass(model, request, PASS_SHAPE.get())
             self._born(block.escape_site)
         elif block.index != last:
             seen.add(block.index)
@@ -2435,8 +2509,17 @@ class Memory:
             model.escape_floor = common + max(
                 (block.allocation_bytes for block in model.blocks.values()), default=0
             )
+        floor = model.escape_floor
+        if any(b.retained for b in model.groups()):
+            # Held blocks are in the pass's held bytes already: the floor is what still streams
+            # (a decode keeping what fits, `keep`); an embedding table gathers on the host.
+            shared = model.common
+            floor = (shared.allocation_bytes if shared and not shared.retained else 0) + max(
+                (b.allocation_bytes for b in model.blocks.values() if not (b.retained or b.table)),
+                default=0,
+            )
         device = self.device.index or 0
-        refused = vt.pass_mark(device, model.escape_site, shape, model.escape_floor)
+        refused = vt.pass_mark(device, model.escape_site, shape, floor)
         self._born(model.escape_site)
         if refused is not None:
             raise DoesNotFit(_does_not_fit(model.component, refused))
@@ -2722,7 +2805,15 @@ class _Kept:
     def get(self) -> tuple[Tensor, ...]:
         if self.region is None:
             raise RuntimeError("retained state read after its loop ended")
-        raw = self.region.use(self.memory._cuda_stream().cuda_stream).tensor
+        try:
+            raw = self.region.use(self.memory._cuda_stream().cuda_stream).tensor
+        except Exhausted as exc:
+            size = sum(n for _, n, _, _ in self.views)
+            raise Exhausted(
+                f"a retained state of {_gib(size)} found no room ({exc}): the states whose "
+                "tensors are held now stay on the card; read each where it is used",
+                exc.requested_bytes,
+            ) from exc
         return tuple(raw[at : at + n].view(dtype).view(shape) for at, n, dtype, shape in self.views)
 
 

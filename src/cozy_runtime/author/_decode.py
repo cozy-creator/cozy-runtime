@@ -9,6 +9,7 @@ package does not import it.
 
 from __future__ import annotations
 
+import errno
 import io
 import math
 import os
@@ -24,7 +25,7 @@ from itertools import chain
 from numbers import Integral
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, cast, overload
+from typing import TYPE_CHECKING, BinaryIO, Literal, NoReturn, Protocol, cast, overload
 
 import PIL.Image
 from PIL.Image import DecompressionBombError, Resampling, Transpose
@@ -144,6 +145,31 @@ class DecoderUnavailable(CapabilityError):
 
 class MediaDecodeError(InvalidRequest):
     default_code = "media_decode"
+
+
+#: The demuxers an input is read with, Calcifer's (`calcifer/tools.rs` DEMUXERS): pictures, videos and
+#: sounds, none that reads what a file names (an HLS playlist, a DASH manifest, a `concat` script) or a
+#: sequence (`image2`). An input reads its own bytes alone, through no protocol but `file`.
+_DEMUXERS = (
+    "mov,matroska,avi,asf,mpeg,mpegts,flv,png_pipe,apng,jpeg_pipe,webp_pipe,gif,bmp_pipe,tiff_pipe,"
+    "jpegxl_pipe,jpegxl_anim,psd_pipe,ico,mp3,ogg,flac,wav,aac,aiff,amr,ape,dsf"
+)
+_INPUT_OPTIONS = {"format_whitelist": _DEMUXERS, "protocol_whitelist": "file"}
+
+
+def _open_input(av: ModuleType, source: BinaryIO) -> InputContainer:
+    """`source` as a container of an allowed format, which opens nothing else."""
+    try:
+        return cast("InputContainer", av.open(source, mode="r", container_options=_INPUT_OPTIONS))
+    except av.FFmpegError as exc:
+        if getattr(exc, "errno", None) != errno.EINVAL:
+            raise
+        raise MediaDecodeError(
+            "the file is not a video or audio container this runtime reads (MP4/MOV, Matroska/WebM, "
+            "AVI, MPEG-TS, Ogg, MP3, FLAC, WAV and the like): a playlist, a DASH manifest or a "
+            "concat list names other files, and is refused",
+            code="media_format_refused",
+        ) from exc
 
 
 class MediaMaterializationError(RuntimeFailure):
@@ -950,7 +976,7 @@ def _media_events(
     """
     with ExitStack() as stack:
         source = stack.enter_context(path.open("rb"))
-        container = stack.enter_context(av.open(source, mode="r"))
+        container = stack.enter_context(_open_input(av, source))
         if kind == "audio":
             stream = _first_stream(list(container.streams.audio), "audio", note)
             yield from _audio_events(
@@ -977,7 +1003,7 @@ def _media_events(
             frames = _seek(av, container, video_stream, origin + start, note)
             if frames is None:
                 source = stack.enter_context(path.open("rb"))
-                container = stack.enter_context(av.open(source, mode="r"))
+                container = stack.enter_context(_open_input(av, source))
                 video_stream = container.streams.video[0]
                 clock = _VideoClock(av, video_stream, limits, end, note, start=start, origin=origin)
         video = clock.pictures(frames or _decoded(av, container, video_stream, note))
@@ -989,7 +1015,7 @@ def _media_events(
         audio_format: DecodedAudioFormat | None = None
         if audio and soundtrack is not None:
             audio_source = stack.enter_context(path.open("rb"))
-            audio_container = stack.enter_context(av.open(audio_source, mode="r"))
+            audio_container = stack.enter_context(_open_input(av, audio_source))
             audio_stream = audio_container.streams.audio[0]
             audio_format = _stream_audio_format(audio_stream, limits)
             decoder = _AudioStreamDecoder(
@@ -1064,7 +1090,7 @@ def _unsaid(_: str) -> None:
 
 def _first_picture_time(av: ModuleType, path: Path) -> Fraction:
     """The presentation time of a video's first decoded frame: the origin `end` counts from."""
-    with path.open("rb") as source, av.open(source, mode="r") as container:
+    with path.open("rb") as source, _open_input(av, source) as container:
         stream = container.streams.video[0]
         stream.codec_context.thread_count = 1
         for frame in _decoded(av, container, stream, _unsaid):
@@ -1607,7 +1633,7 @@ def _stream_duration(
 
 
 def _probe_video(av: ModuleType, path: Path, limits: DecodeLimits) -> VideoProbe:
-    with path.open("rb") as source, av.open(source, mode="r") as container:
+    with path.open("rb") as source, _open_input(av, source) as container:
         stream = _first_stream(list(container.streams.video), "video")
         soundtrack = _soundtrack(container)
         context = stream.codec_context
@@ -1634,7 +1660,7 @@ def _probe_video(av: ModuleType, path: Path, limits: DecodeLimits) -> VideoProbe
 
 
 def _probe_audio(av: ModuleType, path: Path, limits: DecodeLimits) -> AudioProbe:
-    with path.open("rb") as source, av.open(source, mode="r") as container:
+    with path.open("rb") as source, _open_input(av, source) as container:
         stream = _first_stream(list(container.streams.audio), "audio")
         audio_format = _stream_audio_format(stream, limits)
         duration = _stream_duration(av, container, stream)

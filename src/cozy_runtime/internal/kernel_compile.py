@@ -31,7 +31,6 @@ import selectors
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -47,7 +46,7 @@ from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.canonical_json import JsonValue
-from cozy_runtime.internal import config, filelock, kernel_cache, proctree
+from cozy_runtime.internal import call_scope, config, filelock, kernel_cache, proctree
 
 #: kind -> the `module:function` a builder runs: `build(spec, staging, report) -> facts`. The
 #: function fills `staging` (an `object` file, a `site/` tree, or nothing when the artifact
@@ -209,13 +208,14 @@ def wait(store: kernel_cache.Store, job: Job, waiter: str = "") -> State:
     name = waiter or state.kernel
     woke = threading.Event()
     freed: threading.Event | None = None
+    tell = waiting if told.get() else None
     with request_path.forbid(f"kernel build wait: {name}"), held.get()(name, woke.set) as canceled:
         while state.state == "compiling":
-            if waiting is not None and told.get():
-                waiting(replace(state, kernel=name))
+            if tell is not None:
+                tell(replace(state, kernel=name))
             if freed is None or freed.is_set():
                 freed = _released(store, job.key, woke.set)
-            woke.wait(TELL_SECONDS)
+            woke.wait(TELL_SECONDS if tell is not None else None)  # untold: its exit or a cancel
             woke.clear()
             if canceled():
                 raise Canceled(f"canceled waiting for {name} to compile; the compile goes on")
@@ -343,7 +343,7 @@ def _compile_ms(entry_dir: Path) -> float:
 
 
 def _failures() -> Path:
-    return Path(tempfile.gettempdir()) / "cozy-kernel-failures"
+    return Path(call_scope.process_tempdir()) / "cozy-kernel-failures"
 
 
 def _failed_path(key: kernel_cache.Key, scope: Path | None = None) -> Path:

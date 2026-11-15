@@ -147,7 +147,6 @@ class App:
         label: str = "",
         named: str = "",
         reserved: Sequence[str] = (),
-        ui: str = "",
         **options: Unpack[RegistrationOptions],
     ) -> Callable[P, R]: ...
 
@@ -159,7 +158,6 @@ class App:
         label: str = "",
         named: str = "",
         reserved: Sequence[str] = (),
-        ui: str = "",
         **options: Unpack[RegistrationOptions],
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
@@ -171,16 +169,15 @@ class App:
         label: str = "",
         named: str = "",
         reserved: Sequence[str] = (),
-        ui: str = "",
         **options: Unpack[RegistrationOptions],
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """A public function that is a box: its request struct is the box's fields (tools.md).
         It takes `entrypoint`'s options, and is called like one. `label`: its name in the tool
         list. `named`: a new box's name, numbered (`shot` makes `shot_1`). `reserved`: the model's
-        own tags in its text, never mentions. `ui`: a component in this package that draws it.
+        own tags in its text, never mentions.
 
         Placed on a model's own function, it is the shortcut: its arguments are already the box."""
-        box = Tool(label=label, named=named, reserved=reserved, ui=ui)
+        box = Tool(label=label, named=named, reserved=reserved)
         return self._register(fn, tool=box, **options)
 
     def _register(

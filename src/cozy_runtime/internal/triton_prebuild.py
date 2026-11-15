@@ -37,6 +37,7 @@ from cozy_runtime.accel.kernels import _SETS, TritonKernels
 from cozy_runtime.internal import (
     arch,
     attention_sol_fa4,
+    call_scope,
     lora_bake,
     machine_kernels,
     triton_kernels,
@@ -118,7 +119,9 @@ def _launchers(out: Path, given: Path | None) -> dict[str, dict[str, str]]:
 
 def build(out: Path, launchers: Path | None, package: str = "") -> dict[str, object]:
     """OUT, written whole: nothing when `package` declares no set."""
-    with tempfile.TemporaryDirectory(prefix="cozy-triton-") as scratch:
+    with tempfile.TemporaryDirectory(
+        prefix="cozy-triton-", dir=call_scope.process_tempdir()
+    ) as scratch:
         triton.knobs.cache.dir = scratch
         staged = Path(scratch) / "out"
         staged.mkdir()

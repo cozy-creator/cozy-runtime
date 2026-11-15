@@ -159,6 +159,10 @@ BUCKETS = (1, 2, 4, 8, 16)
 #: after each of its tokens (Qwen3.5-9B: 24 x 3 x 2 MiB a row), and with more rows the model's
 #: own step is compute-bound enough that drafts save little; larger buckets decode undrafted.
 DRAFT_ROWS = 4
+#: The most the draft head's prompt pass holds of attention scores at once (`_drafted_prompt`).
+DRAFT_SCORES = 256 << 20
+#: The most prompt tokens a gated-delta-net layer's prefill computes at once (`_prefill_pieces`).
+PREFILL_TOKENS = 4096
 
 
 #: Generation-config fields that add a logits processor to greedy decoding, and their no-op values.
@@ -448,6 +452,10 @@ def install(plan: Plan, model: torch.nn.Module) -> str:
     if ABSENT:
         return _report(plan, ABSENT)
     spaces = {sys.modules.get(type(module).__module__) for module in model.modules()}
+    for space in spaces:  # the prefill's pieces need no kernel: every device, from now on
+        current = getattr(space, "torch_chunk_gated_delta_rule", None)
+        if space is not None and callable(current) and not getattr(current, "_cozy_slot", False):
+            vars(space)["torch_chunk_gated_delta_rule"] = _prefill_pieces(current)
     slots = [
         (space, name)
         for space in spaces
@@ -583,6 +591,49 @@ def _conv_slot(original: _ConvUpdate, launch: Launch) -> _ConvUpdate:
 
     slot._cozy_slot = True  # type: ignore[attr-defined]  # a marker on the function object
     return slot
+
+
+def _prefill_pieces(original: _DeltaRule) -> _DeltaRule:
+    """A gated-delta-net layer's prompt in pieces of `PREFILL_TOKENS`, each starting from the
+    recurrent state the one before ended on: the torch path holds several fp32 copies of a
+    piece's queries, keys, values and decays, so a long prompt's held all at once (Qwen3.5's
+    upsampler at 31,804 tokens, 6.3 GiB live under an 8 GiB cap, run 46625). Pieces end on its
+    chunk boundaries, so each chunk is computed as in the whole call."""
+
+    def pieces(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        chunk_size: int = 64,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        length = int(query.shape[1])
+        piece = max(chunk_size, PREFILL_TOKENS // chunk_size * chunk_size)
+        if length <= piece or kwargs.get("cu_seqlens") is not None:
+            return original(
+                query, key, value, g, beta, chunk_size=chunk_size, initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **kwargs,
+            )  # fmt: skip
+        outs: list[torch.Tensor] = []
+        state = initial_state
+        for at in range(0, length, piece):
+            part = slice(at, at + piece)
+            out, state = original(
+                query[:, part], key[:, part], value[:, part], g[:, part], beta[:, part],
+                chunk_size=chunk_size, initial_state=state, output_final_state=True,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **kwargs,
+            )  # fmt: skip
+            outs.append(out)
+        return torch.cat(outs, 1), state if output_final_state else None
+
+    vars(pieces)["_cozy_slot"] = True
+    return cast("_DeltaRule", pieces)
 
 
 def _recurrent_slot(original: _DeltaRule, launch: Launch) -> _DeltaRule:
@@ -754,23 +805,22 @@ def _fused_experts(model: torch.nn.Module, text: PreTrainedConfig) -> bool:
 
 
 def _capture_contract(model: torch.nn.Module, draft: torch.nn.Module | None = None) -> str:
-    """Shipped decode contracts, dense and with experts split (`moe`), and a drafted step's
-    head (`Draft` around Transformers' decoder layer); persistent KV, positions and counters
-    are device buffers.
+    """Why `model`'s decode step is no graph, "" when it is one: Transformers' own model whose
+    class declares its forward one compiled graph (`_can_compile_fullgraph`: no host sync and no
+    Python branch on a tensor's value, what torch.compile's CUDA graphs need too), dense or with
+    experts split (`moe`), and a drafted step's head (`Draft` around Transformers' decoder
+    layer); persistent KV, positions and counters are device buffers. One contract for every
+    such LM and VLM (Qwen3, Qwen3.5, Qwen3-VL, Mistral3, Llama, ...), not a list of names (cr-289).
 
     The real warm step initializes cache views and advances accepted history once. Capture
     only records the next step's device writes. Custom Python hooks and arbitrary model code
     are never speculatively executed by this graph builder.
     """
-    forward = type(model).forward
-    if not forward.__module__.startswith("transformers.models.") or type(model).__name__ not in {
-        "Qwen3ForCausalLM",
-        "Qwen3_5ForCausalLM",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-    }:
-        return "no shipped decode capture contract"
+    kind = type(model)
+    if not kind.forward.__module__.startswith("transformers.models."):
+        return "not a Transformers model's own forward"
+    if not getattr(kind, "_can_compile_fullgraph", False):
+        return f"Transformers does not declare {kind.__name__}'s forward one graph"
     # A component root's class is Runtime's graphed subclass (`graphs.install`): forward is Draft's.
     if draft is not None and (
         type(draft).forward is not Draft.forward
@@ -981,7 +1031,8 @@ def _transformers(
     if sampling.temperature > 0:
         processors.append(_Draw(prompt, sampling))
     context = CURRENT.get()
-    with _PLANE, torch.inference_mode():
+    with _PLANE, torch.inference_mode(), ExitStack() as held:
+        cancel = _Cancel(context, tell, _Keeper(model, held))
         out = _lm(model).generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -989,17 +1040,74 @@ def _transformers(
             eos_token_id=stops,
             pad_token_id=pad,
             logits_processor=LogitsProcessorList(processors),
-            stopping_criteria=StoppingCriteriaList([_Cancel(context, tell)]),
+            stopping_criteria=StoppingCriteriaList([cancel]),
         )
+        cancel.keeper.report(prompt, cancel.steps)
     return out[:, prompt:]
 
 
-class _Cancel(StoppingCriteria):
-    """Transformers' loop raises the attempt's cancellation between tokens and tells its
-    progress."""
+#: What a streamed decode step needs beyond its kept weights and live memory (its cache's growth,
+#: the logits): the room `_Keeper` leaves.
+KEEP_RESERVE = 512 << 20
 
-    def __init__(self, context: Context | None, tell: _Tell) -> None:
-        self.context, self.tell, self.steps = context, tell, 0
+
+class _Keeper:
+    """Transformers' loop over a model whose decode set doesn't fit: after its first decode step,
+    as many of the blocks that step read as fit stay held to the end of the call, so each later
+    token reads only the others again, not the whole model (cr-286: Qwen3.5-9B int8 at an 8 GiB
+    cap decoded about 1 s a token, every weight read again for each). The prompt's prefill runs
+    before any is held: its working memory is the call's largest."""
+
+    def __init__(self, model: torch.nn.Module, held: ExitStack) -> None:
+        self.placed = PLACED.get(model)
+        self.held, self.since, self.began = held, 0, time.perf_counter()
+        self.decoded = 0.0
+        self.kept = self.read = 0
+
+    def step(self, steps: int) -> None:
+        if self.placed is None or steps > 2:
+            return
+        if steps == 1:  # the prompt's token: the decode begins
+            self.since, self.decoded = time.monotonic_ns(), time.perf_counter()
+            return
+        try:
+            found = self.placed[0].keep(self.placed[1], self.since, KEEP_RESERVE)
+            if found is None:
+                return
+            binding, self.kept, self.read = found
+            self.held.callback(binding.close)
+            self.held.enter_context(binding.prepare())
+            print(
+                f"[lm] streamed decode holds {_gib(self.kept)} of its weights, reads "
+                f"{_gib(self.read)} again a token",
+                file=sys.stderr,
+            )
+        except Exception as exc:  # holding is only speed: the decode streams as it did
+            if not is_capacity(exc):
+                raise
+            _unwind(exc)
+            self.kept = 0
+
+    def report(self, prompt: int, steps: int) -> None:
+        """Its tokens a second, and the bytes kept and read again a token, in the run record."""
+        if self.placed is None or steps < 2:
+            return
+        seconds = time.perf_counter() - self.decoded
+        text = (
+            f"{steps} tokens after {prompt} through Transformers' loop: "
+            f"{(steps - 1) / max(seconds, 1e-9):.2f} tokens/s decoding, "
+            f"{_gib(self.kept)} of its weights held, {_gib(self.read)} read again a token"
+        )
+        print(f"[lm] {text}", file=sys.stderr)
+        self.placed[0].note(f"{self.placed[1]}.lm", text)
+
+
+class _Cancel(StoppingCriteria):
+    """Transformers' loop raises the attempt's cancellation between tokens, tells its progress
+    and, after the first decode step, keeps what of the model fits (`_Keeper`)."""
+
+    def __init__(self, context: Context | None, tell: _Tell, keeper: _Keeper) -> None:
+        self.context, self.tell, self.keeper, self.steps = context, tell, keeper, 0
 
     def __call__(
         self, input_ids: torch.Tensor, scores: tuple[torch.Tensor] | None, **kwargs: object
@@ -1007,6 +1115,7 @@ class _Cancel(StoppingCriteria):
         if self.context is not None:
             self.context.raise_if_cancelled()
         self.steps += 1  # one token a step: this loop drafts none
+        self.keeper.step(self.steps)
         self.tell(lambda: self.steps)
         flags = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         return cast("torch.BoolTensor", flags)  # cast: Transformers types its flags as BoolTensor
@@ -1787,7 +1896,9 @@ class _Engine:
                             if self._occupied():
                                 raise self.unprepared or RuntimeError("decode residency was lost")
                             for request in self.incoming:
-                                request.fallback = "its decode set does not fit at home"
+                                request.fallback = "its decode set does not fit at home" + (
+                                    f" ({str(self.unprepared)[:200]})" if self.unprepared else ""
+                                )
                             self.incoming = []
                         if self.incoming or self.retire:
                             self._settle(self.incoming)
@@ -2095,7 +2206,10 @@ class _Engine:
         ):
             try:
                 self._pool(True)
-            except Exhausted as exc:  # no row decodes (else the pool is held): nothing ran
+            except Exhausted as exc:  # nothing of it ran
+                if occupied:  # the pool is held while rows decode: a refusal here waits for them
+                    request.waits = True
+                    return False
                 # The graphs are only speed: they go, the call decodes eagerly, and a later step
                 # captures again where its pool finds room.
                 why = no_room(_set(self.domain).device, "its graphs' pool", 0, exc)
@@ -2115,6 +2229,9 @@ class _Engine:
         if placed:
             card = self._card(device) + self.held
             if _never(self._need(*alone, position), card):
+                if self.draft is not None and occupied:
+                    request.waits = True  # the head goes once the rows drafting with it leave
+                    return False
                 if self._undraft(request, "its keys do not fit on this card"):
                     return False
                 raise DoesNotFit(self._refused(request, alone, position, card))
@@ -2268,16 +2385,9 @@ class _Engine:
         """The head's keys for the prompt and the first token, as it attends to them while
         drafting: slot j from token j and the model's state for the token before it, so drafts
         read the whole context the head was trained on; and its state for the token after."""
-        prompt = int(ids.shape[1])
+        prompt, rows = int(ids.shape[1]), int(ids.shape[0])
         tokens = torch.cat([ids[:, 1:], token[:, None]], dim=1)
         slots = torch.arange(prompt + 1, device=ids.device)
-        allowed = (slots[None, :] >= 1) & (slots[None, :] <= slots[1:, None])
-        mask = (
-            allowed
-            if self.closed is False
-            else torch.where(allowed, self.open, self.closed).to(self.model.dtype)
-        )
-        mask = mask[None, None].expand(int(ids.shape[0]), 1, prompt, prompt + 1)
         if position is not None:
             following = position[..., -1:] + 1
             at = torch.cat([position[..., 1:], following], dim=-1)
@@ -2288,8 +2398,24 @@ class _Engine:
         keys.cumulative_length = torch.ones((), dtype=torch.long, device=ids.device)
         embed = self.model.get_input_embeddings()
         rotary = _lm(self.model).get_decoder().rotary_emb
-        drafted: torch.Tensor = _set(self.draft)(embed(tokens), hidden, at, cache, mask, rotary)
-        last = drafted[:, -1:]
+        # Its mask is explicit, so attention may materialize each query's scores over every slot:
+        # queries go in pieces whose scores stay within DRAFT_SCORES, each writing its keys before
+        # the next attends to them (a 23,388-token prompt asked 17.5 GB whole: 16 heads x L x L+1).
+        heads = int(getattr(self.text, "num_attention_heads", 1))
+        piece = max(1, DRAFT_SCORES // (rows * heads * (prompt + 1) * 4))
+        drafted: torch.Tensor | None = None
+        for start in range(0, prompt, piece):
+            end = min(start + piece, prompt)
+            allowed = (slots[None, :] >= 1) & (slots[None, :] <= slots[start + 1 : end + 1, None])
+            mask = (
+                allowed
+                if self.closed is False
+                else torch.where(allowed, self.open, self.closed).to(self.model.dtype)
+            )
+            mask = mask[None, None].expand(rows, 1, end - start, prompt + 1)
+            these = embed(tokens[:, start:end]), hidden[:, start:end], at[..., start:end]
+            drafted = _set(self.draft)(*these, cache, mask, rotary)
+        last = _set(drafted)[:, -1:]
         return keys, last
 
     def _splice(self, request: _Request, fresh: _Prefill, free: list[int]) -> None:

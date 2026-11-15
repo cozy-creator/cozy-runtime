@@ -32,7 +32,7 @@ from typing import TypedDict
 
 from packaging.version import InvalidVersion, Version
 
-from cozy_runtime.internal import base_observation, canonical
+from cozy_runtime.internal import base_observation, call_scope, canonical
 
 MAX_ELF_SECTIONS = 16_384
 MAX_NATIVE_MEMBERS = 4_096
@@ -680,7 +680,10 @@ def verify_seat(
 
 def _run_working(command: list[str], environment: Mapping[str, str]) -> tuple[int, bytes, bytes]:
     """Run one disposable child to its exit; whatever of its group outlives it is ended."""
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+    with (
+        tempfile.TemporaryFile(dir=call_scope.process_tempdir()) as stdout,
+        tempfile.TemporaryFile(dir=call_scope.process_tempdir()) as stderr,
+    ):
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,

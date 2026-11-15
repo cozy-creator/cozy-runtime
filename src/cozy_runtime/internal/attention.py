@@ -1455,11 +1455,15 @@ def _head_dim(module: object) -> int:
 
 
 def _base(projection: object) -> object:
-    """A PEFT LoRA wrapper's current base layer (encoded fill can replace it after
-    construction), else the projection itself."""
+    """A PEFT LoRA wrapper's or a LoKr layer's (`lora_composition._Kron`) current base layer
+    (encoded fill can replace it after construction), else the projection itself."""
     peft_linear = getattr(sys.modules.get("peft.tuners.lora.layer"), "Linear", None)
     if peft_linear is not None and isinstance(projection, peft_linear):
         return projection.get_base_layer()
+    import torch
+
+    if isinstance(projection, torch.nn.Module) and getattr(projection, "_cozy_kron", False):
+        return projection.get_submodule("base_layer")
     return projection
 
 

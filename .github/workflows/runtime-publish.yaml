@@ -75,20 +75,20 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.workflow_sha }}
           path: release-tools
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.release_tag }}
           fetch-depth: 0
           path: source
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           # A tag-scoped cache is never restored by another tag.
           save-cache: false
-      - uses: arduino/setup-task@v2
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611 # v2
         with:
           repo-token: ${{ github.token }}
       - run: uv python install 3.12
@@ -113,7 +113,7 @@ jobs:
         run: |
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
           uv build --out-dir dist
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: kernels-*
           path: kernels-out
@@ -163,7 +163,7 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"version={v}\nsha256sums<<SUMS\n{sums}\nSUMS\n")
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-dist
           path: source/dist/
@@ -180,19 +180,19 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.workflow_sha }}
           path: release-tools
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.release_tag }}
           fetch-depth: 0
           path: source
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           save-cache: false
-      - uses: arduino/setup-task@v2
+      - uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611 # v2
         with:
           repo-token: ${{ github.token }}
       - run: uv python install 3.12
@@ -200,7 +200,7 @@ jobs:
         run: uv run --no-project --python 3.12 python release-tools/checks/release.py --source source ${{ inputs.rehearsal && '--rehearsal' || '' }} ${{ !contains(fromJSON(inputs.linux), 'x86_64') && '--adding' || '' }}
       - run: uv sync --locked
         working-directory: source
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: kernels-linux-aarch64
           path: kernels-out
@@ -228,7 +228,7 @@ jobs:
         run: |
           rm -- *-py3-none-any.whl
           echo "sha256sum=$(sha256sum -- *.whl)" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-dist-aarch64
           path: source/dist/*.whl
@@ -246,16 +246,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.workflow_sha }}
           path: release-tools
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.release_tag }}
           fetch-depth: 0
           path: source
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           save-cache: false
       - id: release
@@ -289,7 +289,7 @@ jobs:
           names=($(awk '{for (i = 2; i <= NF; i += 2) print "-p", $i}' <<< "$SUMS"))
           gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist "${names[@]}"
           uv run --no-project --python 3.12 python release-tools/checks/release_assets.py --dist dist --version "$VERSION" --linux "$LINUX"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-dist
           path: dist/
@@ -302,15 +302,19 @@ jobs:
     if: ${{ !cancelled() && !inputs.rehearsal && !contains(needs.*.result, 'failure') && contains(needs.*.result, 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # SHA256SUMS.sigstore.jsonl, the GitHub attestation of SHA256SUMS by this workflow, goes up before SHA256SUMS: a dev machine
+    # that opts into prereleases (cozy's `dev = true`) holds SHA256SUMS to it, as `cozy update` holds a release (xs-196).
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.release_tag }}
       ADDING: ${{ !contains(fromJSON(inputs.linux), 'x86_64') }}
       LINUX: ${{ inputs.linux }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-dist*
           merge-multiple: true
@@ -329,18 +333,38 @@ jobs:
             done
             gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p SHA256SUMS
             sort -k2 -o SHA256SUMS SHA256SUMS part.sums
-            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" -- "${files[@]}"
-            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber SHA256SUMS
+            echo MODE=adding >> "$GITHUB_ENV"
           elif [ "$held" != none ]; then
             [ -z "$held" ] || { echo "::error::$TAG already holds files: a candidate's files never change"; exit 1; }
             cp part.sums SHA256SUMS
-            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease
-            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" -- "${files[@]}" SHA256SUMS
+            echo MODE=empty >> "$GITHUB_ENV"
           else
             cp part.sums SHA256SUMS
-            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --prerelease --title "cozy-runtime ${TAG#v} (candidate)" \
-              --notes "Gate, then publish: .github/workflows/runtime-publish.yaml" -- "${files[@]}" SHA256SUMS
+            echo MODE=new >> "$GITHUB_ENV"
           fi
+      - id: attest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/SHA256SUMS
+      - working-directory: dist
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          files=(cozy_runtime-*)
+          jq -c . "$BUNDLE" > SHA256SUMS.sigstore.jsonl
+          case $MODE in
+            adding)
+              gh release upload "$TAG" -R "$GITHUB_REPOSITORY" -- "${files[@]}"
+              gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber SHA256SUMS.sigstore.jsonl ;;
+            empty)
+              gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease
+              gh release upload "$TAG" -R "$GITHUB_REPOSITORY" -- "${files[@]}" SHA256SUMS.sigstore.jsonl ;;
+            new)
+              gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --prerelease --title "cozy-runtime ${TAG#v} (candidate)" \
+                --notes "Gate, then publish: .github/workflows/runtime-publish.yaml" -- "${files[@]}" SHA256SUMS.sigstore.jsonl ;;
+          esac
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber SHA256SUMS
           w=$(grep -E 'manylinux_2_28_x86_64\.whl$' SHA256SUMS || true)
           { [ -z "$w" ] || echo "gate with: runtime_wheel=https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/${w##* }#sha256=${w%% *}"
             echo "publish with: -f linux='$LINUX' -f gated_sha256sums='$(tr '\n' ' ' < part.sums)'"; } | tee -a "$GITHUB_STEP_SUMMARY"
@@ -355,7 +379,7 @@ jobs:
     permissions:
       id-token: write  # PyPI trusted publishing (OIDC)
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-dist
           path: dist
@@ -372,7 +396,7 @@ jobs:
           printf '%s\n' "$SUMS" | sha256sum --check --strict
           [ "$(ls | sort)" = "$(printf '%s\n' "$SUMS" | awk '{print $2}' | sort)" ]
       - name: Publish (trusted publishing)
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
       # Uploads land one file at a time; a lock taken mid-upload silently misses platform
       # files. Wait while files are absent, refuse at once on any file this run did not build.
       - name: PyPI serves exactly the built files

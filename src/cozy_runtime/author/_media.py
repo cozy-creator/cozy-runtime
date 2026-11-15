@@ -155,6 +155,17 @@ def slot_kind(kinds: Iterable[str], media_type: str) -> str | None:
     return family if family in readers else next(iter(readers), None)
 
 
+def unused(kinds: Iterable[str], media_type: str) -> str | None:
+    """The modality of a file a slot of `kinds` has no use for (a video in an image field), which
+    the Runtime leaves out with a note instead of refusing (Paul, 11-12). None when the slot reads
+    it, or the file is no image, video or audio: a wrong type of its own modality still refuses."""
+    kinds = tuple(kinds)
+    family = media_type.partition("/")[0]
+    if family not in ("image", "video", "audio") or family in kinds or "file" in kinds:
+        return None
+    return None if slot_kind(kinds, media_type) else family
+
+
 #: Spellings people and tools use for the types above.
 ALIASES: dict[str, str] = {
     "image/jpg": "image/jpeg",

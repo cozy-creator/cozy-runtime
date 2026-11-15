@@ -1,0 +1,941 @@
+{
+  "timestamp_utc": "2026-11-15T08:00:22Z",
+  "source_revision": "f8b7e97a1418d2e529bd5405fbf86312be198ae6",
+  "torch": "2.15.0+cu132",
+  "gpu": "_CudaDeviceProperties(name='NVIDIA GeForce RTX 4070 Laptop GPU', major=8, minor=9, total_memory=7807MB, multi_processor_count=36, uuid=3b5ac7cc-b570-e6ad-61c9-8abb87e91f35, pci_bus_id=1, pci_device_id=0, pci_domain_id=0, L2_cache_size=32MB)",
+  "driver": "595.99.02",
+  "resources": {
+    "baseline": {
+      "registers": 168,
+      "shared_bytes": 32768,
+      "ctas_per_sm": 3,
+      "binary_sha256": "a67dbf969178d0261bba403f94adec0c7a74e40aa8699933d6ba01ce24c65449"
+    },
+    "l1kv": {
+      "registers": 168,
+      "shared_bytes": 32768,
+      "ctas_per_sm": 3,
+      "binary_sha256": "ae97be3e1b018f9b578262deb74c1472180557b3ec45a2e4e1bbf012c17c064e"
+    }
+  },
+  "correctness": [
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 0,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 0,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 0,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 0,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 1,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 1,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 1,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 1,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 129,
+      "heads": 3,
+      "selected": 3,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 129,
+      "heads": 3,
+      "selected": 3,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 129,
+      "heads": 3,
+      "selected": 3,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 129,
+      "heads": 3,
+      "selected": 3,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 512,
+      "heads": 2,
+      "selected": 8,
+      "token_aug": 129,
+      "dtype": "torch.bfloat16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 512,
+      "heads": 2,
+      "selected": 8,
+      "token_aug": 129,
+      "dtype": "torch.bfloat16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 512,
+      "heads": 2,
+      "selected": 8,
+      "token_aug": 129,
+      "dtype": "torch.float16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 512,
+      "heads": 2,
+      "selected": 8,
+      "token_aug": 129,
+      "dtype": "torch.float16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 4096,
+      "heads": 4,
+      "selected": 64,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 4096,
+      "heads": 4,
+      "selected": 64,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 4096,
+      "heads": 4,
+      "selected": 64,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 4096,
+      "heads": 4,
+      "selected": 64,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    }
+  ],
+  "timings": [
+    {
+      "tokens": 4096,
+      "heads": 8,
+      "head_dim": 128,
+      "selected_blocks": 8,
+      "input_set_count": 2,
+      "input_bytes": 26368000,
+      "samples_ms": {
+        "baseline": [
+          0.1884160041809082,
+          0.21401600042978922,
+          0.17783466974894205,
+          0.1693013310432434,
+          0.17203199863433838,
+          0.18943999210993448,
+          0.16895999511082968,
+          0.1771519978841146,
+          0.1693013310432434,
+          0.17100799083709717,
+          0.1884160041809082,
+          0.17032533884048462,
+          0.17271467049916586
+        ],
+        "l1kv": [
+          0.2874346574147542,
+          0.21128533283869425,
+          0.1884160041809082,
+          0.17681066195170084,
+          0.1802240014076233,
+          0.17442133029301962,
+          0.17612799008687338,
+          0.18158932526906332,
+          0.17783466974894205,
+          0.17851734161376953,
+          0.1764693260192871,
+          0.17681066195170084,
+          0.17749333381652832
+        ]
+      },
+      "arm_orders": [
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 0.17271467049916586,
+        "l1kv": 0.17783466974894205
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "l1kv": 1.0424242139172757
+      }
+    },
+    {
+      "tokens": 4096,
+      "heads": 8,
+      "head_dim": 128,
+      "selected_blocks": 32,
+      "input_set_count": 2,
+      "input_bytes": 26368000,
+      "samples_ms": {
+        "baseline": [
+          0.49507200717926025,
+          0.47547733783721924,
+          0.4751360019048055,
+          0.6113280057907104,
+          0.47786664962768555,
+          0.4782079855600993,
+          0.4877653519312541,
+          0.4843519926071167,
+          0.49083733558654785,
+          0.501418670018514,
+          0.5283840099970499,
+          0.48742401599884033,
+          0.5143893162409464
+        ],
+        "l1kv": [
+          0.5113173325856527,
+          0.5092693169911703,
+          0.5089279810587565,
+          0.5109759966532389,
+          0.5075626770655314,
+          0.5116586685180664,
+          0.6601386864980062,
+          0.5201919873555502,
+          0.5529599984486898,
+          0.5215573310852051,
+          0.5843626658121744,
+          0.5215573310852051,
+          0.5160959959030151
+        ]
+      },
+      "arm_orders": [
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 0.4877653519312541,
+        "l1kv": 0.5160959959030151
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "l1kv": 1.0700279714704208
+      }
+    },
+    {
+      "tokens": 4096,
+      "heads": 8,
+      "head_dim": 128,
+      "selected_blocks": 64,
+      "input_set_count": 2,
+      "input_bytes": 26368000,
+      "samples_ms": {
+        "baseline": [
+          0.9637546539306641,
+          0.9113600254058838,
+          0.9164799849192301,
+          0.912384033203125,
+          0.9171626567840576,
+          0.9062399864196777,
+          0.9048746426900228,
+          0.9082880020141602,
+          0.9226240317026774,
+          0.9103360176086426,
+          0.9154559771219889,
+          0.9110186894734701,
+          0.914090633392334
+        ],
+        "l1kv": [
+          0.964949369430542,
+          1.1158186594645183,
+          0.9820160071055094,
+          0.9639253616333008,
+          0.9639253616333008,
+          0.9687039852142334,
+          0.9707520008087158,
+          0.9680213133494059,
+          0.9704106648763021,
+          0.9646080334981283,
+          0.9700693289438883,
+          0.9751893679300944,
+          0.9710933367411295
+        ]
+      },
+      "arm_orders": [
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 0.912384033203125,
+        "l1kv": 0.9700693289438883
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "l1kv": 1.062360012526602
+      }
+    },
+    {
+      "tokens": 16384,
+      "heads": 8,
+      "head_dim": 128,
+      "selected_blocks": 32,
+      "input_set_count": 2,
+      "input_bytes": 107020288,
+      "samples_ms": {
+        "baseline": [
+          1.7749333381652832,
+          1.7766399383544922,
+          1.7964372634887695,
+          1.7742506663004558,
+          1.7704960505167644,
+          1.7933653195699055,
+          2.1828266779581704,
+          2.184874693552653,
+          2.178389390309652,
+          2.300586700439453,
+          2.2026240030924478,
+          2.3661227226257324,
+          2.175999959309896
+        ],
+        "l1kv": [
+          2.0250879923502603,
+          1.896447976430257,
+          1.8981547355651855,
+          1.9916799863179524,
+          1.8971306482950847,
+          1.8943999608357747,
+          2.3323307037353516,
+          2.3313066164652505,
+          2.505727926890055,
+          2.338816006978353,
+          2.321407953898112,
+          2.3278932571411133,
+          2.3265280723571777
+        ]
+      },
+      "arm_orders": [
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 2.175999959309896,
+        "l1kv": 2.321407953898112
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "l1kv": 1.0674351822726276
+      }
+    },
+    {
+      "tokens": 16384,
+      "heads": 8,
+      "head_dim": 128,
+      "selected_blocks": 128,
+      "input_set_count": 2,
+      "input_bytes": 107020288,
+      "samples_ms": {
+        "baseline": [
+          8.331594467163086,
+          11.715925852457682,
+          8.55620257059733,
+          6.999381383260091,
+          78.0042215983073,
+          7.1608320871988935,
+          6.600704193115234,
+          6.8290557861328125,
+          6.725290934244792,
+          8.048981348673502,
+          8.122367858886719,
+          8.3329709370931,
+          8.093695958455404
+        ],
+        "l1kv": [
+          10.021205266316732,
+          9.782613118489584,
+          21.785598754882812,
+          13.658111572265625,
+          7.098367691040039,
+          7.078912099202474,
+          7.103829065958659,
+          7.940778732299805,
+          7.279616038004558,
+          8.898560206095377,
+          8.97604242960612,
+          8.63641611735026,
+          8.708096186319986
+        ]
+      },
+      "arm_orders": [
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 8.093695958455404,
+        "l1kv": 8.708096186319986
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "l1kv": 1.0824239589304865
+      }
+    },
+    {
+      "tokens": 65536,
+      "heads": 2,
+      "head_dim": 128,
+      "selected_blocks": 64,
+      "input_set_count": 2,
+      "input_bytes": 113305600,
+      "samples_ms": {
+        "baseline": [
+          3.478560129801432,
+          4.214783986409505,
+          4.348245302836101,
+          3.6980053583780923,
+          3.667626698811849,
+          3.4048000971476235,
+          3.9307947158813477,
+          4.0506025950113935,
+          3.508906682332357,
+          3.3962666193644204,
+          3.381248156229655,
+          3.374762535095215,
+          3.536896069844564
+        ],
+        "l1kv": [
+          3.6720641454060874,
+          4.539392153422038,
+          4.498090744018555,
+          4.044458707173665,
+          4.283391952514648,
+          3.668309211730957,
+          3.6160853703816733,
+          4.540416081746419,
+          3.9594666163126626,
+          4.162560145060222,
+          3.6311041514078775,
+          3.633493423461914,
+          3.632810592651367
+        ]
+      },
+      "arm_orders": [
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 3.536896069844564,
+        "l1kv": 3.9594666163126626
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "l1kv": 1.077016560767818
+      }
+    },
+    {
+      "tokens": 65536,
+      "heads": 2,
+      "head_dim": 128,
+      "selected_blocks": 256,
+      "input_set_count": 2,
+      "input_bytes": 113305600,
+      "samples_ms": {
+        "baseline": [
+          63.41460164388021,
+          16.3775151570638,
+          24.003583272298176,
+          18.065067291259766,
+          58.73493448893229,
+          15.893845876057943,
+          15.200597127278646,
+          16.48196283976237,
+          36.962646484375,
+          25.741653442382812,
+          20.712448120117188,
+          14.787583669026693,
+          21.52038319905599
+        ],
+        "l1kv": [
+          17.414485931396484,
+          17.86777623494466,
+          17.028096516927082,
+          17.08885320027669,
+          17.387861887613933,
+          17.38205846150716,
+          18.440874735514324,
+          19.214677174886067,
+          20.443477630615234,
+          22.736895243326824,
+          15.41427230834961,
+          20.41309865315755,
+          24.157183329264324
+        ]
+      },
+      "arm_orders": [
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "l1kv",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ],
+        [
+          "baseline",
+          "l1kv"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 20.712448120117188,
+        "l1kv": 17.86777623494466
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "l1kv": 0.9459612258706954
+      }
+    }
+  ],
+  "scope": "Synthetic prepacked selected-tile kernel only; no H3, producer, route, or end-to-end qualification.",
+  "method": "CUDA graph replay of identical fixed routes, shuffled arm order, two input sets, 3 replays/sample; warm cache, no clock lock."
+}

@@ -159,7 +159,6 @@ class ToolDoc(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     label: str = ""
     named: str = ""
     reserved: tuple[str, ...] = ()
-    ui: str = ""
 
 
 class Call(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
