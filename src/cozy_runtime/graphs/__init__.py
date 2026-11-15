@@ -1639,10 +1639,10 @@ def _capture_call(
 ) -> object:
     """Record `key`'s signature in this call, replay it once on this call's inputs, then run the
     call as written, which serves, and keep the graph when the two match bit for bit; `_EAGER`
-    when it doesn't record now. A capture that
-    finds no room or a kernel still building runs as written and tries again at a later call;
-    one the code refuses, or a mismatch, runs as written for the process, and the run says why.
-    Never an error a call as written would not raise."""
+    when it doesn't record now. A capture that finds no room or a kernel still building runs as
+    written and tries again at a later call; one the code refuses, or a mismatch, runs as
+    written for the process, and the run says why. Never an error a call as written would not
+    raise."""
     if seen.peak is None and not FORCE:
         # its pass was observed inside another's: a later call may be
         recorder.gap = "its calls' working memory is not measured"
