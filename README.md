@@ -522,10 +522,10 @@ CPU only; True or absent: the machine's GPU when it has one), `preflight=`, `def
 (`memoized_writer`); TensorFS derivation replay answers a repeat.
 
 **A tool is a struct plus a function** ([design/tools.md](https://github.com/cozy-creator/tracker/blob/master/design/tools.md)).
-`@app.tool(label=, named=, reserved=, ui=)` takes `entrypoint`'s options and registers a public
+`@app.tool(label=, named=, reserved=)` takes `entrypoint`'s options and registers a public
 function whose request struct is a box: `label` names it in the tool list, `named` a new box
-(`shot` makes `shot_1`), `reserved` the model's own tags in its text, and `ui` a component that
-draws it. On a model's own function it is the shortcut. A box's fields are `str`, `Prompt`,
+(`shot` makes `shot_1`), and `reserved` the model's own tags in its text. A box is always drawn
+from its fields. On a model's own function it is the shortcut. A box's fields are `str`, `Prompt`,
 `bool`, a bounded `int` or `float`, a `Literal` or `Enum`, one top-level `AspectRatio`, a slot
 (`ImageFile`, `VideoFile`, `AudioFile`, or `Image`, `Video`, `Audio` and their subclasses, or a
 list of one), the package's own structs as groups (nested; `| None` for one, a list for rows),

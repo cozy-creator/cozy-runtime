@@ -424,7 +424,7 @@ _ENTRYPOINT_KEYWORDS = frozenset(
     }
 )
 #: `app.tool`'s own: the box's (`author.Tool`).
-_TOOL_KEYWORDS = frozenset({"label", "named", "reserved", "ui"})
+_TOOL_KEYWORDS = frozenset({"label", "named", "reserved"})
 _APP_KEYWORDS = {
     "entrypoint": _ENTRYPOINT_KEYWORDS,
     "tool": _ENTRYPOINT_KEYWORDS | _TOOL_KEYWORDS,
@@ -2465,6 +2465,13 @@ def _registration(
     on_demand: tuple[str, ...] = ()
     box: dict[str, object] = {}
     for keyword in keywords:
+        if method == "tool" and keyword.arg == "ui":
+            reader.refuse(
+                module,
+                keyword,
+                "@app.tool(ui=) is gone with package UI: delete it, and the box draws its fields",
+                "static_unsupported",
+            )
         if keyword.arg not in _APP_KEYWORDS[method]:
             reader.refuse(
                 module,
