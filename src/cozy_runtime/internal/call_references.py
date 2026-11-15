@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import msgspec
 
 from cozy_runtime.author._errors import ConformanceError
@@ -9,6 +11,31 @@ from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.invocable_interface import Invocable
 from cozy_runtime.internal.package_interface import CallableDoc
+
+
+def declaration_id(body: Mapping[str, Json], name: str) -> str:
+    """One author declaration across source archives and Python interpreters.
+
+    The installed memo identity remains part of the execution descriptor. Generated
+    references bind every other entry field, including its schema, defaults and visibility.
+    """
+    entries = body.get("entrypoints", [])
+    assert isinstance(entries, list)
+    declared_entries: list[Json] = []
+    for entry in entries:
+        if (
+            isinstance(entry, dict)
+            and entry.get("name") == name
+            and isinstance(invocable := entry.get("invocable"), dict)
+        ):
+            entry = dict(entry)
+            entry["invocable"] = {
+                key: value for key, value in invocable.items() if key != "operation_identity"
+            }
+        declared_entries.append(entry)
+    declared = dict(body)
+    declared["entrypoints"] = declared_entries
+    return package_interface.descriptor_id(declared, name)
 
 
 def generate(interface: bytes, distribution: str) -> str:
@@ -277,7 +304,7 @@ def _module(
             )
         exports.add(export)
         model_names = tuple(slot.parameter for slot in entry.models)
-        declaration = package_interface.descriptor_id(body, entry.name)
+        declaration = declaration_id(body, entry.name)
         functions.append(
             f"{export}: Operation[{request_name}, {result_name}] = Operation(\n"
             f"    distribution={distribution!r}, module={metadata.module!r}, export={export!r},\n"

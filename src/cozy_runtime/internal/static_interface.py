@@ -42,6 +42,7 @@ from typing import Annotated, Literal
 import msgspec
 
 import cozy_runtime
+import cozy_runtime.internal.call_references as call_references
 import cozy_runtime.internal.locked_sources as locked
 import cozy_runtime.internal.memo_identity as memo_identity
 import cozy_runtime.internal.package_interface as package_interface
@@ -1915,7 +1916,7 @@ def _calls(
                 )
                 if (
                     callee is None
-                    or package_interface.descriptor_id(reference_interface, str(callee["name"]))
+                    or call_references.declaration_id(reference_interface, str(callee["name"]))
                     != declaration
                 ):
                     reader.refuse(

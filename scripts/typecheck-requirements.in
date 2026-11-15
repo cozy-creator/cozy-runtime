@@ -1,7 +1,7 @@
 # The type check's environment (scripts/typecheck.sh): mypy and the libraries the Runtime's source imports, CPU-only.
 # `scripts/typecheck.sh lock` pins them into typecheck-requirements.txt.
 mypy
-tensorfs==0.25.0
+tensorfs @ https://github.com/cozy-creator/cozy-creator/releases/download/xs-198-tensorfs-0.27.0-95d567d3/tensorfs-0.27.0%2Bdev.g95d567d3-cp311-abi3-manylinux_2_28_x86_64.whl#sha256=650a72ddda60622966c0053129f61dd0270fe5df2c3cba21e1aa9887e6e56a2a
 msgspec
 numpy
 packaging
