@@ -9,6 +9,7 @@ import msgspec
 import torch
 from cozy_runtime import rng
 from cozy_runtime.author import App, Config, Context, Loader, Model, Seed, Telemetry
+from cozy_runtime.media import ImageFile
 
 app = App()
 
@@ -62,6 +63,12 @@ def generate(ctx: Context, payload: Request, model: Flow, tel: Telemetry) -> Res
   replayed for the same shapes, wherever it is called from.
 - **Cancellation.** Every component call checks for a cancel; `ctx.progress(i, n)` does too.
 - **Kernels.** Linear and attention modules get the best kernel for the card and the lane.
+- **Final images.** Return `ImageFile.from_image(pil_image_or_frame)` in an `ImageFile`
+  result field. The SDK snapshots host pixels, then encodes and stores them through the
+  ordinary output path. It defaults to lossless WebP, using PNG for a side over 16383 pixels;
+  `format="png"` or `format="webp"` keeps an explicit choice. Both keep alpha. Existing
+  result schemas, metadata and output bounds still apply. `Outputs` handles intermediate
+  publication and bounded audio/video streams.
 
 ## Optional
 

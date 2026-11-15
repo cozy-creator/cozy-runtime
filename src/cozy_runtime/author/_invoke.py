@@ -79,10 +79,10 @@ from cozy_runtime.author._preview import PreviewFrame, Previews
 from cozy_runtime.author._recipes import DeclaredRecipe
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
+    TELLING,
     AdjustmentRow,
     Adjustments,
     Attempt,
-    TELLING,
     Outputs,
     ProgressFrame,
     Telemetry,
@@ -861,8 +861,8 @@ def _inject(
     *,
     params: Sequence[Param] | None = None,
 ) -> dict[str, object]:
-    """Build the call kwargs. A service absent from the signature is never constructed —
-    which is precisely why a handler without `Outputs` structurally cannot save."""
+    """Build the call kwargs. A service absent from the signature is never injected;
+    the runtime still registers final image values after the handler returns."""
     kwargs: dict[str, object] = {}
     for param in surface.params if params is None else params:
         if param.role == "context":

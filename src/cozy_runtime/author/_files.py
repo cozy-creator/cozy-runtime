@@ -21,7 +21,6 @@ from dataclasses import dataclass, is_dataclass
 from fractions import Fraction
 from pathlib import Path
 from types import MappingProxyType, UnionType
-from uuid import uuid4
 from typing import (
     TYPE_CHECKING,
     ClassVar,
@@ -35,6 +34,7 @@ from typing import (
     get_type_hints,
     overload,
 )
+from uuid import uuid4
 
 import msgspec
 from PIL.Image import Image
@@ -53,7 +53,6 @@ from cozy_runtime.author._walker import field_values, strip, unwrap_optional
 from cozy_runtime.canonical_json import JsonValue
 
 if TYPE_CHECKING:
-    from cozy_runtime.author._services import ImageFrame
     from cozy_runtime.author._decode import (
         AudioProbe,
         DecodedAudio,
@@ -64,6 +63,7 @@ if TYPE_CHECKING:
         Probe,
         VideoProbe,
     )
+    from cozy_runtime.author._services import ImageFrame
 
 _UNBOUND: Final = ""
 Fidelity = Literal["auto", "low", "medium", "high"]
