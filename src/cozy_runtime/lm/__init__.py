@@ -481,6 +481,7 @@ def install(plan: Plan, model: torch.nn.Module) -> str:
             if not getattr(current, "_cozy_slot", False):
                 setattr(space, name, _SLOTS[name](current, launch))
         _STEPS[0] = launch
+        _STEPS_GEN[0] += 1
         for engine in list(_ENGINES.values()):  # their graphs recorded Transformers' path
             engine.stale = True
         _report(plan)
@@ -724,6 +725,7 @@ _SLOTS: dict[
 _LAUNCHED = [0]
 #: The kernels' launcher once they serve: a verify pass's tokens then take one launch per layer.
 _STEPS: list[Launch | None] = [None]
+_STEPS_GEN = [0]  # cr-283 diagnosis (gate only): kernel activations this process
 
 
 def _unsupported(model: PreTrainedModel) -> str:
@@ -2896,6 +2898,7 @@ class _Engine:
                 self.eager += 1
                 return
             capturing = time.perf_counter()
+            self._gen_at_capture = _STEPS_GEN[0]
             reserve, why = vt.pool_bytes(self.peaks[key]), ""
             try:
                 with (
@@ -2995,10 +2998,29 @@ class _Engine:
         self._advance(size)
         self.eager += 1
         why = vt.replay_differs([*state, *self._written(size, at)], replayed)
-        if why:  # cr-297 LM forced gate (never merged): kept, said, never discarded
-            print(f"[lm] forced gate kept a graph that differs from eager: {why}", file=sys.stderr)
+        if why:  # cr-297 LM forced gate (never merged): kept, said, diagnosed (cr-283), never discarded
+            here = [*(value.clone() for value in state), *self._written(size, at)]
+            work = _set(domain.stream)
+            for tensor, value in zip(state, start, strict=True):
+                tensor.copy_(value)
+            work.wait_stream(stream)
+            with torch.cuda.stream(work):
+                self._advance(size)
+            stream.wait_stream(work)
+            on_work = [*(value.clone() for value in state), *self._written(size, at)]
+            for tensor, value in zip(state, start, strict=True):
+                tensor.copy_(value)
+            self._advance(size)  # as the call found it: the eager step here serves, as before
+            landed = _STEPS_GEN[0] != getattr(self, "_gen_at_capture", -1)
+            text = (
+                f"drafted={key[2]} size={size} kernels landed between capture and check: {landed} "
+                f"(launch {'set' if _STEPS[0] is not None else 'none'}); eager on the graph's stream vs "
+                f"replay: {vt.replay_differs(on_work, replayed) or 'identical'}; vs eager here: "
+                f"{vt.replay_differs(on_work, here) or 'identical'}; replay vs eager here: {why}"
+            )
+            print(f"[lm] cr283 diagnosis: {text}", file=sys.stderr)
             if (placed := PLACED.get(self.model)) is not None:
-                placed[0].note(f"{placed[1]}.lm_forced", why[:300])
+                placed[0].note(f"{placed[1]}.lm_forced.{key[0]}.{key[1]}.{key[2]}", text[:600])
             return
         if why:
             stream.synchronize()
