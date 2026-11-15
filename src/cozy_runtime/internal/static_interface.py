@@ -1634,6 +1634,7 @@ def build(
     *,
     environment_python: Path | None = None,
     closures: dict[str, str] | None = None,
+    dependency_roots: tuple[Path, ...] = (),
 ) -> dict[str, Json]:
     """The package interface from source alone. Executes nothing of the package. `closures`, when
     given, gets each memoized callable's code closure (`_code_closure`)."""
@@ -1642,7 +1643,11 @@ def build(
     # A callee package is read as source too: a local one from the directory the project's
     # uv.lock names, a published one from the exact wheel it pins (cr-114).
     pinned = locked.read(project)
-    roots = (*environment_roots(environment_python, project=project), *pinned.roots)
+    roots = (
+        *environment_roots(environment_python, project=project),
+        *pinned.roots,
+        *dependency_roots,
+    )
     own = source_tops(project)
     reader = Reader(project, dependency_roots=roots, wheels=pinned.wheels, own=own)
     name = tomllib.loads((project / "pyproject.toml").read_text())["project"]["name"]
@@ -1677,7 +1682,11 @@ def build_builtin(name: str) -> dict[str, Json]:
 
 
 def build_installed(
-    distribution: str, *, environment_python: Path, closures: dict[str, str] | None = None
+    distribution: str,
+    *,
+    environment_python: Path,
+    closures: dict[str, str] | None = None,
+    dependency_roots: tuple[Path, ...] = (),
 ) -> dict[str, Json]:
     """Describe one explicitly selected wheel using only its metadata and source bytes; `closures`
     as `build`'s."""
@@ -1755,7 +1764,7 @@ def build_installed(
         for path in owned
         if path.is_relative_to(site)
     )
-    reader = Reader(metadata.parent, dependency_roots=roots, own=own)
+    reader = Reader(metadata.parent, dependency_roots=(*roots, *dependency_roots), own=own)
     entry = reader.application_module(application.partition(":")[0])
     source = installed(entry.path)
     if not source.is_relative_to(site) or source not in owned:
@@ -1872,6 +1881,34 @@ def _calls(
             continue
         rows: dict[tuple[str, str], dict[str, Json]] = {}
         for found in _callees(reader, registration):
+            if isinstance(found, Assigned):
+                reference = _operation(reader, found)
+                assert reference is not None
+                package, module, export, declaration = reference
+                reference_interface = dependency_interface(reader, package)
+                callee = next(
+                    (
+                        d
+                        for d in typing.cast(
+                            list[dict[str, Json]], reference_interface["entrypoints"]
+                        )
+                        if _export_of(d) == (module, export) and not d.get("internal")
+                    ),
+                    None,
+                )
+                if (
+                    callee is None
+                    or package_interface.descriptor_id(reference_interface, str(callee["name"]))
+                    != declaration
+                ):
+                    reader.refuse(
+                        found.module,
+                        found.stmt,
+                        "generated operation differs from its locked package; regenerate its calls",
+                        "stale_call_reference",
+                    )
+                rows[(package, str(callee["name"]))] = _call_row(package, callee)
+                continue
             key = (found.module.name, found.node.name)
             if reader._own(key[0].split(".")[0]):
                 callee, package = exported.get(key), distribution
@@ -1915,10 +1952,10 @@ def _call_row(package: str, doc: Mapping[str, Json]) -> dict[str, Json]:
     return row
 
 
-def _callees(reader: Reader, registration: Registration) -> list[Definition]:
+def _callees(reader: Reader, registration: Registration) -> list[Definition | Assigned]:
     """The functions a registration's body reaches that run as calls: the first argument of each
     `call(fn, ...)`. Its own package's other functions run inline, so their bodies are read too."""
-    found: list[Definition] = []
+    found: list[Definition | Assigned] = []
     pending = [(registration.module, registration.fn)]
     seen: set[tuple[Path, int]] = set()
     while pending:
@@ -1935,6 +1972,14 @@ def _callees(reader: Reader, registration: Registration) -> list[Definition]:
             )
             if isinstance(node, ast.Call) and managed:
                 named.add(id(node.args[0]))
+                try:
+                    reference = reader.resolve(module, node.args[0])
+                except StaticRefusal:
+                    reference = None
+                if isinstance(reference, Assigned) and _operation(reader, reference) is not None:
+                    if managed == "author.call":
+                        found.append(reference)
+                    continue
                 callee = _function(reader, module, node.args[0])
                 runtime = callee is None or callee.module.name.split(".")[0] == "cozy_runtime"
                 if managed == "author.call" and not runtime:
@@ -1946,6 +1991,75 @@ def _callees(reader: Reader, registration: Registration) -> list[Definition]:
             if reader._own(target.module.name.split(".")[0]):
                 pending.append((target.module, typing.cast(ast.FunctionDef, target.node)))
     return found
+
+
+def _operation(reader: Reader, found: Assigned) -> tuple[str, str, str, str] | None:
+    node = found.value
+    if not isinstance(node, ast.Call):
+        return None
+    try:
+        target = reader.resolve(found.module, node.func)
+    except StaticRefusal:
+        return None
+    if not isinstance(target, Vocab) or target.key != "author.Operation":
+        return None
+    keywords = {kw.arg: kw.value for kw in node.keywords}
+    values: list[str] = []
+    for name in ("distribution", "module", "export", "declaration"):
+        value = keywords.get(name)
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            reader.refuse(
+                found.module, node, "an operation reference needs generated constant identity"
+            )
+        values.append(value.value)
+    return values[0], values[1], values[2], values[3]
+
+
+def dependency_interface(reader: Reader, distribution: str) -> dict[str, Json]:
+    """Read one locked dependency's actual source, never import its implementation."""
+    normalized = locked.distribution(distribution)
+    pinned = locked.read(reader.project)
+    top = normalized.replace("-", "_")
+    reader._fetched(top)
+    roots = (
+        [*pinned.roots, *([reader.fetched[top]] if top in reader.fetched else [])]
+        if pinned.names
+        else list(reader.roots)
+    )
+    packages: dict[Path, CozyPackage] = {}
+    for root in roots:
+        for candidate in (root, root.parent):
+            project = candidate / "pyproject.toml"
+            if project.is_file():
+                table = tomllib.loads(project.read_text()).get("project", {})
+                if locked.distribution(table.get("name", "")) == normalized:
+                    packages[candidate] = CozyPackage(
+                        distribution, read_application(candidate), candidate, source_tops(candidate)
+                    )
+        for package in (_installed_apps(reader, root) or {}).values():
+            if locked.distribution(package.distribution) == normalized:
+                packages[package.project] = package
+    if len(packages) != 1 or (pinned.names and normalized not in pinned.names):
+        raise StaticRefusal(
+            f"{distribution} must name one locked package source", code="unlocked_dependency"
+        )
+    interface = _callee_interface(reader, next(iter(packages.values())))
+    if interface is None:
+        raise StaticRefusal(
+            f"{distribution} has a cyclic managed declaration", code="static_unsupported"
+        )
+    return interface
+
+
+def build_dependency(project: Path, distribution: str) -> dict[str, Json]:
+    project = project.resolve()
+    pinned = locked.read(project)
+    if locked.distribution(distribution) not in pinned.names:
+        raise StaticRefusal(f"{distribution} is absent from uv.lock", code="unlocked_dependency")
+    reader = Reader(
+        project, dependency_roots=pinned.roots, wheels=pinned.wheels, own=source_tops(project)
+    )
+    return dependency_interface(reader, distribution)
 
 
 def _managed(reader: Reader, module: Module, node: ast.Call) -> str:
