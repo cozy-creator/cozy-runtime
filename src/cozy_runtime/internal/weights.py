@@ -1384,6 +1384,12 @@ class Placement:
         """Every page `binding` covers is on the device now (an idle capture never fills one)."""
         return binding.resident()
 
+    def graph_weights(self) -> dict[str, tuple[Module, int]]:
+        return {
+            name: (model.module, sum(block.allocation_bytes for block in model.groups()))
+            for name, model in self.models.items()
+        }
+
     def note(self, key: str, value: str) -> None:
         self.notes[key] = value
 

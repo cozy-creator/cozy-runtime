@@ -387,6 +387,10 @@ class Residency(Protocol):
         """Every page a retained region covers is on the device now."""
         ...
 
+    def graph_weights(self) -> dict[str, tuple[Module, int]]:
+        """Each component's root and the device bytes of its weights: a graph's loop."""
+        ...
+
     def lora_choices(self, components: tuple[str, ...]) -> dict[str, LoRAServing]:
         """The attempt's selected serving recipe, carried with each mirrored scope."""
         ...

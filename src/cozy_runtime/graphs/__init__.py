@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextvars
 import functools
+import itertools
 import math
 import sys
 import threading
@@ -743,6 +744,10 @@ class _Recorder:
         self.codes: dict[tuple[object, ...], str] = {}
         #: the counters when the current attempt opened (`mark`): receipts are per request
         self.base: dict[str, object] = {}
+        #: its first and latest call this attempt, in the process's order of region calls
+        #: (`_SEQUENCE`): a component called since another's first is in that one's loop
+        self.began: int | None = None
+        self.latest = -1
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -1076,6 +1081,7 @@ def mark(root: Module) -> None:
             recorder.base = recorder.snapshot()
             recorder.structure = None  # a request may swap classes or hooks before its loop
             recorder.sights.clear()
+            recorder.began = None
 
 
 def capture_domain(torch: ModuleType, root: Module, memory: Memory | None = None) -> domain.Domain:
@@ -1407,6 +1413,9 @@ def _region_path(
         _changed(torch, module, recorder, key, (args, kwargs), len(leaves))
     recorder.last = key
     recorder.attempts += 1
+    recorder.latest = next(_SEQUENCE)
+    if recorder.began is None:
+        recorder.began = recorder.latest
     if key in recorder.paths:
         audit: list[_Audit] | None = (
             [] if FORCE and recorder.replays % _AUDIT == _AUDIT - 1 else None
@@ -1616,6 +1625,36 @@ def _capture_cost(recorder: _Recorder, submit_ms: float, busy_ms: float) -> floa
     return submit_ms + busy_ms + 150
 
 
+_SEQUENCE = itertools.count()
+
+
+def _over_card(device: int, placed: _Placed, recorder: _Recorder, pool: int) -> str:
+    """Why a graph of `placed`'s component would refill weights at every replay, "" when it fits.
+    A replay needs all its weights on the card, and every other component its loop runs (called
+    since this one's first call this attempt: Ideogram 4's two DiTs) reads its own each step: its
+    pool beside all of them, what is live and the reserve must fit the card. Otherwise it records
+    into room the loop takes back each step (Ideogram 4 on a 5090, 43476403923: three replays in
+    a row refilled, then dropped), or finds none (H3 15 s: 20.7 GiB of DiT and a 12.1 GiB pool on
+    30.3 GiB), and it runs as written: the streamed case, graphs of block groups later."""
+    residency, name = placed
+    began, weights = recorder.began, residency.graph_weights()
+    loop = sum(
+        size
+        for other, (root, size) in weights.items()
+        if other == name
+        or ((peer := _RECORDERS.get(root)) is not None and began is not None and peer.latest > began)
+    )
+    room = vt.room(device)
+    capacity, live = room["capacity"], room["working_live"]
+    if loop + pool + live + max(capacity // 16, 512 << 20) <= capacity:
+        return ""
+    gib = 1 << 30
+    return (
+        f"its pool of {pool / gib:.1f} GiB beside its loop's {loop / gib:.1f} GiB of weights and "
+        f"{live / gib:.1f} GiB live exceeds {capacity / gib:.1f} GiB: each replay would refill them"
+    )
+
+
 def _capture_call(
     torch: ModuleType,
     module: Module,
@@ -1815,9 +1854,13 @@ def _capture_verified(
                     )
                 )
                 served = held.enter_context(attention_ulysses.observing())
+                pool = vt.pool_bytes(seen.peak or 0)
+                if placed is not None and (over := _over_card(owner.device, placed, recorder, pool)):
+                    _short(module, recorder, key, over)
+                    return None
                 entry = _build(
-                    torch, module, recorder, key, owner, placed, call, spec, layout,
-                    vt.pool_bytes(seen.peak or 0), state, served, overlays=overlays,
+                    torch, module, recorder, key, owner, placed, call, spec, layout, pool,
+                    state, served, overlays=overlays,
                 )
             if entry is None:
                 return None
