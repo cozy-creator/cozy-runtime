@@ -58,6 +58,36 @@ def generate(ctx: Context, payload: Request, model: Flow, tel: Telemetry) -> Res
 - **Errors**: raise `InvalidRequest` (the request is wrong), `UnsupportedInput` (this model can't)
   or `OutputError` (the result is bad). Any other exception fails the run with its first line.
 
+## Calling another package without importing its implementation
+
+Keep managed-only dependencies in the standard `cozy-calls` dependency group in
+`pyproject.toml`, and lock them with the rest of the project:
+
+```toml
+[dependency-groups]
+cozy-calls = ["example-child>=1"]
+```
+
+Generate ordinary Python declarations from that locked package's canonical interface:
+
+```sh
+cozy-runtime calls example-child my_package/child_calls.py
+```
+
+Then use the generated request and non-callable operation reference explicitly:
+
+```python
+from cozy_runtime.author import call
+from .child_calls import Request, generate
+
+result = await call(generate, Request(prompt="a lighthouse"))
+```
+
+Model choices remain named arguments to `call`; returned media and `ChildCallError` retain
+their ordinary managed-call behavior. Regenerate declarations after changing the locked
+dependency. Ordinary implementation imports and local function calls remain ordinary Python.
+The platform prepares the `cozy-calls` group for child execution separately from the caller.
+
 ## What the Runtime does for you
 
 - **Memory.** Each component is put on the device at its first forward, and evicted, streamed or
