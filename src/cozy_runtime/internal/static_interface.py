@@ -463,7 +463,7 @@ class Reader:
         self.modules: dict[str, Module] = {}
         #: callee packages read so far: an unpacked wheel's root, and a package's interface
         self.fetched: dict[str, Path] = {}
-        self.callees: dict[Path, dict[str, Json] | None] = {}
+        self.callees: dict[tuple[Path, str], dict[str, Json] | None] = {}
         self.sites: dict[Path, dict[str, CozyPackage] | None] = {}
         self.structs: dict[tuple[Path, str], type[msgspec.Struct] | None] = {}
         self.enums: dict[tuple[Path, str], type[enum.Enum]] = {}
@@ -2097,9 +2097,11 @@ def _function(reader: Reader, module: Module, node: ast.AST) -> Definition | Non
 
 def _callee_interface(reader: Reader, package: CozyPackage) -> dict[str, Json] | None:
     """Another package's interface, read from its source as this one locked it; once each."""
-    if package.project in reader.callees:
-        return reader.callees[package.project]
-    reader.callees[package.project] = None  # a package that calls back reads as no calls
+    # Several installed Apps share one site-packages directory.
+    key = (package.project, package.distribution)
+    if key in reader.callees:
+        return reader.callees[key]
+    reader.callees[key] = None  # a package that calls back reads as no calls
     callee = Reader(package.project, dependency_roots=reader.roots, own=package.own)
     callee.wheels, callee.fetched, callee.callees = reader.wheels, reader.fetched, reader.callees
     try:
@@ -2111,7 +2113,7 @@ def _callee_interface(reader: Reader, package: CozyPackage) -> dict[str, Json] |
             f"{package.distribution}, which this package calls, can't be read: {exc}",
             code=exc.code,
         ) from exc
-    reader.callees[package.project] = interface
+    reader.callees[key] = interface
     return interface
 
 
