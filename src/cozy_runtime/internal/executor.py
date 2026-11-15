@@ -171,6 +171,7 @@ from cozy_runtime.internal import (
     attention_sol,
     attention_ulysses,
     builtin_operations,
+    call_scope,
     canonical,
     child_env,
     contract,
@@ -377,17 +378,23 @@ def _capture_seal() -> None:
     _SEALED.update(seal_snapshot())
 
 
+def _seal() -> dict[str, str]:
+    """The seal as it holds now: a placed call's TMPDIR stands for the executor's (`call_scope`)."""
+    own = call_scope.names()
+    return {**_SEALED, **{name: own[name] for name in own.keys() & child_env.ALLOWLIST.keys()}}
+
+
 def _env_changes() -> tuple[str, ...]:
     """Names whose current values differ from the pre-Torch executor seal.
 
     Values never cross the seam. The names are enough to diagnose which reviewed
     imposition moved without leaking paths or future secret-bearing values into a terminal.
     """
-    current = seal_snapshot()
+    current, sealed = seal_snapshot(), _seal()
     return tuple(
         name
-        for name in sorted(_SEALED.keys() | current.keys())
-        if current.get(name) != _SEALED.get(name)
+        for name in sorted(sealed.keys() | current.keys())
+        if current.get(name) != sealed.get(name)
     )
 
 
@@ -427,7 +434,7 @@ def _restore_seal() -> tuple[str, ...]:
     configuration it runs. A package's change is a no-op either way: warn, never refuse.
     """
     changed = _env_changes()
-    restore_seal(_SEALED, changed)
+    restore_seal(_seal(), changed)
     if changed:
         print(
             f"[executor] restored sealed environment names changed by package code: "
@@ -450,6 +457,22 @@ _CALL: contextvars.ContextVar[str] = contextvars.ContextVar("cozy_call", default
 #: This thread serves a command the machine is shown the phases of (`_phases`): GPU 0's, past
 #: an import-only start (a process that may still fork starts no thread).
 _TELLS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_tells", default=False)
+
+#: Calls whose process-ending fault is told in their own log (`Executor._call`).
+_TOLD: set[str] = set()
+
+
+def _scratch(command: Invoke) -> Path | None:
+    """The call's own folder in its project (`call_scope`); none: the executor's."""
+    value = getattr(command, "scratch", None)  # a TensorFS before cl-984 has none
+    return Path(value) if value else None
+
+
+def _call_store(command: Invoke) -> Path | None:
+    """The TensorFS store the call's own checkpoints are read from and written to (its sources,
+    its weights outputs); none: the executor's."""
+    value = getattr(command, "store", None)
+    return Path(value) if value else None
 
 
 class _CommandTeller:
@@ -1266,18 +1289,33 @@ class Executor:
             case Load():
                 return self.load(command, forwarded)
             case PrepareRequest():
-                return self.serve_request(command)
+                with call_scope.preparing(command.request_id):
+                    return self.serve_request(command)
             case Invoke():
-                try:
-                    return self._settled(self.serve_invoke(command))
-                except Exception as exc:
-                    target = self.constructions.get(command.construction, self)
-                    return self.unsettled(target, exc, command.request_id)
+                with self._call(command):
+                    try:
+                        return self._settled(self.serve_invoke(command))
+                    except Exception as exc:
+                        target = self.constructions.get(command.construction, self)
+                        return self.unsettled(target, exc, command.request_id)
             case Map():
                 return self.map(command)
             case _:
                 # `cancel` is the seam's (`Mux`), and `shutdown` ends the loop.
                 raise AssertionError(f"{type(command).__name__} is not answered here")
+
+    @contextlib.contextmanager
+    def _call(self, command: Invoke) -> Iterator[None]:
+        """An Invoke in its own place (`call_scope`); a fault that ends this process with it is
+        told in its own log."""
+        with call_scope.entered(_scratch(command), command.request_id) as placed:
+            try:
+                yield
+            except BaseException as exc:
+                if placed and not isinstance(exc, Exception):
+                    traceback.print_exc()
+                    _TOLD.add(command.request_id)
+                raise
 
     def hello(self) -> Reply:
         """What TensorD (`Hello`) and rank 0 (`group._Hello`) read: who this process is, its
@@ -1693,7 +1731,8 @@ class Executor:
         target = self._target(command, attempt=False)  # GPU 0 activated it
         if isinstance(target, dict):
             return target
-        return target._rank_attempt(asked, command, entropy, tag)
+        with call_scope.entered(_scratch(command), command.request_id):
+            return target._rank_attempt(asked, command, entropy, tag)
 
     def _rank_attempt(
         self, asked: PrepareRequest, command: Invoke, entropy: int, tag: str
@@ -3903,9 +3942,10 @@ class Executor:
         }
         exchange = self._exchange(command.request_id)
         connection = _connection(command.tensorfs, command.actor, self.bearers)
+        store = _call_store(command) or self._store()
         weight_outputs = (
             weights_store.Outputs(
-                self._store(),
+                store,
                 request_id=command.request_id,
                 actor=command.actor,
                 code=_replay_code(command, prepared.overlay.digest),
@@ -3971,7 +4011,7 @@ class Executor:
                         tensorfs_source=(
                             functools.partial(
                                 weights_store.open_checkpoint,
-                                self._store(),
+                                store,
                                 connection=connection,
                             )
                             if sources
@@ -5273,6 +5313,8 @@ def main(argv: list[str] | None = None) -> int:
         if os.getppid() != expected:
             return int(Exit.structural)
 
+    # Before any package is imported: whatever keeps `sys.stdout` or `sys.stderr` keeps the router.
+    call_scope.install()
     _capture_seal()
     _remember_distributions()
     declared_recipes.install(run_recipe)
@@ -5573,10 +5615,8 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
     """One command on a pool worker, in its turn. A BaseException, or a reply the seam would
     not take, ends the process, as either did when commands ran on the main thread; so does a
     `shutdown` that waited here for the calls before it, once answered."""
+    call = str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS | {"map"} else ""
     try:
-        call = (
-            str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS | {"map"} else ""
-        )
         _CALL.set(call)  # its wait for its turn is told as its own
         with turn:
             reply = _reply(executor, frame)
@@ -5589,7 +5629,10 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
                 executor.mux.forget(call)
             _send_reply(executor.channel, {**reply, "request_id": call} if call else reply)
     except BaseException as exc:
-        traceback.print_exc()
+        if call in _TOLD:  # its traceback is in its own log (`Executor._call`)
+            print(f"call {call} ended this executor: {type(exc).__name__}", file=sys.stderr)
+        else:
+            traceback.print_exc()
         sys.stderr.flush()
         os._exit(exc.code if isinstance(exc, SystemExit) and isinstance(exc.code, int) else 1)
 

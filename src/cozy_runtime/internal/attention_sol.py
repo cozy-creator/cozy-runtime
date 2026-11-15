@@ -47,7 +47,15 @@ if TYPE_CHECKING:
 from cozy_runtime.accel.attention import _ACTIVE_LAYOUT, AttentionLayout, _request
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._observations import Scalar
-from cozy_runtime.internal import accel, arch, config, kernel_cache, kernel_compile, kernel_ready
+from cozy_runtime.internal import (
+    accel,
+    arch,
+    call_scope,
+    config,
+    kernel_cache,
+    kernel_compile,
+    kernel_ready,
+)
 from cozy_runtime.internal.attention_ulysses import Local
 
 # Tensor and module imports remain type-only, preserving the Torch-free base surface.
@@ -537,7 +545,9 @@ def compile_variant(route: str, blocks: int = 0, full: bool = False) -> bytes:
     compiled = cute.compile(
         operator, *arguments, _SCALE, *scalars, stream=cuda.CUstream(0), options=OPTIONS
     )
-    with tempfile.TemporaryDirectory(prefix="cozy-kernel-") as scratch:
+    with tempfile.TemporaryDirectory(
+        prefix="cozy-kernel-", dir=call_scope.process_tempdir()
+    ) as scratch:
         path = Path(scratch) / "kernel.o"
         compiled.export_to_c(object_file_path=str(path), function_name=FUNCTION)
         return path.read_bytes()
@@ -587,7 +597,9 @@ def load(data: bytes) -> Loaded:
             # As flash-attn-4's own disk cache does: a loaded object resolves the DSL
             # runtime's symbols globally.
             ctypes.CDLL(library, mode=ctypes.RTLD_GLOBAL)
-    with tempfile.TemporaryFile(prefix="cozy-kernel-") as anonymous:
+    with tempfile.TemporaryFile(
+        prefix="cozy-kernel-", dir=call_scope.process_tempdir()
+    ) as anonymous:
         anonymous.write(data)
         anonymous.flush()
         path = f"/proc/self/fd/{anonymous.fileno()}"
