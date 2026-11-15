@@ -60,12 +60,12 @@ def generate(ctx: Context, payload: Request, model: Flow, tel: Telemetry) -> Res
 
 ## Calling another package without importing its implementation
 
-Keep managed-only dependencies in the standard `cozy-calls` dependency group in
+Keep managed-only dependencies in the standard `cozy-calls` optional extra in
 `pyproject.toml`, and lock them with the rest of the project:
 
 ```toml
-[dependency-groups]
-cozy-calls = ["example-child>=1"]
+[project.optional-dependencies]
+cozy-calls = ["example-child[cozy-calls]>=1"]
 ```
 
 Generate ordinary Python declarations from that locked package's canonical interface:
@@ -86,7 +86,10 @@ result = await call(generate, Request(prompt="a lighthouse"))
 Model choices remain named arguments to `call`; returned media and `ChildCallError` retain
 their ordinary managed-call behavior. Regenerate declarations after changing the locked
 dependency. Ordinary implementation imports and local function calls remain ordinary Python.
-The platform prepares the `cozy-calls` group for child execution separately from the caller.
+Each managed requirement requests its callee’s `cozy-calls` extra too, so ordinary wheel
+metadata and uv follow the managed dependency chain recursively. A child without that
+extra still supplies its ordinary dependencies. The platform prepares this closure for
+child execution separately from the caller.
 
 ## What the Runtime does for you
 
