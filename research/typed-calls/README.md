@@ -12,7 +12,7 @@ checks pass; the default-home public process qualification remains pending.
 from cozy_runtime.author import call
 from orbit._calls.minimax_h3 import PackageShot, render_shot
 
-result = await call(render_shot, PackageShot(...), models={"model": choice})
+result = await call(render_shot, PackageShot(...))
 ```
 
 `render_shot` is a generated, non-callable `Operation[PackageShot, ShotResult]`. A positional
