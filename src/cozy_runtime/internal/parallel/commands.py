@@ -34,9 +34,10 @@ class Shutdown(_Own, frozen=True, kw_only=True, tag="shutdown"):
 
 
 class Join(_Own, frozen=True, kw_only=True, tag="join"):
-    """A follower's first half: rank 0's store reached, then it says it is ready (`Form`)."""
+    """A follower's first half: rank 0's store opened, then it says it is ready (`Form`)."""
 
-    port: int
+    #: The attempt's store file, in rank 0's private directory (`group.rendezvous`).
+    store: str
     backend: str = "nccl"
     #: A socket follows: a byte on it aborts this follower's collectives (`RankGroup.interrupt`).
     abort: bool = False

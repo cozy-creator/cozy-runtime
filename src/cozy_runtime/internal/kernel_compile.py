@@ -31,7 +31,6 @@ import selectors
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -47,7 +46,7 @@ from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.canonical_json import JsonValue
-from cozy_runtime.internal import config, filelock, kernel_cache, proctree
+from cozy_runtime.internal import call_scope, config, filelock, kernel_cache, proctree
 
 #: kind -> the `module:function` a builder runs: `build(spec, staging, report) -> facts`. The
 #: function fills `staging` (an `object` file, a `site/` tree, or nothing when the artifact
@@ -344,7 +343,7 @@ def _compile_ms(entry_dir: Path) -> float:
 
 
 def _failures() -> Path:
-    return Path(tempfile.gettempdir()) / "cozy-kernel-failures"
+    return Path(call_scope.process_tempdir()) / "cozy-kernel-failures"
 
 
 def _failed_path(key: kernel_cache.Key, scope: Path | None = None) -> Path:

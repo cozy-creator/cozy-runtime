@@ -1,0 +1,1 @@
+A video or audio input opens only as one of Calcifer's demuxers (MP4/MOV, Matroska/WebM, AVI, MPEG-TS, Ogg, MP3, FLAC, WAV and the like) through the `file` protocol alone: an HLS playlist, a DASH manifest or a `concat` list is refused `media_format_refused`, and no input reaches another file or the network.

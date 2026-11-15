@@ -1,0 +1,43 @@
+baseline
+/home/fidika/.cozy/outputs/memory-246-inference-20260929/offline-native-investigation/compiler-venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvcc /home/fidika/cozy/.worktrees/cozy-runtime/h3-attention-schedule-20261115/research/h3-attention-schedule/build/baseline.cu -I /home/fidika/cozy/.worktrees/cozy-runtime/h3-attention-schedule-20261115/research/h3-attention-schedule/vendor/comfy-kitchen-f8b7e97a1418d2e529bd5405fbf86312be198ae6/comfy_kitchen/backends/cuda/sage_attention --shared -Xcompiler=-fPIC --cudart=shared --cudadevrt=none -L /home/fidika/.cozy/outputs/memory-246-inference-20260929/offline-native-investigation/compiler-venv/lib/python3.12/site-packages/nvidia/cu13/lib -Xlinker=-rpath,/home/fidika/.cozy/outputs/memory-246-inference-20260929/offline-native-investigation/compiler-venv/lib/python3.12/site-packages/nvidia/cu13/lib -std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda -lineinfo -Xptxas=-v -arch=sm_89 -o /home/fidika/cozy/.worktrees/cozy-runtime/h3-attention-schedule-20261115/research/h3-attention-schedule/build/baseline.so
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN44_GLOBAL__N__dabfac42_11_baseline_cu_30df193b16sol_exact_kernelI13__nv_bfloat16EEvPKaPKfS3_PK6float2S3_S5_PKtPKiPKS1_S5_S5_S3_PKjSC_iPT_iiiif' for 'sm_89'
+ptxas info    : Function properties for _ZN44_GLOBAL__N__dabfac42_11_baseline_cu_30df193b16sol_exact_kernelI13__nv_bfloat16EEvPKaPKfS3_PK6float2S3_S5_PKtPKiPKS1_S5_S5_S3_PKjSC_iPT_iiiif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 32768 bytes smem, 500 bytes cmem[0], 4 bytes cmem[2]
+ptxas info    : Compile time = 221.265 ms
+ptxas info    : Compiling entry function '_ZN44_GLOBAL__N__dabfac42_11_baseline_cu_30df193b16sol_exact_kernelI6__halfEEvPKaPKfS3_PK6float2S3_S5_PKtPKiPK13__nv_bfloat16S5_S5_S3_PKjSC_iPT_iiiif' for 'sm_89'
+ptxas info    : Function properties for _ZN44_GLOBAL__N__dabfac42_11_baseline_cu_30df193b16sol_exact_kernelI6__halfEEvPKaPKfS3_PK6float2S3_S5_PKtPKiPK13__nv_bfloat16S5_S5_S3_PKjSC_iPT_iiiif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 32768 bytes smem, 500 bytes cmem[0], 4 bytes cmem[2]
+ptxas info    : Compile time = 213.726 ms
+
+
+stage3
+/home/fidika/.cozy/outputs/memory-246-inference-20260929/offline-native-investigation/compiler-venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvcc /home/fidika/cozy/.worktrees/cozy-runtime/h3-attention-schedule-20261115/research/h3-attention-schedule/build/stage3.cu -I /home/fidika/cozy/.worktrees/cozy-runtime/h3-attention-schedule-20261115/research/h3-attention-schedule/vendor/comfy-kitchen-f8b7e97a1418d2e529bd5405fbf86312be198ae6/comfy_kitchen/backends/cuda/sage_attention --shared -Xcompiler=-fPIC --cudart=shared --cudadevrt=none -L /home/fidika/.cozy/outputs/memory-246-inference-20260929/offline-native-investigation/compiler-venv/lib/python3.12/site-packages/nvidia/cu13/lib -Xlinker=-rpath,/home/fidika/.cozy/outputs/memory-246-inference-20260929/offline-native-investigation/compiler-venv/lib/python3.12/site-packages/nvidia/cu13/lib -std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda -lineinfo -Xptxas=-v -arch=sm_89 -o /home/fidika/cozy/.worktrees/cozy-runtime/h3-attention-schedule-20261115/research/h3-attention-schedule/build/stage3.so
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN41_GLOBAL__N__502ed5bc_9_stage3_cu_30df193b16sol_exact_kernelI13__nv_bfloat16EEvPKaPKfS3_PK6float2S3_S5_PKtPKiPKS1_S5_S5_S3_PKjSC_iPT_iiiif' for 'sm_89'
+ptxas info    : Function properties for _ZN41_GLOBAL__N__502ed5bc_9_stage3_cu_30df193b16sol_exact_kernelI13__nv_bfloat16EEvPKaPKfS3_PK6float2S3_S5_PKtPKiPKS1_S5_S5_S3_PKjSC_iPT_iiiif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 221 registers, used 1 barriers, 49152 bytes smem, 500 bytes cmem[0], 4 bytes cmem[2]
+ptxas info    : Compile time = 219.531 ms
+ptxas info    : Compiling entry function '_ZN41_GLOBAL__N__502ed5bc_9_stage3_cu_30df193b16sol_exact_kernelI6__halfEEvPKaPKfS3_PK6float2S3_S5_PKtPKiPK13__nv_bfloat16S5_S5_S3_PKjSC_iPT_iiiif' for 'sm_89'
+ptxas info    : Function properties for _ZN41_GLOBAL__N__502ed5bc_9_stage3_cu_30df193b16sol_exact_kernelI6__halfEEvPKaPKfS3_PK6float2S3_S5_PKtPKiPK13__nv_bfloat16S5_S5_S3_PKjSC_iPT_iiiif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 221 registers, used 1 barriers, 49152 bytes smem, 500 bytes cmem[0], 4 bytes cmem[2]
+ptxas info    : Compile time = 224.426 ms
+
+
+l1kv
+/home/fidika/.cozy/outputs/memory-246-inference-20260929/offline-native-investigation/compiler-venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvcc /home/fidika/cozy/.worktrees/cozy-runtime/h3-attention-schedule-20261115/research/h3-attention-schedule/build/l1kv.cu -I /home/fidika/cozy/.worktrees/cozy-runtime/h3-attention-schedule-20261115/research/h3-attention-schedule/vendor/comfy-kitchen-f8b7e97a1418d2e529bd5405fbf86312be198ae6/comfy_kitchen/backends/cuda/sage_attention --shared -Xcompiler=-fPIC --cudart=shared --cudadevrt=none -L /home/fidika/.cozy/outputs/memory-246-inference-20260929/offline-native-investigation/compiler-venv/lib/python3.12/site-packages/nvidia/cu13/lib -Xlinker=-rpath,/home/fidika/.cozy/outputs/memory-246-inference-20260929/offline-native-investigation/compiler-venv/lib/python3.12/site-packages/nvidia/cu13/lib -std=c++17 -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda -lineinfo -Xptxas=-v -arch=sm_89 -o /home/fidika/cozy/.worktrees/cozy-runtime/h3-attention-schedule-20261115/research/h3-attention-schedule/build/l1kv.so
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN39_GLOBAL__N__23e21d1c_7_l1kv_cu_30df193b16sol_exact_kernelI13__nv_bfloat16EEvPKaPKfS3_PK6float2S3_S5_PKtPKiPKS1_S5_S5_S3_PKjSC_iPT_iiiif' for 'sm_89'
+ptxas info    : Function properties for _ZN39_GLOBAL__N__23e21d1c_7_l1kv_cu_30df193b16sol_exact_kernelI13__nv_bfloat16EEvPKaPKfS3_PK6float2S3_S5_PKtPKiPKS1_S5_S5_S3_PKjSC_iPT_iiiif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 32768 bytes smem, 500 bytes cmem[0], 4 bytes cmem[2]
+ptxas info    : Compile time = 348.791 ms
+ptxas info    : Compiling entry function '_ZN39_GLOBAL__N__23e21d1c_7_l1kv_cu_30df193b16sol_exact_kernelI6__halfEEvPKaPKfS3_PK6float2S3_S5_PKtPKiPK13__nv_bfloat16S5_S5_S3_PKjSC_iPT_iiiif' for 'sm_89'
+ptxas info    : Function properties for _ZN39_GLOBAL__N__23e21d1c_7_l1kv_cu_30df193b16sol_exact_kernelI6__halfEEvPKaPKfS3_PK6float2S3_S5_PKtPKiPK13__nv_bfloat16S5_S5_S3_PKjSC_iPT_iiiif
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 32768 bytes smem, 500 bytes cmem[0], 4 bytes cmem[2]
+ptxas info    : Compile time = 322.840 ms

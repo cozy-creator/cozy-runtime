@@ -1,6 +1,6 @@
 name: build
-# The PR check (tracker/design/ci-v2.md §1): errors-only lint, every source compiles, the package imports on CPU, the
-# attention table's check, and the type check (scripts/typecheck.sh: mypy --strict).
+# The PR check (tracker/design/ci-v2.md §1): errors-only lint, every source compiles, the package imports on CPU, no unknown
+# advisory in uv.lock (scripts/audit.sh), the attention table's check, and the type check (scripts/typecheck.sh: mypy --strict).
 # Required for merges into master and rc/*: it runs on the merge queue's group (merge_group), on the final
 # PR + branch state; on a pull request it is skipped, which lets the PR be queued. A docs-only group passes
 # without building.
@@ -44,6 +44,14 @@ jobs:
           enable-cache: true
       - if: steps.scope.outputs.run == 'true'
         run: uv sync --locked
+      # Advisories in the locked dependencies (xs-196): one not in pip-audit-known.txt fails.
+      - if: steps.scope.outputs.run == 'true'
+        run: scripts/audit.sh
+      # The release workflows run each action by its commit, never a tag that can move (xs-196).
+      - if: steps.scope.outputs.run == 'true'
+        run: |
+          cd .github/workflows
+          ! grep -nE '^\s*(- )?uses: *[^. ]' runtime-publish.yaml kernels.yaml rc-dev.yaml dev-build.yaml | grep -vE '@[0-9a-f]{40} # '
       - if: steps.scope.outputs.run == 'true'
         run: uv run --locked ruff check --select E9,F63,F7,F82 --output-format github .
       - if: steps.scope.outputs.run == 'true'

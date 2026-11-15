@@ -9,7 +9,6 @@ import sys
 from collections.abc import Sequence
 
 from cozy_runtime.cli import describe as describe_verb
-from cozy_runtime.cli import image_prepare as image_prepare_verb
 from cozy_runtime.cli import machine
 from cozy_runtime.cli import new as new_verb
 from cozy_runtime.cli import version as version_verb
@@ -26,8 +25,6 @@ BUILT = (
 PRIVATE = (
     "machine-describe",
     "frame-codec",
-    "image-prepare",
-    "image-preparation-profile",
     "python-interpreters",
     "python-ensure",
 )
@@ -224,10 +221,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
                 Exit.usage,
             )
         return new_verb.run(args[0], opts.dir)
-    if verb == "image-prepare":
-        return image_prepare_verb.run(args)
-    if verb == "image-preparation-profile":
-        return image_prepare_verb.profile(args)
     raise CliError(
         "usage",
         f"unknown verb {verb!r}",

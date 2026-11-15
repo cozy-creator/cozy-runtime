@@ -1,0 +1,1 @@
+`lora.Sites(component, paths)` hooks only the linears an overlay may arm (every linear when `paths` is omitted), so flux-2, krea-2, qwen-image, qwen-image-2 and minimax-h3 apply their own LoRAs through it with the hooks they had (se-133). Several overlays armed at once take a `Sites` each over the same component.

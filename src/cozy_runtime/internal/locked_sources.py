@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
-from cozy_runtime.internal import egress
+from cozy_runtime.internal import call_scope, egress
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
 
 #: A callee wheel is a package's source and its assets, never a framework.
@@ -98,7 +98,9 @@ class Wheels:
 
     def __init__(self, wheels: Mapping[str, LockedWheel]) -> None:
         self.pending = dict(wheels)
-        self.directory = Path(tempfile.mkdtemp(prefix="cozy-locked-wheels-"))
+        self.directory = Path(
+            tempfile.mkdtemp(prefix="cozy-locked-wheels-", dir=call_scope.process_tempdir())
+        )
         weakref.finalize(self, shutil.rmtree, self.directory, True)
 
     def root(self, module: str) -> Path | None:
