@@ -688,10 +688,6 @@ class _Recorder:
         self.seen: dict[tuple[object, ...], _Seen] = {}
         #: per signature, its launch-overhead probe (`_probe`), and its calls this attempt
         self.probes: dict[tuple[object, ...], _Probe] = {}
-        #: per path family (`_family`: its shapes, not its addresses), its ordinary device time a
-        #: call and its time with no launch gaps, as a probe measured them: a later request's
-        #: path of the same shapes decides by them with no probe of its own
-        self.costs: dict[tuple[object, ...], tuple[float, float]] = {}
         self.sights: dict[tuple[object, ...], int] = {}
         #: per signature, why its idle recording failed: a call may still record it
         self.idle_failed: dict[tuple[object, ...], str] = {}
@@ -897,7 +893,7 @@ class _Idle:
     def run(self, stop: Callable[[], bool]) -> bool:
         """Each queued job once, while `stop()` stays false; False when it turned true (the job
         it interrupted goes first next period)."""
-        self.stop, self.last, later = stop, time.perf_counter(), []
+        self.stop, self.last = stop, time.perf_counter()
         self.periods += 1
         torch = sys.modules.get("torch")  # a job's ops yield only where torch runs them
         token = _IDLE.set(self)
@@ -913,9 +909,11 @@ class _Idle:
                     # check: every torch call under a Python mode pays its dispatch.
                     ops = torch is not None and getattr(job, "yields_per_op", True)
                     with _yielding(torch)() if ops else nullcontext():
-                        done = job()
-                    if not done:
-                        later.append(job)
+                        job()
+                    # Done or not, it leaves the queue: one that can't record now (its pages not
+                    # resident, one call measured, a kernel building) is queued again by its
+                    # region's next call, so a period that records nothing leaves the executor
+                    # idle rather than running it again at once, forever (43715070664).
                 except Yielded:
                     self.yields += 1
                     with self.lock:
@@ -933,8 +931,6 @@ class _Idle:
             _IDLE.reset(token)
             self.queued.clear()
             self.longest_ms = max(self.longest_ms, (time.perf_counter() - self.last) * 1e3)
-            with self.lock:
-                self.jobs.extend(later)
 
     def document(self) -> dict[str, int | float]:
         return {
@@ -1011,10 +1007,21 @@ class _Pending:
     def __call__(self) -> bool:
         tokens = [(var, var.set(value)) for var, value in self.context]
         try:
-            return _capture_pending(self)
+            done = _capture_pending(self)
         finally:
             for var, token in reversed(tokens):
                 var.reset(token)
+        module = self.module()
+        recorder = _RECORDERS.get(module) if module is not None else None
+        if not done and recorder is not None:
+            # Off the queue until its region's next call queues it again (`_Idle.run`), and a
+            # region with no graph keeps no Binding for it
+            with recorder.lock:
+                if recorder.queued.get(self.key) is self:
+                    del recorder.queued[self.key]
+                if recorder.domain is not None:
+                    _drop_unused(recorder, recorder.domain)
+        return done
 
 
 def install(torch: ModuleType, model: object, roots: Mapping[str, Module]) -> list[str]:
@@ -1492,8 +1499,18 @@ def _region_path(
                 return _probe(torch, recorder, key, seen, lambda: call(module, *args, **kwargs))
             if result is not _EAGER:
                 return result
-    elif not any(key in held for held in _settled_by(recorder)):
-        _queue(torch, module, recorder, call, key, spec, leaves, placed)
+        # Not captured in this call (device-bound by its probe, too few calls left, no room):
+        # idle capture stays the backup, judging a replay against the call as written on
+        # resident weights. On a card other executors filled, SDXL's probe saw a streaming call
+        # and declined, and only an idle capture replays it (43715070664: 0.224 against 0.077 s).
+        # Only a call measured short is queued: a 34 s H3 step at idle would hold its executor.
+        took = seen.device_ms()
+        if (
+            took is not None
+            and took <= _PROBE_MS
+            and not any(key in held for held in _settled_by(recorder))
+        ):
+            _queue(torch, module, recorder, call, key, spec, leaves, placed)
     return _first(torch, recorder, key, lambda: call(module, *args, **kwargs))
 
 
@@ -1641,32 +1658,14 @@ def _too_few(recorder: _Recorder, key: tuple[object, ...], seen: _Seen, device: 
 
 
 def _launch_cost(recorder: _Recorder, key: tuple[object, ...]) -> tuple[float, float] | object:
-    """`key`'s ordinary device time a call and its time with no launch gaps: its own probe's,
-    None while that is on the device, else those a path of the same shapes measured in an
-    earlier request (`_family`), else `_PROBE`."""
-    family = _family(key)
-    if (probe := recorder.probes.get(key)) is not None:
-        if (busy := probe.busy_ms()) is None:
-            return None
-        recorder.costs[family] = (probe.normal, busy)
-        return probe.normal, busy
-    return recorder.costs.get(family, _PROBE)
-
-
-def _family(key: tuple[object, ...]) -> tuple[object, ...]:
-    """`key` with no object identities or addresses: its arguments' layout (an opaque argument
-    by its kind alone), autocast, attention layout and structure. What sets a call's cost, so
-    a path's measured launch overhead holds for a later request's path of the same shapes whose
-    prefix K/V sits at another address (Qwen-Image-2's cached steps, a new key every request)."""
-    *signature, parts = key
-    leaves = tuple(
-        ("object", leaf[1][0] if isinstance(leaf[1], tuple) and leaf[1] else type(leaf[1]))
-        if isinstance(leaf, tuple) and len(leaf) == 2 and leaf[0] == "object"
-        else leaf
-        for leaf in signature
-    )
-    found = cast("_Parts", parts)
-    return (*leaves, found.autocast, found.attention, found.structure)
+    """`key`'s ordinary device time a call and its time with no launch gaps from its probe, None
+    while that is on the device, else `_PROBE`. Never carried from another request's path: one
+    measured while its weights streamed reads as device-bound (43715070664)."""
+    if (probe := recorder.probes.get(key)) is None:
+        return _PROBE
+    if (busy := probe.busy_ms()) is None:
+        return None
+    return probe.normal, busy
 
 
 def _unpaid(
