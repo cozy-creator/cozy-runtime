@@ -95,3 +95,14 @@ was selected. The built middle wheel carries `Provides-Extra: cozy-calls` and th
 `Requires-Dist` edge. A legacy leaf without the extra warns and retains its ordinary
 dependencies. There is no second dependency manifest. The CPU fixture now includes
 A → B → legacy C → private self call.
+
+## Shared Torch layer
+
+cl-715 deliberately exposes the machine's full Torch layer to every Python environment.
+The actual local Torch 2.15.0+cu132 layer includes SymPy, so a SymPy-absence assertion would
+misdiagnose correct managed dependency separation. The CPU fixture uses xxhash, verified
+absent from that layer, for a real leaf computation and checks its absence in the caller.
+It separately reports Torch/SymPy availability and whether Torch was imported. The earlier
+minimal-venv UV proof remains a dependency-resolution result, not a claim that production
+Python execution is Torch-free. The shared platform layer remains unchanged; Python-free
+native execution belongs to xs-153.
