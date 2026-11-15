@@ -688,6 +688,10 @@ class _Recorder:
         self.seen: dict[tuple[object, ...], _Seen] = {}
         #: per signature, its launch-overhead probe (`_probe`), and its calls this attempt
         self.probes: dict[tuple[object, ...], _Probe] = {}
+        #: per path family (`_family`: its shapes, not its addresses or identities), the ordinary
+        #: device time of a call its probe found device-bound: a later request's new key of the
+        #: same shapes is judged by it with no hold of its own; idle capture is the backstop
+        self.device_bound: dict[tuple[object, ...], float] = {}
         self.sights: dict[tuple[object, ...], int] = {}
         #: per signature, why its idle recording failed: a call may still record it
         self.idle_failed: dict[tuple[object, ...], str] = {}
@@ -807,10 +811,12 @@ class _Recorder:
         self.idle_failed.clear()
         self.short.clear()
         self.waiting.clear()
-        self.seen.clear()
-        self.probes.clear()
         self.codes.clear()
         self.landed = LANDED[0]
+        # `seen` and `probes` measure the call as written and outlive its graphs: a kernel landing
+        # anywhere in the process forgets graph-less regions too, and wiping them made every
+        # request probe again (43733785568: Klein, HiDream, Ideogram, +0.08-0.14 s a request).
+        # A later call as written replaces `seen`; the idle backup judges a stale probe wrong.
 
 
 #: each installed component root's region
@@ -1659,13 +1665,32 @@ def _too_few(recorder: _Recorder, key: tuple[object, ...], seen: _Seen, device: 
 
 def _launch_cost(recorder: _Recorder, key: tuple[object, ...]) -> tuple[float, float] | object:
     """`key`'s ordinary device time a call and its time with no launch gaps from its probe, None
-    while that is on the device, else `_PROBE`. Never carried from another request's path: one
-    measured while its weights streamed reads as device-bound (43715070664)."""
+    while that is on the device; for a key with no probe, a device-bound verdict its family's
+    probe left (both times its call's, no saving), else `_PROBE`. Only "device-bound" carries:
+    a launch-bound family probes each new key, which may capture."""
     if (probe := recorder.probes.get(key)) is None:
-        return _PROBE
+        normal = recorder.device_bound.get(_family(key))
+        return _PROBE if normal is None else (normal, normal)
     if (busy := probe.busy_ms()) is None:
         return None
+    if max(0.0, probe.normal - busy) < _SAVING * probe.normal:
+        recorder.device_bound[_family(key)] = probe.normal
     return probe.normal, busy
+
+
+def _family(key: tuple[object, ...]) -> tuple[object, ...]:
+    """`key` with no object identities or addresses: its arguments' layout (an opaque argument
+    by its kind alone), autocast, attention layout and structure: what sets a call's cost.
+    Flux-2's key changes every request in its host state (43733785568)."""
+    *signature, parts = key
+    leaves = tuple(
+        ("object", leaf[1][0] if isinstance(leaf[1], tuple) and leaf[1] else type(leaf[1]))
+        if isinstance(leaf, tuple) and len(leaf) == 2 and leaf[0] == "object"
+        else leaf
+        for leaf in signature
+    )
+    found = cast("_Parts", parts)
+    return (*leaves, found.autocast, found.attention, found.structure)
 
 
 def _unpaid(
@@ -3316,6 +3341,11 @@ def _changed(
         elif what == "context":
             moved = sorted(set(before.context) ^ set(now.context))
             what = f"context {moved[0][0]}"
+        elif what == "host":  # a context object, a producer's request state, a hook's closure
+            at = next((i for i, (a, b) in enumerate(zip(before.host, now.host)) if a != b), 0)
+            item = now.host[at] if at < len(now.host) else None
+            label = item[0] if isinstance(item, tuple) and item and isinstance(item[0], str) else at
+            what = f"host {label}"
     recorder.changes[what] = recorder.changes.get(what, 0) + 1
 
 
