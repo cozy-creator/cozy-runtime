@@ -688,6 +688,10 @@ class _Recorder:
         self.seen: dict[tuple[object, ...], _Seen] = {}
         #: per signature, its launch-overhead probe (`_probe`), and its calls this attempt
         self.probes: dict[tuple[object, ...], _Probe] = {}
+        #: per path family (`_family`: its shapes, not its addresses), its ordinary device time a
+        #: call and its time with no launch gaps, as a probe measured them: a later request's
+        #: path of the same shapes decides by them with no probe of its own
+        self.costs: dict[tuple[object, ...], tuple[float, float]] = {}
         self.sights: dict[tuple[object, ...], int] = {}
         #: per signature, why its idle recording failed: a call may still record it
         self.idle_failed: dict[tuple[object, ...], str] = {}
@@ -1313,6 +1317,7 @@ OUTCOMES = {
     "first_occurrence": "its path's first call: measured for its next",
     "measuring": "its last call's timing was still on the device",
     "device_bound": "the device, not the host, sets its pace: a graph saves nothing",
+    "too_few": "too few calls left in this request to repay a capture, even all launch overhead",
     "no_gain": "a checked replay was no faster",
     "no_room": "no room for its graph's pool or weights",
     "refused": "the code can't be recorded (a capture refusal, state it changes)",
@@ -1619,17 +1624,59 @@ def _probe[T](
     return result
 
 
+def _too_few(recorder: _Recorder, key: tuple[object, ...], seen: _Seen, device: float) -> str:
+    """Why probing `key` can't pay ("" when it might): a replay saves at most a call's host
+    submission (all of it launch overhead) and at most its device time, and even that over the
+    calls left in this request repays no capture and check. A 4-step turbo held the device for
+    its probe at every request and never captured (Qwen-Image-2, 43687738568: 0.45 s a step)."""
+    ahead = _ahead(recorder, key)
+    most = min(seen.submit_ms, device) * ahead
+    cost = _capture_cost(recorder, seen.submit_ms, device)
+    if most > cost:
+        return ""
+    return f"{ahead} calls left save at most {most:.0f} ms, against ~{cost:.0f} ms to capture and check"
+
+
+def _launch_cost(recorder: _Recorder, key: tuple[object, ...]) -> tuple[float, float] | object:
+    """`key`'s ordinary device time a call and its time with no launch gaps: its own probe's,
+    None while that is on the device, else those a path of the same shapes measured in an
+    earlier request (`_family`), else `_PROBE`."""
+    family = _family(key)
+    if (probe := recorder.probes.get(key)) is not None:
+        if (busy := probe.busy_ms()) is None:
+            return None
+        recorder.costs[family] = (probe.normal, busy)
+        return probe.normal, busy
+    return recorder.costs.get(family, _PROBE)
+
+
+def _family(key: tuple[object, ...]) -> tuple[object, ...]:
+    """`key` with no object identities or addresses: its arguments' layout (an opaque argument
+    by its kind alone), autocast, attention layout and structure. What sets a call's cost, so
+    a path's measured launch overhead holds for a later request's path of the same shapes whose
+    prefix K/V sits at another address (Qwen-Image-2's cached steps, a new key every request)."""
+    *signature, parts = key
+    leaves = tuple(
+        ("object", leaf[1][0] if isinstance(leaf[1], tuple) and leaf[1] else type(leaf[1]))
+        if isinstance(leaf, tuple) and len(leaf) == 2 and leaf[0] == "object"
+        else leaf
+        for leaf in signature
+    )
+    found = cast("_Parts", parts)
+    return (*leaves, found.autocast, found.attention, found.structure)
+
+
 def _unpaid(
-    recorder: _Recorder, key: tuple[object, ...], seen: _Seen, probe: _Probe, busy: float
+    recorder: _Recorder, key: tuple[object, ...], seen: _Seen, normal: float, busy: float
 ) -> str:
     """Why capturing `key` in this call wouldn't pay ("" when it would): its launch overhead
     over the calls ahead against the capture's cost, and at least `_SAVING` of the call."""
-    saving, ahead = max(0.0, probe.normal - busy), _ahead(recorder, key)
+    saving, ahead = max(0.0, normal - busy), _ahead(recorder, key)
     cost = _capture_cost(recorder, seen.submit_ms, busy)
-    if saving >= _SAVING * probe.normal and saving * ahead > cost:
+    if saving >= _SAVING * normal and saving * ahead > cost:
         return ""
     return (
-        f"launch overhead {saving:.1f} of {probe.normal:.1f} ms a call, {ahead} calls ahead, "
+        f"launch overhead {saving:.1f} of {normal:.1f} ms a call, {ahead} calls ahead, "
         f"against ~{cost:.0f} ms to capture and check"
     )
 
@@ -1723,12 +1770,16 @@ def _capture_call(
         recorder.gap = f"device-bound: a {device:.0f} ms call"
         _note(recorder, "device_bound", recorder.gap)
         return _EAGER
-    elif (probe := recorder.probes.get(key)) is None:
+    elif (measured := _launch_cost(recorder, key)) is _PROBE:
+        if why := _too_few(recorder, key, seen, device):
+            recorder.gap = why
+            _note(recorder, "too_few", why)
+            return _EAGER
         return _PROBE
-    elif (busy := probe.busy_ms()) is None:
+    elif measured is None:
         _note(recorder, "measuring", "its probe is still on the device")
         return _EAGER
-    elif why := _unpaid(recorder, key, seen, probe, busy):
+    elif why := _unpaid(recorder, key, seen, *cast("tuple[float, float]", measured)):
         recorder.gap = why
         _note(recorder, "device_bound", why)
         return _EAGER
