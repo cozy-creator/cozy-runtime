@@ -78,7 +78,7 @@ def read(project: Path) -> Locked:
             tree = (project / where).resolve()
             if tree != project and tree.is_dir():
                 roots += [tree / "src", tree]
-        elif "registry" in source and isinstance(name := row.get("name"), str):
+        elif ("registry" in source or "url" in source) and isinstance(name := row.get("name"), str):
             pure = [w for w in row.get("wheels", ()) if isinstance(w, dict) and _pure(w)]
             if len(pure) == 1 and str(pure[0].get("hash", "")).startswith("sha256:"):
                 module = re.sub(r"[-_.]+", "_", name).lower()
