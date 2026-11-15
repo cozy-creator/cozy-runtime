@@ -408,6 +408,9 @@ class _Recording:
         self.bands = [(site, band, b) for (site, band), held in served.bands.items() for b in held]
         #: the storages outside the call it reads (`observe`): each must live for it to replay
         self.foreign = observed.foreign
+        #: the Bindings of the overlays whose factors it adds per call, held with its own
+        #: weights at each replay (`_lease`)
+        self.overlays: tuple[Binding, ...] = ()
         #: the retained states it reads, each with the address it read it at: pinned there for
         #: each replay (`_pinned`), or the graph goes
         self.retained: list[tuple[weakref.ref[object], int]] = [
@@ -529,7 +532,7 @@ class _Recording:
     def close(self) -> None:
         """After last use: release static tensors and executable before their pool."""
         self.inputs, self.outputs, self.writes, self.foreign, self.reads = [], None, [], [], ()
-        self.retained = []
+        self.retained, self.overlays = [], ()
         cast("CUDAGraph", self.graph).reset()  # cast: it closes once
         self.graph = self.pool = None
 
@@ -685,6 +688,10 @@ class _Recorder:
         self.producers: tuple[AttentionProducer, ...] = ()
         #: its LoRA overlay hooks (`_loras`), found with its structure
         self.loras = _Loras((), ())
+        #: the components this call's overlays add factors from (`_state`), and each one's
+        #: Binding once a graph needed it (`_overlay_bindings`)
+        self.overlays: list[_Placed] = []
+        self.overlay_bindings: dict[tuple[int, str], Binding] = {}
         #: bumped by an attribute set on any of its modules (`_watching`), which a graph's
         #: read guards are checked again for; `structural`, by a class or submodule set
         self.generation = 0
@@ -755,6 +762,11 @@ class _Recorder:
         for entry in self.recordings.values():
             entry.finish()
 
+    def close_overlays(self) -> None:
+        for binding in self.overlay_bindings.values():
+            binding.close()
+        self.overlay_bindings.clear()
+
     def drop(self) -> None:
         self.retired += len(self.recordings)
         for entry in self.recordings.values():
@@ -764,6 +776,7 @@ class _Recorder:
         if self.binding is not None:
             self.binding.close()
             self.binding = None
+        self.close_overlays()
         self.pool = None
         self.queued.clear()
         self.failed.clear()
@@ -1779,6 +1792,9 @@ def _capture_verified(
             with ExitStack() as held:
                 if recorder.binding is not None:
                     held.enter_context(recorder.binding.prepare(current))
+                overlays = _overlay_bindings(recorder) if recorder.binding is not None else ()
+                for binding in overlays:  # factors added per call: their component's Regions
+                    held.enter_context(binding.prepare(current))
                 state = held.enter_context(
                     _capture_state(
                         torch, module, cast("Stream", owner.stream), weights, clone=False
@@ -1787,7 +1803,7 @@ def _capture_verified(
                 served = held.enter_context(attention_ulysses.observing())
                 entry = _build(
                     torch, module, recorder, key, owner, placed, call, spec, layout,
-                    vt.pool_bytes(seen.peak or 0), state, served,
+                    vt.pool_bytes(seen.peak or 0), state, served, overlays=overlays,
                 )
             if entry is None:
                 return None
@@ -1796,7 +1812,7 @@ def _capture_verified(
             # The state it writes outside the call, as the call found it: put back after the
             # check's replay, so the call as written starts where the replay did.
             replayed.saved = [t.clone() for t in entry.writes]
-            with _lease(torch, placed, recorder.binding):
+            with _lease(torch, placed, recorder.binding, overlays=entry.overlays):
                 replayed.first.record(current)
                 began = time.perf_counter()
                 entry(leaves, out, written=replayed.inputs)
@@ -1841,6 +1857,7 @@ def _drop_unused(recorder: _Recorder, owner: domain.Domain) -> None:
     if recorder.binding is not None:
         recorder.binding.close()
         recorder.binding = None
+    recorder.close_overlays()
 
 
 #: a replay is kept when it saves more than this share of the call as written
@@ -2042,8 +2059,24 @@ _VARIANTS = 4
 def _state(
     torch: ModuleType, recorder: _Recorder, module: Module
 ) -> tuple[tuple[object, ...], str]:
-    """The key's overlays part, and why the call runs as written ("" when none)."""
-    return _overlays(recorder.loras)
+    """The key's overlays part, and why the call runs as written ("" when none). The components
+    whose factors it adds per call are this call's `recorder.overlays` (`_overlay_bindings`)."""
+    owners: list[_Placed] = []
+    part, why = _overlays(recorder.loras, owners)
+    recorder.overlays = owners
+    return part, why
+
+
+def _overlay_bindings(recorder: _Recorder) -> tuple[Binding, ...]:
+    """The Bindings of the components this call's overlays add factors from, retained once."""
+    held = []
+    for residency, name in recorder.overlays:
+        key = (id(residency), name)
+        binding = recorder.overlay_bindings.get(key)
+        if binding is None:
+            binding = recorder.overlay_bindings[key] = residency.retain(name, ("",))
+        held.append(binding)
+    return tuple(held)
 
 
 def _context() -> tuple[tuple[str, object], ...]:
@@ -2223,7 +2256,7 @@ def _replay(
     missed: list[int] = []
     try:
         began = time.perf_counter()
-        lease = _lease(torch, placed, recorder.binding, missed)
+        lease = _lease(torch, placed, recorder.binding, missed, entry.overlays)
         lease.__enter__()
         recorder.prepare_ms += (time.perf_counter() - began) * 1e3
     except StaleBinding as exc:
@@ -2450,6 +2483,7 @@ def _record(
                 # A rejected warm-up keeps no Regions when no executable reads them.
                 recorder.binding.close()
                 recorder.binding = None
+            recorder.close_overlays()
 
 
 def _build(
@@ -2467,6 +2501,7 @@ def _build(
     served: Seen,
     *,
     idle: bool = False,
+    overlays: tuple[Binding, ...] = (),
 ) -> _Recording | None:
     """`call` recorded on static inputs of `layout` in its region's pool, `reserve` bytes of it
     prepared first; None when it can't be kept, its reason recorded: the capture refused it
@@ -2485,7 +2520,7 @@ def _build(
     outputs: list[object] = []
     observed: list[observe.Observed] = []
     reads: list[tuple[Module, str, object, bool]] = []
-    weights = _weights(torch, module, recorder.binding)
+    weights = _weights(torch, module, recorder.binding, overlays)
     from cozy_runtime.internal import residency  # loaded by any placement
 
     retained = residency.kept_ranges()
@@ -2544,19 +2579,21 @@ def _build(
             _note(recorder, "refused", why)
         return None
     entry = _Recording(torch, graph, pool, statics, outputs[0], key, served, owner, seen)
+    entry.overlays = overlays
     entry.reads = tuple(reads)
     return entry
 
 
 def _weights(
-    torch: ModuleType, module: Module, binding: Binding | None
+    torch: ModuleType, module: Module, binding: Binding | None, overlays: tuple[Binding, ...] = ()
 ) -> list[tuple[int, int]]:
     """The address ranges of what a capture of `module` may read as its weights: its binding's
-    Regions and computed tensors, and its own parameters and buffers bound now."""
+    Regions and computed tensors, its own parameters and buffers bound now, and the Regions of
+    the overlays whose factors it adds per call (held with it at each replay)."""
     spans = observe.ranges((*module.parameters(), *module.buffers()))
-    if binding is not None:
-        spans += observe.ranges(binding.computed)
-        spans += [(r.ptr, r.ptr + r.allocated_bytes) for r in binding.regions or () if r.ptr]
+    for held in (binding, *overlays) if binding is not None else ():
+        spans += observe.ranges(held.computed)
+        spans += [(r.ptr, r.ptr + r.allocated_bytes) for r in held.regions or () if r.ptr]
     return observe.merge(spans)
 
 
@@ -2731,27 +2768,57 @@ def _armed_now(hook: object) -> object | None:
     return None if answer is None else cast("tuple[object, ...]", answer)[0]
 
 
-def _overlays(loras: _Loras) -> tuple[tuple[object, ...], str]:
-    """What the LoRA hooks arm now, as a key part, and why the call runs as written: factors a
-    hook adds per call read another component's pages, which a replay does not hold. Baked
+def _overlays(loras: _Loras, owners: list[_Placed] | None = None) -> tuple[tuple[object, ...], str]:
+    """What the LoRA hooks arm now, as a key part, and why the call runs as written. Baked
     factors are in the call's own pages, under the overlay they were filled with, so a graph
-    keyed by them reads the right ones."""
+    keyed by them reads the right ones. Factors a hook adds per call are another component's
+    (the overlay's own model): keyed by identity, that component goes into `owners`, and a
+    graph of the call holds its Binding at capture and each replay, as it holds its own weights.
+    Factors of no placed component run the call as written."""
     part: list[object] = []
     for sites, hooks in loras.sites:
         if sites.armed is None:
             continue
         for hook in hooks:
-            if _armed_now(hook) is not None and not getattr(hook, "_cozy_baked", False):
-                return (), "under a LoRA overlay applied per call"
+            factors = _armed_now(hook)
+            if factors is not None and not getattr(hook, "_cozy_baked", False):
+                if (owner := _overlay_owner(factors)) is None:
+                    return (), "under a LoRA overlay applied per call"
+                if owners is not None and owner not in owners:
+                    owners.append(owner)
         part.append((id(sites), id(sites.armed)))
     for path, hook in loras.hooks:
         factors = _armed_now(hook)
         if factors is None:
             continue
         if not getattr(hook, "_cozy_baked", False):
-            return (), f"under a LoRA overlay applied per call at {path}"
+            if (owner := _overlay_owner(factors)) is None:
+                return (), f"under a LoRA overlay applied per call at {path}"
+            if owners is not None and owner not in owners:
+                owners.append(owner)
+            part.append((path, id(factors), "per call"))
+            continue
         part.append((path, id(factors)))
     return tuple(part), ""
+
+
+#: an overlay's factors (a module of its own model) to the placed component holding them
+_OWNERS: weakref.WeakKeyDictionary[object, _Placed] = weakref.WeakKeyDictionary()
+
+
+def _overlay_owner(factors: object) -> _Placed | None:
+    """The placed component whose model holds these factors, found once."""
+    try:
+        if (held := _OWNERS.get(factors)) is not None:
+            return held
+    except TypeError:  # not weakly referable: no module of a loaded model
+        return None
+    for root, placed in list(PLACED.items()):
+        modules = getattr(root, "modules", None)
+        if callable(modules) and any(sub is factors for sub in modules()):
+            _OWNERS[factors] = placed
+            return placed
+    return None
 
 
 class _State:
@@ -2948,6 +3015,7 @@ def _lease(
     placed: _Placed | None,
     binding: Binding | None,
     missed: list[int] | None = None,
+    overlays: tuple[Binding, ...] = (),
 ) -> AbstractContextManager[None]:
     if placed is None or binding is None:
         return nullcontext()
@@ -2955,7 +3023,7 @@ def _lease(
     stream, held = torch.cuda.current_stream(), placed[0].graph_held(placed[1])
     if held is not None and held != stream:
         stream.wait_stream(held)
-    return replaying(stream, (binding,), missed)
+    return replaying(stream, (binding, *overlays), missed)
 
 
 def _refused(recorder: _Recorder, placed: _Placed | None, why: str) -> None:
