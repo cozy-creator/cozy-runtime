@@ -1864,6 +1864,11 @@ def _capture_verified(
                 return None
             owner.initialize()
             owner.prime_blas()
+            # Before any weight moves for it: a pool that can't sit beside its loop's weights
+            pool = vt.pool_bytes(seen.peak or 0)
+            if placed is not None and (over := _over_card(owner.device, placed, recorder, pool)):
+                _short(module, recorder, key, over)
+                return None
             if placed is not None and recorder.binding is None:
                 recorder.binding = placed[0].retain(placed[1], ("",))
             weights = (
@@ -1889,10 +1894,6 @@ def _capture_verified(
                     )
                 )
                 served = held.enter_context(attention_ulysses.observing())
-                pool = vt.pool_bytes(seen.peak or 0)
-                if placed is not None and (over := _over_card(owner.device, placed, recorder, pool)):
-                    _short(module, recorder, key, over)
-                    return None
                 entry = _build(
                     torch, module, recorder, key, owner, placed, call, spec, layout, pool,
                     state, served, overlays=overlays,
