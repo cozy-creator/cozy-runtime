@@ -285,7 +285,7 @@ def _module(
             f"    models={model_names!r}, assets_parameter={assets_parameter!r},\n"
             f"    wire_request={wire_request},\n)\n"
         )
-    return "\n".join(imports + [item[1] for item in declarations.values()] + functions + [""])
+    return "\n".join(imports + [item[1] for item in declarations.values()] + functions).rstrip() + "\n"
 
 
 _MEDIA = {"image": "Image", "video": "Video", "audio": "Audio"}
