@@ -11,14 +11,15 @@ graph also holds the module attributes its capture read (`_reading`): it replays
 each still has the value it had, so one path may keep a few graphs, one per such state. A
 signature's first call runs as written and measures its working memory (`_first`); its next
 records in the call (`_capture_call`) when its pool fits beside its loop's weights
-(`_over_card`): the graph replays once on that call's inputs, the call runs as written and
-serves, and the graph is kept when the two match bit for bit (outputs, the inputs it writes
-and the state it writes outside the call); every later call replays. Every path records,
-whatever it would save: a device-bound call replays as fast as it runs. What the capture
-reads outside its inputs, pool and weights (`observe`) must still be there at each replay, or
-the graph goes and the call records again. Recording changes no state of the model. An idle
-period records a short signature its call could not (no room, a kernel building), under its
-call's context (`capture_idle`), as the backup.
+(`_over_card`) and the request's capture work stays within its share (`_Budget`): the graph
+replays once on that call's inputs, the call runs as written and serves, and the graph is kept
+when the two match bit for bit (outputs, the inputs it writes and the state it writes outside
+the call); every later call replays. Every path records, whatever it would save: a
+device-bound call replays as fast as it runs. What the capture reads outside its inputs, pool
+and weights (`observe`) must still be there at each replay, or the graph goes and the call
+records again. Recording changes no state of the model. An idle period records a short
+signature its call could not (no room, a kernel building, its request's share spent), under
+its call's context (`capture_idle`), as the backup.
 Every graph has its own static buffers in its region's capture pool (`domain`), opened only for
 a capture that may keep it. A cached binding owns virtual addresses only; its physical lease
 covers preparation through output copies, and a completion event orders reuse across streams.
@@ -737,6 +738,11 @@ class _Recorder:
         #: every call records again every call)
         self.last: tuple[object, ...] | None = None
         self.changes: dict[str, int] = {}
+        #: the requests it last recorded and replayed in, the one whose first capture checked
+        #: them, its requests in a row that recorded again with no replay, and why it stopped
+        #: recording for the process (`_churning`)
+        self.recorded_in = self.replayed_in = self.checked_in = self.churned = ""
+        self.churn = 0
         self.eager: _Timing = _Timing()
         self.replayed: _Timing = _Timing()
         #: calls a guard ran as written, by reason (`_region_call`'s `why`)
@@ -1322,6 +1328,7 @@ OUTCOMES = {
     "replayed": "its graph replayed",
     "recorded": "it captured a graph, checked against the call as written, which served",
     "first_occurrence": "its path's first call: its working memory measured for its pool",
+    "deferred": "this request's capture work reached its share: a later request records it",
     "no_room": "no room for its graph's pool or weights",
     "refused": "the code can't be recorded (a capture refusal, state it changes)",
     "capture_refused": "its capture failed",
@@ -1370,6 +1377,7 @@ def _region_call(
 ) -> object:
     """A region call, counted by how it ran (`OUTCOMES`)."""
     recorder.now = ("first_occurrence", "")
+    _BUDGET.called()
     running: list[tuple[_Recorder, Module]] = _RUNNING.__dict__.setdefault("regions", [])
     running.append((recorder, module))
     try:
@@ -1592,6 +1600,72 @@ _IDLE_MS = 1000.0
 _SEQUENCE = itertools.count()
 
 
+class _Budget:
+    """This process's request and the capture work it paid: a capture runs its call twice on the
+    device (the check's replay, then the call as written), so a request records at most
+    `_SHARE` of its length (this request's so far, or the last one's), at least `_FLOOR_MS`, and
+    always its first capture. More waits for a later request or an idle period: H3's dense steps
+    differ in shape step to step, and on a card their pools fit, request 2 recording each at once
+    would run every ~34 s step twice."""
+
+    __slots__ = ("began", "last", "previous", "request", "spent")
+
+    def __init__(self) -> None:
+        self.request, self.began, self.last, self.previous, self.spent = "", 0.0, 0.0, 0.0, 0.0
+
+    def called(self) -> None:
+        """A region call: a new request id opens a new budget."""
+        context, now = CURRENT.get(), time.perf_counter()
+        request = context.request_id if context is not None else ""
+        if request != self.request:
+            if self.request:
+                self.previous = (self.last - self.began) * 1e3
+            self.request, self.began, self.spent = request, now, 0.0
+        self.last = now
+
+    def over(self, seen: _Seen) -> str:
+        """Why recording `seen`'s path now would pass this request's share ("" when it fits)."""
+        if self.spent == 0.0:
+            return ""
+        cost = max(seen.host_ms, seen.device_ms() or 0.0) + seen.submit_ms
+        share = max(_SHARE * max((self.last - self.began) * 1e3, self.previous), _FLOOR_MS)
+        if self.spent + cost <= share:
+            return ""
+        return f"its request's captures took {self.spent:.0f} ms; {cost:.0f} more pass {share:.0f}"
+
+    def spend(self, ms: float) -> None:
+        self.spent += max(ms, 0.001)
+
+
+#: the share of a request its captures may take beyond its calls, and the least they may take
+_SHARE, _FLOOR_MS = 0.10, 1000.0
+_BUDGET = _Budget()
+
+
+def _churning(recorder: _Recorder) -> str:
+    """Why a region records no more in this process ("" while it may): its paths changed in
+    `_CHURN` requests in a row, each recording again before any graph of an earlier request
+    replayed, so its graphs never outlive their request and each capture is pure cost (a key part
+    rebuilt per request: H3's loop slots and rope presentation, by address). Checked at a
+    request's first capture of the region; named by the key part that moved most."""
+    request = _BUDGET.request
+    if not recorder.churned and recorder.checked_in != request:
+        recorder.checked_in = request
+        again = recorder.recorded_in not in ("", request) and recorder.replayed_in != request
+        recorder.churn = recorder.churn + 1 if again else 0
+        if recorder.churn >= _CHURN:
+            moved = max(recorder.changes, key=recorder.changes.__getitem__, default="its key")
+            recorder.churned = (
+                f"its paths change every request ({moved}): recorded again in {_CHURN} requests "
+                "in a row before any earlier graph replayed"
+            )
+    return recorder.churned
+
+
+#: requests in a row a region may record again with no earlier graph replayed
+_CHURN = 2
+
+
 def _over_card(device: int, placed: _Placed, recorder: _Recorder, pool: int) -> str:
     """Why a graph of `placed`'s component would refill weights at every replay, "" when it fits.
     A replay needs all its weights on the card, and every other component its loop runs (called
@@ -1655,12 +1729,21 @@ def _capture_call(
             recorder.codes[key] = "refused"
         _note(recorder, "refused", why)
         return _EAGER
+    if not FORCE and (why := _churning(recorder)):
+        recorder.gap = why
+        _note(recorder, "refused", why)
+        return _EAGER
+    if not FORCE and (why := _BUDGET.over(seen)):
+        recorder.gap = why
+        _note(recorder, "deferred", why)
+        return _EAGER
     owner = _owner(torch, module, recorder, placed)
     recorder.capture_attempts += 1
     began = time.perf_counter()
     entry = _capture_verified(torch, module, recorder, call, key, spec, leaves, placed, seen, owner)
     if entry is None:
         recorder.capture_ms += (time.perf_counter() - began) * 1e3
+        _BUDGET.spend((time.perf_counter() - began) * 1e3)
         return _EAGER
     recording, out, replayed = entry
     # As written, last: what serves the call is eager's, whatever the check finds.
@@ -1693,6 +1776,7 @@ def _capture_call(
             if recorder.landed != LANDED[0] or _find(recorder, key) is not None:
                 return result  # a kernel landed meanwhile: its graphs go
             _admit(recorder, key, recording)
+            recorder.recorded_in = _BUDGET.request
             kept = True
             recorder.queued.pop(key, None)
             recorder.short.pop(key, None)
@@ -1702,7 +1786,9 @@ def _capture_call(
             _note(recorder, "recorded", f"capture and check {recorder.capture_each[-1]:.0f} ms")
         return result
     finally:
-        recorder.capture_ms += (time.perf_counter() - began) * 1e3
+        took = (time.perf_counter() - began) * 1e3
+        recorder.capture_ms += took
+        _BUDGET.spend(took - max(seen.host_ms, seen.device_ms() or 0.0))  # past the call served
         recording.writes, replayed.saved, replayed.wrote, replayed.inputs = [], [], [], []
         if not kept:
             with recorder.lock:
@@ -2322,6 +2408,9 @@ def _replay(
         lease.__exit__(None, None, None)
     recorder.gap = ""
     recorder.replays += 1
+    if recorder.recorded_in != _BUDGET.request:
+        recorder.churn = 0  # a graph outlived its request
+    recorder.replayed_in = _BUDGET.request
     _note(recorder, "replayed")
     recorder.copy_bytes += entry.copied
     entry.refilled = entry.refilled + 1 if missed and missed[0] else 0
