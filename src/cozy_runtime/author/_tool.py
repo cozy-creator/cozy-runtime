@@ -115,16 +115,15 @@ def _words(name: str, value: object) -> tuple[str, ...]:
 class Tool:
     """`app.tool`'s own options. `label`: its name in the tool list. `named`: a new box's name,
     numbered (`shot` makes `shot_1`). `reserved`: the model's own tags in its text, never
-    mentions. `ui`: a component in this package that draws the box."""
+    mentions."""
 
     label: str = ""
     named: str = ""
     reserved: Sequence[str] = ()
-    ui: str = ""
 
     def __post_init__(self) -> None:
-        if not all(type(word) is str for word in (self.label, self.named, self.ui)):
-            raise ConformanceError("tool label, named and ui are text", code="tool")
+        if not all(type(word) is str for word in (self.label, self.named)):
+            raise ConformanceError("tool label and named are text", code="tool")
         if "." in self.named:
             raise ConformanceError(
                 "tool named= holds no `.`: a dot selects inside a box", code="tool"
@@ -137,6 +136,5 @@ class Tool:
             "label": self.label,
             "named": self.named,
             "reserved": list(self.reserved),
-            "ui": self.ui,
         }
         return {key: value for key, value in written.items() if value}
