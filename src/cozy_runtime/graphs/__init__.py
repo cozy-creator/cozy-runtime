@@ -445,6 +445,11 @@ class _Recording:
         # Nothing reads a pool between replays, so the core may take its pages back when idle.
         held = [t for t in inputs if t is not None]
         held += [t for t in torch.utils._pytree.tree_leaves(outputs) if isinstance(t, torch.Tensor)]
+        # An output a forward returns as a view (a reshape, a slice) keeps its base tensor, which
+        # shares its storage and is reached only through it: held too, or every such pool stays
+        # mapped (43476403923, 43683255718: SDXL, Klein, Qwen-Image-2, Ideogram 4, Krea 2).
+        held += [base for t in held if (base := t._base) is not None]
+        held = list({id(t): t for t in held}.values())
         try:
             vt.pool_scratch(pool.handle, held, owner.device)
         except (RuntimeError, ValueError) as exc:  # An escaped alias: its pool just stays mapped.
