@@ -1,8 +1,8 @@
 """Typed files — the ONE file type, both directions (§1.3/§3.4).
 
 Input files are ordinary typed request fields or an explicit ordered Files input.
-Their bytes arrive digest-verified; output files are what `out.save_*` returns and
-what the result struct declares. Both use the same handles and granted reader.
+Their bytes arrive digest-verified; output files come from `out.save_*` or returned
+`ImageFile.from_image` values. Both use the same handles and granted reader.
 
 `File` is deliberately NOT a msgspec-native type. The only way one comes into existence
 from the wire is `asset_dec_hook`, which accepts a REF STRING and nothing else — so
@@ -307,7 +307,11 @@ class ImageFile(File):
         from cozy_runtime.author._services import ImageFrame, as_frame
 
         frame = as_frame(image)
-        codec = format or ("webp" if max(frame.width, frame.height) < 16384 else "png")
+        codec = (
+            ("webp" if max(frame.width, frame.height) < 16384 else "png")
+            if format is None
+            else format
+        )
         if codec not in ("png", "webp"):
             raise OutputError(
                 f"image format {codec!r} has no encoder: choose png or lossless webp",

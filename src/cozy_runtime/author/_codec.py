@@ -476,6 +476,7 @@ class _FrameFacts(TypedDict, total=False):
     audio_samples: int
     fps: float
     keyframe_interval: int
+    max_bytes: int
 
 
 def encode_frame(codec: str, frame_facts: Mapping[str, JsonValue], raw: bytes) -> bytes:
@@ -483,16 +484,17 @@ def encode_frame(codec: str, frame_facts: Mapping[str, JsonValue], raw: bytes) -
 
     One function under both callers — the worker's post thread and a fake's settle-at-save
     — so the bytes an author's test sees are the bytes the worker writes. Every shape here
-    was validated at registration; this only encodes.
+    was validated at registration. A result field's encoded-byte bound is checked here,
+    before either caller can commit the blob to its output spool.
     """
     facts = cast("_FrameFacts", frame_facts)  # registration validated these shapes
     if codec in ("png", "webp"):
         encode = encode_png if codec == "png" else encode_webp
-        return encode(int(facts["width"]), int(facts["height"]), raw, str(facts["mode"]))
-    if codec == "flac":
+        encoded = encode(int(facts["width"]), int(facts["height"]), raw, str(facts["mode"]))
+    elif codec == "flac":
         planar = Planar(raw, (int(facts["channels"]), int(facts["samples"])))
-        return encode_flac(planar, int(facts["sample_rate"]))
-    if codec == "mp4":
+        encoded = encode_flac(planar, int(facts["sample_rate"]))
+    elif codec == "mp4":
         split = int(facts["video_bytes"])
         view = memoryview(raw)
         video = Planar(view[:split], tuple(int(d) for d in facts["shape"]))
@@ -505,8 +507,16 @@ def encode_frame(codec: str, frame_facts: Mapping[str, JsonValue], raw: bytes) -
             sample_rate = int(facts["sample_rate"])
         keys = facts.get("keyframe_interval")
         interval = None if keys is None else int(keys)
-        return encode_mp4(video, float(facts["fps"]), audio, sample_rate, interval)
-    raise OutputError(f"{codec!r} is not a registered-frame codec", code="encoder_unavailable")
+        encoded = encode_mp4(video, float(facts["fps"]), audio, sample_rate, interval)
+    else:
+        raise OutputError(f"{codec!r} is not a registered-frame codec", code="encoder_unavailable")
+    maximum = facts.get("max_bytes")
+    if maximum is not None and len(encoded) > maximum:
+        raise OutputError(
+            f"encoded output is {len(encoded)} B, over its declared {maximum}-byte bound",
+            code="result_bound",
+        )
+    return encoded
 
 
 @dataclass(frozen=True, slots=True)
