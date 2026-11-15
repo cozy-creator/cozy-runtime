@@ -51,7 +51,9 @@ unchanged by these replacements.
 - `busy_union_ms`: occupied traced device intervals inside the explicit window.
 - `aggregate_device_work_ms`: sum of the same event/window intersections. It may
   exceed the window. CUDA activity includes kernels, copies and memory operations;
-  the helper does not mislabel every activity as a kernel.
+  the helper does not mislabel every activity as a kernel. GPU user-annotation
+  spans are excluded via `FunctionEvent.is_user_annotation`; they describe regions,
+  not device work.
 - `observed_span_ms`: first-to-last intersecting activity, zero when none exists.
 - `unclassified_inactivity_ms`: window minus occupied intervals, including tails.
   It does not establish CPU launch overhead, paging, or any other cause.
@@ -81,7 +83,23 @@ intervals and model errors. A regression ensures visible but unselected GPUs are
 untouched. The trace tool exercises the same accounting module and works both as a
 CLI and under path-based dynamic import without changing `sys.path`.
 
-This is source qualification. It is not a CUDA execution, H3 rerun, performance
-claim, release or deployment. The graph owner must apply the replacement to a
+A bounded local CUDA collector probe also passed on 2026-11-15 with PyTorch
+`2.15.0+cu132` and an RTX 4070 Laptop GPU. Two streams ran small CUDA sleep/add
+workloads; output checks passed. The call window was 4.507471 ms, with 32 kernel
+events occupying 2.306871 ms and 4.074879 ms of aggregate work. An independent
+sweep of FunctionEvent timestamps agreed exactly. The exported ChromeTrace
+kernel categories independently gave 2.306870117 ms occupied and 4.074877441 ms
+aggregate; the offline trace tool reproduced those results. The difference is
+within trace-export timestamp rounding. Only current device 0 was synchronized,
+and no compute process remained after the probe.
+
+That real collector check exposed PyTorch's two synthetic GPU annotation spans;
+the adapter now excludes them. Its regression first failed with 110 ms occupied
+instead of 20 ms; it passes after excluding `is_user_annotation` events. The
+profiler context lasted 1124.09 ms while the annotated call lasted 4.51 ms,
+confirming that setup/teardown cannot be treated as the device measurement window.
+
+This establishes source and local collector behavior. It is not an H3 rerun,
+performance claim, release or deployment. The graph owner must apply the replacement to a
 measurement build and collect new timestamps to qualify real profiling behavior.
 No GPU rental is needed to run the regressions.

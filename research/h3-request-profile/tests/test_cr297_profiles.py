@@ -20,13 +20,14 @@ profiles = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(profiles)
 
 
-def event(start, end, *, device=0, stream=7, name="kernel", kind="CUDA"):
+def event(start, end, *, device=0, stream=7, name="kernel", kind="CUDA", user_annotation=False):
     return types.SimpleNamespace(
         name=name,
         key=name,
         device_type=f"DeviceType.{kind}",
         device_index=device,
         thread=stream,
+        is_user_annotation=user_annotation,
         time_range=types.SimpleNamespace(start=start, end=end),
         device_time=end - start,
         self_device_time_total=end - start,
@@ -88,6 +89,19 @@ class ProfileTests(unittest.TestCase):
         busy = row["busy_ms"] if "busy_ms" in row else row["device_activity"][0]["busy_union_ms"]
         self.assertEqual(busy, 110.0)
         self.assertEqual(row["device_activity"][0]["aggregate_device_work_ms"], 140.0)
+
+    def test_cuda_annotation_spans_are_not_device_work(self):
+        self.events = [
+            self.events[0],
+            event(11000, 21000),
+            event(81000, 91000),
+            event(1000, 111000, name="cozy.cr297.profiled-call", user_annotation=True),
+        ]
+        activity = self.run_profile()["device_activity"][0]
+        self.assertEqual(activity["busy_union_ms"], 20)
+        self.assertEqual(activity["aggregate_device_work_ms"], 20)
+        self.assertEqual(activity["event_count"], 2)
+        self.assertEqual(activity["unclassified_inactivity_ms"], 90)
 
     def test_contains_duplicate_and_disjoint_events(self):
         self.events = [

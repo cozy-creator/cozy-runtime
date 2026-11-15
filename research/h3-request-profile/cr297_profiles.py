@@ -68,7 +68,7 @@ def profiled[T](
         by_name: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
         excluded_devices: set[int] = set()
         for event in events:
-            if not str(event.device_type).endswith("CUDA"):
+            if not str(event.device_type).endswith("CUDA") or event.is_user_annotation:
                 continue
             device = int(event.device_index)
             if device not in intervals:
