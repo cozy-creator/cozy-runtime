@@ -68,8 +68,8 @@ class Registration:
     preflight: Handler | None = None
     child_task: bool = False
     """`private=True`: called by this package's own code only; never a root request."""
-    accelerator: bool | None = None
-    """An explicit resource override; otherwise constructed Model slots select the GPU."""
+    accelerator: bool = True
+    """False: CPU only. True (the default): the machine's GPU when it has one."""
     tool: Tool | None = None
     """`app.tool`'s own options: this function is a box."""
     checked: bool = field(default=False, repr=False)
@@ -129,9 +129,7 @@ class App:
           optional `Seed` field unset runs without the cache.
         - `on_demand=("upsampler",)`: model arguments a request may leave unused; each is
           built, and its weights fetched, when the function first reads it.
-        - `accelerator`: defaults to GPU for a constructed `Model` parameter, else CPU.
-          `True` selects the machine's GPU for custom compute without a `Model`; `False`
-          stays CPU only. Raw `Weights` inputs do not select a GPU.
+        - `accelerator=False`: CPU only; otherwise it gets the machine's GPU when there is one.
         - `weights=`: the TensorFS model outputs it writes.
         - `private=True`: only this package's own calls run it, never a root request.
         - `preflight=`: the function that resolves a request's `Preflight[T]` before it runs.
@@ -230,7 +228,7 @@ class App:
                 weights_outputs=weights,
                 preflight=preflight,
                 child_task=private,
-                accelerator=accelerator,
+                accelerator=accelerator is not False,
                 tool=tool,
             )
             return target

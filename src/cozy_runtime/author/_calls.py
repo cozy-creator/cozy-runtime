@@ -14,7 +14,7 @@ import time
 from collections.abc import Awaitable, Callable, Coroutine, Generator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Protocol, TypeVar, cast, overload
+from typing import Any, Protocol, TypeVar, cast, overload
 
 import msgspec
 from tensorfs.executor import (
@@ -86,29 +86,6 @@ class ChildCallError(CapabilityError):
         self.child_traceback = child_traceback
 
 
-@dataclass(frozen=True, slots=True)
-class Operation[Q: msgspec.Struct, R: msgspec.Struct]:
-    """A generated, non-callable reference to a package operation.
-
-    Generate it from the locked package interface; pass its typed request to ``call``.
-    It grants no authority: the current attempt must already admit this exact export.
-    """
-
-    distribution: str
-    module: str
-    export: str
-    declaration: str
-    request: type[Q]
-    result: type[R]
-    models: tuple[str, ...] = ()
-
-
-@overload
-def call[Q: msgspec.Struct, R: msgspec.Struct](
-    fn: Operation[Q, R], request: Q, /, **models: ModelChoice | None
-) -> PendingCall[R]: ...
-
-
 @overload
 def call[R](  # type: ignore[explicit-any]  # any package function: call() names its arguments
     fn: Callable[..., Coroutine[object, object, R]], /, **arguments: object
@@ -119,12 +96,7 @@ def call[R](  # type: ignore[explicit-any]  # any package function: call() names
 def call[R](fn: Callable[..., R], /, **arguments: object) -> PendingCall[R]: ...  # type: ignore[explicit-any]  # any package function: call() names its arguments
 
 
-def call(  # type: ignore[explicit-any]  # a package function retains its own arguments
-    fn: Callable[..., object] | Operation[msgspec.Struct, msgspec.Struct],
-    request: msgspec.Struct | None = None,
-    /,
-    **arguments: object,
-) -> PendingCall[object]:
+def call(fn: Callable[..., object], /, **arguments: object) -> PendingCall[object]:  # type: ignore[explicit-any]  # any package function: call() names its arguments
     """Run `fn` as a managed call: its own job on the machine, with its own models, memo and
     progress. Awaiting it returns `fn`'s result.
 
@@ -136,35 +108,12 @@ def call(  # type: ignore[explicit-any]  # a package function retains its own ar
     broker = _current.get()
     if broker is None:
         raise CapabilityError("a managed call has no admitted attempt", code="child_broker_absent")
-    if isinstance(fn, Operation):
-        if not isinstance(request, fn.request):
-            raise ConformanceError(
-                "an operation takes its generated request", code="child_arguments"
-            )
-        if set(arguments) - set(fn.models):
-            raise ConformanceError(
-                "an operation names an unknown model slot", code="child_arguments"
-            )
-        models = msgspec.defstruct(
-            f"{fn.export}Models",
-            [(name, ModelChoice | None, None) for name in fn.models],
-            kw_only=True,
-        )
-        envelope = msgspec.defstruct(
-            f"{fn.export}Call", [("payload", fn.request), ("models", models)], kw_only=True
-        )
-        binding = _CallType(fn.declaration, fn.module, fn.export, envelope, fn.result)
-        return broker.reserve(
-            fn.module, fn.export, {"payload": request, "models": arguments}, reference=binding
-        )
-    if request is not None:
-        raise ConformanceError("a function call takes named arguments", code="child_arguments")
     module, name = getattr(fn, "__module__", ""), getattr(fn, "__name__", "")
     return broker.reserve(module, name, arguments)
 
 
 def prefetch[**P, R](
-    callee: Callable[P, R] | Operation[msgspec.Struct, msgspec.Struct],
+    callee: Callable[P, R],
     *,
     models: Mapping[str, ModelChoice | None] | None = None,
 ) -> None:
@@ -181,12 +130,8 @@ def prefetch[**P, R](
     if broker is None or broker.closed or broker.context is None:
         raise CapabilityError("model prefetch has no admitted attempt", code="child_broker_absent")
     broker.context.raise_if_cancelled()
-    module, name = (
-        (callee.module, callee.export)
-        if isinstance(callee, Operation)
-        else (getattr(callee, "__module__", ""), getattr(callee, "__name__", ""))
-    )
-    if not any(key == (module, name) for key in broker.bindings):
+    module, name = getattr(callee, "__module__", ""), getattr(callee, "__name__", "")
+    if not callable(callee) or (module, name) not in broker.bindings:
         raise CapabilityError("prefetch needs an exact locked callable", code="child_undeclared")
     selected = {} if models is None else dict(models)
     if any(
@@ -349,19 +294,12 @@ class _Broker:
         module: str,
         export: str,
         arguments: Mapping[str, object],
-        *,
-        reference: _CallType | None = None,
     ) -> PendingCall[object]:
         ctx = self.context
         if self.closed or ctx is None or ctx.request_id != self.request_id:
             raise CapabilityError("package call escaped its attempt", code="escaped_handle")
         ctx.raise_if_cancelled()
-        # Iteration checks the admitted inventory without importing a lazy foreign binding.
-        binding = (
-            (reference if any(key == (module, export) for key in self.bindings) else None)
-            if reference is not None
-            else self.bindings.get((module, export))
-        )
+        binding = self.bindings.get((module, export))
         if binding is None:
             raise CapabilityError(
                 f"{module}:{export} is not a registered function of this package or of a "
