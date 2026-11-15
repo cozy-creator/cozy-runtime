@@ -8,6 +8,7 @@ unpacked as files. Nothing is built, installed or imported (#713).
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import tempfile
@@ -38,6 +39,7 @@ class LockedWheel:
     distribution: str
     url: str
     sha256: str
+    local: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +59,8 @@ def distribution(name: str) -> str:
 
 def read(project: Path) -> Locked:
     """What `project/uv.lock` pins beside the project: its `directory` and `editable`
-    sources, and each registry package's pure (`none-any`) wheel. Reading TOML only."""
+    sources, and pure (`none-any`) wheels from registries, exact URLs or local paths.
+    Reading TOML only."""
     lock = project / "uv.lock"
     try:
         if not lock.is_file() or lock.stat().st_size > LOCK_CEILING:
@@ -78,6 +81,17 @@ def read(project: Path) -> Locked:
             tree = (project / where).resolve()
             if tree != project and tree.is_dir():
                 roots += [tree / "src", tree]
+        elif isinstance(where := source.get("path"), str) and where.endswith(".whl"):
+            pure = [w for w in row.get("wheels", ()) if isinstance(w, dict) and _pure(w)]
+            name = row.get("name")
+            if (
+                isinstance(name, str)
+                and len(pure) == 1
+                and str(pure[0].get("hash", "")).startswith("sha256:")
+            ):
+                path = (project / where).resolve()
+                module = re.sub(r"[-_.]+", "_", name).lower()
+                wheels[module] = LockedWheel(name, path.as_uri(), str(pure[0]["hash"]), path)
         elif ("registry" in source or "url" in source) and isinstance(name := row.get("name"), str):
             pure = [w for w in row.get("wheels", ()) if isinstance(w, dict) and _pure(w)]
             if len(pure) == 1 and str(pure[0].get("hash", "")).startswith("sha256:"):
@@ -87,7 +101,9 @@ def read(project: Path) -> Locked:
 
 
 def _pure(wheel: dict[str, object]) -> bool:
-    filename = unquote(PurePosixPath(urlsplit(str(wheel.get("url", ""))).path).name)
+    filename = unquote(
+        PurePosixPath(urlsplit(str(wheel.get("url", wheel.get("filename", "")))).path).name
+    )
     tags = filename.removesuffix(".whl").split("-")
     return filename.endswith(".whl") and len(tags) >= 5 and tags[-2:] == ["none", "any"]
 
@@ -111,8 +127,20 @@ class Wheels:
         target = self.directory / wheel.sha256.removeprefix("sha256:")
         archive = target.with_suffix(".whl")
         try:
-            egress.fetch_public_wheel(archive, wheel.url, wheel.sha256, WHEEL_CEILING)
-        except EnvironmentRefusal as exc:
+            if wheel.local is None:
+                egress.fetch_public_wheel(archive, wheel.url, wheel.sha256, WHEEL_CEILING)
+            else:
+                with wheel.local.open("rb") as source:
+                    raw = source.read(WHEEL_CEILING + 1)
+                if (
+                    len(raw) > WHEEL_CEILING
+                    or "sha256:" + hashlib.sha256(raw).hexdigest() != wheel.sha256
+                ):
+                    raise LockedSourceRefusal(
+                        f"{wheel.distribution}: its local wheel differs from uv.lock"
+                    )
+                archive.write_bytes(raw)
+        except (EnvironmentRefusal, OSError) as exc:
             pinned = urlsplit(wheel.url)._replace(query="").geturl()
             raise LockedSourceRefusal(
                 f"{wheel.distribution}: the wheel its uv.lock pins ({pinned}) could not be "
