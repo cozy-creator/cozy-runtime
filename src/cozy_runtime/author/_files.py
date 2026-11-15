@@ -908,7 +908,9 @@ def asset_inputs(payload: object) -> list[AssetInput]:
             return
         if isinstance(value, Tree) or id(value) in seen:
             return
-        seen.add(id(value))
+        # Only ancestors are cycles: an aliased container still has one occurrence
+        # per field path, with that path's own bound and preparation.
+        seen = seen | {id(value)}
         if isinstance(value, References):
             # By wire index, as the grant names it (`summary.references.2.file`), though one
             # before it was left out.

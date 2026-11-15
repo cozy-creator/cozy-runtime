@@ -647,17 +647,21 @@ def declares_trees(tp: object) -> bool:
     return _declares(tp, Tree)
 
 
-def trees_in(value: object) -> list[Tree]:
+def trees_in(value: object, _seen: set[int] | None = None) -> list[Tree]:
     """Every input tree reachable from a payload, in declaration order."""
     found: list[Tree] = []
     if isinstance(value, Tree):
         return [value]
+    seen = _seen if _seen is not None else set()
+    if id(value) in seen:
+        return []
+    seen = seen | {id(value)}
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [t for item in value for t in trees_in(item)]
+        return [t for item in value for t in trees_in(item, seen)]
     if isinstance(value, dict):
-        return [t for item in value.values() for t in trees_in(item)]
+        return [t for item in value.values() for t in trees_in(item, seen)]
     for member in field_values(value).values():
-        found += trees_in(member)
+        found += trees_in(member, seen)
     return found
 
 
@@ -987,7 +991,7 @@ def _call(
 def assets_in(value: object, _seen: set[int] | None = None) -> list[File]:
     """Every file reachable from a value, in declaration order.
 
-    Files are collected EVERY time they appear — the cycle guard covers containers only,
+    Files are collected EVERY time they appear — the cycle guard covers ancestors only,
     because "the same handle returned twice" is exactly what step 1 must catch.
     """
     seen = _seen if _seen is not None else set()
@@ -995,7 +999,7 @@ def assets_in(value: object, _seen: set[int] | None = None) -> list[File]:
         return [value]
     if id(value) in seen:
         return []
-    seen.add(id(value))
+    seen = seen | {id(value)}
     if isinstance(value, (list, tuple, set, frozenset)):
         return [a for item in value for a in assets_in(item, seen)]
     if isinstance(value, dict):
