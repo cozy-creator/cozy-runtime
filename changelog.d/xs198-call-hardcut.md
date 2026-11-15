@@ -1,1 +1,0 @@
-Managed calls require one positional typed request struct, with model selectors in `models=` and separately injected Files in `assets=`. Remove request keyword/dict forms and foreign function targets; foreign calls use generated Operation references. Runtime builtins expose canonical request structs.

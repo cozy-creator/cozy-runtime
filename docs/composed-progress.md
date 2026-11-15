@@ -9,7 +9,7 @@ Use a scope to name one part of the work:
 
 ```python
 with tel.scope("Shot 2 of 7"):
-    result = await call(render_shot, shot)
+    result = await call(render_shot, payload=shot)
 ```
 
 The child can report `denoise`, step 3 of 8. The parent reports `Shot 2 of 7 / denoise`

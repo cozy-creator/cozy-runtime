@@ -79,14 +79,13 @@ from cozy_runtime.author._preview import PreviewFrame, Previews
 from cozy_runtime.author._recipes import DeclaredRecipe
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
-    TELLING,
     AdjustmentRow,
     Adjustments,
     Attempt,
+    TELLING,
     Outputs,
     ProgressFrame,
     Telemetry,
-    _adopt_image,
 )
 from cozy_runtime.author._signature import Param, Surface
 from cozy_runtime.author._walker import field_values, strip, unwrap_optional, walk
@@ -354,9 +353,6 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
             CURRENT.reset(context)
             _current.reset(token)
             handles.__exit__(*sys.exc_info())
-
-    for asset in assets_in(result):
-        _adopt_image(attempt, asset)
 
     _validate_result(
         surface, result, attempt, grant_token=inv.calls.grant_token if inv.calls else None
@@ -646,21 +642,17 @@ def declares_trees(tp: object) -> bool:
     return _declares(tp, Tree)
 
 
-def trees_in(value: object, _seen: set[int] | None = None) -> list[Tree]:
+def trees_in(value: object) -> list[Tree]:
     """Every input tree reachable from a payload, in declaration order."""
     found: list[Tree] = []
     if isinstance(value, Tree):
         return [value]
-    seen = _seen if _seen is not None else set()
-    if id(value) in seen:
-        return []
-    seen = seen | {id(value)}
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [t for item in value for t in trees_in(item, seen)]
+        return [t for item in value for t in trees_in(item)]
     if isinstance(value, dict):
-        return [t for item in value.values() for t in trees_in(item, seen)]
+        return [t for item in value.values() for t in trees_in(item)]
     for member in field_values(value).values():
-        found += trees_in(member, seen)
+        found += trees_in(member)
     return found
 
 
@@ -864,8 +856,8 @@ def _inject(
     *,
     params: Sequence[Param] | None = None,
 ) -> dict[str, object]:
-    """Build the call kwargs. A service absent from the signature is never injected;
-    the runtime still registers final image values after the handler returns."""
+    """Build the call kwargs. A service absent from the signature is never constructed —
+    which is precisely why a handler without `Outputs` structurally cannot save."""
     kwargs: dict[str, object] = {}
     for param in surface.params if params is None else params:
         if param.role == "context":
@@ -990,7 +982,7 @@ def _call(
 def assets_in(value: object, _seen: set[int] | None = None) -> list[File]:
     """Every file reachable from a value, in declaration order.
 
-    Files are collected EVERY time they appear — the cycle guard covers ancestors only,
+    Files are collected EVERY time they appear — the cycle guard covers containers only,
     because "the same handle returned twice" is exactly what step 1 must catch.
     """
     seen = _seen if _seen is not None else set()
@@ -998,7 +990,7 @@ def assets_in(value: object, _seen: set[int] | None = None) -> list[File]:
         return [value]
     if id(value) in seen:
         return []
-    seen = seen | {id(value)}
+    seen.add(id(value))
     if isinstance(value, (list, tuple, set, frozenset)):
         return [a for item in value for a in assets_in(item, seen)]
     if isinstance(value, dict):
@@ -1030,13 +1022,9 @@ def _check_result_bounds(surface: Surface, result: object, attempt: Attempt) -> 
                 code="result_bound",
                 fields=[item.input_id],
             )
-        frame = attempt.frames.get(asset.ref)
-        if bound.max_bytes is not None and frame is not None:
-            # Pending frames have no encoded length yet. Keep the authored field bound
-            # with the frame so the shared codec checks it before committing its blob.
-            frame.facts["max_bytes"] = bound.max_bytes
         if bound.max_decoded_bytes is None:
             continue
+        frame = attempt.frames.get(asset.ref)
         if frame is not None:
             decoded = frame.raw_bytes
         elif isinstance(asset, ImageFile) and asset._local is not None:

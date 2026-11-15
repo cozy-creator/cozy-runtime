@@ -3,17 +3,17 @@
 Package code can send an optional known-next-call hint through Runtime:
 
 ```python
-from cozy_runtime.author import call, prefetch
+from cozy_runtime.author import prefetch
 
 prefetch(render_video)
 references = await generate_references(...)
-video = await call(render_video, VideoRequest(references=references, ...))
+video = await render_video(references=references, ...)
 ```
 
 The callee must be an existing locked managed callable. Runtime checks the binding,
 serializes any requested `models` choices and sends `ModelPrefetch` to TensorD. The
 acknowledgment does not promise completion or a particular residency state. The later
-managed call still resolves its own models and performs any required preparation.
+ordinary invocation still resolves its own models and performs any required preparation.
 TensorD overlays explicit `ModelChoice` values on the same inherited choices used by
 an ordinary child call. An omitted entry or `None` retains the parent's applicable choice
 or the callee's captured default. Choices must name declared callee model slots, and the
