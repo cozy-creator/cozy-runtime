@@ -1,0 +1,181 @@
+{
+  "observed_at": "2026-11-15",
+  "new_gpu_runs": false,
+  "profile_source_revision": "b41d433fc122fb6e7c730d3c4172cfd0f4592743",
+  "method_warning": "busy_ms is the sum of CUDA event durations, not the union of activity intervals. Overlap and profiler overhead prevent treating wall_ms - busy_ms as measured GPU idle time or a graph-speedup bound. Profiles are duplicated under component records; use only base_model.transformer once.",
+  "profile_cell": {
+    "name": "m-h1",
+    "tree": "pkh",
+    "target": "minimax-h3/generate",
+    "args": [
+      "beats:=[{\"description\":\"[Shot 1]\\nA slow bank of fog crosses the bay. The camera tracks along the cliff edge while gulls ride the wind. Spray climbs the rocks below the gallery.\",\"duration\":15}]",
+      "soundscape=Wind and ocean surf, with waves splashing against the rocks.",
+      "seed:=29751",
+      "turbo:=true"
+    ],
+    "update": {
+      "runtime": "43441624366"
+    }
+  },
+  "receipts": [
+    {
+      "source": "/home/fidika/cozy_v2/outputs/cr-297/session-43442514074/session-ab-43442514074/m-h1.json",
+      "sha256": "e48fffb58fe83d364e0a624749f739e2861d8ccfe604678de9fe1c82a2033bb5",
+      "session": "43442514074",
+      "cell": "m-h1",
+      "run_number": 40,
+      "status": "completed",
+      "actual_degree": 1,
+      "gpu_architectures": [
+        "sm_89"
+      ],
+      "transformer": {
+        "capture_attempts": 0,
+        "captures": 0,
+        "eager_gap": "under a sparse attention layout",
+        "profiles": {
+          "transformer as written in its region": {
+            "busy_ms": 49596.04,
+            "kernels": 5357,
+            "top": [
+              [
+                "void qk_int_sv_i8_attn_kernel<128u, 128u, 16u, 128u, 128u, (DataType)1, (QuantGr",
+                38361.96
+              ],
+              [
+                "void cutlass::Kernel2<cutlass::gemm::kernel::DefaultGemmWithVisitor<signed char,",
+                7433.03
+              ],
+              [
+                "Memcpy HtoD (Pinned -> Device)",
+                896.9
+              ],
+              [
+                "void (anonymous namespace)::quant_v_int8_kernel<__nv_bfloat16, 512, false>(__nv_",
+                623.93
+              ],
+              [
+                "void cozy_int8::(anonymous namespace)::quantize_kernel<__nv_bfloat16, true, fals",
+                426.68
+              ],
+              [
+                "_rope_norm_kernel",
+                417.06
+              ],
+              [
+                "_norm_mod_kernel",
+                384.91
+              ],
+              [
+                "void cozy_int8::(anonymous namespace)::quantize_kernel<__nv_bfloat16, false, fal",
+                321.31
+              ]
+            ],
+            "wall_ms": 49445.33
+          },
+          "transformer as written: under a sparse attention layout": {
+            "busy_ms": 25617.12,
+            "kernels": 67153,
+            "top": [
+              [
+                "void (anonymous namespace)::sol_exact_kernel<__nv_bfloat16>(signed char const*, ",
+                9959.8
+              ],
+              [
+                "void cutlass::Kernel2<cutlass::gemm::kernel::DefaultGemmWithVisitor<signed char,",
+                7721.34
+              ],
+              [
+                "void qk_int_sv_i8_attn_kernel<128u, 128u, 16u, 128u, 128u, (DataType)1, (QuantGr",
+                3859.92
+              ],
+              [
+                "void cozy_int8::(anonymous namespace)::quantize_kernel<__nv_bfloat16, false, fal",
+                931.82
+              ],
+              [
+                "Memcpy HtoD (Pinned -> Device)",
+                894.2
+              ],
+              [
+                "(anonymous namespace)::sol_producer_kernel(__nv_bfloat16 const*, float const*, _",
+                487.06
+              ],
+              [
+                "void cozy_int8::(anonymous namespace)::quantize_kernel<__nv_bfloat16, true, fals",
+                423.46
+              ],
+              [
+                "_norm_mod_kernel",
+                385.42
+              ]
+            ],
+            "wall_ms": 26793.68
+          }
+        },
+        "replays": 0,
+        "why": {
+          "device_bound": "device-bound: a 50118 ms call",
+          "guard": "under a sparse attention layout"
+        }
+      },
+      "safeguards": {}
+    },
+    {
+      "source": "/home/fidika/cozy_v2/outputs/cr-297/session-43476403923/session-ab-43476403923/f-h1.json",
+      "sha256": "efe12b64bb0ed606ae440708177c3d039e1409fbc0d8fcc4383feafa2ddffb4c",
+      "session": "43476403923",
+      "cell": "f-h1",
+      "run_number": 39,
+      "status": "completed",
+      "actual_degree": 1,
+      "gpu_architectures": [
+        "sm_120"
+      ],
+      "transformer": {
+        "capture_attempts": 4,
+        "captures": 0,
+        "eager_gap": "its capture needs 12.1 GiB beside 0.5 GiB live and 10.9 GiB of weights in use, of 30.3 GiB (CUDA capacity exhausted allocating 13040091136 bytes)",
+        "replays": 0,
+        "why": {
+          "no_room": "its capture needs 12.1 GiB beside 0.5 GiB live and 10.9 GiB of weights in use, of 30.3 GiB (CUDA capacity exhausted allocating 13040091136 bytes)"
+        }
+      },
+      "safeguards": {
+        "no_room": [
+          "transformer: its capture needs 12.1 GiB beside 0.5 GiB live and 10.9 GiB of weights in use, of 30.3 GiB (CUDA capacity exhausted allocating 13040091136 bytes)",
+          "transformer: its capture needs 12.1 GiB beside 0.5 GiB live and 10.9 GiB of weights in use, of 30.3 GiB (CUDA capacity exhausted allocating 13040091136 bytes)",
+          "transformer: its capture needs 12.1 GiB beside 0.5 GiB live and 10.9 GiB of weights in use, of 30.3 GiB (CUDA capacity exhausted allocating 13040091136 bytes)"
+        ]
+      }
+    },
+    {
+      "source": "/home/fidika/cozy_v2/outputs/cr-297/session-43683255718/session-ab-43683255718/f-h1.json",
+      "sha256": "70e6e129667136323795db62a4a7eb6ec7182af74cd77a6797243db7701d5188",
+      "session": "43683255718",
+      "cell": "f-h1",
+      "run_number": 22,
+      "status": "completed",
+      "actual_degree": 1,
+      "gpu_architectures": [
+        "sm_120"
+      ],
+      "transformer": {
+        "capture_attempts": 4,
+        "captures": 0,
+        "eager_gap": "ResidencyError: capture requires an active prepared weight binding (fl2va_turbo block transformer_blocks.0.adaln_proj: entered 1, retained 0, assigned False)",
+        "replays": 0,
+        "why": {
+          "capture_refused": "ResidencyError: capture requires an active prepared weight binding (fl2va_turbo block transformer_blocks.0.adaln_proj: entered 1, retained 0, assigned False)"
+        }
+      },
+      "safeguards": {
+        "capture_refused": [
+          "transformer: ResidencyError: capture requires an active prepared weight binding (fl2va_turbo block transformer_blocks.0.adaln_proj: entered 1, retained 0, assigned False)",
+          "transformer: ResidencyError: capture requires an active prepared weight binding (fl2va_turbo block transformer_blocks.0.adaln_proj: entered 1, retained 0, assigned False)",
+          "transformer: ResidencyError: capture requires an active prepared weight binding (fl2va_turbo block transformer_blocks.0.adaln_proj: entered 1, retained 0, assigned False)"
+        ]
+      }
+    }
+  ]
+}
