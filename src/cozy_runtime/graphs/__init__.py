@@ -102,7 +102,7 @@ if TYPE_CHECKING:
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
 #: Gates only, never a setting: every path records at its first sight, whatever it would save, so
 #: a gate build proves each model captures and replays (cr-297). False in every release.
-FORCE = False
+FORCE = True
 #: Under `FORCE`, every this-many-th replay of a region also runs as written from the same state
 #: and the two are compared (`_audit`): a graph that drifts from its call after its one check goes
 _AUDIT = 16
