@@ -1,0 +1,1 @@
+Return `ImageFile.from_image(image)` in an existing image result field to let the SDK encode and save final host pixels through its ordinary bounded output path. Defaults to lossless WebP, with PNG for sides over 16383 pixels; explicit PNG/WebP choices and alpha are preserved. `Outputs` remains available for streaming and intermediate publication.

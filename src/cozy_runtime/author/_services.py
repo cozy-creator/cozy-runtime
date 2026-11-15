@@ -1,8 +1,9 @@
 """The typed services. A signature that names one IS the declaration of that capability.
 
 `describe` derives the AuthorCapabilitySet from these parameter types (§1.3), so there is
-no capability list to drift from the code: a handler without `Outputs` structurally
-cannot save, one without `Secrets` structurally cannot read a secret. The set names powers
+no capability list to drift from the code: a handler without `Outputs` cannot explicitly
+save or publish, one without `Secrets` cannot read a secret. Final image values are saved
+by the runtime after the handler returns. The set names powers
 granted to AUTHOR code — the runtime still journals, fetches, stages and emits telemetry
 under its own policy, and none of that appears in an author-facing schema.
 
@@ -507,13 +508,18 @@ class Outputs(_Bound):
         return _codec.AAC_FRAME_SAMPLES
 
     def save_image(self, image: ImageFrame | Image, *, format: str = "png") -> ImageFile:
+        return self._save_image(image, format=format)
+
+    def _save_image(
+        self, image: ImageFrame | Image, *, format: str, asset: ImageFile | None = None
+    ) -> ImageFile:
         if format not in ("png", "webp"):
             raise OutputError(
                 f"image format {format!r} has no encoder: choose png or lossless webp",
                 code="encoder_unavailable",
             )
         if not self._attempt.writes:
-            return self._unwritten_file(ImageFile, format)
+            return self._unwritten_file(ImageFile, format, asset=asset)
         frame = as_frame(image)
         return self._register_frame(
             ImageFile,
@@ -521,6 +527,7 @@ class Outputs(_Bound):
             (frame.pixels,),
             {"width": frame.width, "height": frame.height, "mode": frame.mode},
             charge=len(frame.pixels),
+            asset=asset,
         )
 
     def save_audio(
@@ -1244,6 +1251,7 @@ class Outputs(_Bound):
         facts: dict[str, JsonValue],
         *,
         charge: int,
+        asset: A | None = None,
     ) -> A:
         """REGISTER a host frame: the raw snapshot lands in the spool, the aggregate ceiling
         is charged now, and the codec runs later — in the worker's post phase, or here
@@ -1263,20 +1271,27 @@ class Outputs(_Bound):
             for part in parts:
                 raw_bytes += spool.write(part)
         frame = HostFrame(handle, codec, path, raw_bytes, charge, facts)
-        asset = kind(handle, media_type=frame.media_type, attempt=self._attempt.request_id)
+        if asset is None:
+            asset = kind(handle)
+        asset.ref = handle
+        asset.media_type = frame.media_type
+        asset._attempt = self._attempt.request_id
         self._attempt.pending[handle] = asset
         self._attempt.frames[handle] = frame
         if self._attempt.settle_at_save:
             settle_frame(self._attempt, handle)
         return asset
 
-    def _unwritten_file(self, kind: type[A], codec: str) -> A:
+    def _unwritten_file(self, kind: type[A], codec: str, *, asset: A | None = None) -> A:
         """A save on a group's other GPU: GPU 0's is the run's, so this one names its asset and
         reads, copies, encodes and writes nothing."""
         self._attempt.check_open("Outputs.save")
         handle = self._attempt.next_handle(kind.kind)
         media_type = _codec.FRAME_MEDIA_TYPES.get(codec, codec)
-        unwritten = kind(handle, media_type=media_type, attempt=self._attempt.request_id)
+        unwritten = asset if asset is not None else kind(handle)
+        unwritten.ref = handle
+        unwritten.media_type = media_type
+        unwritten._attempt = self._attempt.request_id
         self._attempt.pending[handle] = unwritten
         return unwritten
 
