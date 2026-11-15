@@ -87,6 +87,10 @@ metadata and uv follow the managed dependency chain recursively. A child without
 extra still supplies its ordinary dependencies. The platform prepares this closure for
 child execution separately from the caller.
 
+Python environments continue to expose the machine's shared Torch layer. Managed dependency
+separation removes the callee's implementation and its additional dependencies from the
+caller; it does not remove that existing platform layer or imply that available Torch was imported.
+
 ## What the Runtime does for you
 
 - **Memory.** Each component is put on the device at its first forward, and evicted, streamed or
