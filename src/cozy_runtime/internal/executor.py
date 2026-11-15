@@ -1514,7 +1514,7 @@ class Executor:
         return device
 
     def join(self, command: Join) -> Reply:
-        """A FOLLOWER's first half of the group: rank 0's store reached and its device current.
+        """A FOLLOWER's first half of the group: rank 0's store opened and its device current.
         Its answer is the readiness every GPU gives before any enters group init (`form`)."""
         if self.rank == 0:
             return {"ok": False, "code": "not_a_follower", "detail": f"{_gpu(0)} forms the group"}
@@ -1540,7 +1540,7 @@ class Executor:
         spec = RankSpec(
             rank=self.rank,
             world=self.world,
-            port=command.port,
+            store=command.store,
             backend=command.backend or "nccl",
             nccl=dict(command.nccl),
         )
