@@ -460,8 +460,7 @@ def _scratch(command: Invoke) -> Path | None:
 
 
 def _call_store(command: Invoke) -> Path | None:
-    """The TensorFS store the call's own checkpoints are read from and written to (its sources,
-    its weights outputs); none: the executor's."""
+    """The TensorFS store this call writes its weights outputs into; none: the executor's."""
     value = getattr(command, "store", None)
     return Path(value) if value else None
 
@@ -3932,10 +3931,10 @@ class Executor:
         }
         exchange = self._exchange(command.request_id)
         connection = _connection(command.tensorfs, command.actor, self.bearers)
-        store = _call_store(command) or self._store()
+        output_store = _call_store(command) or self._store()
         weight_outputs = (
             weights_store.Outputs(
-                store,
+                output_store,
                 request_id=command.request_id,
                 actor=command.actor,
                 code=_replay_code(command, prepared.overlay.digest),
@@ -3998,10 +3997,12 @@ class Executor:
                         sources=sources,
                         weights_bytes=weights_store.read_into,
                         weights_values=functools.partial(read_values_into, self.torch),
+                        # TensorD admits these source refs in the sealed model store.
+                        # The call's store override owns its outputs.
                         tensorfs_source=(
                             functools.partial(
                                 weights_store.open_checkpoint,
-                                store,
+                                self._store(),
                                 connection=connection,
                             )
                             if sources
