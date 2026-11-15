@@ -9,16 +9,16 @@ classes and hooks, the LoRA overlays its hooks arm, the plain context variables 
 and the Runtime's choices (the kernels serving, `LANDED`; the attention layout's band). A
 graph also holds the module attributes its capture read (`_reading`): it replays only while
 each still has the value it had, so one path may keep a few graphs, one per such state. A
-signature's first warm call runs as written and is measured (`_first`), its next with the device
-held back while the host submits it (`_probe`), which measures its launch overhead; a later one
-records in the call when that overhead over the calls ahead beats the capture's cost
-(`_capture_call`): the graph replays once on that call's inputs, the call runs as
-written and serves, and the graph is kept when the two match bit for bit (outputs, the inputs
-it writes and the state it writes outside the call) and the replay is faster; every later call
-replays. What the capture reads outside its inputs, pool and weights (`observe`) must still be
-there at each replay, or the graph goes and the call records again. Recording changes no state
-of the model. An idle period records the signatures seen once, under their call's context
-(`capture_idle`), as the backup.
+signature's first call runs as written and measures its working memory (`_first`); its next
+records in the call (`_capture_call`) when its pool fits beside its loop's weights
+(`_over_card`): the graph replays once on that call's inputs, the call runs as written and
+serves, and the graph is kept when the two match bit for bit (outputs, the inputs it writes
+and the state it writes outside the call); every later call replays. Every path records,
+whatever it would save: a device-bound call replays as fast as it runs. What the capture
+reads outside its inputs, pool and weights (`observe`) must still be there at each replay, or
+the graph goes and the call records again. Recording changes no state of the model. An idle
+period records a short signature its call could not (no room, a kernel building), under its
+call's context (`capture_idle`), as the backup.
 Every graph has its own static buffers in its region's capture pool (`domain`), opened only for
 a capture that may keep it. A cached binding owns virtual addresses only; its physical lease
 covers preparation through output copies, and a completion event orders reuse across streams.
@@ -675,8 +675,7 @@ class _Recorder:
         self.queued: dict[tuple[object, ...], _Pending] = {}
         #: why a signature runs as written until its graphs are dropped (a refusal)
         self.failed: dict[tuple[object, ...], str] = {}
-        #: why one runs as written for the process: measured, it would save nothing
-        #: (device-bound, or a replay no faster than its eager call)
+        #: why one runs as written for the process: its code can't be recorded
         self.judged: dict[tuple[object, ...], str] = {}
         #: per signature, its idle recordings in a row that found no room (`_short`)
         self.short: dict[tuple[object, ...], int] = {}
@@ -684,15 +683,9 @@ class _Recorder:
         #: per signature its idle measure: host submission, the warm-up's host time and its
         #: waits on the device, and (recorded) replay ms a call
         self.bound: dict[tuple[object, ...], tuple[float, float, float, float | None]] = {}
-        #: per signature, its last call as written (`_first`), which decides a capture in a call
+        #: per signature, its last call as written (`_first`): its working peak sizes the pool
+        #: its next call records into
         self.seen: dict[tuple[object, ...], _Seen] = {}
-        #: per signature, its launch-overhead probe (`_probe`), and its calls this attempt
-        self.probes: dict[tuple[object, ...], _Probe] = {}
-        #: per path family (`_family`: its shapes, not its addresses or identities), the ordinary
-        #: device time of a call its probe found device-bound: a later request's new key of the
-        #: same shapes is judged by it with no hold of its own; idle capture is the backstop
-        self.device_bound: dict[tuple[object, ...], float] = {}
-        self.sights: dict[tuple[object, ...], int] = {}
         #: per signature, why its idle recording failed: a call may still record it
         self.idle_failed: dict[tuple[object, ...], str] = {}
         #: its modules' classes and hooks (`_structure`), read at each attempt's first call and
@@ -813,10 +806,9 @@ class _Recorder:
         self.waiting.clear()
         self.codes.clear()
         self.landed = LANDED[0]
-        # `seen` and `probes` measure the call as written and outlive its graphs: a kernel landing
-        # anywhere in the process forgets graph-less regions too, and wiping them made every
-        # request probe again (43733785568: Klein, HiDream, Ideogram, +0.08-0.14 s a request).
-        # A later call as written replaces `seen`; the idle backup judges a stale probe wrong.
+        # `seen` measures the call as written and outlives its graphs: a kernel landing anywhere
+        # in the process forgets every region, and wiping it made each path's next call a first
+        # sight again (43733785568: Klein, HiDream, Ideogram). A later call replaces it.
 
 
 #: each installed component root's region
@@ -861,8 +853,8 @@ class _Idle:
 
     def meter(self) -> None:
         """Before a job's next op on the device: wait, yielding, while `_QUEUED` of its ops are
-        queued there. Its waits are the device's time, which says whether a call is
-        device-bound (`_record`), so it only yields the CPU between polls: a 0.2 ms sleep per wait
+        queued there. Its waits are the device's time (`_record`'s receipt), so it only yields
+        the CPU between polls: a 0.2 ms sleep per wait
         counted its oversleep as the device's (SDXL's UNet: 96 to 163 ms of waits a call, against
         a 78 ms replay)."""
         self._settle()
@@ -1109,7 +1101,6 @@ def mark(root: Module) -> None:
         with recorder.lock:
             recorder.base = recorder.snapshot()
             recorder.structure = None  # a request may swap classes or hooks before its loop
-            recorder.sights.clear()
             recorder.began = None
 
 
@@ -1214,7 +1205,7 @@ def _receipt(recorder: _Recorder) -> dict[str, object]:
     """A region's graph economics so far: each idle capture's cost (warm-up, capture and
     instantiation), what each signature measured, a replay's saving over an eager
     call (device time between their events, beyond each way's first call) and the calls that
-    repay the captures. A device-bound signature never records."""
+    repay the captures."""
     eager, replay = recorder.eager.wall_ms(), recorder.replayed.wall_ms()
     saving = eager - replay if eager is not None and replay is not None else None
     cost = sum(recorder.capture_each)
@@ -1330,11 +1321,7 @@ def _name(root: Module) -> str:
 OUTCOMES = {
     "replayed": "its graph replayed",
     "recorded": "it captured a graph, checked against the call as written, which served",
-    "first_occurrence": "its path's first call: measured for its next",
-    "measuring": "its last call's timing was still on the device",
-    "device_bound": "the device, not the host, sets its pace: a graph saves nothing",
-    "too_few": "too few calls left in this request to repay a capture, even all launch overhead",
-    "no_gain": "a checked replay was no faster",
+    "first_occurrence": "its path's first call: its working memory measured for its pool",
     "no_room": "no room for its graph's pool or weights",
     "refused": "the code can't be recorded (a capture refusal, state it changes)",
     "capture_refused": "its capture failed",
@@ -1404,8 +1391,11 @@ def _region_path(
     kwargs: dict[str, object],
 ) -> object:
     """The call replayed when its signature has a graph; recorded in the call at its signature's
-    second sight when its first was launch-bound (`_capture_call`); otherwise as written, with
-    nothing around it but its key and two timing events."""
+    second sight, its first having measured the working memory its pool needs (`_capture_call`);
+    otherwise as written, with nothing around it but its key and two timing events. Every path
+    records: a device-bound one replays as fast as it runs, and only correctness (the guards,
+    the check against the call as written) and memory (`_over_card`, no room) keep one as
+    written."""
     placed = PLACED.get(module)
     leaves: list[object]
     spec: TreeSpec
@@ -1480,7 +1470,6 @@ def _region_path(
             return result
         # No graph of this path holds now (what it read outside the call is gone, or a module
         # attribute it read has another value): this call records one.
-    recorder.sights[key] = recorder.sights.get(key, 0) + 1
     if (
         FORCE
         and key not in recorder.seen
@@ -1488,7 +1477,7 @@ def _region_path(
         and key not in recorder.judged
         and recorder.eager.calls  # a region's first call autotunes and pages in
     ):
-        # Gates only: every path records at its first sight, whatever it would save.
+        # Gates only: every path records at its first sight, sized by its region's peak.
         peak = max((s.peak or 0 for s in recorder.seen.values()), default=0)
         warm = _Seen(0.0, 0.0, torch.cuda.Event(), torch.cuda.Event(), peak or None)
         result = _capture_call(
@@ -1501,19 +1490,15 @@ def _region_path(
             result = _capture_call(
                 torch, module, recorder, call, key, spec, leaves, (args, kwargs), placed, seen
             )
-            if result is _PROBE:
-                return _probe(torch, recorder, key, seen, lambda: call(module, *args, **kwargs))
             if result is not _EAGER:
                 return result
-        # Not captured in this call (device-bound by its probe, too few calls left, no room):
-        # idle capture stays the backup, judging a replay against the call as written on
-        # resident weights. On a card other executors filled, SDXL's probe saw a streaming call
-        # and declined, and only an idle capture replays it (43715070664: 0.224 against 0.077 s).
-        # Only a call measured short is queued: a 34 s H3 step at idle would hold its executor.
+        # Not recorded in this call (no room, a kernel building, its working memory unmeasured):
+        # idle capture is the backup, on resident weights. Only a short call is queued: a 34 s
+        # H3 step at idle would hold its executor.
         took = seen.device_ms()
         if (
             took is not None
-            and took <= _PROBE_MS
+            and took <= _IDLE_MS
             and not any(key in held for held in _settled_by(recorder))
         ):
             _queue(torch, module, recorder, call, key, spec, leaves, placed)
@@ -1552,8 +1537,6 @@ class _Seen:
     start: Event
     end: Event
     peak: int | None
-    #: its region's first call: autotuning, library setup and page-in make it no measure
-    cold: bool = False
 
     def device_ms(self) -> float | None:
         """Read once the device passed its end; None before (never a wait)."""
@@ -1597,135 +1580,13 @@ def _first[T](
         peak = last.peak
     elif peak is not None and last is not None and last.peak is not None:
         peak = max(peak, last.peak)
-    recorder.seen[key] = _Seen(submit, host, start, end, peak, cold=recorder.eager.calls == 1)
+    recorder.seen[key] = _Seen(submit, host, start, end, peak)
     return result
 
 
-#: the longest call a probe measures (`_probe`): past it, launch overhead (microseconds a kernel)
-#: can't be a share worth capturing in the call
-_PROBE_MS = 1000.0
-#: the least share of a call its launch overhead must be for a capture in the call
-_SAVING = 0.05
-#: `_capture_call`'s answer when the call should run as its probe
-_PROBE = object()
-
-
-class _Probe:
-    """A path's call run with the device held back while the host submitted it (`_probe`): its
-    device time between its events is the work alone, as a graph would run it."""
-
-    __slots__ = ("end", "normal", "start")
-
-    def __init__(self, start: Event, end: Event, normal: float) -> None:
-        #: the path's ordinary device time a call when it was probed: a later call's can carry
-        #: paging stalls a replay would not save
-        self.start, self.end, self.normal = start, end, normal
-
-    def busy_ms(self) -> float | None:
-        return float(self.start.elapsed_time(self.end)) if self.end.query() else None
-
-
-def _probe[T](
-    torch: ModuleType,
-    recorder: _Recorder,
-    key: tuple[object, ...],
-    seen: _Seen,
-    run: Callable[[], T],
-) -> T:
-    """The call as written, measured for its launch overhead: a spin kernel holds the device
-    for longer than the host takes to submit the call (`seen`'s submission), so every kernel is
-    queued before the device reaches it and runs back to back. Its device time is the work
-    alone; the path's ordinary device time less it is what a replay saves. It costs this call
-    the hold, once per path."""
-    stream = torch.cuda.current_stream()
-    props = torch.cuda.get_device_properties(stream.device)
-    torch.cuda._sleep(int(seen.submit_ms * 1.25 * props.clock_rate))  # clock_rate: kHz
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record(stream)
-    result = recorder.eager.run(torch, run)
-    end.record(stream)
-    recorder.probes[key] = _Probe(start, end, seen.device_ms() or 0.0)
-    _note(recorder, "measuring", "its launch overhead (probe)")
-    return result
-
-
-def _too_few(recorder: _Recorder, key: tuple[object, ...], seen: _Seen, device: float) -> str:
-    """Why probing `key` can't pay ("" when it might): a replay saves at most a call's host
-    submission (all of it launch overhead) and at most its device time, and even that over the
-    calls left in this request repays no capture and check. A 4-step turbo held the device for
-    its probe at every request and never captured (Qwen-Image-2, 43687738568: 0.45 s a step)."""
-    ahead = _ahead(recorder, key)
-    most = min(seen.submit_ms, device) * ahead
-    cost = _capture_cost(recorder, seen.submit_ms, device)
-    if most > cost:
-        return ""
-    return f"{ahead} calls left save at most {most:.0f} ms, against ~{cost:.0f} ms to capture and check"
-
-
-def _launch_cost(recorder: _Recorder, key: tuple[object, ...]) -> tuple[float, float] | object:
-    """`key`'s ordinary device time a call and its time with no launch gaps from its probe, None
-    while that is on the device; for a key with no probe, a device-bound verdict its family's
-    probe left (both times its call's, no saving), else `_PROBE`. Only "device-bound" carries:
-    a launch-bound family probes each new key, which may capture."""
-    if (probe := recorder.probes.get(key)) is None:
-        normal = recorder.device_bound.get(_family(key))
-        return _PROBE if normal is None else (normal, normal)
-    if (busy := probe.busy_ms()) is None:
-        return None
-    if max(0.0, probe.normal - busy) < _SAVING * probe.normal:
-        recorder.device_bound[_family(key)] = probe.normal
-    return probe.normal, busy
-
-
-def _family(key: tuple[object, ...]) -> tuple[object, ...]:
-    """`key` with no object identities or addresses: its arguments' layout (an opaque argument
-    by its kind alone), autocast, attention layout and structure: what sets a call's cost.
-    Flux-2's key changes every request in its host state (43733785568)."""
-    *signature, parts = key
-    leaves = tuple(
-        ("object", leaf[1][0] if isinstance(leaf[1], tuple) and leaf[1] else type(leaf[1]))
-        if isinstance(leaf, tuple) and len(leaf) == 2 and leaf[0] == "object"
-        else leaf
-        for leaf in signature
-    )
-    found = cast("_Parts", parts)
-    return (*leaves, found.autocast, found.attention, found.structure)
-
-
-def _unpaid(
-    recorder: _Recorder, key: tuple[object, ...], seen: _Seen, normal: float, busy: float
-) -> str:
-    """Why capturing `key` in this call wouldn't pay ("" when it would): its launch overhead
-    over the calls ahead against the capture's cost, and at least `_SAVING` of the call."""
-    saving, ahead = max(0.0, normal - busy), _ahead(recorder, key)
-    cost = _capture_cost(recorder, seen.submit_ms, busy)
-    if saving >= _SAVING * normal and saving * ahead > cost:
-        return ""
-    return (
-        f"launch overhead {saving:.1f} of {normal:.1f} ms a call, {ahead} calls ahead, "
-        f"against ~{cost:.0f} ms to capture and check"
-    )
-
-
-def _ahead(recorder: _Recorder, key: tuple[object, ...]) -> int:
-    """The calls of `key` likely still to come in this attempt: what a loop's progress says is
-    left, else as many as it ran already (a loop that ran k times runs about k more)."""
-    context = CURRENT.get()
-    step = getattr(context, "_step", None) if context is not None else None
-    if isinstance(step, tuple) and len(step) == 2 and step[1] > step[0]:
-        return int(step[1] - step[0])
-    return recorder.sights.get(key, 1)
-
-
-def _capture_cost(recorder: _Recorder, submit_ms: float, busy_ms: float) -> float:
-    """What capturing and checking a call costs beyond the call as written, which serves it
-    either way: its region's last capture less that call, else a capture's submission, a replay
-    and the comparison (5090, 43476403923: SDXL ~350 ms, Klein ~170, Qwen-Image-2 4 MP ~1.1 s)."""
-    served = max(submit_ms, busy_ms)
-    if recorder.capture_each:
-        return max(0.0, recorder.capture_each[-1] - served)
-    return submit_ms + busy_ms + 150
+#: the longest call idle capture records (`_queue`): a longer one would hold the device through
+#: a request that arrives meanwhile (an H3 DiT step: 34 s)
+_IDLE_MS = 1000.0
 
 
 _SEQUENCE = itertools.count()
@@ -1777,39 +1638,11 @@ def _capture_call(
     seen: _Seen,
 ) -> object:
     """Record `key`'s signature in this call, replay it once on this call's inputs, then run the
-    call as written, which serves, and keep the graph when the two match bit for bit and the
-    replay costs less than the call did; `_EAGER` when it doesn't record now. A capture that
+    call as written, which serves, and keep the graph when the two match bit for bit; `_EAGER`
+    when it doesn't record now. A capture that
     finds no room or a kernel still building runs as written and tries again at a later call;
     one the code refuses, or a mismatch, runs as written for the process, and the run says why.
     Never an error a call as written would not raise."""
-    device = 0.0 if FORCE else seen.device_ms()
-    if device is None:
-        _note(recorder, "measuring")
-        return _EAGER  # its last call's events are still queued: the next call decides
-    if FORCE:
-        pass  # gates: no measure, no probe, no cost: record it
-    elif seen.cold:  # a region's first call autotunes and pages in: measure it once more
-        _note(recorder, "measuring", "its region's first call")
-        return _EAGER
-    elif device > _PROBE_MS:
-        # Launch overhead is a few microseconds a kernel: a call this long can't owe it a
-        # share worth a capture in the call. Idle capture, off the critical path, decides it.
-        recorder.gap = f"device-bound: a {device:.0f} ms call"
-        _note(recorder, "device_bound", recorder.gap)
-        return _EAGER
-    elif (measured := _launch_cost(recorder, key)) is _PROBE:
-        if why := _too_few(recorder, key, seen, device):
-            recorder.gap = why
-            _note(recorder, "too_few", why)
-            return _EAGER
-        return _PROBE
-    elif measured is None:
-        _note(recorder, "measuring", "its probe is still on the device")
-        return _EAGER
-    elif why := _unpaid(recorder, key, seen, *cast("tuple[float, float]", measured)):
-        recorder.gap = why
-        _note(recorder, "device_bound", why)
-        return _EAGER
     if seen.peak is None and not FORCE:
         # its pass was observed inside another's: a later call may be
         recorder.gap = "its calls' working memory is not measured"
@@ -1855,16 +1688,8 @@ def _capture_call(
             return result
         replayed.synchronize()
         replay = max(replayed.host_ms, replayed.device_ms())
-        cost = max(seen.host_ms, device)
         with recorder.lock:
-            recorder.bound[key] = (seen.submit_ms, seen.host_ms, device, replay)
-            if cost - replay <= max(_NOISE * cost, 0.05) and not FORCE:
-                recorder.judged[key] = recorder.gap = (
-                    f"no gain: replay {replay:.3f} ms a call against {cost:.3f} ms as written"
-                )
-                recorder.codes[key] = "no_gain"
-                _note(recorder, "no_gain", recorder.gap)
-                return result
+            recorder.bound[key] = (seen.submit_ms, seen.host_ms, seen.device_ms() or 0.0, replay)
             if recorder.landed != LANDED[0] or _find(recorder, key) is not None:
                 return result  # a kernel landed meanwhile: its graphs go
             _admit(recorder, key, recording)
@@ -2029,10 +1854,6 @@ def _drop_unused(recorder: _Recorder, owner: domain.Domain) -> None:
         recorder.binding.close()
         recorder.binding = None
     recorder.close_overlays()
-
-
-#: a replay is kept when it saves more than this share of the call as written
-_NOISE = 0.02
 
 
 def _owner(
@@ -2530,10 +2351,10 @@ def _capture_pending(pending: _Pending) -> bool:
     if submit is None:
         return False
     seen = recorder.seen.get(pending.key)
-    if seen is not None and (took := seen.device_ms()) is not None and took > _PROBE_MS:
-        # A warm-up would hold the idle device for the whole call (an H3 DiT step: 34 s) to
-        # find what its length already says: launch overhead is no share of it worth a graph.
-        recorder.idle_failed[pending.key] = f"device-bound: a {took:.0f} ms call"
+    if seen is not None and (took := seen.device_ms()) is not None and took > _IDLE_MS:
+        # Its warm-up, capture and check would hold the idle device three calls this long (an
+        # H3 DiT step: 34 s) through any request that arrives: its next call records it.
+        recorder.idle_failed[pending.key] = f"a {took:.0f} ms call is too long to record at idle"
         recorder.queued.pop(pending.key, None)
         return True
     placed, owner = PLACED.get(module), recorder.domain
@@ -2584,9 +2405,8 @@ def _record(
     submit: float,
 ) -> bool:
     """Records `pending`'s signature at idle on seeded inputs of its layout, in its region's
-    capture pool: a warm-up run, measured, then the capture unless the warm-up's host waited on
-    the device half its time (device-bound: a graph saves nothing). The replay decides the rest:
-    bit for bit equal to eager, and faster than its eager calls (`_no_gain`). Its pool gets one
+    capture pool: a warm-up run, measured, then the capture, kept when its replay is bit for bit
+    equal to the warm-up. Its pool gets one
     free run of `vt.pool_bytes` of the warm-up's peak beside what the pool holds, more if the
     capture takes more (`capture`). No room for its weights, warm-up, pool or capture: it runs as
     written until a call records it, the run says what it needed, and its next call queues it
@@ -2648,12 +2468,6 @@ def _record(
                     _WARMING.reset(warming)
                 waited = IDLE.metered_ms - metered
                 recorder.bound[key] = (submit, took, waited, None)
-                if 2 * waited >= took:  # the device, not the host, set its pace
-                    recorder.idle_failed[key] = (
-                        f"device-bound: its warm-up's host waited {waited:.3f} of {took:.3f} ms "
-                        "on the device"
-                    )
-                    return True
                 if not peak:
                     recorder.idle_failed[key] = "its warm-up's working memory was not measured"
                     return True
@@ -2670,12 +2484,6 @@ def _record(
                 replayed = entry(inputs, entry.output())
                 if differs := vt.replay_differs(eager, replayed):
                     _failed(module, recorder, key, differs, "replay_mismatch", idle=True)
-                    return True
-                IDLE.check()
-                why, replay_ms = _no_gain(torch, entry, recorder.eager)
-                recorder.bound[key] = (submit, took, waited, replay_ms)
-                if why:
-                    recorder.idle_failed[key] = why
                     return True
         _admit(recorder, key, entry)
         entry = None
@@ -3138,35 +2946,6 @@ class _State:
             self.torch.cuda.set_rng_state(self.rng[1])
             self.changed = ", ".join(sorted(changed))
         return self.changed
-
-
-def _no_gain(torch: ModuleType, entry: _Recording, eager: _Timing) -> tuple[str, float | None]:
-    """Why a verified graph is dropped, and a replay's measured ms: a replay as a request makes
-    it (its inputs copied in, its outputs copied out), timed twice at idle, costs no less than
-    an eager call by more than the two differ by (v14/v15: CLIP's tiny regions recorded, then
-    replayed no faster: the copies and the launch were their whole cost). A call costs the
-    longer of its host submission and its device time between events: a launch-bound call
-    queued behind other work shows its kernels' time alone on the device, its cost on the host
-    (v17's two-stream MLP). "" when it gains, or with no eager call measured past the first."""
-    submit, device = eager.submit_ms(), eager.wall_ms()
-    if submit is None or device is None:
-        return "", None
-    leaves = [t.clone() if t is not None else None for t in entry.inputs]
-    costs = []
-    for _ in range(2):
-        out = entry.output()
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
-        began = time.perf_counter()
-        entry(leaves, out)
-        host = (time.perf_counter() - began) * 1e3
-        end.record()
-        _settled(end)
-        costs.append(max(host, float(start.elapsed_time(end))))
-    replay, called = sum(costs) / len(costs), max(submit, device)
-    if called - replay > abs(costs[0] - costs[1]):
-        return "", replay
-    return f"no gain: replay {replay:.3f} ms a call against eager {called:.3f} ms", replay
 
 
 #: the idle inputs' seed: any fixed one (the verify needs the same inputs twice, not these)
