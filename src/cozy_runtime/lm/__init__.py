@@ -246,6 +246,9 @@ def _set[T](value: T | None) -> T:
     return cast("T", value)  # cast: each caller reads it only in the state that sets it
 
 
+_MEASURE = [0, 0]  # cr-297 LM gate: requests this process, decode steps this request
+
+
 def generate(
     model: PreTrainedModel,
     inputs: Mapping[str, torch.Tensor],
@@ -285,6 +288,8 @@ def generate(
     the decode's own check's to act on). Without one, the running telemetry stage is told them
     as a count of tokens, `max_new_tokens` only their cap. `ctx.progress` called from it counts
     tokens too, never steps."""
+    _MEASURE[0] += 1
+    _MEASURE[1] = 0
     for named in (draft, _DRAFT.get(), HEADS.get(model)):
         if named is not None:
             draft = named
@@ -2829,6 +2834,15 @@ class _Engine:
                 current.wait_stream(side)
 
     def _replay(self, size: int, cuda: bool) -> None:
+        _MEASURE[1] += 1
+        if _MEASURE[0] % 2 == 0 and _MEASURE[1] == 8:
+            from cozy_runtime.graphs import profiles
+            label = f"lm decode step 8, request {_MEASURE[0]}, rows {size}"
+            profiles.profiled(torch, label, lambda: self._replay_measured(size, cuda), at=1)
+            return
+        self._replay_measured(size, cuda)
+
+    def _replay_measured(self, size: int, cuda: bool) -> None:
         drafted = self._drafting(size)
         constrained = self._constrained()
         part = self.part if drafted else -1
@@ -2981,6 +2995,11 @@ class _Engine:
         self._advance(size)
         self.eager += 1
         why = vt.replay_differs([*state, *self._written(size, at)], replayed)
+        if why:  # cr-297 LM forced gate (never merged): kept, said, never discarded
+            print(f"[lm] forced gate kept a graph that differs from eager: {why}", file=sys.stderr)
+            if (placed := PLACED.get(self.model)) is not None:
+                placed[0].note(f"{placed[1]}.lm_forced", why[:300])
+            return
         if why:
             stream.synchronize()
             if len(self.graphs) == 1:
