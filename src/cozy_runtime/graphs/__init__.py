@@ -1335,7 +1335,7 @@ def _since(now: Mapping[str, int], base: Mapping[str, int]) -> dict[str, int]:
     return {code: n - base.get(code, 0) for code, n in now.items() if n > base.get(code, 0)}
 
 
-#: the region whose call runs on this thread (`_region_call`) and its root
+#: the region calls running on this thread (`_region_call`), outermost first, with their roots
 _RUNNING = threading.local()
 
 
@@ -1344,10 +1344,12 @@ def entering(root: Module) -> None:
     component's region call, that call reads it: its graphs hold `root`'s Binding at capture and
     each replay, as an overlay's. H3 Turbo's bank is engaged on its DiT and read from there, with
     no LoRA hook between (43683255718: "capture requires an active prepared weight binding")."""
-    region = getattr(_RUNNING, "region", None)
-    if region is None or region[1] is root or (placed := PLACED.get(root)) is None:
+    running: list[tuple[_Recorder, Module]] | None = getattr(_RUNNING, "regions", None)
+    if not running or (placed := PLACED.get(root)) is None:
         return
-    region[0].entered.setdefault((id(placed[0]), placed[1]), placed)
+    for recorder, region in running:  # a region nested in another runs inside its capture too
+        if region is not root:
+            recorder.entered.setdefault((id(placed[0]), placed[1]), placed)
 
 
 def _region_call(
@@ -1360,12 +1362,12 @@ def _region_call(
 ) -> object:
     """A region call, counted by how it ran (`OUTCOMES`)."""
     recorder.now = ("first_occurrence", "")
-    outer = getattr(_RUNNING, "region", None)
-    _RUNNING.region = (recorder, module)
+    running: list[tuple[_Recorder, Module]] = _RUNNING.__dict__.setdefault("regions", [])
+    running.append((recorder, module))
     try:
         return _region_path(torch, module, recorder, call, args, kwargs)
     finally:
-        _RUNNING.region = outer
+        running.pop()
         code, why = recorder.now
         recorder.outcomes[code] = recorder.outcomes.get(code, 0) + 1
         if why:
