@@ -95,8 +95,15 @@ from tensorfs.executor import (
 )
 from tensorfs.varena import _runtime as varena
 
-#: TensorFS's request for a model read now (cl-966); none in a TensorFS before it.
-_MODEL_NEED: Callable[..., Request] | None = getattr(tensorfs.executor, "ModelNeed", None)
+
+class _ModelNeed(Protocol):
+    """TensorFS's request for a model read now (cl-966)."""
+
+    def __call__(self, *, manifest: str, components: list[str]) -> Request: ...
+
+
+#: None in a TensorFS before it.
+_MODEL_NEED: _ModelNeed | None = getattr(tensorfs.executor, "ModelNeed", None)
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
