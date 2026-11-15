@@ -14,7 +14,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import App
 from cozy_runtime.author._artifacts import Lora, ModelArtifact, ModelChoice
-from cozy_runtime.author._calls import ChildCallError, call, prefetch
+from cozy_runtime.author._calls import ChildCallError, Operation, call, prefetch
 from cozy_runtime.author._context import Context, Device, device
 from cozy_runtime.author._errors import InvalidRequest, OutputError, UnsupportedInput
 from cozy_runtime.author._loader import Config, DerivedCache, Loader, ModelAssets
@@ -63,6 +63,7 @@ __all__ = [
     "ModelArtifact",
     "ModelAssets",
     "ModelChoice",
+    "Operation",
     "OutputError",
     "Outputs",
     "QuantizationPlan",

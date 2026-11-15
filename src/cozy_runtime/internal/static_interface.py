@@ -463,7 +463,7 @@ class Reader:
         self.modules: dict[str, Module] = {}
         #: callee packages read so far: an unpacked wheel's root, and a package's interface
         self.fetched: dict[str, Path] = {}
-        self.callees: dict[Path, dict[str, Json] | None] = {}
+        self.callees: dict[tuple[Path, str], dict[str, Json] | None] = {}
         self.sites: dict[Path, dict[str, CozyPackage] | None] = {}
         self.structs: dict[tuple[Path, str], type[msgspec.Struct] | None] = {}
         self.enums: dict[tuple[Path, str], type[enum.Enum]] = {}
@@ -1566,7 +1566,7 @@ class Registration:
     memoize: bool = False
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     child_task: bool = False
-    accelerator: bool = True
+    accelerator: bool | None = None
     model_on_demand: tuple[str, ...] = ()
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     #: A model argument's class where the registration names it, not its annotation.
@@ -1634,6 +1634,7 @@ def build(
     *,
     environment_python: Path | None = None,
     closures: dict[str, str] | None = None,
+    dependency_roots: tuple[Path, ...] = (),
 ) -> dict[str, Json]:
     """The package interface from source alone. Executes nothing of the package. `closures`, when
     given, gets each memoized callable's code closure (`_code_closure`)."""
@@ -1642,7 +1643,11 @@ def build(
     # A callee package is read as source too: a local one from the directory the project's
     # uv.lock names, a published one from the exact wheel it pins (cr-114).
     pinned = locked.read(project)
-    roots = (*environment_roots(environment_python, project=project), *pinned.roots)
+    roots = (
+        *environment_roots(environment_python, project=project),
+        *pinned.roots,
+        *dependency_roots,
+    )
     own = source_tops(project)
     reader = Reader(project, dependency_roots=roots, wheels=pinned.wheels, own=own)
     name = tomllib.loads((project / "pyproject.toml").read_text())["project"]["name"]
@@ -1677,7 +1682,11 @@ def build_builtin(name: str) -> dict[str, Json]:
 
 
 def build_installed(
-    distribution: str, *, environment_python: Path, closures: dict[str, str] | None = None
+    distribution: str,
+    *,
+    environment_python: Path,
+    closures: dict[str, str] | None = None,
+    dependency_roots: tuple[Path, ...] = (),
 ) -> dict[str, Json]:
     """Describe one explicitly selected wheel using only its metadata and source bytes; `closures`
     as `build`'s."""
@@ -1755,7 +1764,7 @@ def build_installed(
         for path in owned
         if path.is_relative_to(site)
     )
-    reader = Reader(metadata.parent, dependency_roots=roots, own=own)
+    reader = Reader(metadata.parent, dependency_roots=(*roots, *dependency_roots), own=own)
     entry = reader.application_module(application.partition(":")[0])
     source = installed(entry.path)
     if not source.is_relative_to(site) or source not in owned:
@@ -1839,7 +1848,7 @@ def _build(
                 closures[f"{registration.module.name}:{registration.fn.name}"] = closure
         declared[registration.name] = row
     body = package_interface.assemble(application, list(declared.values()), recipes=recipes)
-    _calls(reader, registrations, body, distribution)
+    _calls(reader, registrations, body, distribution, pinned.names if pinned is not None else None)
     return body
 
 
@@ -1858,7 +1867,11 @@ class CozyPackage:
 
 
 def _calls(
-    reader: Reader, registrations: Sequence[Registration], body: dict[str, Json], distribution: str
+    reader: Reader,
+    registrations: Sequence[Registration],
+    body: dict[str, Json],
+    distribution: str,
+    locked_packages: frozenset[str] | None = None,
 ) -> None:
     """Each entry's `calls`: the functions it reaches, through its own package's helpers, that
     run as their own calls (`call(fn, ...)`): its package's own, and another package's public
@@ -1872,6 +1885,44 @@ def _calls(
             continue
         rows: dict[tuple[str, str], dict[str, Json]] = {}
         for found in _callees(reader, registration):
+            if isinstance(found, Assigned):
+                reference = _operation(reader, found)
+                assert reference is not None
+                package, module, export, declaration = reference
+                if (
+                    locked_packages is not None
+                    and locked.distribution(package) not in locked_packages
+                ):
+                    reader.refuse(
+                        found.module,
+                        found.stmt,
+                        f"{package} is absent from uv.lock; lock it before generating calls",
+                        "unlocked_dependency",
+                    )
+                reference_interface = dependency_interface(reader, package)
+                callee = next(
+                    (
+                        d
+                        for d in typing.cast(
+                            list[dict[str, Json]], reference_interface["entrypoints"]
+                        )
+                        if _export_of(d) == (module, export) and not d.get("internal")
+                    ),
+                    None,
+                )
+                if (
+                    callee is None
+                    or package_interface.descriptor_id(reference_interface, str(callee["name"]))
+                    != declaration
+                ):
+                    reader.refuse(
+                        found.module,
+                        found.stmt,
+                        "generated operation differs from its locked package; regenerate its calls",
+                        "stale_call_reference",
+                    )
+                rows[(package, str(callee["name"]))] = _call_row(package, callee)
+                continue
             key = (found.module.name, found.node.name)
             if reader._own(key[0].split(".")[0]):
                 callee, package = exported.get(key), distribution
@@ -1915,10 +1966,10 @@ def _call_row(package: str, doc: Mapping[str, Json]) -> dict[str, Json]:
     return row
 
 
-def _callees(reader: Reader, registration: Registration) -> list[Definition]:
+def _callees(reader: Reader, registration: Registration) -> list[Definition | Assigned]:
     """The functions a registration's body reaches that run as calls: the first argument of each
     `call(fn, ...)`. Its own package's other functions run inline, so their bodies are read too."""
-    found: list[Definition] = []
+    found: list[Definition | Assigned] = []
     pending = [(registration.module, registration.fn)]
     seen: set[tuple[Path, int]] = set()
     while pending:
@@ -1935,6 +1986,14 @@ def _callees(reader: Reader, registration: Registration) -> list[Definition]:
             )
             if isinstance(node, ast.Call) and managed:
                 named.add(id(node.args[0]))
+                try:
+                    reference = reader.resolve(module, node.args[0])
+                except StaticRefusal:
+                    reference = None
+                if isinstance(reference, Assigned) and _operation(reader, reference) is not None:
+                    if managed == "author.call":
+                        found.append(reference)
+                    continue
                 callee = _function(reader, module, node.args[0])
                 runtime = callee is None or callee.module.name.split(".")[0] == "cozy_runtime"
                 if managed == "author.call" and not runtime:
@@ -1946,6 +2005,75 @@ def _callees(reader: Reader, registration: Registration) -> list[Definition]:
             if reader._own(target.module.name.split(".")[0]):
                 pending.append((target.module, typing.cast(ast.FunctionDef, target.node)))
     return found
+
+
+def _operation(reader: Reader, found: Assigned) -> tuple[str, str, str, str] | None:
+    node = found.value
+    if not isinstance(node, ast.Call):
+        return None
+    try:
+        target = reader.resolve(found.module, node.func)
+    except StaticRefusal:
+        return None
+    if not isinstance(target, Vocab) or target.key != "author.Operation":
+        return None
+    keywords = {kw.arg: kw.value for kw in node.keywords}
+    values: list[str] = []
+    for name in ("distribution", "module", "export", "declaration"):
+        value = keywords.get(name)
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            reader.refuse(
+                found.module, node, "an operation reference needs generated constant identity"
+            )
+        values.append(value.value)
+    return values[0], values[1], values[2], values[3]
+
+
+def dependency_interface(reader: Reader, distribution: str) -> dict[str, Json]:
+    """Read one locked dependency's actual source, never import its implementation."""
+    normalized = locked.distribution(distribution)
+    pinned = locked.read(reader.project)
+    top = normalized.replace("-", "_")
+    reader._fetched(top)
+    roots = (
+        [*pinned.roots, *([reader.fetched[top]] if top in reader.fetched else [])]
+        if pinned.names
+        else list(reader.roots)
+    )
+    packages: dict[Path, CozyPackage] = {}
+    for root in roots:
+        for candidate in (root, root.parent):
+            project = candidate / "pyproject.toml"
+            if project.is_file():
+                table = tomllib.loads(project.read_text()).get("project", {})
+                if locked.distribution(table.get("name", "")) == normalized:
+                    packages[candidate] = CozyPackage(
+                        distribution, read_application(candidate), candidate, source_tops(candidate)
+                    )
+        for package in (_installed_apps(reader, root) or {}).values():
+            if locked.distribution(package.distribution) == normalized:
+                packages[package.project] = package
+    if len(packages) != 1 or (pinned.names and normalized not in pinned.names):
+        raise StaticRefusal(
+            f"{distribution} must name one locked package source", code="unlocked_dependency"
+        )
+    interface = _callee_interface(reader, next(iter(packages.values())))
+    if interface is None:
+        raise StaticRefusal(
+            f"{distribution} has a cyclic managed declaration", code="static_unsupported"
+        )
+    return interface
+
+
+def build_dependency(project: Path, distribution: str) -> dict[str, Json]:
+    project = project.resolve()
+    pinned = locked.read(project)
+    if locked.distribution(distribution) not in pinned.names:
+        raise StaticRefusal(f"{distribution} is absent from uv.lock", code="unlocked_dependency")
+    reader = Reader(
+        project, dependency_roots=pinned.roots, wheels=pinned.wheels, own=source_tops(project)
+    )
+    return dependency_interface(reader, distribution)
 
 
 def _managed(reader: Reader, module: Module, node: ast.Call) -> str:
@@ -1983,9 +2111,11 @@ def _function(reader: Reader, module: Module, node: ast.AST) -> Definition | Non
 
 def _callee_interface(reader: Reader, package: CozyPackage) -> dict[str, Json] | None:
     """Another package's interface, read from its source as this one locked it; once each."""
-    if package.project in reader.callees:
-        return reader.callees[package.project]
-    reader.callees[package.project] = None  # a package that calls back reads as no calls
+    # Several installed Apps share one site-packages directory.
+    key = (package.project, package.distribution)
+    if key in reader.callees:
+        return reader.callees[key]
+    reader.callees[key] = None  # a package that calls back reads as no calls
     callee = Reader(package.project, dependency_roots=reader.roots, own=package.own)
     callee.wheels, callee.fetched, callee.callees = reader.wheels, reader.fetched, reader.callees
     try:
@@ -1997,7 +2127,7 @@ def _callee_interface(reader: Reader, package: CozyPackage) -> dict[str, Json] |
             f"{package.distribution}, which this package calls, can't be read: {exc}",
             code=exc.code,
         ) from exc
-    reader.callees[package.project] = interface
+    reader.callees[key] = interface
     return interface
 
 
@@ -2460,7 +2590,8 @@ def _registration(
     used_components: dict[str, tuple[str, ...]] = {}
     module = declaration or module
     name = fn.name
-    accelerator, private = True, False
+    accelerator: bool | None = None
+    private = False
     weights: tuple[author.WeightsOutput, ...] = ()
     on_demand: tuple[str, ...] = ()
     box: dict[str, object] = {}
@@ -2500,6 +2631,8 @@ def _registration(
             name = str(value)
         elif keyword.arg in _TOOL_KEYWORDS:
             box[keyword.arg] = value
+        elif keyword.arg == "accelerator" and value is None:
+            accelerator = None
         elif keyword.arg in ("accelerator", "private", "memoize"):
             if type(value) is not bool:
                 reader.refuse(module, keyword.value, f"{keyword.arg} is True or False")
