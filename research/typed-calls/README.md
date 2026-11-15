@@ -12,13 +12,13 @@ checks pass; the default-home public process qualification remains pending.
 from cozy_runtime.author import call
 from orbit._calls.minimax_h3 import PackageShot, render_shot
 
-result = await call(render_shot, PackageShot(...))
+result = await call(render_shot, PackageShot(...), model=choice)
 ```
 
 `render_shot` is a generated, non-callable `Operation[PackageShot, ShotResult]`. A positional
 request supplies the generated type, and named model choices keep the existing per-slot
 selection behavior. The operation carries the real Python module/export identity from its
-canonical interface. Same-package/private function targets use the same positional request form; `fn(...)` remains
+canonical interface. Ordinary `call(fn, **arguments)` remains supported; `fn(...)` remains
 an ordinary local function call. No import rewriting or automatic function proxy is involved.
 
 ## Existing implementation and changes

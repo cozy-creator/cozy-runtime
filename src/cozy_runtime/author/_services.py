@@ -27,6 +27,7 @@ from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Literal,
     Protocol,
     TypedDict,
@@ -70,6 +71,9 @@ from cozy_runtime.author._observations import (
     Scalar,
 )
 from cozy_runtime.canonical_json import JsonValue
+
+if TYPE_CHECKING:
+    from PIL.Image import Image
 
 T = TypeVar("T")
 S = TypeVar("S")
@@ -488,37 +492,8 @@ class _AuthorEvents(Iterator[DecodedMediaEvent]):
             raise
 
 
-def _adopt_image(attempt: Attempt, asset: File) -> None:
-    """Register an image value once at a result, child-input or publish boundary.
-
-    Copies share the pending value. Its actual file remains in the invocation's ordinary
-    pending inventory; adopting in another invocation never changes that ownership.
-    """
-    if not isinstance(asset, ImageFile) or asset._image is None:
-        return
-    image = asset._image
-    if image.saved is None:
-        attempt.check_open("image value")
-        out = Outputs(attempt)
-        frame = image.frame
-        assert frame is not None
-        image.saved = (
-            out._register_frame(
-                type(asset),
-                image.format,
-                (frame.pixels,),
-                {"width": frame.width, "height": frame.height, "mode": frame.mode},
-                charge=len(frame.pixels),
-            )
-            if attempt.writes
-            else out._unwritten_file(type(asset), image.format)
-        )
-        image.frame = None
-    asset._sync_image()
-
-
 class Outputs(_Bound):
-    """Explicit publication, bounded streams and encoded artifacts (``out``).
+    """Transactional outputs (``out``). Save registers a bounded pending handle.
 
     Returning a saved value completes it with the invocation. Passing a saved file to a child
     call gives the child its bytes, and the result need not return it then.
@@ -531,6 +506,29 @@ class Outputs(_Bound):
         """The fixed audio codec quantum used by ``save_video_stream``."""
 
         return _codec.AAC_FRAME_SAMPLES
+
+    def save_image(self, image: ImageFrame | Image, *, format: str = "png") -> ImageFile:
+        return self._save_image(image, format=format)
+
+    def _save_image(
+        self, image: ImageFrame | Image, *, format: str, asset: ImageFile | None = None
+    ) -> ImageFile:
+        if format not in ("png", "webp"):
+            raise OutputError(
+                f"image format {format!r} has no encoder: choose png or lossless webp",
+                code="encoder_unavailable",
+            )
+        if not self._attempt.writes:
+            return self._unwritten_file(ImageFile, format, asset=asset)
+        frame = as_frame(image)
+        return self._register_frame(
+            ImageFile,
+            format,
+            (frame.pixels,),
+            {"width": frame.width, "height": frame.height, "mode": frame.mode},
+            charge=len(frame.pixels),
+            asset=asset,
+        )
 
     def save_audio(
         self, waveform: _codec.Samples, *, sample_rate: int, format: str = "flac"
@@ -1087,12 +1085,11 @@ class Outputs(_Bound):
         Returning the result is the last publish, so the returned value keeps what was
         published (a list extends it). `label` is for people: its first 256 characters,
         printable ASCII (others read "?"). A child call's publishes are not shown; its parent
-        publishes what it wants seen. An `ImageFile.from_image` value is encoded here."""
+        publishes what it wants seen."""
         attempt = self._attempt
         attempt.check_open("Outputs.publish")
         if not isinstance(asset, File):
             raise OutputError("publish takes one saved or received asset", code="output_kind")
-        _adopt_image(attempt, asset)
         # The log carries printable ASCII: anything else reads as "?", never a refusal.
         label = "".join(char if 0x20 <= ord(char) <= 0x7E else "?" for char in label[:256])
         # Published or dropped, the author meant it as a product, never an unreturned save.
@@ -1103,7 +1100,6 @@ class Outputs(_Bound):
             return
         if asset.ref in attempt.frames:
             settle_frame(attempt, asset.ref)
-            _adopt_image(attempt, asset)
         request = Publish(
             output=output,
             label=label,
@@ -1255,6 +1251,7 @@ class Outputs(_Bound):
         facts: dict[str, JsonValue],
         *,
         charge: int,
+        asset: A | None = None,
     ) -> A:
         """REGISTER a host frame: the raw snapshot lands in the spool, the aggregate ceiling
         is charged now, and the codec runs later — in the worker's post phase, or here
@@ -1274,20 +1271,27 @@ class Outputs(_Bound):
             for part in parts:
                 raw_bytes += spool.write(part)
         frame = HostFrame(handle, codec, path, raw_bytes, charge, facts)
-        asset = kind(handle, media_type=frame.media_type, attempt=self._attempt.request_id)
+        if asset is None:
+            asset = kind(handle)
+        asset.ref = handle
+        asset.media_type = frame.media_type
+        asset._attempt = self._attempt.request_id
         self._attempt.pending[handle] = asset
         self._attempt.frames[handle] = frame
         if self._attempt.settle_at_save:
             settle_frame(self._attempt, handle)
         return asset
 
-    def _unwritten_file(self, kind: type[A], codec: str) -> A:
+    def _unwritten_file(self, kind: type[A], codec: str, *, asset: A | None = None) -> A:
         """A save on a group's other GPU: GPU 0's is the run's, so this one names its asset and
         reads, copies, encodes and writes nothing."""
         self._attempt.check_open("Outputs.save")
         handle = self._attempt.next_handle(kind.kind)
         media_type = _codec.FRAME_MEDIA_TYPES.get(codec, codec)
-        unwritten = kind(handle, media_type=media_type, attempt=self._attempt.request_id)
+        unwritten = asset if asset is not None else kind(handle)
+        unwritten.ref = handle
+        unwritten.media_type = media_type
+        unwritten._attempt = self._attempt.request_id
         self._attempt.pending[handle] = unwritten
         return unwritten
 

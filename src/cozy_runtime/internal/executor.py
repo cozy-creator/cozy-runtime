@@ -334,8 +334,8 @@ _OPEN_MAX = 10240
 
 
 class CallBindings(Mapping[tuple[str, str], _CallType]):
-    """Admitted identities, with function bindings only for this package and Runtime builtins.
-    Foreign calls supply generated declarations and never import their implementation."""
+    """Each callable an attempt may call, by (module, export). Another package's function is bound
+    from its own code at its first call, so a dependency nothing calls is never imported."""
 
     def __init__(
         self, bound: dict[tuple[str, str], _CallType], installed: Collection[tuple[str, str]]
@@ -347,10 +347,19 @@ class CallBindings(Mapping[tuple[str, str], _CallType]):
         if binding is None:
             if key not in self._installed:
                 raise KeyError(key)
-            raise CapabilityError(
-                "another package's managed call requires a generated Operation reference",
-                code="child_reference_required",
-            )
+            module, export = key
+            try:
+                function = getattr(importlib.import_module(module), export, None)
+            except ImportError as exc:
+                raise CapabilityError(
+                    f"{module}:{export} can't be imported here: {exc}", code="child_interface"
+                ) from exc
+            if not callable(function):
+                raise CapabilityError(
+                    f"{module}:{export} is not installed in this environment",
+                    code="child_interface",
+                )
+            binding = self._bound[key] = _serving(module, export, analyze(function, name=export))
         return binding
 
     def __iter__(self) -> Iterator[tuple[str, str]]:
@@ -767,7 +776,8 @@ def _granted(input_id: str, file: InputFile) -> GrantedInput:
 
 
 def _serving(module: str, export: str, surface: Surface) -> _CallType:
-    """A local/builtin handler's canonical wire envelope and separately declared input planes."""
+    """A callable bound from its own code, called as every function is: `{payload, models}`.
+    Its direct caller passes the model slots beside the request fields (`_CallType.models`)."""
     slots = frozenset(binding.param for binding in surface.model_bindings)
     payload, answer = surface.payload_type, surface.result_type
     if not all(isinstance(t, type) and issubclass(t, msgspec.Struct) for t in (payload, answer)):
@@ -796,8 +806,8 @@ def _serving(module: str, export: str, surface: Surface) -> _CallType:
     call = msgspec.defstruct(
         f"{export}Call", [("payload", request), ("models", models)], module=module, frozen=True
     )
-    assets = "" if surface.assets is None else surface.assets.parameter
-    return _CallType("", module, export, call, result, models=slots, assets_parameter=assets)
+    struct = next((p.name for p in surface.params if p.role == "payload"), "")
+    return _CallType("", module, export, call, result, models=slots, request_parameter=struct)
 
 
 # --------------------------------------------------------------------------- state
@@ -4800,7 +4810,7 @@ class Executor:
                     )
                 bindings[(module, export)] = _serving(module, export, own_surface)
             else:
-                # Another package is admitted by identity; callers use generated references.
+                # Another package's function, installed beside this one: bound at its first call.
                 installed.add((module, export))
         for export in own:
             key = (effect_interfaces.MODULE, export)

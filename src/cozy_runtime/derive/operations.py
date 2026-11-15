@@ -8,26 +8,9 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from types import ModuleType
-from typing import TYPE_CHECKING
-
-import msgspec
+from typing import TYPE_CHECKING, Any
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author import (
-    MAX_WEIGHTS_NEW_BYTES,
-    App,
-    Context,
-    DerivationHook,
-    Model,
-    ModelArtifact,
-    QuantizationPlan,
-    SelectionPlan,
-    Telemetry,
-    UnsupportedInput,
-    Weights,
-    WeightsOutput,
-)
-from cozy_runtime.author._recipes import DeclaredRecipe, Plan, canonical, fingerprint
 from cozy_runtime.bench import (
     attention_inventory,
     attention_quality,
@@ -45,6 +28,21 @@ from cozy_runtime.bench import (
     quantize_reuse,
     varena_core,
 )
+from cozy_runtime.author import (
+    MAX_WEIGHTS_NEW_BYTES,
+    App,
+    Context,
+    DerivationHook,
+    Model,
+    ModelArtifact,
+    QuantizationPlan,
+    SelectionPlan,
+    Telemetry,
+    UnsupportedInput,
+    Weights,
+    WeightsOutput,
+)
+from cozy_runtime.author._recipes import DeclaredRecipe, Plan, canonical, fingerprint
 from cozy_runtime.weights_store import Checkpoint, Derivation
 
 from . import facade, native_quantization, svdq
@@ -200,27 +198,22 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
     return selection
 
 
-class QuantizeRequest(msgspec.Struct, kw_only=True):
-    """The canonical request for the Runtime's managed quantization operation."""
-
-    plan: QuantizationPlan
-    max_relative_frobenius: float | None = None
-
-
 async def quantize(
     ctx: Context,
-    payload: QuantizeRequest,
+    *,
     source: Weights,
+    plan: QuantizationPlan,
     tel: Telemetry,
+    max_relative_frobenius: float | None = None,
 ) -> ModelArtifact:
     """Quantize one granted source under a closed caller-authored selection plan."""
     return quantize_into(
         ctx,
         tel,
         source=source,
-        plan=payload.plan,
+        plan=plan,
         output="model",
-        max_relative_frobenius=payload.max_relative_frobenius,
+        max_relative_frobenius=max_relative_frobenius,
     )
 
 
@@ -383,8 +376,7 @@ def run_recipe(
     if opener is None:
         raise UnsupportedInput("this attempt writes no weights", code="weights_output_ungranted")
     ctx._tensorfs_output = lambda slot, made: opener(
-        slot,
-        replace(made, provenance={**provenance, **(made.provenance or {})}),  # type: ignore[dict-item]  # provenance is JSON metadata
+        slot, replace(made, provenance={**provenance, **(made.provenance or {})})  # type: ignore[dict-item]  # provenance is JSON metadata
     )
     tel.log("recipe", recipe=row.name, lane=row.lane, fingerprint=digest)
     try:
