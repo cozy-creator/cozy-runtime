@@ -38,6 +38,7 @@ class Describe(msgspec.Struct, tag="describe", tag_field="kind"):
 
     project: str
     environment_python: str | None = None
+    calls_python: str | None = None
 
 
 class DescribeInstalled(msgspec.Struct, tag="describe_installed", tag_field="kind"):
@@ -57,6 +58,7 @@ class DescribeEnvironment(msgspec.Struct, tag="describe_environment", tag_field=
     interface: bool = False
     #: also the root's memoized callables' code closures
     closures: bool = False
+    calls_python: str | None = None
 
 
 class Callee(msgspec.Struct, frozen=True):
@@ -119,6 +121,7 @@ def _environment(request: DescribeEnvironment) -> DescribedEnvironment:
     function instead of the package."""
     found = {_normalized(d.metadata["Name"]): d for d in importlib.metadata.distributions()}
     callees = []
+    dependency_roots = _call_roots(request.calls_python)
     for key, distribution in sorted(found.items()):
         applications = [e for e in distribution.entry_points if e.group == "cozy.application"]
         if key == _normalized(request.root) or not applications:
@@ -126,7 +129,7 @@ def _environment(request: DescribeEnvironment) -> DescribedEnvironment:
         name = distribution.metadata["Name"]
         try:
             document = static_interface.build_installed(
-                name, environment_python=Path(sys.executable)
+                name, environment_python=Path(sys.executable), dependency_roots=dependency_roots
             )
         except Exception as exc:
             raise _Undescribed(
@@ -162,7 +165,10 @@ def _environment(request: DescribeEnvironment) -> DescribedEnvironment:
     closures: dict[str, str] = {}
     if request.interface:
         built = static_interface.build_installed(
-            request.root, environment_python=Path(sys.executable), closures=closures
+            request.root,
+            environment_python=Path(sys.executable),
+            closures=closures,
+            dependency_roots=dependency_roots,
         )
         own = msgspec.json.encode(built).decode()
     elif request.closures:
@@ -171,7 +177,10 @@ def _environment(request: DescribeEnvironment) -> DescribedEnvironment:
         # contract's refusal stands here: swallowed, a refused package installed and ran.
         try:
             static_interface.build_installed(
-                request.root, environment_python=Path(sys.executable), closures=closures
+                request.root,
+                environment_python=Path(sys.executable),
+                closures=closures,
+                dependency_roots=dependency_roots,
             )
         except ConformanceError as exc:
             if exc.code == "package_contract":
@@ -179,6 +188,14 @@ def _environment(request: DescribeEnvironment) -> DescribedEnvironment:
             closures = {}
     return DescribedEnvironment(
         record_digest(found.get(_normalized(request.root))), callees, own, closures
+    )
+
+
+def _call_roots(python: str | None) -> tuple[Path, ...]:
+    return (
+        static_interface.environment_roots(Path(python), project=Path(python).parent.parent)
+        if python
+        else ()
     )
 
 
@@ -201,7 +218,10 @@ def describe() -> int:
             python = Path(request.environment_python) if request.environment_python else None
             closures: dict[str, str] = {}
             document = static_interface.build(
-                Path(request.project), environment_python=python, closures=closures
+                Path(request.project),
+                environment_python=python,
+                closures=closures,
+                dependency_roots=_call_roots(request.calls_python),
             )
             reply = Described(msgspec.Raw(msgspec.json.encode(document)), closures)
     except AuthorError as exc:
