@@ -2501,8 +2501,10 @@ def _registration(
             name = str(value)
         elif keyword.arg in _TOOL_KEYWORDS:
             box[keyword.arg] = value
+        elif keyword.arg == "accelerator" and value is None:
+            accelerator = None
         elif keyword.arg in ("accelerator", "private", "memoize"):
-            if type(value) is not bool and not (keyword.arg == "accelerator" and value is None):
+            if type(value) is not bool:
                 reader.refuse(module, keyword.value, f"{keyword.arg} is True or False")
             if keyword.arg == "private":
                 private = value
