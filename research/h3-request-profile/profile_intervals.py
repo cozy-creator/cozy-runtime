@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from itertools import chain
 from typing import Any
 
 
@@ -15,17 +16,15 @@ def interval_summary(
     intersections. Its inactivity includes both tails; it has no causal attribution.
     Without bounds, only observed first-to-last span and interior gaps are available.
     """
-    for start, end in [*intervals, *([] if window is None else [window])]:
+    for start, end in chain(intervals, () if window is None else (window,)):
         if not math.isfinite(start) or not math.isfinite(end) or end < start:
             raise ValueError("Interval bounds must be finite and end must not precede start")
-    ordered = sorted(
-        (start, end)
-        for start, end in (
-            (max(left, window[0]), min(right, window[1])) if window else (left, right)
-            for left, right in intervals
-        )
-        if end > start
+    bounded = (
+        intervals
+        if window is None
+        else ((max(left, window[0]), min(right, window[1])) for left, right in intervals)
     )
+    ordered = sorted(interval for interval in bounded if interval[1] > interval[0])
     result: dict[str, Any] = {
         "event_count": len(ordered),
         "duration_sum_us": sum(right - left for left, right in ordered),
