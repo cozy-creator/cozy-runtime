@@ -43,6 +43,7 @@ from cozy_runtime.author._observations import Scalar
 from cozy_runtime.author._services import (
     Attempt,
     Telemetry,
+    _adopt_image,
     _progress_scope,
     _ProgressScope,
     settle_frame,
@@ -325,6 +326,7 @@ class _Broker:
         attempt = self.attempt
         if attempt is None or not isinstance(value, File):
             return None
+        _adopt_image(attempt, value)
         saved = attempt.pending.get(value.ref)
         if saved is None:
             return None
@@ -335,6 +337,7 @@ class _Broker:
             )
         if value.ref in attempt.frames:
             settle_frame(attempt, value.ref)
+            _adopt_image(attempt, value)
         attempt.shown.add(value.ref)
         digest = self.saved_sha256.get(value.ref)
         if digest is None:

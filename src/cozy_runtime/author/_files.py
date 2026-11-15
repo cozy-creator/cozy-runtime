@@ -285,24 +285,36 @@ class File:
         return row
 
 
+@dataclass(slots=True)
+class _ImageValue:
+    """One owned snapshot and its eventual invocation-owned file, shared by labeled copies."""
+
+    frame: ImageFrame | None
+    format: str
+    width: int
+    height: int
+    saved: ImageFile | None = None
+
+
 class ImageFile(File):
     """An image input or result. `from_image()` returns host pixels for the SDK to save;
     `read()` decodes a granted input once per call, charging the attempt budget."""
 
     kind: ClassVar[str] = "image"
-    _image: ImageFrame | None = None
-    _image_format: str = ""
+    _image: _ImageValue | None = None
 
     @classmethod
     def from_image(
         cls, image: ImageFrame | Image, *, format: Literal["png", "webp"] | None = None
     ) -> Self:
-        """Snapshot host pixels for a final result, without encoding or publishing them.
+        """Snapshot host pixels for a result, child input or explicit publication.
 
-        Return this value in an existing `ImageFile` field. The SDK uses the ordinary
+        Return this value in an `ImageFile` field, pass it to `call`, or publish it with
+        `Outputs.publish`. The SDK uses the ordinary
         bounded output spool and finalization path. The default is lossless WebP, or PNG
         when a side exceeds WebP's 16383-pixel limit; both preserve alpha. Explicit format
-        choices are honored. Use `Outputs` for intermediate publication or streaming.
+        choices are honored. `probe()` reads the captured geometry before encoding;
+        `read_bytes()` is available after a child call or publish encoded this value.
         """
         from cozy_runtime.author._services import ImageFrame, as_frame
 
@@ -318,9 +330,28 @@ class ImageFile(File):
                 code="encoder_unavailable",
             )
         result = cls(f"image-value:{uuid4().hex}")
-        result._image = ImageFrame(frame.width, frame.height, bytes(frame.pixels), frame.mode)
-        result._image_format = codec
+        result._image = _ImageValue(
+            ImageFrame(frame.width, frame.height, bytes(frame.pixels), frame.mode),
+            codec,
+            frame.width,
+            frame.height,
+        )
         return result
+
+    def _sync_image(self) -> None:
+        """A copy hears about the same file its original or another copy handed off."""
+        saved = self._image.saved if self._image is not None else None
+        if saved is not None:
+            self.ref = saved.ref
+            self.media_type = saved.media_type
+            self.size_bytes = saved.size_bytes
+            self.digest = saved.digest
+            self._local = saved._local
+            self._attempt = saved._attempt
+
+    def read_bytes(self) -> bytes:
+        self._sync_image()
+        return super().read_bytes()
 
     def read(self, *, mode: Literal["RGB", "RGBA"] = "RGB", max_pixels: int | None = None) -> Image:
         """Display-oriented pixels with the field's `ImagePreparation` applied, and scaled down
@@ -330,6 +361,12 @@ class ImageFile(File):
 
     def probe(self) -> ImageProbe:
         """Header geometry: `width`/`height` are what `read()` returns. No decode."""
+        if self._image is not None:
+            from cozy_runtime.author._decode import ImageProbe
+
+            return ImageProbe(
+                self._image.width, self._image.height, self._image.width, self._image.height
+            )
         return self._reads().probe(self)  # type: ignore[return-value]
 
 
