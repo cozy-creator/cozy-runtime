@@ -1848,7 +1848,7 @@ def _build(
                 closures[f"{registration.module.name}:{registration.fn.name}"] = closure
         declared[registration.name] = row
     body = package_interface.assemble(application, list(declared.values()), recipes=recipes)
-    _calls(reader, registrations, body, distribution)
+    _calls(reader, registrations, body, distribution, pinned.names if pinned is not None else None)
     return body
 
 
@@ -1867,7 +1867,11 @@ class CozyPackage:
 
 
 def _calls(
-    reader: Reader, registrations: Sequence[Registration], body: dict[str, Json], distribution: str
+    reader: Reader,
+    registrations: Sequence[Registration],
+    body: dict[str, Json],
+    distribution: str,
+    locked_packages: frozenset[str] | None = None,
 ) -> None:
     """Each entry's `calls`: the functions it reaches, through its own package's helpers, that
     run as their own calls (`call(fn, ...)`): its package's own, and another package's public
@@ -1885,6 +1889,16 @@ def _calls(
                 reference = _operation(reader, found)
                 assert reference is not None
                 package, module, export, declaration = reference
+                if (
+                    locked_packages is not None
+                    and locked.distribution(package) not in locked_packages
+                ):
+                    reader.refuse(
+                        found.module,
+                        found.stmt,
+                        f"{package} is absent from uv.lock; lock it before generating calls",
+                        "unlocked_dependency",
+                    )
                 reference_interface = dependency_interface(reader, package)
                 callee = next(
                     (
