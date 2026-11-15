@@ -289,6 +289,10 @@ class Attempt:
     #: Its open `tel.stage`s, innermost last: `ctx.progress` from a thread of its own counts
     #: under the innermost.
     _stages: list[str] = field(default_factory=list)
+    #: Each open stage's marks (work clock, device, waited) as it last moved on: opened, or a
+    #: step of it ended. A count's first step is timed from there, as it ran: a loop with no
+    #: model call timed it from its own `ctx.progress`, near 0 ms.
+    _stage_marks: dict[str, tuple[float, object, float]] = field(default_factory=dict)
     #: Its last frame of its own (no phase's), and the lock its frames and its phases' are
     #: told under: a phase never says its stage after the attempt moved on (`_phases`).
     _said: ProgressFrame | None = None
@@ -1580,6 +1584,10 @@ class Telemetry(_Bound):
         STEP_NOW.set((name or stage, 0))
         clock = DEVICE[0] if DEVICE else None
         attempt._step_device = clock.mark() if clock is not None else None
+        # Its stage open: its first step began as the stage opened, or as its last step ended.
+        moved = attempt._stage_marks.get(name) if name is not None else None
+        if moved is not None:
+            attempt._step_mark, attempt._step_device, attempt._step_waited = moved
         if attempt._stall_watch is None:
             attempt._stall_watch = _stalls.watch(lambda: not attempt.closed)
             if attempt._stall_watch is not None:
@@ -1609,6 +1617,8 @@ class Telemetry(_Bound):
                     stalls.stop()
                     attempt._stall_watch = None
             attempt._step_mark, attempt._step_device, attempt._step_waited = now, ran, off
+            if name is not None and name in attempt._stage_marks:
+                attempt._stage_marks[name] = (now, ran, off)
             step_ms = (now - mark) * 1000 if mark else 0.0
             if (
                 name is None
@@ -1781,6 +1791,10 @@ class Telemetry(_Bound):
             self._progress_frame(stage)
             attempt._stages.append(stage)
         start = work_clock()
+        if stage is not None:
+            clock = DEVICE[0] if DEVICE else None
+            device = clock.mark() if clock is not None else None
+            attempt._stage_marks[stage] = (start, device, waited())
         token = _stage.set((self, stage)) if stage is not None else None
         try:
             yield
@@ -1792,6 +1806,8 @@ class Telemetry(_Bound):
             if stage is not None:
                 with suppress(ValueError):
                     attempt._stages.remove(stage)
+                if stage not in attempt._stages:
+                    attempt._stage_marks.pop(stage, None)
                 attempt.attribution.stage(stage, elapsed)
                 attempt.emit("stage", stage, round(elapsed, 3))
 
