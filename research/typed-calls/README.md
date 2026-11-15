@@ -45,8 +45,8 @@ do not maintain a second schema. Generated declarations must record their distri
 declaration identity, and source-only describe must resolve them against the existing lock.
 The generator must preserve nested structs, defaults, tagged unions, media and model choices.
 
-Changing Orbit's import alone does **not** remove Torch from its installed closure. The bounded installation change is the standard `[dependency-groups].cozy-calls` group, locked in the existing `uv.lock`: default sync installs the caller, and a separate prepared
-environment installs that group for managed children. TensorD reuses its existing builder and retains the child environment inside the held caller
+Changing Orbit's import alone does **not** remove Torch from its installed closure. The bounded installation change is the standard `[project.optional-dependencies].cozy-calls` extra, locked in the existing `uv.lock`: default sync installs the caller, and a separate prepared
+environment selects that extra for managed children. TensorD reuses its existing builder and retains the child environment inside the held caller
 environment, selecting its Python for that callee. Local cached callee records use the
 canonical shared environment path, so they do not retain an evictable generation symlink.
 Published carried wheels are filtered by the caller closure before installation. Root-only
@@ -58,7 +58,7 @@ and av; no H3, Torch, Diffusers or Transformers.
 Use a real CPU caller and child through package build/install, CLI, executor processes,
 sockets and storage. Verify media in both directions, model override semantics, typed child
 failure, private operation refusal and unchanged local calls. Inspect both installed
-closures, and statically describe Orbit/H3 without importing callee code. No GPU, weights,
+closures, and statically describe Orbit/H3 without importing callee code. No GPU, model-weight download,
 native Rust package or new generic broker is required.
 
 
@@ -80,8 +80,18 @@ native Rust package or new generic broker is required.
 
 Orbit requires Runtime `>=0.47.0.dev0,<0.48` for `Operation`. Published H3 `0.13.0rc2`
 currently requires Runtime `<0.47`, so the final combined `uv.lock` cannot resolve until
-H3's Runtime floor is migrated in the coordinated package cohort. Dependency groups share
+H3's Runtime floor is migrated in the coordinated package cohort. Optional extras share
 one uv resolution even though their installed environments are separate. The earlier
 root-only sync receipt used the existing 0.46 lock; it proves the group closure distinction,
 not a finished 0.47 package installation. The CPU fixture pins both sources to the candidate
 SDK for qualification. No dependency cap was relaxed to hide this integration gate.
+
+## Recursive closure
+
+Managed dependencies use the wheel-published `cozy-calls` optional extra, with each edge
+requesting `child[cozy-calls]`. An actual three-package uv resolution exported no children
+for the default root and middle, legacy leaf and its ordinary dependency when the extra
+was selected. The built middle wheel carries `Provides-Extra: cozy-calls` and the onward
+`Requires-Dist` edge. A legacy leaf without the extra warns and retains its ordinary
+dependencies. There is no second dependency manifest. The CPU fixture now includes
+A → B → legacy C → private self call.
