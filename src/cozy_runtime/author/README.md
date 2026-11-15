@@ -83,7 +83,8 @@ from .child_calls import Request, generate
 result = await call(generate, Request(prompt="a lighthouse"))
 ```
 
-Model choices remain named arguments to `call`; returned media and `ChildCallError` retain
+Model choices are passed in `models={"slot": ModelChoice(...)}`; returned media and
+`ChildCallError` retain
 their ordinary managed-call behavior. Regenerate declarations after changing the locked
 dependency. Ordinary implementation imports and local function calls remain ordinary Python.
 Each managed requirement requests its callee’s `cozy-calls` extra too, so ordinary wheel
@@ -107,8 +108,12 @@ caller; it does not remove that existing platform layer or imply that available 
   result field. The SDK snapshots host pixels, then encodes and stores them through the
   ordinary output path. It defaults to lossless WebP, using PNG for a side over 16383 pixels;
   `format="png"` or `format="webp"` keeps an explicit choice. Both keep alpha. Existing
-  result schemas, metadata and output bounds still apply. `Outputs` handles intermediate
-  publication and bounded audio/video streams.
+  result schemas, metadata and output bounds still apply. The same value can go directly
+  into a child request or `out.publish("image", image)`: the SDK registers it once and
+  encodes it when those bytes are needed. Labeled copies share that file, and the original
+  can read its encoded bytes after the child or publication consumed it. `image.probe()`
+  reads captured geometry even before encoding. `Outputs.save_image` has been removed;
+  `Outputs` handles explicit publication, encoded artifacts and bounded audio/video streams.
 
 ## Optional
 
@@ -138,3 +143,8 @@ Package code runs as plain Python too: with no executor, `retained` holds the te
 runs whole and a Model method is an ordinary method.
 
 More: `docs/package-extensions.md`.
+
+The request must be a positional `msgspec.Struct`; keyword request fields and dicts are not
+accepted. Same-package registered/private functions and Runtime builtins use the same form.
+Handlers with separately injected `Files` take them through `assets=...`. Other packages
+require generated operation references, even when their implementation is installed locally.
