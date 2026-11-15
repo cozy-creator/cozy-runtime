@@ -756,6 +756,9 @@ class _Recorder:
         self.codes: dict[tuple[object, ...], str] = {}
         #: the counters when the current attempt opened (`mark`): receipts are per request
         self.base: dict[str, object] = {}
+        #: why its calls run as written for the process: a package set a `_cozy` attribute on one
+        #: of its modules (`_reserved`), which no read guard sees
+        self.reserved = ""
         #: its first and latest call this attempt, in the process's order of region calls
         #: (`_SEQUENCE`): a component called since another's first is in that one's loop
         self.began: int | None = None
@@ -1406,7 +1409,7 @@ def _region_path(
         # A dev-only attention capture sees every call with its own inputs and step.
         else "under an attention capture"
         if attention_ulysses.CAPTURE.get() is not None
-        else _unplain(torch, leaves)
+        else recorder.reserved or _unplain(torch, leaves)
     )
     state: tuple[object, ...] = ()
     if not why:  # a guarded call reads no overlays
@@ -2085,6 +2088,10 @@ def _watching(torch: ModuleType) -> None:
             caller = sys._getframe(1).f_globals.get("__name__", "")
             if caller.partition(".")[0] not in _OURS:
                 _reserved(self, name, caller)
+                if (recorder := watch()) is not None and not recorder.reserved:
+                    # No read guard sees it, so a replay could serve a call it steers (SDXL's
+                    # HiDiffusion seed, Krea 2's control projection): the region runs as written.
+                    recorder.reserved = f"a package sets {type(self).__name__}.{name}, which no guard reads"
             return
         recorder = watch()
         if recorder is not None:
