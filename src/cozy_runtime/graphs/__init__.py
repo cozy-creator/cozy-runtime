@@ -1580,11 +1580,13 @@ def _ahead(recorder: _Recorder, key: tuple[object, ...]) -> int:
 
 
 def _capture_cost(recorder: _Recorder, submit_ms: float, busy_ms: float) -> float:
-    """What capturing and checking a call costs this one: its region's last such cost, else a
-    capture's submission, a replay and the call as written (SDXL 4090/5090: 0.6-0.7 s)."""
+    """What capturing and checking a call costs beyond the call as written, which serves it
+    either way: its region's last capture less that call, else a capture's submission, a replay
+    and the comparison (5090, 43476403923: SDXL ~350 ms, Klein ~170, Qwen-Image-2 4 MP ~1.1 s)."""
+    served = max(submit_ms, busy_ms)
     if recorder.capture_each:
-        return recorder.capture_each[-1]
-    return 3 * submit_ms + 2 * busy_ms + 250
+        return max(0.0, recorder.capture_each[-1] - served)
+    return submit_ms + busy_ms + 150
 
 
 def _capture_call(
