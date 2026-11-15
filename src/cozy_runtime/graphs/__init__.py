@@ -1602,11 +1602,11 @@ _SEQUENCE = itertools.count()
 
 class _Budget:
     """This process's request and the capture work it paid: a capture runs its call twice on the
-    device (the check's replay, then the call as written), so a request records at most
-    `_SHARE` of its length (this request's so far, or the last one's), at least `_FLOOR_MS`, and
-    always its first capture. More waits for a later request or an idle period: H3's dense steps
-    differ in shape step to step, and on a card their pools fit, request 2 recording each at once
-    would run every ~34 s step twice."""
+    device (the check's replay, then the call as written), so a request records while its capture
+    work is under `_SHARE` of its length (this request's so far, or the last one's), at least
+    `_FLOOR_MS`: the capture that crosses it is the last. More waits for a later request or an
+    idle period: H3's dense steps differ in shape step to step, and on a card their pools fit,
+    request 2 recording each at once would run every ~34 s step twice."""
 
     __slots__ = ("began", "last", "previous", "request", "spent")
 
@@ -1623,15 +1623,12 @@ class _Budget:
             self.request, self.began, self.spent = request, now, 0.0
         self.last = now
 
-    def over(self, seen: _Seen) -> str:
-        """Why recording `seen`'s path now would pass this request's share ("" when it fits)."""
-        if self.spent == 0.0:
-            return ""
-        cost = max(seen.host_ms, seen.device_ms() or 0.0) + seen.submit_ms
+    def over(self) -> str:
+        """Why this request records no more ("" while its share lasts)."""
         share = max(_SHARE * max((self.last - self.began) * 1e3, self.previous), _FLOOR_MS)
-        if self.spent + cost <= share:
+        if self.spent < share:
             return ""
-        return f"its request's captures took {self.spent:.0f} ms; {cost:.0f} more pass {share:.0f}"
+        return f"its request's captures took {self.spent:.0f} ms of a {share:.0f} ms share"
 
     def spend(self, ms: float) -> None:
         self.spent += max(ms, 0.001)
@@ -1733,7 +1730,7 @@ def _capture_call(
         recorder.gap = why
         _note(recorder, "refused", why)
         return _EAGER
-    if not FORCE and (why := _BUDGET.over(seen)):
+    if not FORCE and (why := _BUDGET.over()):
         recorder.gap = why
         _note(recorder, "deferred", why)
         return _EAGER
