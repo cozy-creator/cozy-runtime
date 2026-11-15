@@ -15,6 +15,7 @@ region's working set plus every graph's static buffers.
 
 from __future__ import annotations
 
+import functools
 import sys
 import threading
 import weakref
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from types import ModuleType
 
     from torch.cuda import CUDAGraph, Event, Stream
+    from torch.cuda.graphs import _GraphPool
 
     from cozy_runtime.internal.residency import Memory
 
@@ -59,6 +61,33 @@ class Pool:
     handle: tuple[int, int]
     #: the room its latest capture was prepared with (`graphs.capture`)
     prepared: int = 0
+
+
+def cuda_graph() -> CUDAGraph:
+    """A CUDA graph whose capture refuses only its own thread's unsafe calls (`thread_local`).
+    Under Torch's default (`global`) any other thread's call that CUDA deems unsafe during it ends
+    the capture: TensorFS registering the host pages it reads ahead, a kernel opening. The decode
+    step then failed at its next launch, "operation failed due to a previous error during capture",
+    and the call decoded eagerly (cr-291). The step's own calls are refused as before."""
+    return _thread_graph()()
+
+
+@functools.cache
+def _thread_graph() -> type[CUDAGraph]:
+    import torch
+
+    class ThreadGraph(torch.cuda.CUDAGraph):
+        def capture_begin(
+            self,
+            pool: _GraphPool | None = None,
+            capture_error_mode: str = "thread_local",
+            check_input_liveness: bool = False,
+        ) -> None:
+            # Whatever a caller asks (varena's `graph` asks the default): another thread's
+            # work never joins this capture, so only this thread's calls can break it.
+            super().capture_begin(pool, "thread_local", check_input_liveness)
+
+    return ThreadGraph
 
 
 # A failed CUDA destruction does not prove whether its handle remains valid.
@@ -125,7 +154,7 @@ class Domain:
                 self.fork.record(self.control)
                 self.join.record(self.stream)
                 self.done.record(self.stream)
-                self.owner = self.torch.cuda.CUDAGraph()
+                self.owner = cuda_graph()
                 # No library work or allocation inside this owner graph. Recording an event makes
                 # its capture stream explicit; reset later clears only this stream.
                 with vt.graph(self.owner, stream=self.stream, reserve_bytes=0):

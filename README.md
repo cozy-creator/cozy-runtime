@@ -515,17 +515,17 @@ fill without the reader is a typed `reader_unavailable` refusal naming the insta
 model — and it is what the end-to-end suite builds, installs and runs.
 
 **Registration (xs-040).** `@app.entrypoint` registers a public function and `@app.entrypoint(private=True)`
-one only its own package's calls run; `await call(fn, ...)` runs either as its own job
+one only its own package's calls run; `await call(target, request, models=..., assets=...)` runs either as its own job
 ([docs/managed-calls.md](docs/managed-calls.md)). Both take `weights=`, `accelerator=` (False:
 CPU only; True or absent: the machine's GPU when it has one), `preflight=`, `defaults=`,
 `components=`, `on_demand=` and `memoize=`. A writer (`weights=`) is never memoized
 (`memoized_writer`); TensorFS derivation replay answers a repeat.
 
 **A tool is a struct plus a function** ([design/tools.md](https://github.com/cozy-creator/tracker/blob/master/design/tools.md)).
-`@app.tool(label=, named=, reserved=, ui=)` takes `entrypoint`'s options and registers a public
+`@app.tool(label=, named=, reserved=)` takes `entrypoint`'s options and registers a public
 function whose request struct is a box: `label` names it in the tool list, `named` a new box
-(`shot` makes `shot_1`), `reserved` the model's own tags in its text, and `ui` a component that
-draws it. On a model's own function it is the shortcut. A box's fields are `str`, `Prompt`,
+(`shot` makes `shot_1`), and `reserved` the model's own tags in its text. A box is always drawn
+from its fields. On a model's own function it is the shortcut. A box's fields are `str`, `Prompt`,
 `bool`, a bounded `int` or `float`, a `Literal` or `Enum`, one top-level `AspectRatio`, a slot
 (`ImageFile`, `VideoFile`, `AudioFile`, or `Image`, `Video`, `Audio` and their subclasses, or a
 list of one), the package's own structs as groups (nested; `| None` for one, a list for rows),
@@ -542,7 +542,7 @@ field a box can't draw keeps its default, off the box, and so does an optional g
 required member a box can't draw. Marker arguments are read from source: literals, arithmetic and
 module-level constants (`STRENGTHS[0]` too), never a call, so write `Snap(first=124)`, not
 `Snap(first=frames_for(5))`. A keyword request's tuple fields are `tuple[int, ...]`. The interface carries each tool's `tool`
-record and each entry point's `calls`: the functions it reaches with `call(fn, ...)`, its own and
+record and each entry point's `calls`: the functions it reaches with `call(target, request)`, its own and
 other packages', read at the release it locked, with their models, `accelerator` and `gpus`.
 
 Model-producing functions declare `WeightsOutput` slots and use `Context.tensorfs_source`,

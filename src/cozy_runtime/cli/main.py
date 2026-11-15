@@ -8,8 +8,8 @@ from __future__ import annotations
 import sys
 from collections.abc import Sequence
 
+from cozy_runtime.cli import calls as calls_verb
 from cozy_runtime.cli import describe as describe_verb
-from cozy_runtime.cli import image_prepare as image_prepare_verb
 from cozy_runtime.cli import machine
 from cozy_runtime.cli import new as new_verb
 from cozy_runtime.cli import version as version_verb
@@ -19,6 +19,7 @@ from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 
 BUILT = (
+    "calls",
     "describe",
     "new",
     "version",
@@ -26,8 +27,6 @@ BUILT = (
 PRIVATE = (
     "machine-describe",
     "frame-codec",
-    "image-prepare",
-    "image-preparation-profile",
     "python-interpreters",
     "python-ensure",
 )
@@ -37,6 +36,7 @@ usage: cozy-runtime [--json] [--full] [--fields a,b] [--dir <path>] <verb> [args
 
 verbs:
   describe [<fn>]                the PackageInterface, from source alone (no package code runs)
+  calls <distribution> <file.py>  generate typed calls from this project's locked dependency
   new <name>                     scaffold a minimal valid package skeleton
   version                        tag, commit, and Python author contract
 
@@ -166,13 +166,21 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
             "cozy-runtime describe --environment-python <venv/bin/python>",
             Exit.usage,
         )
-    if opts.package_interface and verb != "describe":
+    if opts.package_interface and verb not in ("describe", "calls"):
         raise CliError(
             "usage",
             "--package-interface belongs only to describe",
             "use --package-interface <exact-package-interface> with cozy-runtime describe",
             Exit.usage,
         )
+    if verb == "calls":
+        if len(args) != 2:
+            raise CliError(
+                "usage",
+                "calls takes a distribution and output file",
+                "cozy-runtime calls <distribution> <file.py>",
+            )
+        return calls_verb.run(args[0], args[1], opts)
     if verb == "describe":
         if len(args) > 1:
             raise CliError(
@@ -224,10 +232,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
                 Exit.usage,
             )
         return new_verb.run(args[0], opts.dir)
-    if verb == "image-prepare":
-        return image_prepare_verb.run(args)
-    if verb == "image-preparation-profile":
-        return image_prepare_verb.profile(args)
     raise CliError(
         "usage",
         f"unknown verb {verb!r}",

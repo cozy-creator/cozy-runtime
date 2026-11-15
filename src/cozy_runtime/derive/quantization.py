@@ -25,6 +25,7 @@ from numpy.typing import NDArray
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import Context, Telemetry, UnsupportedInput, _numeric
 from cozy_runtime.author._loader import TENSORFS_DTYPES, TENSORFS_NAMES
+from cozy_runtime.internal import call_scope
 from cozy_runtime.internal.model_values import read_values_into
 from cozy_runtime.weights_store import Checkpoint, Output, PartData, read_into
 
@@ -540,7 +541,8 @@ def _encode_tensor(
                 amax = _numeric.worst(amax, float(np.max(np.abs(values))))
     read = rows = saturated = 0
     scales: list[list[bytes]] = [[] for _ in expected]
-    spill = tempfile.TemporaryFile()  # noqa: SIM115 - ownership returns to the caller
+    # The machine's disk, never a call's place (`call_scope`): the weights are the machine's.
+    spill = tempfile.TemporaryFile(dir=call_scope.process_tempdir())  # noqa: SIM115 - ownership returns to the caller
     try:
         for values in read_chunks():
             if stop.is_set():

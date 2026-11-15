@@ -8,9 +8,8 @@ executor. It does not copy the media, change source permissions, or delete the s
 attempt cleanup. Source identity is checked before consuming borrowed bytes; callers must
 keep sources available and unchanged until execution finishes.
 
-Network downloads belong to the granting host, not Runtime. Downloaded media and generated
-image-preparation derivatives use the operating system temporary directory's `cozy/`
-subdirectory with content-hash filenames. There is no second worker input-media cache.
+Network downloads belong to the granting host, not Runtime. There is no second worker
+input-media cache.
 Native retained byte/tree results retain their existing workspace and checkout ownership.
 
 Validation covers actual paths/inodes, size/hash/media refusals, changes after verification,
@@ -22,10 +21,3 @@ consumption; a disappeared or changed source raises a typed refusal. This does n
 another process editing the original, so it is not a filesystem immutability guarantee.
 Raw-byte reads are bounded by the verified length. Media handle reads (`read`, `stream`,
 `probe`) check the same facts and keep their decode limits.
-
-The image-prepare stdin request no longer accepts `output_directory`; its `prepared` result
-names the one hash-addressed temporary derivative. Small images return the original path.
-Existing derivative bytes must match the hash before reuse; publication never replaces an
-existing inode. Attempt cleanup leaves temporary shared media in place for other readers.
-The host or user can reclaim those disposable files when idle. Runtime 0.9.0 is the client
-helper version boundary for this change.

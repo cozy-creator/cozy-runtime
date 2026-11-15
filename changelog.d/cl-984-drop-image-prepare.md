@@ -1,0 +1,1 @@
+The `image-prepare` and `image-preparation-profile` verbs are gone: nothing called them, and image-prepare wrote prepared copies of input images to the system temporary directory, outside any project (cl-984).

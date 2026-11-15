@@ -8,7 +8,6 @@ TensorFS Store may live elsewhere (a laptop's `~/.tensorfs`); the Host names it.
 from __future__ import annotations
 
 import os
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -122,8 +121,3 @@ def layout(raw: str | None, tensorfs: str | None = None) -> Layout:
         _absolute(raw, "machine root") if raw else POD_ROOT,
         _absolute(tensorfs, "TensorFS root") if tensorfs else None,
     )
-
-
-def input_media_root() -> Path:
-    """Disposable downloaded media and prepared derivatives, shared with the granting host."""
-    return Path(tempfile.gettempdir()) / "cozy"

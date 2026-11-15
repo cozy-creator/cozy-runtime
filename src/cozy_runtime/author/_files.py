@@ -1,8 +1,8 @@
 """Typed files — the ONE file type, both directions (§1.3/§3.4).
 
 Input files are ordinary typed request fields or an explicit ordered Files input.
-Their bytes arrive digest-verified; output files are what `out.save_*` returns and
-what the result struct declares. Both use the same handles and granted reader.
+Their bytes arrive digest-verified; output files come from `out.save_*` or returned
+`ImageFile.from_image` values. Both use the same handles and granted reader.
 
 `File` is deliberately NOT a msgspec-native type. The only way one comes into existence
 from the wire is `asset_dec_hook`, which accepts a REF STRING and nothing else — so
@@ -13,25 +13,28 @@ paths cannot enter a schema, a digest, or serialized output.
 from __future__ import annotations
 
 import hashlib
+import re
 import stat
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass, is_dataclass
 from fractions import Fraction
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, UnionType
 from typing import (
     TYPE_CHECKING,
     ClassVar,
     Final,
     Literal,
     Self,
+    Union,
     cast,
     get_args,
     get_origin,
     get_type_hints,
     overload,
 )
+from uuid import uuid4
 
 import msgspec
 from PIL.Image import Image
@@ -60,6 +63,7 @@ if TYPE_CHECKING:
         Probe,
         VideoProbe,
     )
+    from cozy_runtime.author._services import ImageFrame
 
 _UNBOUND: Final = ""
 Fidelity = Literal["auto", "low", "medium", "high"]
@@ -281,10 +285,73 @@ class File:
         return row
 
 
+@dataclass(slots=True)
+class _ImageValue:
+    """One owned snapshot and its eventual invocation-owned file, shared by labeled copies."""
+
+    frame: ImageFrame | None
+    format: str
+    width: int
+    height: int
+    saved: ImageFile | None = None
+
+
 class ImageFile(File):
-    """An image input. `read()` decodes it once per call, charging the attempt budget."""
+    """An image input or result. `from_image()` returns host pixels for the SDK to save;
+    `read()` decodes a granted input once per call, charging the attempt budget."""
 
     kind: ClassVar[str] = "image"
+    _image: _ImageValue | None = None
+
+    @classmethod
+    def from_image(
+        cls, image: ImageFrame | Image, *, format: Literal["png", "webp"] | None = None
+    ) -> Self:
+        """Snapshot host pixels for a result, child input or explicit publication.
+
+        Return this value in an `ImageFile` field, pass it to `call`, or publish it with
+        `Outputs.publish`. The SDK uses the ordinary
+        bounded output spool and finalization path. The default is lossless WebP, or PNG
+        when a side exceeds WebP's 16383-pixel limit; both preserve alpha. Explicit format
+        choices are honored. `probe()` reads the captured geometry before encoding;
+        `read_bytes()` is available after a child call or publish encoded this value.
+        """
+        from cozy_runtime.author._services import ImageFrame, as_frame
+
+        frame = as_frame(image)
+        codec = (
+            ("webp" if max(frame.width, frame.height) < 16384 else "png")
+            if format is None
+            else format
+        )
+        if codec not in ("png", "webp"):
+            raise OutputError(
+                f"image format {codec!r} has no encoder: choose png or lossless webp",
+                code="encoder_unavailable",
+            )
+        result = cls(f"image-value:{uuid4().hex}")
+        result._image = _ImageValue(
+            ImageFrame(frame.width, frame.height, bytes(frame.pixels), frame.mode),
+            codec,
+            frame.width,
+            frame.height,
+        )
+        return result
+
+    def _sync_image(self) -> None:
+        """A copy hears about the same file its original or another copy handed off."""
+        saved = self._image.saved if self._image is not None else None
+        if saved is not None:
+            self.ref = saved.ref
+            self.media_type = saved.media_type
+            self.size_bytes = saved.size_bytes
+            self.digest = saved.digest
+            self._local = saved._local
+            self._attempt = saved._attempt
+
+    def read_bytes(self) -> bytes:
+        self._sync_image()
+        return super().read_bytes()
 
     def read(self, *, mode: Literal["RGB", "RGBA"] = "RGB", max_pixels: int | None = None) -> Image:
         """Display-oriented pixels with the field's `ImagePreparation` applied, and scaled down
@@ -294,6 +361,12 @@ class ImageFile(File):
 
     def probe(self) -> ImageProbe:
         """Header geometry: `width`/`height` are what `read()` returns. No decode."""
+        if self._image is not None:
+            from cozy_runtime.author._decode import ImageProbe
+
+            return ImageProbe(
+                self._image.width, self._image.height, self._image.width, self._image.height
+            )
         return self._reads().probe(self)  # type: ignore[return-value]
 
 
@@ -402,16 +475,19 @@ class Files[T](Sequence[T]):
 
     @classmethod
     def _from_bound(cls, values: Iterable[File]) -> Files[T]:
-        """Retain exact slot IDs/order after binding; no byte acquisition or decode."""
+        """Retain exact slot IDs/order after binding; no byte acquisition or decode. A file
+        left out of the request leaves a gap in the positions."""
         result = cls()
         items: list[File] = []
         seen: set[str] = set()
-        for position, value in enumerate(values):
+        last = -1
+        for value in values:
             if not isinstance(value, File):
                 raise TypeError("Files accepts typed file handles")
-            if not value.id or value.id in seen or value.position != position:
+            if not value.id or value.id in seen or value.position <= last:
                 raise ValueError("bound Files requires distinct input IDs in binding order")
             seen.add(value.id)
+            last = value.position
             items.append(copy(value))
         result._items = tuple(items)
         result._check_labels()
@@ -536,10 +612,14 @@ class References[T](Mapping[str, T]):
     """A prompt's references by mention, in order of first mention. On the wire each is its value
     with its `key`, in a list, because a JSON object's key order isn't kept."""
 
-    __slots__ = ("_items",)
+    __slots__ = ("_at", "_items", "_left")
 
     def __init__(self, items: Mapping[str, T] | Iterable[tuple[str, T]] = ()) -> None:
         self._items = dict(items)
+        #: Each value's index in the wire's list, which its files' input ids name.
+        self._at = tuple(range(len(self._items)))
+        #: The keys of the wire's references left out (`unused_reference`).
+        self._left: tuple[str, ...] = ()
 
     def __getitem__(self, key: str) -> T:
         return self._items[key]
@@ -562,25 +642,70 @@ class References[T](Mapping[str, T]):
         ]
 
 
+def _reference_type(target: object) -> object:
+    """What a `References[T]` holds: `T`, or its bound when unset (bare `Prompt`)."""
+    (item,) = get_args(target) or (object,)
+    return getattr(item, "__bound__", None) or item
+
+
+def reference_kinds(target: object) -> frozenset[str]:
+    """The media a `References[T]` takes, by its values' tags: `Prompt[Image]`'s is `image`."""
+    item = _reference_type(target)
+    if item is object:
+        return MEDIA_KINDS
+    members = get_args(item) if get_origin(item) in (Union, UnionType) else (item,)
+    tags = {getattr(getattr(m, "__struct_config__", None), "tag", None) for m in members}
+    return MEDIA_KINDS & tags
+
+
+def unused_reference(kinds: frozenset[str], item: object) -> str | None:
+    """The modality of a wire reference its prompt takes none of (a `<Video1>` in a
+    `Prompt[Image]`), which is left out with a note instead of refused (Paul, 11-12). None for
+    one it takes, or a malformed one, which stays the decoder's."""
+    kind = item.get("type") if isinstance(item, dict) else None
+    return kind if isinstance(kind, str) and kind in MEDIA_KINDS - kinds else None
+
+
+def unmentioned(text: str, keys: Iterable[str]) -> str:
+    """`text` with the mention of each reference left out as its name, as Calcifer's binder
+    sends one a function can't use: `<V>` as `V`, `<amy.2>` as `amy`, `<clip:0-5>` as `clip`."""
+    for key in keys:
+        text = text.replace(f"<{key}>", re.split(r"[.:]", key, maxsplit=1)[0])
+    return text
+
+
 def _references(
     target: object, obj: object, hook: Callable[[type, object], object]
 ) -> References[object]:
-    """References from their wire list, each value converted to the prompt's media type."""
-    (item,) = get_args(target) or (object,)
-    item = getattr(item, "__bound__", None) or item
-    if not isinstance(obj, list) or not all(
-        isinstance(e, dict) and isinstance(e.get("key"), str) for e in obj
-    ):
-        raise TypeError("a prompt's references are a list of values, each with its `key`")
-    values = [(e["key"], {k: v for k, v in e.items() if k != "key"}) for e in obj]
-    if len({key for key, _ in values}) != len(values):
+    """References from their wire list, each value converted to the prompt's media type. One the
+    prompt has no use for is left out (`fit` notes it); the rest keep their wire index."""
+    item = _reference_type(target)
+    shape = "a prompt's references are a list of values, each with its `key`"
+    if not isinstance(obj, list):
+        raise TypeError(shape)
+    wire: list[tuple[str, dict[str, object]]] = []
+    for e in obj:
+        if not isinstance(e, dict) or not isinstance(key := e.get("key"), str):
+            raise TypeError(shape)
+        wire.append((key, {k: v for k, v in e.items() if k != "key"}))
+    if len({key for key, _ in wire}) != len(wire):
         raise ValueError("a prompt names each reference once")
+    kinds = reference_kinds(target)
+    kept: list[tuple[int, str, dict[str, object]]] = []
+    left: list[str] = []
+    for at, (key, value) in enumerate(wire):
+        if unused_reference(kinds, value) is None:
+            kept.append((at, key, value))
+        else:
+            left.append(key)
     try:
-        return References(
-            (key, msgspec.convert(value, type=item, dec_hook=hook)) for key, value in values
+        references: References[object] = References(
+            (key, msgspec.convert(value, type=item, dec_hook=hook)) for _, key, value in kept
         )
     except msgspec.ValidationError as exc:
         raise ValueError(f"a reference {exc}") from None
+    references._at, references._left = tuple(at for at, _, _ in kept), tuple(left)
+    return references
 
 
 class Tree:
@@ -760,6 +885,16 @@ def bind_tree(tree: Tree, *, root: Path, digest: str, attempt: str) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class Slot:
+    """Where a value sits: an item of a list or dict, or a record's attribute, and the annotation
+    that declares it there (its list's, for a list's item)."""
+
+    holder: object
+    key: str | int
+    annotation: object = None
+
+
+@dataclass(frozen=True, slots=True)
 class AssetInput:
     """One typed File occurrence and its lossless request address."""
 
@@ -769,6 +904,7 @@ class AssetInput:
     bound: FileBound | None
     segments: tuple[str | int, ...]
     preparation: Preparation | None = None
+    slot: Slot | None = None
 
 
 def asset_inputs(payload: object) -> list[AssetInput]:
@@ -793,6 +929,7 @@ def asset_inputs(payload: object) -> list[AssetInput]:
         seen: set[int],
         bound: FileBound | None,
         preparation: Preparation | None,
+        slot: Slot | None = None,
     ) -> None:
         if isinstance(value, File):
             bad = [part for part in segments if isinstance(part, str) and (not part or "." in part)]
@@ -804,21 +941,29 @@ def asset_inputs(payload: object) -> list[AssetInput]:
                 )
             input_id = ".".join(str(part) for part in segments)
             prepared = preparation if preparation and preparation.kind == value.kind else None
-            found.append(AssetInput(input_id, order, value, bound, segments, prepared))
+            found.append(AssetInput(input_id, order, value, bound, segments, prepared, slot))
             return
         if isinstance(value, Tree) or id(value) in seen:
             return
-        seen.add(id(value))
+        # Only ancestors are cycles: an aliased container still has one occurrence
+        # per field path, with that path's own bound and preparation.
+        seen = seen | {id(value)}
         if isinstance(value, References):
-            # By position, as the wire's list spells it: `summary.references.0.file`.
-            value = list(value.values())
+            # By wire index, as the grant names it (`summary.references.2.file`), though one
+            # before it was left out.
+            for index, item in zip(value._at, value.values(), strict=True):
+                walk_value(item, (*segments, index), index, seen, bound, preparation)
+            return
+        declared = slot.annotation if slot is not None else None
         if isinstance(value, (list, tuple)):
             for index, item in enumerate(value):
-                walk_value(item, (*segments, index), index, seen, bound, preparation)
+                held = Slot(value, index, declared)
+                walk_value(item, (*segments, index), index, seen, bound, preparation, held)
             return
         if isinstance(value, dict):
             for key, item in value.items():
-                walk_value(item, (*segments, str(key)), order, seen, bound, preparation)
+                held = Slot(value, key, declared)
+                walk_value(item, (*segments, str(key)), order, seen, bound, preparation, held)
             return
         if isinstance(value, msgspec.Struct):
             fields = [
@@ -832,15 +977,16 @@ def asset_inputs(payload: object) -> list[AssetInput]:
             return
         for name, attribute, annotation in fields:
             base, markers = strip(annotation)
-            declared = next((m for m in markers if isinstance(m, FileBound)), None)
+            limit = next((m for m in markers if isinstance(m, FileBound)), None)
             prepared = field_preparation(base, markers)
             walk_value(
                 getattr(value, attribute),
                 (*segments, name),
                 order,
                 seen,
-                declared if declared is not None else bound,
+                limit if limit is not None else bound,
                 prepared if prepared is not None else preparation,
+                Slot(value, attribute, annotation),
             )
 
     walk_value(payload, (), 0, set(), None, None)

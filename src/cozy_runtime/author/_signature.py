@@ -363,8 +363,8 @@ class Declaration:
     memoize: bool = False
     child_task: bool = False
     """Run by its own package's calls only (`private=True`), never a root request."""
-    accelerator: bool = True
-    """False: CPU only, never opens CUDA. True: the machine's GPU when it has one."""
+    accelerator: bool | None = None
+    """Resolved from constructed Model slots when omitted; explicit overrides win."""
     tool: Tool | None = None
     """`app.tool`'s own options: this function is a box."""
     model_defaults: Mapping[str, str] = field(default_factory=dict)
@@ -381,6 +381,8 @@ class Declaration:
     capabilities: frozenset[str] = field(init=False)
 
     def __post_init__(self) -> None:
+        if self.accelerator is None:
+            object.__setattr__(self, "accelerator", any(not slot.weights for slot in self.slots))
         media = media_kinds(self.payload_type, self.assets)
         object.__setattr__(
             self,
@@ -547,7 +549,7 @@ def analyze(
     weights_outputs: tuple[WeightsOutput, ...] = (),
     preflight: Handler | None = None,
     child_task: bool = False,
-    accelerator: bool = True,
+    accelerator: bool | None = None,
     tool: Tool | None = None,
     memoize: bool = False,
     model_defaults: Mapping[str, str] | None = None,
@@ -772,7 +774,7 @@ def _wire_default(value: object) -> None:
     )
 
 
-def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
+def _wire_type(annotation: object, seen: frozenset[object] = frozenset()) -> None:
     """Refuse interpreter-local values before an interface is generated."""
     base, _ = strip(annotation)
     if isinstance(base, typing.NewType):  # `Seed`
@@ -799,6 +801,11 @@ def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
             )
         for arg in args:
             _wire_type(arg, seen)
+        return
+    if isinstance(origin, type) and is_struct(origin) and base not in seen:
+        # A generic struct (`Control[Literal["pose"]]`): its fields, with its arguments.
+        for field in msgspec.structs.fields(typing.cast(type[msgspec.Struct], base)):
+            _wire_type(field.type, seen | {base})
         return
     if isinstance(base, type):
         if issubclass(base, (File, Tree)):

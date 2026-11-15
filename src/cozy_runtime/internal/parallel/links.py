@@ -25,8 +25,8 @@ import hashlib
 import json
 import os
 import selectors
+import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -39,7 +39,7 @@ from types import ModuleType
 from typing import TypedDict
 
 from cozy_runtime.graphs import streams
-from cozy_runtime.internal import filelock, kernel_cache, spawn
+from cozy_runtime.internal import call_scope, filelock, kernel_cache, spawn
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.config import inherited_environment
 from cozy_runtime.internal.parallel import copy_engine, group
@@ -405,9 +405,15 @@ def _probe(devices: Sequence[str]) -> Links:
     }
     began = time.monotonic()
     # A file, not a pipe: a child blocked on a full pipe would look wedged.
-    errors = tempfile.TemporaryFile("w+")  # noqa: SIM115
+    errors = tempfile.TemporaryFile("w+", dir=call_scope.process_tempdir())  # noqa: SIM115
+    # Its group's store file (`group.rendezvous`), in a directory only this user enters; removed
+    # here, as the child's own teardown may be ended.
+    directory = tempfile.mkdtemp(prefix="links-", dir=call_scope.process_tempdir())
     child = subprocess.Popen(
-        [sys.executable, "-I", "-c", _CHILD, json.dumps(sys.path), str(count)],
+        [
+            *(sys.executable, "-I", "-c", _CHILD, json.dumps(sys.path)),
+            *(str(count), os.path.join(directory, "store")),
+        ],
         env=environment,
         stdout=subprocess.PIPE,
         stderr=errors,
@@ -446,6 +452,7 @@ def _probe(devices: Sequence[str]) -> Links:
     with contextlib.suppress(ProcessLookupError):
         os.killpg(child.pid, signal.SIGKILL)
     child.wait()
+    shutil.rmtree(directory, ignore_errors=True)
     with errors:
         errors.seek(0)
         tail = errors.read().strip().splitlines()[-1:] or [f"exit {child.returncode}"]
@@ -466,7 +473,7 @@ def _unformed(level: str, detail: str) -> Processes:
     return {"nccl_peer": False, "copy_engines": False, "level": level, "detail": detail}
 
 
-def _group(torch: ModuleType, rank: int, world: int, port: int, level: str) -> Processes:
+def _group(torch: ModuleType, rank: int, world: int, store: str, level: str) -> Processes:
     """One process of the probe's own group: NCCL over peer memory, then the copy engines
     through symmetric memory, each checked against the other's bytes."""
     from torch.distributed import _symmetric_memory as symm
@@ -475,9 +482,13 @@ def _group(torch: ModuleType, rank: int, world: int, port: int, level: str) -> P
     group.route({"NCCL_P2P_LEVEL": level})
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
-    store = dist.TCPStore("127.0.0.1", port, world, is_master=rank == 0, timeout=group.NEVER)
     dist.init_process_group(
-        "nccl", store=store, rank=rank, world_size=world, device_id=device, timeout=group.NEVER
+        "nccl",
+        store=group.rendezvous(torch, store, world),
+        rank=rank,
+        world_size=world,
+        device_id=device,
+        timeout=group.NEVER,
     )
     report = _unformed(level, "")
     try:
@@ -546,10 +557,9 @@ def main(argv: Sequence[str]) -> int:
     import torch
 
     if argv[0] == "--follower":
-        rank, world, port = (int(value) for value in argv[1:4])
-        _group(torch, rank, world, port, argv[4])
+        _group(torch, int(argv[1]), int(argv[2]), argv[3], argv[4])
         return 0
-    count = int(argv[0])
+    count, store = int(argv[0]), argv[1]
     pairs: list[Pair] = []
 
     def emit(pair: Pair) -> None:
@@ -561,14 +571,13 @@ def main(argv: Sequence[str]) -> int:
         # NCCL forms at the level the group would take; the copy engines are tried either way.
         level = links.level
         # Followers launch as an executor's do (its trampoline, its seal), as children.
-        port = _free_port()
         seam, unused = os.pipe()
         followers = [
             spawn.spawn_follower(
                 python=sys.executable,
                 module_argv=[
                     *("-c", _CHILD, json.dumps(sys.path), "--follower"),
-                    *(str(rank), str(count), str(port), level),
+                    *(str(rank), str(count), store, level),
                 ],
                 env=inherited_environment(),
                 inherit_fd=unused,
@@ -576,16 +585,10 @@ def main(argv: Sequence[str]) -> int:
             for rank in range(1, count)
         ]
         os.close(seam)
-        print(json.dumps({"group": _group(torch, 0, count, port, level)}), flush=True)
+        print(json.dumps({"group": _group(torch, 0, count, store, level)}), flush=True)
         for follower in followers:
             follower.wait()
     return 0
-
-
-def _free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
 
 
 if __name__ == "__main__":

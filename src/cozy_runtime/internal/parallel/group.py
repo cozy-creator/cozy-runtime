@@ -12,6 +12,9 @@ interrupt) ends GPU 0's process, so TensorD sees the exit at
 once. torch's own deadlines (`NEVER`) never end a group. A formation attempt still unfinished after
 `ATTEMPT` prints every GPU's stacks, is ended on every GPU and tried again, up to `ATTEMPTS`; then
 the group is refused naming each GPU and its step (cr-263).
+
+A group is one host's GPUs and opens nothing to the network (xs-196): it meets on a file in GPU 0's
+private directory (`rendezvous`), and NCCL's own sockets stay on loopback (`LOOPBACK`).
 """
 
 from __future__ import annotations
@@ -20,9 +23,11 @@ import contextlib
 import faulthandler
 import os
 import queue
+import shutil
 import signal
 import socket
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -41,7 +46,7 @@ from cozy_runtime.internal.parallel.plan import GroupRefusal
 from cozy_runtime.internal.seam import Channel, SeamError
 
 if TYPE_CHECKING:
-    from torch._C._distributed_c10d import ProcessGroup, Store, TCPStore
+    from torch._C._distributed_c10d import ProcessGroup, Store
 
 #: NCCL reads this once, at communicator creation. NVLink SHARP multicast needs a privilege
 #: our containers do not have and Ulysses' all-to-all never uses it (pgw#929: CUDA 401 on
@@ -49,6 +54,15 @@ if TYPE_CHECKING:
 #: then written, never "only when unset" - and every rank REQUIRES it before forming a
 #: communicator: the executor asserts the seal, it does not write its own environment.
 NVLS_ENV = "NCCL_NVLS_ENABLE"
+#: NCCL's bootstrap and proxy sockets listen for as long as a communicator lives, by default on
+#: the host's first LAN interface; gloo's on whatever the hostname resolves to. Every group is one
+#: host's GPUs: both bind loopback, and NCCL takes no InfiniBand or other network transport. No
+#: interface named `lo` fails formation; nothing falls back to another one.
+LOOPBACK = {
+    "NCCL_SOCKET_IFNAME": "=lo",
+    "NCCL_IB_DISABLE": "1",
+    "GLOO_SOCKET_IFNAME": "lo0" if sys.platform == "darwin" else "lo",
+}
 #: Another GPU ended the collective this one waited in (`RankGroup.interrupt`).
 ENDED = "group_call_ended"
 #: Every group wait's deadline. torch has no "none": its store gives up after 5 min, group init and
@@ -78,7 +92,10 @@ _REPLY_STEPS = frozenset({"join", "proof"})
 STACKS = b"\2"
 #: Steps whose stall is the GPUs' link failing them: NCCL connects and moves its first bytes here.
 LINK_STEPS = frozenset({"barrier", "warm", "exchange", "proof"})
-#: A store wait's slice: how soon an ended formation ends it.
+#: How often a store meeting looks again: at first within 0.1 ms, as GPUs in step arrive together
+#: (Ulysses meets at every attention call), then backing off to 10 ms (a file store has no wakeup).
+_POLL = (0.0001, 0.01)
+#: How often a store meeting asks whether a missing GPU already ended.
 _SLICE = timedelta(seconds=1)
 #: This process's formation ended (`abort_process_group`); cleared as the next one forms.
 _ENDED = threading.Event()
@@ -86,12 +103,12 @@ _ENDED = threading.Event()
 
 @dataclass(frozen=True, slots=True)
 class RankSpec:
-    """What one rank needs to join: its rank, the world, rank 0's store port, the backend,
+    """What one rank needs to join: its rank, the world, rank 0's store file, the backend,
     and the NCCL route rank 0 chose from the group's measured links (`links.Links.nccl`)."""
 
     rank: int
     world: int
-    port: int
+    store: str
     backend: str
     nccl: Mapping[str, str] = field(default_factory=dict)
 
@@ -208,12 +225,20 @@ def abortable(backend: str) -> None:
 
 def route(nccl: Mapping[str, str]) -> None:
     """NCCL reads its route once, when this process's first communicator forms; every GPU of
-    the group writes the same values, chosen by rank 0, before it joins."""
-    update_environment(nccl)
+    the group writes the same values, chosen by rank 0, before it joins, on loopback alone."""
+    update_environment({**nccl, **LOOPBACK})
 
 
-def ready_rank(torch: ModuleType, spec: RankSpec, sealed: Mapping[str, str]) -> TCPStore:
-    """A follower's first half of joining: its route set and rank 0's store reached. Returns the
+def rendezvous(torch: ModuleType, path: str, world: int) -> Store:
+    """The group's store: a file in GPU 0's private directory (`RankGroup.directory`). A TCPStore
+    listens on every interface whatever host it is given, unauthenticated, for the group's life."""
+    store: Store = torch.distributed.FileStore(path, world)
+    store.set_timeout(NEVER)
+    return store
+
+
+def ready_rank(torch: ModuleType, spec: RankSpec, sealed: Mapping[str, str]) -> Store:
+    """A follower's first half of joining: its route set and rank 0's store opened. Returns the
     store `form_rank` forms the group on once every follower said it is ready.
 
     The caller has already made this rank's device current (`torch.cuda.set_device(r)`)
@@ -222,10 +247,7 @@ def ready_rank(torch: ModuleType, spec: RankSpec, sealed: Mapping[str, str]) -> 
     require_nvls_off(sealed, spec.backend)
     abortable(spec.backend)
     route(spec.nccl)
-    store: TCPStore = torch.distributed.TCPStore(
-        "127.0.0.1", spec.port, spec.world, is_master=False, timeout=NEVER
-    )
-    return store
+    return rendezvous(torch, spec.store, spec.world)
 
 
 def form_rank(torch: ModuleType, spec: RankSpec, store: Store) -> ProcessGroup:
@@ -289,33 +311,33 @@ def gather(
     slow host, a long decode): no clock judges it (xs-172). The wait ends (code `ENDED`) when the
     formation ends (`abort_process_group`: an interrupt, or a GPU that failed or died) or a missing
     GPU's `ended` key says it failed; a missing GPU that returned is a divergence, named; GPUs at
-    different calls both arrive, and the caller names them. The store's own connection ends it
-    once GPU 0, which holds the store, is gone. A wait past `TOLD` calls `told` once with the
-    missing GPUs (`keys` and `ended` are in GPU order)."""
-    import torch.distributed as dist
-
+    different calls both arrive, and the caller names them. A follower whose GPU 0 is gone dies
+    with it (its parent-death signal). A wait past `TOLD` calls `told` once with the missing GPUs
+    (`keys` and `ended` are in GPU order)."""
     keys = list(keys)
     shown = time.monotonic() + TOLD.total_seconds() if told is not None else None
+    pause, judged = _POLL[0], time.monotonic() + _SLICE.total_seconds()
     while True:
         if _ENDED.is_set():
             raise GroupRefusal(f"{what}: another GPU ended this call", code=ENDED)
-        try:
-            store.wait(keys, _SLICE)
-        except dist.DistStoreError:  # the slice passed
+        if store.check(keys):
+            return list(store.multi_get(keys))
+        if time.monotonic() >= judged:
+            judged = time.monotonic() + _SLICE.total_seconds()
             for rank, key in enumerate(ended):
                 if store.check([key]) and not store.check([keys[rank]]):
                     if store.get(key) == b"failed":
-                        raise GroupRefusal(f"{what}: GPU {rank} failed", code=ENDED) from None
+                        raise GroupRefusal(f"{what}: GPU {rank} failed", code=ENDED)
                     raise GroupRefusal(
                         f"{what}: GPU {rank} had already returned; the GPUs no longer run the "
                         "same calls",
                         code="group_diverged",
-                    ) from None
+                    )
             if told is not None and shown is not None and time.monotonic() >= shown:
                 shown = None
                 told([rank for rank, key in enumerate(keys) if not store.check([key])])
-            continue
-        return list(store.multi_get(keys))
+        time.sleep(pause)
+        pause = min(pause * 2, _POLL[1])
 
 
 def rejoined() -> None:
@@ -387,8 +409,12 @@ class RankGroup:
         #: rank 0's own environment, or the suite's launcher for the gloo arms
         self._launch = launch or self._spawn_follower
         self.followers: list[Follower] = []
-        self.store: TCPStore | None = None
-        self.port = 0
+        self.store: Store | None = None
+        #: this group's private directory (mode 0700, under the executor's own `root`), made at
+        #: its first formation and removed at `close`; each attempt's store is a new file in it
+        self.directory = ""
+        self.path = ""
+        self.formations = 0
         self.pg: ProcessGroup | None = None
         #: the NCCL route every formation of this group uses (`links.Links.nccl`)
         self.nccl: dict[str, str] = {}
@@ -592,7 +618,7 @@ class RankGroup:
         formed: Callable[[ProcessGroup], None] | None = None,
     ) -> ProcessGroup | None:
         """Form the process group in two steps, so a partial group never forms. `join`: every
-        follower reaches the store on a kernel-chosen loopback port and says it is ready (or
+        follower opens the attempt's store file and says it is ready (or
         refuses, or dies), each followed by the socket its watcher reads (`interrupt`). `form`:
         only then do all GPUs enter group init, rank 0 last, with one barrier as the proof.
         Each attempt gets `ATTEMPT`; a stalled one is ended on every GPU and tried again on a new
@@ -606,7 +632,7 @@ class RankGroup:
         abortable(self.backend)
         if nccl is not None:
             self.nccl = dict(nccl)
-            route(self.nccl)
+        route(self.nccl)
         stalls: list[str] = []
         for attempt in range(1, ATTEMPTS + 1):
             if stalls:
@@ -641,10 +667,11 @@ class RankGroup:
         with self._lock:
             self.interrupted = False  # this attempt's collectives are this attempt's to abort
         _ENDED.clear()  # as `rejoined()`
-        self.store = dist.TCPStore(
-            "127.0.0.1", 0, self.degree, is_master=True, wait_for_workers=False, timeout=NEVER
-        )
-        self.port = int(self.store.port)
+        if not self.directory:
+            self.directory = tempfile.mkdtemp(prefix="group-", dir=self.root or None)
+        self.formations += 1
+        self.path = os.path.join(self.directory, str(self.formations))
+        self.store = rendezvous(torch, self.path, self.degree)
         done = threading.Event()
         threading.Thread(
             target=self._watch, args=(done, attempt), name="formation", daemon=True
@@ -686,7 +713,7 @@ class RankGroup:
         self.forming = "join"
         for follower in self.followers:
             follower.forming = ""
-        join = {"cmd": "join", "port": self.port, "backend": self.backend, "nccl": self.nccl}
+        join = {"cmd": "join", "store": self.path, "backend": self.backend, "nccl": self.nccl}
         for follower in self.followers:
             if again:
                 self.send_one(follower.rank, {**join, "again": True})
@@ -909,6 +936,9 @@ class RankGroup:
                 torch.distributed.destroy_process_group()
         self.store = None
         self.formed = False
+        if self.directory:
+            shutil.rmtree(self.directory, ignore_errors=True)
+            self.directory = ""
 
 
 def _reap(process: ChildProcess) -> None:

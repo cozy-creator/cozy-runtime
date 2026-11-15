@@ -1,0 +1,1 @@
+Describing a package's environment takes seconds, not most of a minute: the static reader no longer walks or splits a whole module for each lookup it refuses and then catches (minimax-h3: 38.7 s to 4.7 s, the same description), which every install and every first run after a Runtime update waited for.

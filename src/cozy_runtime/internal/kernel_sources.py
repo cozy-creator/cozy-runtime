@@ -52,7 +52,7 @@ from packaging.utils import parse_wheel_filename
 
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.internal import config, egress, filelock, kernel_cache, kernel_compile
+from cozy_runtime.internal import call_scope, config, egress, filelock, kernel_cache, kernel_compile
 
 ROOT = Path("/opt/cozy/kernel-sources")
 INDEX = "index.json"
@@ -827,7 +827,9 @@ def build_python(
     site.mkdir()
     rows = sorted(spec["sources"].values(), key=lambda row: row["name"])
     _fetched(rows)
-    with tempfile.TemporaryDirectory(prefix="cozy-python-") as scratch:
+    with tempfile.TemporaryDirectory(
+        prefix="cozy-python-", dir=call_scope.process_tempdir()
+    ) as scratch:
         for done, row in enumerate(rows, 1):
             if row.get("package"):
                 tree = _extract(row, Path(scratch) / row["name"])
@@ -871,7 +873,9 @@ def build_setup(
     recipe = RECIPES[spec["recipe"]]
     sources = spec["sources"]
     _fetched(sources.values())
-    with tempfile.TemporaryDirectory(prefix=f"cozy-build-{recipe.name}-") as scratch:
+    with tempfile.TemporaryDirectory(
+        prefix=f"cozy-build-{recipe.name}-", dir=call_scope.process_tempdir()
+    ) as scratch:
         work = Path(scratch)
         tree = _extract(sources[recipe.sources[0]], work / "src")
         for name, where in recipe.place.items():

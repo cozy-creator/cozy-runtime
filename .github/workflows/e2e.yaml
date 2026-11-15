@@ -1,8 +1,9 @@
 name: e2e
 # CI v2 (tracker/design/ci-v2.md): cozy-creator's e2e suites, selected by what the change touches. Required for
-# merges into master and rc/*: it runs on the merge queue's group (merge_group), on the final PR + branch state;
-# on a pull request the called workflow skips its suites, which lets the PR be queued. The required check is
-# this job's `e2e / e2e`.
+# merges into master: it runs on the merge queue's group (merge_group), on the final PR + branch state; on a pull
+# request the called workflow skips its suites, which lets the PR be queued. The required check is this job's
+# `e2e / e2e`. An rc/* queue merges on `build` alone, and the RC is tested after (cozy-creator's rc-e2e.yaml reads
+# this RC; Paul, 11-12), so its groups run no suites here.
 on:
   pull_request:
   merge_group:
@@ -15,6 +16,7 @@ on:
         default: ''
 jobs:
   e2e:
+    if: github.event_name != 'merge_group' || !startsWith(github.event.merge_group.base_ref, 'refs/heads/rc/')
     uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@f85096b9d6a97a623515526ece6940b6635b3200
     secrets:
       TENSORHUB_READ_KEY: ${{ secrets.TENSORHUB_READ_KEY }}

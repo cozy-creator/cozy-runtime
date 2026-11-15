@@ -5,6 +5,10 @@ The view's base weights are `<path>.base_layer.*` and its factors `<path>.lora_{
 names, by stored names, the PEFT layers (linear and 2-D convolution) this module builds before the
 ordinary census, fill and residency own them.
 
+A LoKr layer (LyCORIS' Kronecker adapter) bakes `s * kron(W1, W2)` into its linear where a LoRA
+bakes (`weights._Bakes`, a dense delta); else it adds `s * x @ kron(W1, W2).T` each step, never the
+product: `x` as `[.., b, d]`, then `W1 · x · W2ᵀ` (`[.., a, c]`), its target's rows.
+
 A DoRA term is PEFT's, `D = m * V / ||V||` per output channel with `V = W + s * B @ A`
 (s = alpha / r), at strength t: `W' = W + t * (D - W)` (`lora_bake.dora_weight`), the identity at 0
 and PEFT's own weight at 1. The weight plane (`weights._Bakes`) computes it from the stored bytes as
@@ -37,6 +41,7 @@ from cozy_runtime.internal.lora_contract import (
     Graph as Graph,
 )
 from cozy_runtime.internal.lora_contract import (
+    KRON_ROLES,
     Layer,
 )
 from cozy_runtime.internal.lora_contract import (
@@ -101,6 +106,71 @@ def composer(graph: Graph, magnitudes: Mapping[str, str]) -> Callable[[object], 
                     lora.accumulate(x, result, down.weight, up.weight, self.scaling[name])
             return result
 
+    _DTYPES = {"F16": torch.float16, "BF16": torch.bfloat16, "F32": torch.float32}
+
+    class _Factor(nn.Module):
+        """One LoKr factor, `[rows, cols]`."""
+
+        def __init__(self, shape: tuple[int, int], dtype: torch.dtype) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
+
+    class _Kron(nn.Module):
+        """A linear with LoKr adapters: `base_layer(x)` plus each adapter's scale times
+        `x @ kron(W1, W2).T` (its `rows`), W1 and W2 each `lokr_<role>[adapter]`, whole or a
+        pair."""
+
+        #: what `attention._base` unwraps to read the base's output dtype
+        _cozy_kron = True
+        #: the weight plane baked the update into the base weight's resident bytes
+        _cozy_baked = False
+
+        def __init__(self, base: nn.Linear, rows: list[Layer]) -> None:
+            super().__init__()
+            self.base_layer = base
+            self.in_features, self.out_features = base.in_features, base.out_features
+            for role in KRON_ROLES:
+                self.add_module(f"lokr_{role}", nn.ModuleDict())
+            #: each adapter's scale (alpha / rank * strength) and rows
+            self.terms: dict[str, tuple[float, tuple[tuple[int, int], ...]]] = {}
+            for row in rows:
+                kron = row.kron
+                assert kron is not None  # every row of a _Kron is a LoKr's
+                dtype = _DTYPES[row.dtype]
+                for role, shape in kron.factors.items():
+                    factors = cast("nn.ModuleDict", getattr(self, f"lokr_{role}"))
+                    factors[row.adapter] = _Factor(shape, dtype)
+                self.terms[row.adapter] = (row.alpha / row.rank * row.strength, kron.rows)
+
+        def _factor(self, w: str, adapter: str) -> torch.Tensor:
+            whole = cast("nn.ModuleDict", getattr(self, f"lokr_{w}"))
+            if adapter in whole:
+                return cast("torch.Tensor", whole[adapter].weight)
+            pair = (cast("nn.ModuleDict", getattr(self, f"lokr_{w}_{p}"))[adapter] for p in "ab")
+            a, b = (cast("torch.Tensor", factor.weight) for factor in pair)
+            return a @ b
+
+        def forward(self, x: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
+            result: torch.Tensor = self.base_layer(x, *args, **kwargs)
+            if self._cozy_baked:
+                return result
+            return result + self.update(x).to(result.dtype)
+
+        def update(self, x: torch.Tensor) -> torch.Tensor:
+            """Every adapter's `scale * x @ kron(W1, W2).T` (its rows), at x's precision."""
+            result: torch.Tensor | None = None
+            for adapter, (scale, rows) in self.terms.items():
+                w1 = self._factor("w1", adapter).to(x.dtype)
+                w2 = self._factor("w2", adapter).to(x.dtype)
+                (a, b), (c, d) = w1.shape, w2.shape
+                # x @ kron(W1, W2).T: row p*c + q of the product is W1[p, :] (x) W2[q, :].
+                y = torch.matmul(w1, x.reshape(-1, b, d) @ w2.t()).reshape(*x.shape[:-1], a * c)
+                if rows:
+                    y = torch.cat([y[..., start:stop] for start, stop in rows], -1)
+                result = y * scale if result is None else result.add_(y, alpha=scale)
+            assert result is not None  # a _Kron holds at least one adapter
+            return result
+
     class _Conv2d(PeftConv2d):
         _cozy_baked = False
 
@@ -126,6 +196,9 @@ def composer(graph: Graph, magnitudes: Mapping[str, str]) -> Callable[[object], 
             groups.setdefault((row.component, row.target), []).append(row)
         seen: set[int] = set()
         for (component, path), rows in groups.items():
+            kron = [row.kron is not None for row in rows]
+            if any(kron) and not all(kron):
+                raise _refuse("graph", f"{component}.{path}: LoRA and LoKr adapters on one layer")
             root = members.get(component)
             if not isinstance(root, nn.Module):
                 raise _refuse("component", f"{component!r} is not a constructed module")
@@ -146,6 +219,12 @@ def composer(graph: Graph, magnitudes: Mapping[str, str]) -> Callable[[object], 
             seen.add(id(base))
             if len({row.adapter for row in rows}) != len(rows):
                 raise _refuse("graph", f"{component}.{path} repeats one adapter term")
+            if all(kron):
+                if not isinstance(base, nn.Linear):
+                    why = f"{component}.{path}: a LoKr adapts a linear, not a convolution"
+                    raise _refuse("target_type", why)
+                parent.set_submodule(name, _Kron(base, rows))
+                continue
             first, *others = rows
             kind = _Linear if isinstance(base, nn.Linear) else _Conv2d
             if kind is _Conv2d and any(row.dora for row in rows):
@@ -226,6 +305,9 @@ def bind(
         for role in ("A", "B"):
             dtypes.pop(prefix + f".lora_{role}.{row.adapter}.weight", None)
             shapes.pop(prefix + f".lora_{role}.{row.adapter}.weight", None)
+        for role in KRON_ROLES if row.kron is not None else ():
+            dtypes.pop(prefix + f".lokr_{role}.{row.adapter}.weight", None)
+            shapes.pop(prefix + f".lokr_{role}.{row.adapter}.weight", None)
         if row.dora:
             key = prefix + f".lora_magnitude_vector.{row.adapter}.weight"
             if key not in dtypes:

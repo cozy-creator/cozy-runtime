@@ -1,0 +1,1 @@
+An on-demand model's first read asks the machine for it (`model_need`, cl-966): TensorD fetches what of it isn't on disk before every other download and answers once it has, so the build reads it from disk instead of fetching it over its own slow connection. A machine before it answers unavailable, and the build fetches as before.
