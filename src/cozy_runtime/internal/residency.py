@@ -2264,6 +2264,7 @@ class Memory:
 
     def _enter(self, block: _Block, reclaim: bool = True) -> None:
         model = block.model
+        graphs.entering(model.module)
         overlay = None if model.fill is None else model.fill.overlay(block.path, block.parts)
         if overlay != block.overlay and (block.paged() or block.parked):
             self._switch_overlay(block, overlay)

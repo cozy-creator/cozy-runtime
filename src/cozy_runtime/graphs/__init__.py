@@ -700,6 +700,9 @@ class _Recorder:
         #: Binding once a graph needed it (`_overlay_bindings`)
         self.overlays: list[_Placed] = []
         self.overlay_bindings: dict[tuple[int, str], Binding] = {}
+        #: other placed components whose weights its calls entered as written (`entering`): its
+        #: graphs hold them as an overlay's, at capture and each replay
+        self.entered: dict[tuple[int, str], _Placed] = {}
         #: bumped by an attribute set on any of its modules (`_watching`), which a graph's
         #: read guards are checked again for; `structural`, by a class or submodule set
         self.generation = 0
@@ -778,6 +781,7 @@ class _Recorder:
         for binding in self.overlay_bindings.values():
             binding.close()
         self.overlay_bindings.clear()
+        self.entered.clear()  # a later call as written finds them again
 
     def drop(self) -> None:
         self.retired += len(self.recordings)
@@ -1326,6 +1330,21 @@ def _since(now: Mapping[str, int], base: Mapping[str, int]) -> dict[str, int]:
     return {code: n - base.get(code, 0) for code, n in now.items() if n > base.get(code, 0)}
 
 
+#: the region whose call runs on this thread (`_region_call`) and its root
+_RUNNING = threading.local()
+
+
+def entering(root: Module) -> None:
+    """A weight block of `root`'s component is entered on this thread. Inside another
+    component's region call, that call reads it: its graphs hold `root`'s Binding at capture and
+    each replay, as an overlay's. H3 Turbo's bank is engaged on its DiT and read from there, with
+    no LoRA hook between (43683255718: "capture requires an active prepared weight binding")."""
+    region = getattr(_RUNNING, "region", None)
+    if region is None or region[1] is root or (placed := PLACED.get(root)) is None:
+        return
+    region[0].entered.setdefault((id(placed[0]), placed[1]), placed)
+
+
 def _region_call(
     torch: ModuleType,
     module: Module,
@@ -1336,9 +1355,12 @@ def _region_call(
 ) -> object:
     """A region call, counted by how it ran (`OUTCOMES`)."""
     recorder.now = ("first_occurrence", "")
+    outer = getattr(_RUNNING, "region", None)
+    _RUNNING.region = (recorder, module)
     try:
         return _region_path(torch, module, recorder, call, args, kwargs)
     finally:
+        _RUNNING.region = outer
         code, why = recorder.now
         recorder.outcomes[code] = recorder.outcomes.get(code, 0) + 1
         if why:
@@ -1643,6 +1665,12 @@ def _over_card(device: int, placed: _Placed, recorder: _Recorder, pool: int) -> 
         for other, (root, size) in weights.items()
         if other == name
         or ((peer := _RECORDERS.get(root)) is not None and began is not None and peer.latest > began)
+        or (id(residency), other) in recorder.entered
+    )
+    loop += sum(
+        held.graph_weights()[other][1]
+        for held, other in recorder.entered.values()
+        if held is not residency
     )
     room = vt.room(device)
     capacity, live = room["capacity"], room["working_live"]
@@ -2118,7 +2146,7 @@ def _state(
 ) -> tuple[tuple[object, ...], str]:
     """The key's overlays part, and why the call runs as written ("" when none). The components
     whose factors it adds per call are this call's `recorder.overlays` (`_overlay_bindings`)."""
-    owners: list[_Placed] = []
+    owners: list[_Placed] = list(recorder.entered.values())
     part, why = _overlays(recorder.loras, owners)
     recorder.overlays = owners
     return part, why
