@@ -21,6 +21,7 @@ Further source studies:
 - [Existing native H3 engines: mmh3, h3-rs and h3-hrx](native-h3-engines.md).
 - [NVIDIA Sol H3: measured decomposition, existing Cozy ports, and remaining candidates](sol-h3-gap-analysis.md).
 - [A native H3 stage within Cozy: capture lifecycle, current interfaces, proposed private boundary, and profiling recipe](cozy-native-h3-stage.md).
+- [Varena/TensorFS dependency audit and a native CUDA smoke test without PyTorch](varena-native-dependencies.md).
 
 The useful pattern is to specialize the execution schedule and data layout for a model, workload, and hardware class. Baseten implements a graph of specialized kernels, with selected fusion and persistence; its source does not establish a single whole-model megakernel. Nor does its benchmark isolate Rust versus Python or CUDA C++ versus a GPU DSL. The [external source study](external-study.md) identifies the launch paths and their restrictions.
 
