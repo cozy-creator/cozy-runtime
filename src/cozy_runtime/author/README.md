@@ -8,7 +8,7 @@ whatever card it lands on.
 import msgspec
 import torch
 from cozy_runtime import rng
-from cozy_runtime.author import App, Config, Context, Loader, Model, Outputs, Seed, Telemetry
+from cozy_runtime.author import App, Config, Context, Loader, Model, Seed, Telemetry
 
 app = App()
 
@@ -34,10 +34,10 @@ class Flow(Model[FlowGraph]):
 
 
 @app.entrypoint(defaults={"model": "acme/flow@1.0.0"})
-def generate(ctx: Context, payload: Request, model: Flow, out: Outputs, tel: Telemetry) -> Result:
+def generate(ctx: Context, payload: Request, model: Flow, tel: Telemetry) -> Result:
     with tel.stage("generating image"):
         latents = model.denoise(ctx, model.encode(payload.prompt), payload.steps, payload.seed)
-    return Result(out.save_image(model.decode(latents), format="png"))
+    return Result(ImageFile.from_image(model.decode(latents)))
 ```
 
 ## The core

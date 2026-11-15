@@ -354,6 +354,11 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
             _current.reset(token)
             handles.__exit__(*sys.exc_info())
 
+    for asset in assets_in(result):
+        if isinstance(asset, ImageFile) and asset._image is not None:
+            Outputs(attempt)._save_image(asset._image, format=asset._image_format, asset=asset)
+            asset._image = None
+
     _validate_result(
         surface, result, attempt, grant_token=inv.calls.grant_token if inv.calls else None
     )

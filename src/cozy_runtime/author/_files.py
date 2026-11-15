@@ -21,6 +21,7 @@ from dataclasses import dataclass, is_dataclass
 from fractions import Fraction
 from pathlib import Path
 from types import MappingProxyType, UnionType
+from uuid import uuid4
 from typing import (
     TYPE_CHECKING,
     ClassVar,
@@ -52,6 +53,7 @@ from cozy_runtime.author._walker import field_values, strip, unwrap_optional
 from cozy_runtime.canonical_json import JsonValue
 
 if TYPE_CHECKING:
+    from cozy_runtime.author._services import ImageFrame
     from cozy_runtime.author._decode import (
         AudioProbe,
         DecodedAudio,
@@ -284,9 +286,37 @@ class File:
 
 
 class ImageFile(File):
-    """An image input. `read()` decodes it once per call, charging the attempt budget."""
+    """An image input or result. `from_image()` returns host pixels for the SDK to save;
+    `read()` decodes a granted input once per call, charging the attempt budget."""
 
     kind: ClassVar[str] = "image"
+    _image: ImageFrame | None = None
+    _image_format: str = ""
+
+    @classmethod
+    def from_image(
+        cls, image: ImageFrame | Image, *, format: Literal["png", "webp"] | None = None
+    ) -> Self:
+        """Snapshot host pixels for a final result, without encoding or publishing them.
+
+        Return this value in an existing `ImageFile` field. The SDK uses the ordinary
+        bounded output spool and finalization path. The default is lossless WebP, or PNG
+        when a side exceeds WebP's 16383-pixel limit; both preserve alpha. Explicit format
+        choices are honored. Use `Outputs` for intermediate publication or streaming.
+        """
+        from cozy_runtime.author._services import ImageFrame, as_frame
+
+        frame = as_frame(image)
+        codec = format or ("webp" if max(frame.width, frame.height) < 16384 else "png")
+        if codec not in ("png", "webp"):
+            raise OutputError(
+                f"image format {codec!r} has no encoder: choose png or lossless webp",
+                code="encoder_unavailable",
+            )
+        result = cls(f"image-value:{uuid4().hex}")
+        result._image = ImageFrame(frame.width, frame.height, bytes(frame.pixels), frame.mode)
+        result._image_format = codec
+        return result
 
     def read(self, *, mode: Literal["RGB", "RGBA"] = "RGB", max_pixels: int | None = None) -> Image:
         """Display-oriented pixels with the field's `ImagePreparation` applied, and scaled down
