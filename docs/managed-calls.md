@@ -14,7 +14,7 @@ async def segment(ctx: Context, payload: SegmentInput, base_model: H3, out: Outp
 
 @app.entrypoint
 async def shot(ctx: Context, payload: ShotInput) -> ShotOutput:
-    selected = {"base_model": ModelChoice(ref=lora)}
+    selected = {"base_model": ModelChoice(ref=checkpoint)}
     prefetch(segment, models=selected)  # optional model preparation hint
     result = await call(segment, SegmentInput(...), models=selected)
 ```
