@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import importlib.util
 import json
 import math
 from collections import Counter, defaultdict
@@ -12,7 +13,14 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, TextIO
 
-from profile_intervals import interval_summary
+# Some research consumers load this script by path without adding its directory to sys.path.
+_interval_spec = importlib.util.spec_from_file_location(
+    "h3_profile_intervals", Path(__file__).with_name("profile_intervals.py")
+)
+assert _interval_spec is not None and _interval_spec.loader is not None
+_intervals = importlib.util.module_from_spec(_interval_spec)
+_interval_spec.loader.exec_module(_intervals)
+interval_summary = _intervals.interval_summary
 
 
 class JSONStream:

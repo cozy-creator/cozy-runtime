@@ -24,15 +24,22 @@ _LOCK = threading.Lock()
 _WINDOW = "cozy.cr297.profiled-call"
 
 
-def profiled[T](torch: ModuleType, label: str, run: Callable[[], T], *, at: int = 2) -> T:
-    """Profile the `at`th call; report each GPU separately in the profiler's clock."""
+def profiled[T](
+    torch: ModuleType,
+    label: str,
+    run: Callable[[], T],
+    *,
+    at: int = 2,
+    devices: tuple[int, ...] | None = None,
+) -> T:
+    """Profile the `at`th call on the current GPU, or an explicitly selected device set."""
     with _LOCK:
         n = _SEEN[label] = _SEEN.get(label, 0) + 1
     if n != at or label in PROFILES:
         return run()
     from torch.profiler import ProfilerActivity, profile, record_function
 
-    devices = range(torch.cuda.device_count())
+    devices = tuple(dict.fromkeys((torch.cuda.current_device(),) if devices is None else devices))
     for device in devices:
         torch.cuda.synchronize(device)
     began = time.perf_counter()
@@ -59,12 +66,16 @@ def profiled[T](torch: ModuleType, label: str, run: Callable[[], T], *, at: int 
         bounds = interval_summary([], window=window)
         intervals: dict[int, list[tuple[float, float]]] = {device: [] for device in devices}
         by_name: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        excluded_devices: set[int] = set()
         for event in events:
             if not str(event.device_type).endswith("CUDA"):
                 continue
             device = int(event.device_index)
+            if device not in intervals:
+                excluded_devices.add(device)
+                continue
             start, end = float(event.time_range.start), float(event.time_range.end)
-            intervals.setdefault(device, []).append((start, end))
+            intervals[device].append((start, end))
             duration = max(0.0, min(end, window[1]) - max(start, window[0]))
             if duration:
                 by_name[device][event.name] += duration / 1e3
@@ -91,8 +102,10 @@ def profiled[T](torch: ModuleType, label: str, run: Callable[[], T], *, at: int 
                 "start_us": window[0],
                 "end_us": window[1],
                 "duration_ms": bounds["window_duration_us"] / 1e3,
+                "synchronized_devices": list(devices),
             },
             device_activity=activity,
+            excluded_cuda_device_indices=sorted(excluded_devices),
         )
     except Exception as exc:  # A diagnostic failure must not discard a completed model call.
         record["error"] = f"{type(exc).__name__}: {exc}"[:240]

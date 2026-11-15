@@ -47,7 +47,9 @@ class ProfileTests(unittest.TestCase):
         ]
         self.torch = types.ModuleType("torch")
         self.torch.cuda = types.SimpleNamespace(
-            synchronize=lambda device=0: self.syncs.append(device), device_count=lambda: 1
+            synchronize=lambda device=0: self.syncs.append(device),
+            device_count=lambda: 1,
+            current_device=lambda: 0,
         )
         self.profiler = types.ModuleType("torch.profiler")
         self.profiler.ProfilerActivity = types.SimpleNamespace(CPU="CPU", CUDA="CUDA")
@@ -72,9 +74,11 @@ class ProfileTests(unittest.TestCase):
         self.annotation_names.append(name)
         yield
 
-    def run_profile(self, *, at=1):
+    def run_profile(self, *, at=1, devices=None):
         with patch.object(profiles.time, "perf_counter", side_effect=[0.0, 0.11]):
-            result = profiles.profiled(self.torch, "dense", lambda: "output", at=at)
+            # Preserve the legacy repro: the optional scope is new only for explicit tests.
+            options = {} if devices is None else {"devices": devices}
+            result = profiles.profiled(self.torch, "dense", lambda: "output", at=at, **options)
         self.assertEqual(result, "output")
         return profiles.PROFILES.get("dense")
 
@@ -102,15 +106,27 @@ class ProfileTests(unittest.TestCase):
     def test_devices_are_separate_and_all_finish_in_window(self):
         self.torch.cuda.device_count = lambda: 3
         self.events = [self.events[0], event(11000, 51000), event(21000, 81000, device=1)]
-        row = self.run_profile()
+        row = self.run_profile(devices=(0, 1, 2))
         self.assertEqual([d["busy_union_ms"] for d in row["device_activity"]], [40, 60, 0])
         self.assertEqual(
             [d["unclassified_inactivity_ms"] for d in row["device_activity"]], [70, 50, 110]
         )
         self.assertEqual(self.syncs, [0, 1, 2, 0, 1, 2])
+        self.assertEqual(row["measurement_window"]["synchronized_devices"], [0, 1, 2])
         self.assertEqual(row["measurement_window"]["duration_ms"], 110)
         self.assertEqual(self.annotation_names, ["cozy.cr297.profiled-call"])
         self.assertEqual(self.activity_requests, [["CPU", "CUDA"]])
+
+    def test_visible_unselected_devices_are_not_touched(self):
+        self.torch.cuda.device_count = lambda: 4
+        self.torch.cuda.current_device = lambda: 2
+        self.events.append(event(21000, 61000, device=2))
+        row = self.run_profile()
+        self.assertEqual(self.syncs, [2, 2])
+        self.assertEqual(row["measurement_window"]["synchronized_devices"], [2])
+        self.assertEqual([d["device_index"] for d in row["device_activity"]], [2])
+        self.assertEqual(row["device_activity"][0]["busy_union_ms"], 40)
+        self.assertEqual(row["excluded_cuda_device_indices"], [0])
 
     def test_window_clips_events_and_separates_profiler_overhead(self):
         self.events = [

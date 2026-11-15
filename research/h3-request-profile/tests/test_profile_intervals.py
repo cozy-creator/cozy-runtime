@@ -1,5 +1,6 @@
 """Union and measurement-window semantics for both diagnostic consumers."""
 
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -10,6 +11,19 @@ from trace_summary import summarize
 
 
 class IntervalTests(unittest.TestCase):
+    def test_trace_script_can_be_loaded_by_path_without_sibling_on_sys_path(self):
+        script = Path(__file__).resolve().parents[1] / "trace_summary.py"
+        code = """
+import importlib.util
+import sys
+spec = importlib.util.spec_from_file_location("isolated_trace", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert module.summarize(iter([]))["device_activity"] == []
+assert module.interval_summary([(0, 7), (4, 11)])["busy_union_us"] == 11
+"""
+        subprocess.run([sys.executable, "-I", "-c", code, str(script)], check=True)
+
     def test_union_patterns(self):
         for intervals, busy, total, span in (
             ([(0, 7), (4, 11)], 11, 14, 11),

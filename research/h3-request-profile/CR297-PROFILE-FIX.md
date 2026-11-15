@@ -38,13 +38,16 @@ unchanged by these replacements.
 
 - `measurement_window`: the CPU `record_function("cozy.cr297.profiled-call")`
   start/end, in the same trace-relative microsecond clock as CUDA events. The
-  annotation encloses the call and completion synchronization of every visible
-  device. Initialization synchronization precedes the profiler.
+  annotation encloses the call and completion synchronization of the current GPU
+  by default. A caller can explicitly pass `devices=(0, 1)` to measure that set.
+  `synchronized_devices` records this scope; other visible GPUs are never touched.
+  Initialization synchronization precedes the profiler.
 - `profiler_context_wall_ms`: independent host-clock duration including profiler
   entry/exit. It is not used as a device denominator. The annotated call is still
   instrumented and is not a clean inference benchmark.
-- `device_activity`: one row per visible/observed device, with all of its streams
-  unioned. No total combines different GPUs into a single wall-time utilization.
+- `device_activity`: one row per selected device, with all of its streams unioned.
+  Observed events from other devices are excluded and named in
+  `excluded_cuda_device_indices`; their completion is outside this measurement. No total combines different GPUs into a single wall-time utilization.
 - `busy_union_ms`: occupied traced device intervals inside the explicit window.
 - `aggregate_device_work_ms`: sum of the same event/window intersections. It may
   exceed the window. CUDA activity includes kernels, copies and memory operations;
@@ -72,9 +75,11 @@ interval arithmetic.
 
 The local suite exercises the actual `profiled(torch, label, run)` adapter with
 profiler-shaped events and deterministic context managers: overlapping streams,
-containment, duplicate/disjoint events, device separation, idle devices, bounded
+containment, duplicate/disjoint events, explicit device separation, idle devices, bounded
 clipping, tails, warm-call selection, missing/ambiguous annotations, invalid
-intervals and model errors. The trace tool exercises the same accounting module.
+intervals and model errors. A regression ensures visible but unselected GPUs are
+untouched. The trace tool exercises the same accounting module and works both as a
+CLI and under path-based dynamic import without changing `sys.path`.
 
 This is source qualification. It is not a CUDA execution, H3 rerun, performance
 claim, release or deployment. The graph owner must apply the replacement to a
