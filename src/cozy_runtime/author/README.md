@@ -83,7 +83,8 @@ from .child_calls import Request, generate
 result = await call(generate, Request(prompt="a lighthouse"))
 ```
 
-Model choices remain named arguments to `call`; returned media and `ChildCallError` retain
+Model choices are passed in `models={"slot": ModelChoice(...)}`; returned media and
+`ChildCallError` retain
 their ordinary managed-call behavior. Regenerate declarations after changing the locked
 dependency. Ordinary implementation imports and local function calls remain ordinary Python.
 Each managed requirement requests its callee’s `cozy-calls` extra too, so ordinary wheel
@@ -142,3 +143,8 @@ Package code runs as plain Python too: with no executor, `retained` holds the te
 runs whole and a Model method is an ordinary method.
 
 More: `docs/package-extensions.md`.
+
+The request must be a positional `msgspec.Struct`; keyword request fields and dicts are not
+accepted. Same-package registered/private functions and Runtime builtins use the same form.
+Handlers with separately injected `Files` take them through `assets=...`. Other packages
+require generated operation references, even when their implementation is installed locally.

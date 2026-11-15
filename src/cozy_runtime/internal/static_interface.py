@@ -1985,6 +1985,17 @@ def _callees(reader: Reader, registration: Registration) -> list[Definition | As
                 _managed(reader, module, node) if isinstance(node, ast.Call) and node.args else ""
             )
             if isinstance(node, ast.Call) and managed:
+                accepted = {"models", "assets"} if managed == "author.call" else {"models"}
+                arity = 2 if managed == "author.call" else 1
+                if len(node.args) != arity or any(
+                    keyword.arg not in accepted for keyword in node.keywords
+                ):
+                    reader.refuse(
+                        module,
+                        node,
+                        "call takes (target, request) and only models=/assets=; prefetch takes a target and models=",
+                        "call_signature",
+                    )
                 named.add(id(node.args[0]))
                 try:
                     reference = reader.resolve(module, node.args[0])
@@ -1996,6 +2007,17 @@ def _callees(reader: Reader, registration: Registration) -> list[Definition | As
                     continue
                 callee = _function(reader, module, node.args[0])
                 runtime = callee is None or callee.module.name.split(".")[0] == "cozy_runtime"
+                if (
+                    callee is not None
+                    and not runtime
+                    and not reader._own(callee.module.name.split(".")[0])
+                ):
+                    reader.refuse(
+                        module,
+                        node.args[0],
+                        "another package's managed call needs a generated Operation reference",
+                        "child_reference_required",
+                    )
                 if managed == "author.call" and not runtime:
                     found.append(typing.cast(Definition, callee))
                 continue
