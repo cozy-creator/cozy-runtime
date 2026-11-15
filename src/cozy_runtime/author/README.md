@@ -45,6 +45,9 @@ def generate(ctx: Context, payload: Request, model: Flow, out: Outputs, tel: Tel
 - **`App`**: `@app.entrypoint` publishes a function; `@app.tool` publishes one that is also a canvas
   box. Options: `name`, `defaults`, `memoize`, `on_demand`, `accelerator`, `weights`, `private`,
   `components`, `preflight`.
+  A constructed `Model` parameter selects the GPU by default; other handlers use CPU.
+  Set `accelerator=True` for custom GPU work with only raw `Weights` or ordinary inputs,
+  or `accelerator=False` to keep a model handler on CPU. Explicit settings always win.
 - **Handler parameters** are injected by type: `Context`, a `msgspec.Struct` request, any `Model`,
   and the services `Outputs`, `Telemetry`, `Adjustments`.
 - **`Model`**: `load(loader)` builds the components. `loader.construct(factory)` takes a class or a

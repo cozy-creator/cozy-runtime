@@ -1523,7 +1523,7 @@ class Registration:
     memoize: bool = False
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     child_task: bool = False
-    accelerator: bool = True
+    accelerator: bool | None = None
     model_on_demand: tuple[str, ...] = ()
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     #: A model argument's class where the registration names it, not its annotation.
@@ -2415,7 +2415,8 @@ def _registration(
     used_components: dict[str, tuple[str, ...]] = {}
     module = declaration or module
     name = fn.name
-    accelerator, private = True, False
+    accelerator: bool | None = None
+    private = False
     weights: tuple[author.WeightsOutput, ...] = ()
     on_demand: tuple[str, ...] = ()
     box: dict[str, object] = {}
@@ -2449,7 +2450,7 @@ def _registration(
         elif keyword.arg in _TOOL_KEYWORDS:
             box[keyword.arg] = value
         elif keyword.arg in ("accelerator", "private", "memoize"):
-            if type(value) is not bool:
+            if type(value) is not bool and not (keyword.arg == "accelerator" and value is None):
                 reader.refuse(module, keyword.value, f"{keyword.arg} is True or False")
             if keyword.arg == "private":
                 private = value
