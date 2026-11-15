@@ -102,6 +102,9 @@ BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypas
 #: Gates only, never a setting: every path records at its first sight, whatever it would save, so
 #: a gate build proves each model captures and replays (cr-297). False in every release.
 FORCE = False
+#: Under `FORCE`, every this-many-th replay of a region also runs as written from the same state
+#: and the two are compared (`_audit`): a graph that drifts from its call after its one check goes
+_AUDIT = 16
 #: Set while a region warms up its capture: the regions under it run as written.
 _WARMING = contextvars.ContextVar("cozy_graphs_warming", default=False)
 #: The idle period recording on this thread (`capture_idle`): each region boundary checks it.
@@ -1296,6 +1299,7 @@ OUTCOMES = {
     "refused": "the code can't be recorded (a capture refusal, state it changes)",
     "capture_refused": "its capture failed",
     "replay_mismatch": "its replay differed from the call as written; the graph went",
+    "audited": "gates: its replay was compared with the call as written, which served",
     "building": "a kernel is still building, or its weights moved: a later call records",
     "retired": "its graphs went (a kernel landed, its weights changed)",
     "waiting": "its graph waits for room after a refusal this attempt",
@@ -1400,7 +1404,13 @@ def _region_path(
     recorder.last = key
     recorder.attempts += 1
     if key in recorder.paths:
-        result = _replay_call(torch, module, recorder, key, leaves, placed)
+        audit: list[_Audit] | None = (
+            [] if FORCE and recorder.replays % _AUDIT == _AUDIT - 1 else None
+        )
+        result = _replay_call(torch, module, recorder, key, leaves, placed, audit)
+        if audit and result is not _EAGER and result is not _STALE:
+            written = functools.partial(call, module, *args, **kwargs)
+            return audit[0].compare(module, recorder, key, result, written)
         if result is _EAGER:
             return recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
         if result is not _STALE:
@@ -2205,9 +2215,12 @@ def _replay_call(
     key: tuple[object, ...],
     leaves: list[object],
     placed: _Placed | None,
+    audit: list[_Audit] | None = None,
 ) -> object:
     """The call replayed in its component's pass, serialized on the device, or `_EAGER`: its
-    graphs retired (a kernel landed, a changed fill), or no room to prepare its weights."""
+    graphs retired (a kernel landed, a changed fill), or no room to prepare its weights. With
+    `audit` (gates), the state its graph writes is kept first, for the caller to run the call as
+    written from it (`_Audit.compare`, outside the region's lock)."""
     owner = recorder.domain
     assert owner is not None
     scope = placed[0].graph_pass(placed[1], "") if placed is not None else nullcontext()
@@ -2233,9 +2246,53 @@ def _replay_call(
         entry.used = recorder.attempts
         if placed is not None and recorder.binding is None:
             recorder.binding = placed[0].retain(placed[1], ("",))
+        if audit is not None:
+            audit.append(_Audit(torch, entry, leaves))
         result = _replay(torch, leaves, placed, recorder, key, entry, attempt)
         if result is _STALE:
             _expire(recorder, handle, owner)
+        return result
+
+
+class _Audit:
+    """A gate's check of one replay: the state its graph writes (foreign tensors, written inputs)
+    as the call found it, so the call as written can run from there after the replay."""
+
+    def __init__(self, torch: ModuleType, entry: _Recording, leaves: list[object]) -> None:
+        self.torch, self.entry = torch, entry
+        self.written = [cast("Tensor", leaves[i]) for i in entry.arg_writes]
+        self.writes = [t.clone() for t in entry.writes]
+        self.inputs = [t.clone() for t in self.written]
+
+    def compare(
+        self,
+        module: Module,
+        recorder: _Recorder,
+        key: tuple[object, ...],
+        replayed: object,
+        call: Callable[[], object],
+    ) -> object:
+        """The call as written, run from the state the replay found and compared with it: a
+        difference drops the path's graphs for the process (`replay_mismatch`). It serves."""
+        entry = self.entry
+        wrote = [t.clone() for t in entry.writes]
+        inputs = [t.clone() for t in self.written]
+        tensors, saved = (*entry.writes, *self.written), (*self.writes, *self.inputs)
+        for tensor, before in zip(tensors, saved, strict=True):
+            tensor.copy_(before)
+        result = recorder.eager.run(self.torch, call)
+        differs = vt.replay_differs(result, replayed)
+        if not differs and (state := vt.replay_differs(entry.writes, wrote)):
+            differs = f"the state it writes outside the call: {state}"
+        if not differs and (changed := vt.replay_differs(self.written, inputs)):
+            differs = f"the inputs it writes: {changed}"
+        if differs:
+            with recorder.lock:
+                _failed(module, recorder, key, f"audit: {differs}", "replay_mismatch")
+                for handle in list(recorder.paths.get(key, ())):
+                    _remove(recorder, handle)
+        else:
+            _note(recorder, "audited")
         return result
 
 
