@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import NoReturn
 
+from cozy_runtime.internal import call_scope
 from cozy_runtime.internal.canonical import DOC_MAX_BYTES
 
 if sys.platform == "win32":
@@ -616,11 +617,11 @@ def anonymous(name: str, sealing: bool = False) -> int:
     sealed); on macOS, which has none, an unlinked file; on Windows, a temporary file gone
     with its last handle."""
     if sys.platform == "win32":
-        path = os.path.join(tempfile.gettempdir(), f"{name}.{os.urandom(8).hex()}")
+        path = os.path.join(call_scope.process_tempdir(), f"{name}.{os.urandom(8).hex()}")
         flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_BINARY | os.O_NOINHERIT
         return os.open(path, flags | os.O_TEMPORARY | os.O_SHORT_LIVED, 0o600)
     if sys.platform != "linux":
-        fd, path = tempfile.mkstemp(prefix=f"{name}.")
+        fd, path = tempfile.mkstemp(prefix=f"{name}.", dir=call_scope.process_tempdir())
         os.unlink(path)
         return fd
     # libc's own: python-build-standalone's old glibc build lacks `os.memfd_create`.

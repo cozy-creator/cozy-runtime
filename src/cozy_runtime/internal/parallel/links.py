@@ -39,7 +39,7 @@ from types import ModuleType
 from typing import TypedDict
 
 from cozy_runtime.graphs import streams
-from cozy_runtime.internal import filelock, kernel_cache, spawn
+from cozy_runtime.internal import call_scope, filelock, kernel_cache, spawn
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.config import inherited_environment
 from cozy_runtime.internal.parallel import copy_engine, group
@@ -405,10 +405,10 @@ def _probe(devices: Sequence[str]) -> Links:
     }
     began = time.monotonic()
     # A file, not a pipe: a child blocked on a full pipe would look wedged.
-    errors = tempfile.TemporaryFile("w+")  # noqa: SIM115
+    errors = tempfile.TemporaryFile("w+", dir=call_scope.process_tempdir())  # noqa: SIM115
     # Its group's store file (`group.rendezvous`), in a directory only this user enters; removed
     # here, as the child's own teardown may be ended.
-    directory = tempfile.mkdtemp(prefix="links-")
+    directory = tempfile.mkdtemp(prefix="links-", dir=call_scope.process_tempdir())
     child = subprocess.Popen(
         [
             *(sys.executable, "-I", "-c", _CHILD, json.dumps(sys.path)),

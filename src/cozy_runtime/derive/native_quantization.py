@@ -19,6 +19,7 @@ import tensorfs
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import Context, Telemetry, UnsupportedInput
 from cozy_runtime.author._loader import TENSORFS_NAMES
+from cozy_runtime.internal import call_scope
 from cozy_runtime.weights_store import Checkpoint, Output, ReusedQuantization
 
 from .microscale import CONVROT_GROUP, NVFP4_BLOCK, W4A8_GROUP
@@ -176,7 +177,9 @@ def snapshot(
             code="quantization_calibration",
         )
     torch = calibration.torch
-    with tempfile.TemporaryDirectory(prefix="cozy-svdq-calibration-") as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="cozy-svdq-calibration-", dir=call_scope.process_tempdir()
+    ) as directory:
         writer = tensorfs.Writer(Path(directory) / "calibration.cozytensors")
         writer.metadata["provenance"] = {
             "source": source.id,
