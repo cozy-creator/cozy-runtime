@@ -1,0 +1,941 @@
+{
+  "timestamp_utc": "2026-11-15T07:59:24Z",
+  "source_revision": "f8b7e97a1418d2e529bd5405fbf86312be198ae6",
+  "torch": "2.15.0+cu132",
+  "gpu": "_CudaDeviceProperties(name='NVIDIA GeForce RTX 4070 Laptop GPU', major=8, minor=9, total_memory=7807MB, multi_processor_count=36, uuid=3b5ac7cc-b570-e6ad-61c9-8abb87e91f35, pci_bus_id=1, pci_device_id=0, pci_domain_id=0, L2_cache_size=32MB)",
+  "driver": "595.99.02",
+  "resources": {
+    "baseline": {
+      "registers": 168,
+      "shared_bytes": 32768,
+      "ctas_per_sm": 3,
+      "binary_sha256": "a67dbf969178d0261bba403f94adec0c7a74e40aa8699933d6ba01ce24c65449"
+    },
+    "stage3": {
+      "registers": 221,
+      "shared_bytes": 49152,
+      "ctas_per_sm": 2,
+      "binary_sha256": "50cfa0d4a924a17f5cd8bd5fb8a4525be307e49aad45234fa7ac752a2d589412"
+    }
+  },
+  "correctness": [
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 0,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 0,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 0,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 0,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 1,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 1,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 1,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 65,
+      "heads": 2,
+      "selected": 1,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 129,
+      "heads": 3,
+      "selected": 3,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 129,
+      "heads": 3,
+      "selected": 3,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 129,
+      "heads": 3,
+      "selected": 3,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 129,
+      "heads": 3,
+      "selected": 3,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 512,
+      "heads": 2,
+      "selected": 8,
+      "token_aug": 129,
+      "dtype": "torch.bfloat16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 512,
+      "heads": 2,
+      "selected": 8,
+      "token_aug": 129,
+      "dtype": "torch.bfloat16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 512,
+      "heads": 2,
+      "selected": 8,
+      "token_aug": 129,
+      "dtype": "torch.float16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 512,
+      "heads": 2,
+      "selected": 8,
+      "token_aug": 129,
+      "dtype": "torch.float16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 4096,
+      "heads": 4,
+      "selected": 64,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 4096,
+      "heads": 4,
+      "selected": 64,
+      "token_aug": 0,
+      "dtype": "torch.bfloat16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 4096,
+      "heads": 4,
+      "selected": 64,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 298,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    },
+    {
+      "tokens": 4096,
+      "heads": 4,
+      "selected": 64,
+      "token_aug": 0,
+      "dtype": "torch.float16",
+      "seed": 299,
+      "equal_bytes": true,
+      "inputs_unchanged": true
+    }
+  ],
+  "timings": [
+    {
+      "tokens": 4096,
+      "heads": 8,
+      "head_dim": 128,
+      "selected_blocks": 8,
+      "input_set_count": 2,
+      "input_bytes": 26368000,
+      "samples_ms": {
+        "baseline": [
+          0.17060265938440958,
+          0.16849066813786825,
+          0.16792533795038858,
+          0.17040000359217325,
+          0.1699840029080709,
+          0.17169066270192465,
+          0.17001599073410034,
+          0.17100799083709717,
+          0.17141334215799967,
+          0.1699840029080709,
+          0.1699946721394857,
+          0.16725333531697592,
+          0.16895999511082968
+        ],
+        "stage3": [
+          0.32096000512441,
+          0.17612799008687338,
+          0.17554134130477905,
+          0.17407999436060587,
+          0.17502933740615845,
+          0.1762453317642212,
+          0.17612799008687338,
+          0.1764693260192871,
+          0.17618133624394736,
+          0.17612799008687338,
+          0.17779199282328287,
+          0.17544533809026083,
+          0.17578667402267456
+        ]
+      },
+      "arm_orders": [
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 0.1699946721394857,
+        "stage3": 0.17612799008687338
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "stage3": 1.0361445022689884
+      }
+    },
+    {
+      "tokens": 4096,
+      "heads": 8,
+      "head_dim": 128,
+      "selected_blocks": 32,
+      "input_set_count": 2,
+      "input_bytes": 26368000,
+      "samples_ms": {
+        "baseline": [
+          0.5593173503875732,
+          0.5294080177942911,
+          0.4755733410517375,
+          0.4747946659723918,
+          0.4747946659723918,
+          0.4775253136952718,
+          0.47315200169881183,
+          0.47545599937438965,
+          0.47607465585072833,
+          0.4751360019048055,
+          0.47411199410756427,
+          0.4734293222427368,
+          0.4734826485315959
+        ],
+        "stage3": [
+          0.5011519988377889,
+          0.504149317741394,
+          0.5023573239644369,
+          0.5007359981536865,
+          0.5007893244425455,
+          0.501418670018514,
+          0.5003946622212728,
+          0.501418670018514,
+          0.5010773340861002,
+          0.50381867090861,
+          0.4991573492685954,
+          0.5031253496805826,
+          0.500053326288859
+        ]
+      },
+      "arm_orders": [
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 0.4751360019048055,
+        "stage3": 0.5011519988377889
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "stage3": 1.0546369494867138
+      }
+    },
+    {
+      "tokens": 4096,
+      "heads": 8,
+      "head_dim": 128,
+      "selected_blocks": 64,
+      "input_set_count": 2,
+      "input_bytes": 26368000,
+      "samples_ms": {
+        "baseline": [
+          0.9400746822357178,
+          0.9014826615651449,
+          0.9049066702524821,
+          1.0431146621704102,
+          0.9086293379465739,
+          0.9492159684499105,
+          0.9021440347035726,
+          0.8973546822865804,
+          0.9113600254058838,
+          0.9052159786224365,
+          0.8990506331125895,
+          0.9052159786224365,
+          0.9060053030649821
+        ],
+        "stage3": [
+          0.9855039914449056,
+          0.9390079975128174,
+          0.9375680287679037,
+          0.9393493334452311,
+          0.9839893182118734,
+          0.9383253256479899,
+          0.938805341720581,
+          0.9386666615804037,
+          0.9383253256479899,
+          0.9457813103993734,
+          0.9486080010732015,
+          0.9386666615804037,
+          0.9432319800059
+        ]
+      },
+      "arm_orders": [
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 0.9052159786224365,
+        "stage3": 0.9390079975128174
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "stage3": 1.0410888068921689
+      }
+    },
+    {
+      "tokens": 16384,
+      "heads": 8,
+      "head_dim": 128,
+      "selected_blocks": 32,
+      "input_set_count": 2,
+      "input_bytes": 107020288,
+      "samples_ms": {
+        "baseline": [
+          2.135039965311686,
+          1.9845120112101238,
+          2.171562671661377,
+          2.0558506647745767,
+          1.810431957244873,
+          2.236757278442383,
+          2.7876691818237305,
+          2.02511994043986,
+          2.601322650909424,
+          2.591637293497721,
+          2.1763946215311685,
+          2.9672107696533203,
+          2.0722667376200357
+        ],
+        "stage3": [
+          2.084895928700765,
+          1.887231985727946,
+          2.3586133321126304,
+          1.8838186264038086,
+          1.9247786204020183,
+          2.3705600102742515,
+          2.0101119677225747,
+          3.2252585093180337,
+          3.582634607950846,
+          2.5367892583211265,
+          2.756608009338379,
+          3.367253303527832,
+          2.4360960324605307
+        ]
+      },
+      "arm_orders": [
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 2.171562671661377,
+        "stage3": 2.3705600102742515
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "stage3": 1.063159878889433
+      }
+    },
+    {
+      "tokens": 16384,
+      "heads": 8,
+      "head_dim": 128,
+      "selected_blocks": 128,
+      "input_set_count": 2,
+      "input_bytes": 107020288,
+      "samples_ms": {
+        "baseline": [
+          8.656746546427408,
+          10.126335779825846,
+          7.755434672037761,
+          7.860223770141602,
+          10.216106414794922,
+          21.314795176188152,
+          28.6166508992513,
+          13.566975911458334,
+          10.428757349650065,
+          8.247637430826822,
+          8.42854372660319,
+          8.654261271158854,
+          7.778687795003255
+        ],
+        "stage3": [
+          11.681109110514322,
+          11.17639414469401,
+          10.584063847859701,
+          10.252629597981771,
+          10.22977066040039,
+          8.981845219930014,
+          21.697535196940105,
+          20.745184580485027,
+          8.778752009073893,
+          8.605354944864908,
+          8.604330698649088,
+          10.282666524251303,
+          10.924799601236979
+        ]
+      },
+      "arm_orders": [
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 8.656746546427408,
+        "stage3": 10.282666524251303
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "stage3": 1.1036957876668616
+      }
+    },
+    {
+      "tokens": 65536,
+      "heads": 2,
+      "head_dim": 128,
+      "selected_blocks": 64,
+      "input_set_count": 2,
+      "input_bytes": 113305600,
+      "samples_ms": {
+        "baseline": [
+          7.56819216410319,
+          7.22978146870931,
+          5.738837560017903,
+          7.321599960327148,
+          5.725866953531901,
+          6.438229242960612,
+          4.896426518758138,
+          5.013471921284993,
+          5.352789560953776,
+          4.369322776794434,
+          4.411861419677734,
+          4.311039924621582,
+          5.112511952718099
+        ],
+        "stage3": [
+          15.145301818847656,
+          7.043071746826172,
+          7.748608271280925,
+          8.16981315612793,
+          4.5090131759643555,
+          7.61412239074707,
+          5.9886932373046875,
+          6.257322947184245,
+          6.425600051879883,
+          5.582848230997722,
+          5.5313065846761065,
+          5.804714838663737,
+          4.578303972880046
+        ]
+      },
+      "arm_orders": [
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 5.352789560953776,
+        "stage3": 6.257322947184245
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "stage3": 1.223074259230092
+      }
+    },
+    {
+      "tokens": 65536,
+      "heads": 2,
+      "head_dim": 128,
+      "selected_blocks": 256,
+      "input_set_count": 2,
+      "input_bytes": 113305600,
+      "samples_ms": {
+        "baseline": [
+          24.853973388671875,
+          29.875882466634113,
+          22.15082550048828,
+          21.654869079589844,
+          16.84824498494466,
+          35.71711985270182,
+          34.45800526936849,
+          23.381332397460938,
+          30.771199544270832,
+          32.61713155110677,
+          32.85643768310547,
+          25.949183146158855,
+          25.917098999023438
+        ],
+        "stage3": [
+          37.58831024169922,
+          38.241600036621094,
+          26.64379628499349,
+          19.392852783203125,
+          22.488011678059895,
+          45.61339823404948,
+          35.85809071858724,
+          28.858367919921875,
+          21.6275634765625,
+          26.49224599202474,
+          27.551808675130207,
+          34.363049825032554,
+          34.13401540120443
+        ]
+      },
+      "arm_orders": [
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "stage3",
+          "baseline"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ],
+        [
+          "baseline",
+          "stage3"
+        ]
+      ],
+      "median_ms": {
+        "baseline": 25.949183146158855,
+        "stage3": 28.858367919921875
+      },
+      "paired_ratio": {
+        "baseline": 1.0,
+        "stage3": 1.2342482211602153
+      }
+    }
+  ],
+  "scope": "Synthetic prepacked selected-tile kernel only; no H3, producer, route, or end-to-end qualification.",
+  "method": "CUDA graph replay of identical fixed routes, shuffled arm order, two input sets, 3 replays/sample; warm cache, no clock lock."
+}
