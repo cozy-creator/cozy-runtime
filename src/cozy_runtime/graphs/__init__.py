@@ -63,7 +63,7 @@ from cozy_runtime.author._errors import (
     unwind,
 )
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded, recovered
-from cozy_runtime.graphs import domain, observe
+from cozy_runtime.graphs import domain, observe, profiles
 from cozy_runtime.internal import attention_ulysses, kernel_ready
 from cozy_runtime.internal.accel import StaleBinding
 
@@ -1193,6 +1193,7 @@ def describe(root: Module) -> dict[str, object]:
         graph_pools=len(pools),
         graph_pool_bytes=None,  # stock Torch does not expose a public per-pool byte counter
         domains=len(domains),
+        profiles=dict(profiles.PROFILES),
     )
     return answer
 
