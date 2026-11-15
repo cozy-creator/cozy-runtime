@@ -86,7 +86,6 @@ from cozy_runtime.author._services import (
     Outputs,
     ProgressFrame,
     Telemetry,
-    _adopt_image,
 )
 from cozy_runtime.author._signature import Param, Surface
 from cozy_runtime.author._walker import field_values, strip, unwrap_optional, walk
@@ -356,7 +355,9 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
             handles.__exit__(*sys.exc_info())
 
     for asset in assets_in(result):
-        _adopt_image(attempt, asset)
+        if isinstance(asset, ImageFile) and asset._image is not None:
+            Outputs(attempt)._save_image(asset._image, format=asset._image_format, asset=asset)
+            asset._image = None
 
     _validate_result(
         surface, result, attempt, grant_token=inv.calls.grant_token if inv.calls else None

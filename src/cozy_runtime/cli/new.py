@@ -29,7 +29,7 @@ def _pyproject(name: str, pkg: str) -> str:
 name = "{name}"
 version = "0.1.0"
 requires-python = ">={python_interpreters.supported_minors()[0]}"
-dependencies = ["cozy-runtime>={__version__.split("+")[0]},<1.0.0"]
+dependencies = ["cozy-runtime>={__version__.split('+')[0]},<1.0.0"]
 
 [project.entry-points."cozy.application"]
 default = "{pkg}:app"
@@ -63,13 +63,14 @@ warn_unreachable = true
 
 _MODULE = '''"""__PKG__ — a cozy-runtime package.
 
-The SIGNATURE is the contract: a `model: MyModel` parameter selects the GPU.
-Return an image value; the SDK encodes and stores its pixels.
+The SIGNATURE is the contract:
+naming `out: Outputs` IS declaring the save capability, and a `model: MyModel` parameter
+is what derives `gpu`. Nothing else declares either.
 """
 
 import msgspec
 
-from cozy_runtime.author import App, Context, ImageFrame
+from cozy_runtime.author import App, Context, ImageFrame, Outputs
 from cozy_runtime.media import ImageFile
 
 app = App()
@@ -88,7 +89,7 @@ class GenerateResult(msgspec.Struct):
 
 
 @app.entrypoint
-def generate(ctx: Context, payload: GenerateRequest) -> GenerateResult:
+def generate(ctx: Context, payload: GenerateRequest, out: Outputs) -> GenerateResult:
     # Weightless: no model parameter yet. Adding `model: MyModel` binds real weights.
     ctx.raise_if_cancelled()
     pixels = bytearray()
@@ -97,7 +98,7 @@ def generate(ctx: Context, payload: GenerateRequest) -> GenerateResult:
             pixels += bytes((x % 256, y % 256, len(payload.prompt) % 256))
     frame = ImageFrame(payload.width, payload.height, bytes(pixels))
     return GenerateResult(
-        image=ImageFile.from_image(frame, format="png"), prompt=payload.prompt
+        image=out.save_image(frame, format="png"), prompt=payload.prompt
     )
 '''
 
