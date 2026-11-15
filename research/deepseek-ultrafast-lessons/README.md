@@ -16,6 +16,12 @@ Source snapshots:
 
 Follow-up: [Hyperkernel compared with Baseten, and what a native Cozy execution path would mean](hyperkernel-comparison.md).
 
+Further source studies:
+
+- [Existing native H3 engines: mmh3, h3-rs and h3-hrx](native-h3-engines.md).
+- [NVIDIA Sol H3: measured decomposition, existing Cozy ports, and remaining candidates](sol-h3-gap-analysis.md).
+- [A native H3 stage within Cozy: capture lifecycle, current interfaces, proposed private boundary, and profiling recipe](cozy-native-h3-stage.md).
+
 The useful pattern is to specialize the execution schedule and data layout for a model, workload, and hardware class. Baseten implements a graph of specialized kernels, with selected fusion and persistence; its source does not establish a single whole-model megakernel. Nor does its benchmark isolate Rust versus Python or CUDA C++ versus a GPU DSL. The [external source study](external-study.md) identifies the launch paths and their restrictions.
 
 Cozy already implements much of this pattern. The next useful H3 investigation is the expensive attention and GEMM paths and the materialized tensors between them. A wholesale language rewrite has no measured justification here.

@@ -22,6 +22,12 @@ The release's [notices](https://github.com/Hyperstitioncc/Hyperkernel/blob/4076a
 
 ## Interpretation for Cozy
 
+### Baseten's graph is prepared after startup allocations
+
+The kernel machine code is built ahead of time: [build.rs](https://github.com/basetenlabs/deepseek-ultrafast/blob/76766a97308bfd1658fb055e835d0f92de737dc3/crates/kernels/build.rs#L37-L56) invokes `nvcc -cubin` and embeds the bytes. The live executable CUDA graph is created later. At each GPU worker's startup, [Worker::new](https://github.com/basetenlabs/deepseek-ultrafast/blob/76766a97308bfd1658fb055e835d0f92de737dc3/crates/server/src/engine.rs#L242-L249) runs a tiny one-token prefill, initializes speculative/sampling state, calls `capture_spec`, and retains its `GraphExec`; readiness follows worker initialization. The [adaptive capture](https://github.com/basetenlabs/deepseek-ultrafast/blob/76766a97308bfd1658fb055e835d0f92de737dc3/crates/engine/src/model.rs#L4004-L4044) records drafting and conditional verification branches, then instantiates and uploads the graph.
+
+Each request updates seed, prompt/KV state and the initial decode position. The [decode loop](https://github.com/basetenlabs/deepseek-ultrafast/blob/76766a97308bfd1658fb055e835d0f92de737dc3/crates/server/src/engine.rs#L296-L339) repeatedly launches the retained graph. It does not recapture on every request. The prebuilt recipe/kernel code is reusable across processes; this graph instance binds the current process's allocations/context and is recreated at initialization. Its scope is the speculative decoding pipeline, not every preprocessing, prefill and serving operation.
+
 There is a credible direction toward a specialized native serving artifact whose repeated computation no longer needs Python or PyTorch dispatch. Source inspection supports that possibility; it does not establish that every model/workload should become a separate hand-maintained runtime.
 
 Three decisions are independent:
