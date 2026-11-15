@@ -63,7 +63,7 @@ from cozy_runtime.author._errors import (
     unwind,
 )
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded, recovered
-from cozy_runtime.graphs import domain, observe
+from cozy_runtime.graphs import domain, observe, profiles
 from cozy_runtime.internal import attention_ulysses, kernel_ready
 from cozy_runtime.internal.accel import StaleBinding
 
@@ -102,7 +102,7 @@ if TYPE_CHECKING:
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
 #: Gates only, never a setting: every path records at its first sight, whatever it would save, so
 #: a gate build proves each model captures and replays (cr-297). False in every release.
-FORCE = False
+FORCE = True
 #: Under `FORCE`, every this-many-th replay of a region also runs as written from the same state
 #: and the two are compared (`_audit`): a graph that drifts from its call after its one check goes
 _AUDIT = 16
@@ -1032,6 +1032,7 @@ def install(torch: ModuleType, model: object, roots: Mapping[str, Module]) -> li
         if not getattr(type(root), "_cozy_graphed", False):
             root.__class__ = _graphed(torch, type(root))
         installed.append(name)
+    profiles.hook_roots(torch, dict(roots), active_attention_layout)
     return installed
 
 
@@ -1190,6 +1191,7 @@ def describe(root: Module) -> dict[str, object]:
         graph_pools=len(pools),
         graph_pool_bytes=None,  # stock Torch does not expose a public per-pool byte counter
         domains=len(domains),
+        profiles=dict(profiles.PROFILES),
     )
     return answer
 
