@@ -107,8 +107,12 @@ caller; it does not remove that existing platform layer or imply that available 
   result field. The SDK snapshots host pixels, then encodes and stores them through the
   ordinary output path. It defaults to lossless WebP, using PNG for a side over 16383 pixels;
   `format="png"` or `format="webp"` keeps an explicit choice. Both keep alpha. Existing
-  result schemas, metadata and output bounds still apply. `Outputs` handles intermediate
-  publication and bounded audio/video streams.
+  result schemas, metadata and output bounds still apply. The same value can go directly
+  into a child request or `out.publish("image", image)`: the SDK registers it once and
+  encodes it when those bytes are needed. Labeled copies share that file, and the original
+  can read its encoded bytes after the child or publication consumed it. `image.probe()`
+  reads captured geometry even before encoding. `Outputs.save_image` has been removed;
+  `Outputs` handles explicit publication, encoded artifacts and bounded audio/video streams.
 
 ## Optional
 
