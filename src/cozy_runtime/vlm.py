@@ -22,7 +22,7 @@ import json
 import secrets
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 
@@ -176,9 +176,17 @@ class Watched:
 
 @dataclass(frozen=True)
 class Question:
-    """One single-turn question: its text, pictures and videos in the order the model reads them."""
+    """One single-turn question: its text after its images and videos, or `parts`, its text,
+    pictures and videos in the order the model reads them."""
 
-    parts: Sequence[str | Image | Watched]
+    text: str = ""
+    images: list[Image] = field(default_factory=list)
+    videos: list[Watched] = field(default_factory=list)
+    parts: Sequence[str | Image | Watched] = ()
+
+    def read(self) -> Sequence[str | Image | Watched]:
+        """What the model reads, in order."""
+        return self.parts or [*self.images, *self.videos, self.text]
 
 
 def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> AskResult:
@@ -254,7 +262,7 @@ def _answers(
         return part.read() if isinstance(part, ImageFile) else part
 
     with tel.stage("reading"):
-        read_questions = [Question([read(part) for part in question]) for question in questions]
+        read_questions = [Question(parts=[read(part) for part in parts]) for parts in questions]
     with tel.stage("answering"):
         return model.ask(
             read_questions,
@@ -473,7 +481,7 @@ class VisionLM(Model[Pipeline]):
         before its first `stop`; with `thinking`, only what follows the thought is the answer,
         and a thought `max_new_tokens` cut short is returned as it stands, with a run warning."""
         texts = [self._chat(question, system, thinking) for question in questions]
-        parts = [part for question in questions for part in question.parts]
+        parts = [part for question in questions for part in question.read()]
         images = [part for part in parts if isinstance(part, Image)]
         videos = [part for part in parts if isinstance(part, Watched)]
         kwargs: dict[str, object] = {"images": images} if images else {}
@@ -525,7 +533,7 @@ class VisionLM(Model[Pipeline]):
             {"type": "text", "text": part}
             if isinstance(part, str)
             else {"type": "video" if isinstance(part, Watched) else "image"}
-            for part in question.parts
+            for part in question.read()
         ]
         messages = [{"role": "system", "content": system}] if system else []
         text: str = self.processor.apply_chat_template(
