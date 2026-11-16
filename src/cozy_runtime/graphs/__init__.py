@@ -110,7 +110,7 @@ FORCE = False
 DIAG = True
 #: Diagnosis fault control (never merged): from a graph's third replay its largest static input
 #: is not copied in, so it replays on a stale input (a real fault class the check must catch).
-DIAG_FAULT = False
+DIAG_FAULT = True
 #: Under `FORCE`, every this-many-th replay of a region also runs as written from the same state
 #: and the two are compared (`_audit`): a graph that drifts from its call after its one check goes
 _AUDIT = 16
