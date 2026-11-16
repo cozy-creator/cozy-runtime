@@ -110,7 +110,7 @@ FORCE = False
 DIAG = True
 #: Diagnosis fault control (never merged): from a graph's third replay its largest static input
 #: is not copied in, so it replays on a stale input (a real fault class the check must catch).
-DIAG_FAULT = False
+DIAG_FAULT = True
 #: Under `FORCE`, every this-many-th replay of a region also runs as written from the same state
 #: and the two are compared (`_audit`): a graph that drifts from its call after its one check goes
 _AUDIT = 16
@@ -524,8 +524,8 @@ class _Recording:
             self.served_replays += 1
             stale = -1
             if DIAG_FAULT and self.served_replays > 2:
-                sized = [(s.numel(), i) for i, s in enumerate(self.inputs) if s is not None]
-                stale = max(sized)[1] if sized else -1
+                # the first tensor argument: a denoiser's latents, new every step
+                stale = next((i for i, s in enumerate(self.inputs) if s is not None), -1)
             for index, (static, value) in enumerate(zip(self.inputs, leaves, strict=True)):
                 # Always: a pool's contents need not survive between replays.
                 if static is not None and index != stale:
