@@ -31,12 +31,14 @@ covers preparation through output copies, and a completion event orders reuse ac
 from __future__ import annotations
 
 import contextvars
+import enum
 import functools
 import itertools
 import math
 import sys
 import threading
 import time
+import types
 import weakref
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -1524,6 +1526,8 @@ def _region_path(
         )
     except _Unkeyed as unkeyed:
         return guarded(f"with a host value no key can hold: {unkeyed}")
+    except Exception as exc:  # a host object that raises as it is read: never the call's error
+        return guarded(f"with a host value that can't be read: {type(exc).__name__}")
     if layout is not None:  # an idle recording runs outside the caller's scope: under its own
         call = functools.partial(_under, layout, call)
     if recorder.last is not None and recorder.last != key:
@@ -1594,7 +1598,7 @@ def _region_path(
             _queue(torch, module, recorder, call, key, spec, leaves, placed)
     result = _first(torch, recorder, key, lambda: call(module, *args, **kwargs))
     if key not in recorder.failed and key not in recorder.judged:
-        _settle(torch, module, recorder, key, leaves, spec, (args, kwargs))
+        _settle(torch, module, recorder, key, (args, kwargs))
     return result
 
 
@@ -1614,8 +1618,6 @@ def _settle(
     module: Module,
     recorder: _Recorder,
     key: tuple[object, ...],
-    leaves: list[object],
-    spec: TreeSpec,
     arguments: _Arguments,
 ) -> None:
     """After a call as written: whether its Python left alone what its path is keyed by, its
@@ -1627,15 +1629,20 @@ def _settle(
     (`_State`) no guard reads; a replay skips it too (design 5.3)."""
     what = ""
     try:
-        after = _signature(torch, leaves, spec)
-        at = next((i for i in range(1, len(after)) if after[i] != key[i]), None)
-        if at is not None:
+        # Flattened again: a forward that rebinds an entry of an argument dict or list changes
+        # the tree, not the leaf this call was keyed by.
+        after = _signature(torch, *torch.utils._pytree.tree_flatten(arguments))
+        if len(after) != len(key) - 1 or after[0] != key[0]:
+            what = "the layout of its arguments"
+        elif (at := next((i for i in range(1, len(after)) if after[i] != key[i]), None)) is not None:
             paths = torch.utils._pytree.tree_flatten_with_path(arguments)[0]
             what = f"its argument {torch.utils._pytree.keystr(paths[at - 1][0])}"
         else:
             what = _moved(cast("_Parts", key[-1]).host, _host(torch, recorder, module))
     except _Unkeyed as unkeyed:
         what = f"a host value no key can hold now ({unkeyed})"
+    except Exception as exc:  # the call is served: reading its state again never fails it
+        what = f"a host value that can't be read now ({type(exc).__name__})"
     if not what:
         recorder.impure.pop(key, None)
         return
@@ -1646,9 +1653,15 @@ def _settle(
         recorder.impure[key] = (strikes, what)
         return
     recorder.impure.pop(key, None)
-    with recorder.lock:
+    owner = recorder.domain
+    using = owner.using() if owner is not None else nullcontext()
+    with using, recorder.lock:
         recorder.judged[key] = recorder.gap = f"its forward changes {what} as it runs"
         recorder.codes[key] = "refused"
+        for handle in list(recorder.paths.get(key, ())):  # a graph of it recorded before
+            _remove(recorder, handle)
+        if owner is not None:
+            _drop_unused(recorder, owner)
 
 
 class _Parts(NamedTuple):
@@ -1723,6 +1736,7 @@ def _first[T](
         peak = max(peak, last.peak)
     if last is None and len(recorder.seen) >= _FIRST_SEEN:
         del recorder.seen[next(iter(recorder.seen))]  # its next call is a first sight again
+    recorder.seen.pop(key, None)  # the latest called last: the one longest uncalled goes first
     recorder.seen[key] = _Seen(submit, host, start, end, peak)
     if key not in recorder.first_seen:
         if len(recorder.first_seen) >= _FIRST_SEEN:
@@ -3231,7 +3245,8 @@ def _shallow(
             and kind in ("b", "i", "u", "f", "c", "S", "U")
             and callable(listed)
         ):
-            return (type(value), getattr(value, "shape", ()), kind, _frozen(listed()))
+            dtype = str(getattr(value, "dtype", ""))
+            return (type(value), getattr(value, "shape", ()), dtype, _frozen(listed()))
         return (type(value), _one(value))
     # A subclass of a plain type (an IntEnum), and the plain types `_PLAIN` leaves out: by value.
     if isinstance(value, int):
@@ -3244,6 +3259,12 @@ def _shallow(
         return (type(value), str(value))
     if isinstance(value, bytes):
         return (type(value), bytes(value))
+    if isinstance(value, type | types.ModuleType):
+        # A class, a module (one a hook's closure holds): what it is, not the hundreds of names
+        # in it.
+        return (type(value), _one(value))
+    if isinstance(value, enum.Enum):
+        return (type(value), value.name, _shallow(torch, value.value, depth + 1, room))
     if isinstance(value, slice):
         return (
             slice,
@@ -3316,7 +3337,7 @@ def _shallow(
 #: the items a container (or a host tensor) may hold for `_shallow` to key each within two
 #: levels; the values one key part may read past that, in longer or deeper lists, tuples and
 #: dicts; and the levels it may go down at all
-_SHALLOW_ITEMS, _ROOM, _DEEP = 8, 256, 32
+_SHALLOW_ITEMS, _ROOM, _DEEP = 8, 1024, 32
 
 
 def _moved(before: tuple[object, ...], after: tuple[object, ...]) -> str:
@@ -3474,8 +3495,9 @@ class _State:
     the tensors, lists and dicts they hold (`_guarded`), its buffers (contents and version
     counters) and the RNG. Package code may keep a counter, a table or a cache in them;
     recording runs the forward once more than its call (twice at idle) and captures it once, so
-    each is put back, and a change means the forward has state a replay would not keep: its
-    path runs as written (run 11226: measuring must never change a later request)."""
+    each is put back. A changed plain value, list or dict means the forward has state a replay
+    would not keep: its path runs as written (run 11226: measuring must never change a later
+    request). A rebound tensor is put back and the path may still record."""
 
     def __init__(
         self,
@@ -3549,8 +3571,12 @@ class _State:
             for module, name, value, items in self.kept:
                 now = vars(module).get(name, _MISSING)
                 if now is not value:
+                    # A tensor it bound is the recording's (in a capture, never computed): put
+                    # back, and no more. A forward that binds one each call (a weight norm's
+                    # weight, a cache it only writes) keeps its graphs: one that reads what an
+                    # earlier call bound is held by its read guard on that object.
                     vars(module)[name] = value
-                    if not _alike(value, now):
+                    if items is not None and not _alike(value, now):
                         changed.add(name)
                 if items is not None and not _alike(items, _items(value)):
                     changed.add(name)
@@ -3566,8 +3592,9 @@ class _State:
                         continue  # the Runtime's own (a cut's mark), not the forward's
                     added = vars(module)[name]
                     if type(added) in _PLAIN or _guarded(self.torch, name, added):
-                        changed.add(name)  # an attribute its Python added
-                        del vars(module)[name]
+                        del vars(module)[name]  # an attribute its Python added
+                        if not isinstance(added, self.torch.Tensor):
+                            changed.add(name)
             for table, name, tensor, version, saved, geometry in self.immutable:
                 current = (
                     tuple(tensor.shape),
