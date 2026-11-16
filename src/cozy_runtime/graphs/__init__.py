@@ -739,6 +739,10 @@ class _Recorder:
         #: per signature, its last call as written (`_first`): its working peak sizes the pool
         #: its next call records into
         self.seen: dict[tuple[object, ...], _Seen] = {}
+        #: per signature, what its last call as written changed of its own key (an argument, the
+        #: host state `_host` reads) and how many in a row did: it records only after a call
+        #: that changed nothing (`_settle`)
+        self.impure: dict[tuple[object, ...], tuple[int, str]] = {}
         #: per signature, why its idle recording failed: a call may still record it
         self.idle_failed: dict[tuple[object, ...], str] = {}
         #: its modules' classes and hooks (`_structure`), read at each attempt's first call and
@@ -1483,13 +1487,17 @@ def _region_path(
     state: tuple[object, ...] = ()
     if not why:  # a guarded call reads no overlays
         state, why = _state(torch, recorder, module)
-    if why:
+
+    def guarded(why: str) -> object:
         recorder.gap = why
         _note(recorder, "guard", why)
         if placed is not None:
             placed[0].note(f"{placed[1]}.graphs", f"eager {why}")
         timing = recorder.written.get(why) or recorder.written.setdefault(why, _Timing())
         return timing.run(torch, lambda: call(module, *args, **kwargs))
+
+    if why:
+        return guarded(why)
     addresses = (
         ()
         if placed is not None
@@ -1500,19 +1508,22 @@ def _region_path(
     )
     autocast = torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
     declared = tuple(functools.reduce(getattr, p.split("."), module) for p in recorder.keys)
-    key = (
-        *_signature(torch, leaves, spec),
-        _Parts(
-            declared,
-            addresses,
-            autocast,
-            _dense(layout),
-            structure,
-            state,
-            _context(),
-            _host(torch, recorder, module),
-        ),
-    )
+    try:
+        key = (
+            *_signature(torch, leaves, spec),
+            _Parts(
+                declared,
+                addresses,
+                autocast,
+                _dense(layout),
+                structure,
+                state,
+                _context(),
+                _host(torch, recorder, module),
+            ),
+        )
+    except _Unkeyed as unkeyed:
+        return guarded(f"with a host value no key can hold: {unkeyed}")
     if layout is not None:  # an idle recording runs outside the caller's scope: under its own
         call = functools.partial(_under, layout, call)
     if recorder.last is not None and recorder.last != key:
@@ -1545,7 +1556,12 @@ def _region_path(
     ):
         # Gates only: every path records at its first sight, sized by its region's peak.
         peak = max((s.peak or 0 for s in recorder.seen.values()), default=0)
-        warm = _Seen(0.0, 0.0, torch.cuda.Event(), torch.cuda.Event(), peak or None)
+        # Recorded, timed events: `device_ms` reads the time between them (two never recorded
+        # raised there once the capture succeeded).
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        end.record()
+        warm = _Seen(0.0, 0.0, start, end, peak or None)
         result = _capture_call(
             torch, module, recorder, call, key, spec, leaves, (args, kwargs), placed, warm
         )
@@ -1553,11 +1569,19 @@ def _region_path(
             return result
     if (seen := recorder.seen.get(key)) is not None and key not in recorder.failed:
         if key not in recorder.judged:
-            result = _capture_call(
-                torch, module, recorder, call, key, spec, leaves, (args, kwargs), placed, seen
-            )
-            if result is not _EAGER:
-                return result
+            if (changed := recorder.impure.get(key)) is None:
+                result = _capture_call(
+                    torch, module, recorder, call, key, spec, leaves, (args, kwargs), placed, seen
+                )
+                if result is not _EAGER:
+                    return result
+            else:
+                _note(
+                    recorder,
+                    "guard",
+                    f"its last call as written changed {changed[1]}: it records after a call "
+                    "that changes nothing",
+                )
         # Not recorded in this call (no room, a kernel building, its working memory unmeasured):
         # idle capture is the backup, on resident weights. Only a short call is queued: a 34 s
         # H3 step at idle would hold its executor.
@@ -1568,12 +1592,63 @@ def _region_path(
             and not any(key in held for held in _settled_by(recorder))
         ):
             _queue(torch, module, recorder, call, key, spec, leaves, placed)
-    return _first(torch, recorder, key, lambda: call(module, *args, **kwargs))
+    result = _first(torch, recorder, key, lambda: call(module, *args, **kwargs))
+    if key not in recorder.failed and key not in recorder.judged:
+        _settle(torch, module, recorder, key, leaves, spec, (args, kwargs))
+    return result
 
 
 def _settled_by(recorder: _Recorder) -> tuple[Mapping[tuple[object, ...], object], ...]:
-    """Where a signature already has its fate: queued, refused, judged, refused at idle."""
-    return recorder.queued, recorder.failed, recorder.judged, recorder.idle_failed
+    """Where a signature already has its fate: queued, refused, judged, refused at idle, or
+    changed by its own last call (`_settle`)."""
+    return recorder.queued, recorder.failed, recorder.judged, recorder.idle_failed, recorder.impure
+
+
+#: calls as written in a row that may change their own key before their path is judged, and the
+#: signatures a region remembers as changed by their last call
+_IMPURE, _IMPURES = 2, 1024
+
+
+def _settle(
+    torch: ModuleType,
+    module: Module,
+    recorder: _Recorder,
+    key: tuple[object, ...],
+    leaves: list[object],
+    spec: TreeSpec,
+    arguments: _Arguments,
+) -> None:
+    """After a call as written: whether its Python left alone what its path is keyed by, its
+    arguments and the host state `_host` reads. A capture runs that Python once more than the
+    call does (a mismatch's diagnosis, once again), so a forward that advances a counter in an
+    argument or a producer's state would advance it twice in the request that records: a path
+    records, in a call or at idle, only after a call that changed neither, and `_IMPURE` in a
+    row that did judge it. What a forward changes outside those and its modules' attributes
+    (`_State`) no guard reads; a replay skips it too (design 5.3)."""
+    what = ""
+    try:
+        after = _signature(torch, leaves, spec)
+        at = next((i for i in range(1, len(after)) if after[i] != key[i]), None)
+        if at is not None:
+            paths = torch.utils._pytree.tree_flatten_with_path(arguments)[0]
+            what = f"its argument {torch.utils._pytree.keystr(paths[at - 1][0])}"
+        else:
+            what = _moved(cast("_Parts", key[-1]).host, _host(torch, recorder, module))
+    except _Unkeyed as unkeyed:
+        what = f"a host value no key can hold now ({unkeyed})"
+    if not what:
+        recorder.impure.pop(key, None)
+        return
+    strikes = recorder.impure.get(key, (0, ""))[0] + 1
+    if strikes < _IMPURE:
+        if key not in recorder.impure and len(recorder.impure) >= _IMPURES:
+            del recorder.impure[next(iter(recorder.impure))]
+        recorder.impure[key] = (strikes, what)
+        return
+    recorder.impure.pop(key, None)
+    with recorder.lock:
+        recorder.judged[key] = recorder.gap = f"its forward changes {what} as it runs"
+        recorder.codes[key] = "refused"
 
 
 class _Parts(NamedTuple):
@@ -1646,6 +1721,8 @@ def _first[T](
         peak = last.peak
     elif peak is not None and last is not None and last.peak is not None:
         peak = max(peak, last.peak)
+    if last is None and len(recorder.seen) >= _FIRST_SEEN:
+        del recorder.seen[next(iter(recorder.seen))]  # its next call is a first sight again
     recorder.seen[key] = _Seen(submit, host, start, end, peak)
     if key not in recorder.first_seen:
         if len(recorder.first_seen) >= _FIRST_SEEN:
@@ -1654,7 +1731,8 @@ def _first[T](
     return result
 
 
-#: the signatures a region remembers the first request of (`_key_moved`)
+#: the signatures a region remembers the first request of (`_key_moved`), and the last call as
+#: written of (`_Recorder.seen`): a key that moves every call would grow either without end
 _FIRST_SEEN = 4096
 
 
@@ -1729,11 +1807,17 @@ def _key_moved(recorder: _Recorder, key: tuple[object, ...]) -> bool:
 
 
 def _churning(recorder: _Recorder, key: tuple[object, ...]) -> str:
-    """Why a region records no more in this process ("" while it may): its paths moved in
-    `_CHURN` requests in a row (`_key_moved`), so its graphs never outlive their request (a key part
-    rebuilt per request: H3's loop slots and rope presentation, by address). Checked at a
-    request's first capture of the region; named by the key part that moved most."""
+    """Why a region records nothing now ("" while it may): its paths moved in `_CHURN` requests
+    in a row (`_key_moved`), so its graphs never outlive their request (a key part rebuilt per
+    request: H3's loop slots and rope presentation, by address). Checked at a request's first
+    capture of the region; named by the key part that moved most. It ends when a path first
+    seen in an earlier request is called again (here), or a graph of an earlier request replays
+    (`_replay_call`): its keys hold again."""
     request = _BUDGET.request
+    if recorder.churned and recorder.first_seen.get(key, request) != request:
+        # A path of an earlier request is back: its keys hold again, and it may record. The stop
+        # was for the process once, and three sizes of SDXL in a row ended its recording.
+        recorder.churned, recorder.churn = "", 0
     if not recorder.churned and recorder.checked_in != request:
         recorder.checked_in = request
         again = _key_moved(recorder, key)
@@ -2420,6 +2504,7 @@ def _queue(
             key in recorder.queued
             or key in recorder.failed
             or key in recorder.judged
+            or key in recorder.impure
             or recorder.churned
         ):
             return
@@ -2638,7 +2723,7 @@ def _replay(
     recorder.gap = ""
     recorder.replays += 1
     if recorder.recorded_in != _BUDGET.request:
-        recorder.churn = 0  # a graph outlived its request
+        recorder.churn, recorder.churned = 0, ""  # a graph outlived its request
     recorder.replayed_in = _BUDGET.request
     _note(recorder, "replayed")
     recorder.copy_bytes += entry.copied
@@ -2665,6 +2750,10 @@ def _capture_pending(pending: _Pending) -> bool:
     recorder = _RECORDERS.get(module) if module is not None else None
     if recorder is None or recorder.queued.get(pending.key) is not pending:
         return True  # released, or its graphs dropped since it queued: its next call queues
+    if pending.key in recorder.judged or pending.key in recorder.impure:
+        with recorder.lock:  # its own call changes its key (`_settle`)
+            recorder.queued.pop(pending.key, None)
+        return True
     submit = recorder.eager.submit_ms()
     if submit is None:
         return False
@@ -2739,7 +2828,7 @@ def _record(
     try:
         parts, why = _state(torch, recorder, module)
         held = cast("_Parts", key[-1])
-        if why or parts != held.state or _host(torch, recorder, module) != held.host:
+        if why or parts != held.state or _hosted(torch, recorder, module) != held.host:
             # A call's host state (its overlays, context objects, producers' request states)
             # is its request's: only a call records it.
             recorder.idle_failed[key] = why or "its host state at idle is not its call's"
@@ -2900,7 +2989,7 @@ def _build(
             raise
 
     _as_written()
-    host = _host(torch, recorder, module)
+    host = _hosted(torch, recorder, module)
     try:
         graph, why = capture(torch, step, pool, owner, reserve, alone=not recorder.recordings)
     except observe.HostRead as read:
@@ -2919,7 +3008,7 @@ def _build(
     if graph is None:
         _failed(module, recorder, key, why, idle=idle)
         return None
-    if moved := _moved(host, _host(torch, recorder, module)):
+    if moved := _moved(host, _hosted(torch, recorder, module)):
         # Its Python changed host state as it ran (a cache it fills, a counter): a replay
         # would skip that. Only state it reads and leaves alone is safe to freeze.
         graph.reset()
@@ -3012,15 +3101,116 @@ def _package_hooks(subs: Iterable[Module]) -> tuple[object, ...]:
     return tuple(found)
 
 
-def _shallow(torch: ModuleType, value: object, depth: int = 0) -> object:
-    """A host value as a key part, by what a forward can decide or read from it: plain values by
-    value; a CUDA tensor by its address and layout (a graph reads that address), a small host
-    tensor by its values; a function by its code, the object it is bound to and its closure; an
-    object by its type and fields, a small container by its items, both two levels down; past
-    that, or a container too long to read each call, by identity and length. A host decision
-    this misses, the capture's check or a later call catches."""
+class _Unkeyed(Exception):
+    """A host value no key can hold exactly (`_shallow`): its region's call runs as written."""
+
+
+#: each weakly referable object a key holds by what it is: its number, given once and never to
+#: another object. An `id` goes to the next object made at its address: a fresh value each step
+#: met an earlier step's key and would have replayed its graph, with the old value in it.
+_NUMBERS: dict[int, tuple[weakref.ref[object], int]] = {}
+_NUMBER = itertools.count(1)
+
+
+def _same(value: object) -> int | None:
+    """`value`'s number while it lives; None when it can't be weakly referenced."""
+    at = id(value)
+    held = _NUMBERS.get(at)
+    if held is not None and held[0]() is value:
+        return held[1]
+    try:
+        ref = weakref.ref(value, functools.partial(_gone, at))
+    except TypeError:
+        return None
+    number = next(_NUMBER)
+    _NUMBERS[at] = (ref, number)
+    return number
+
+
+def _gone(at: int, ref: weakref.ref[object]) -> None:
+    held = _NUMBERS.get(at)
+    if held is not None and held[0] is ref:
+        _NUMBERS.pop(at, None)
+
+
+class _Held:
+    """An object that can't be weakly referenced, as a key part by what it is: the key holds
+    it, so its address is its own while the key lives."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Held) and other.value is self.value
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+
+def _one(value: object) -> object:
+    """An object as a key part by what it is, never by an address another can take."""
+    number = _same(value)
+    return number if number is not None else _Held(value)
+
+
+def _spend(room: list[int], items: int, value: object) -> None:
+    """`items` more values read for one key part; past `_ROOM`, no key holds it."""
+    room[0] -= items
+    if room[0] < 0:
+        raise _Unkeyed(f"a {type(value).__name__} of {items} items, past the {_ROOM} a key reads")
+
+
+def _frozen(value: object) -> object:
+    return tuple(_frozen(v) for v in value) if isinstance(value, list) else value
+
+
+def _alike(a: object, b: object, depth: int = 0) -> bool:
+    """Whether two values bound to a module attribute are the same to its forward: one object,
+    equal plain values, or containers of such two levels down. Tensors and other objects only
+    as one object."""
+    if a is b:
+        return True
+    if type(a) is not type(b):
+        return False
+    if type(a) in _PLAIN or isinstance(a, complex | bytes | range | slice):
+        return a == b
+    if depth > 1:
+        return False
+    if isinstance(a, list | tuple):
+        other = cast("Sequence[object]", b)
+        return len(a) == len(other) and all(
+            _alike(x, y, depth + 1) for x, y in zip(a, other, strict=True)
+        )
+    if isinstance(a, dict):
+        table = cast("dict[object, object]", b)
+        return len(a) == len(table) and all(
+            k in table and _alike(v, table[k], depth + 1) for k, v in a.items()
+        )
+    if isinstance(a, set | frozenset):
+        return a == b
+    return False
+
+
+def _shallow(
+    torch: ModuleType, value: object, depth: int = 0, room: list[int] | None = None
+) -> object:
+    """A host value as a key part, by what a forward can decide or read from it: plain values
+    and numbers by value (a numpy scalar, a small array, a `slice`); a CUDA tensor by its
+    address and layout (a graph reads that address), a small host tensor by its values; a
+    function by its code, the object it is bound to and its closure; an object by its type and
+    fields, a small container by its items, both two levels down. Past that an object is keyed
+    by what it is (`_one`: its own number, never an address another object can take), and a
+    list, tuple or dict, which has no such number, by its items while `_ROOM` values hold them
+    all: one longer or deeper is `_Unkeyed`, and its call runs as written. A host decision this
+    misses, the capture's check or a later call catches."""
     if type(value) in _PLAIN or isinstance(value, torch.dtype | torch.device):
         return value
+    if depth > _DEEP:  # a closure that holds itself, a container in itself
+        raise _Unkeyed(f"a {type(value).__name__} nested past {_DEEP} levels")
+    if room is None:
+        room = [_ROOM]
     if isinstance(value, torch.Tensor):
         try:
             layout = (tuple(value.shape), value.stride(), value.dtype)
@@ -3028,46 +3218,105 @@ def _shallow(torch: ModuleType, value: object, depth: int = 0) -> object:
                 return ("tensor", value.device, value.data_ptr(), *layout)
             return ("tensor", *layout, tuple(value.flatten().tolist()))
         except (RuntimeError, NotImplementedError):  # a wrapper subclass with no storage
-            return ("tensor", id(value))
+            return ("tensor", _one(value))
+    if type(value).__module__ == "numpy":
+        # A numpy scalar is no plain float and can't be weakly referenced: by value, as a small
+        # array is. A larger array by what it is, as a larger host tensor.
+        size = getattr(value, "size", None)
+        kind = getattr(getattr(value, "dtype", None), "kind", None)
+        listed = getattr(value, "tolist", None)
+        if (
+            isinstance(size, int)
+            and size <= _SHALLOW_ITEMS
+            and kind in ("b", "i", "u", "f", "c", "S", "U")
+            and callable(listed)
+        ):
+            return (type(value), getattr(value, "shape", ()), kind, _frozen(listed()))
+        return (type(value), _one(value))
+    # A subclass of a plain type (an IntEnum), and the plain types `_PLAIN` leaves out: by value.
+    if isinstance(value, int):
+        return (type(value), int(value))
+    if isinstance(value, float):
+        return (type(value), float(value))
+    if isinstance(value, complex):
+        return (type(value), complex(value))
+    if isinstance(value, str):
+        return (type(value), str(value))
+    if isinstance(value, bytes):
+        return (type(value), bytes(value))
+    if isinstance(value, slice):
+        return (
+            slice,
+            _shallow(torch, value.start, depth + 1, room),
+            _shallow(torch, value.stop, depth + 1, room),
+            _shallow(torch, value.step, depth + 1, room),
+        )
+    if isinstance(value, range):
+        return (range, value.start, value.stop, value.step)
     if isinstance(value, functools.partial):
         return (
             "partial",
-            _shallow(torch, value.func, depth + 1),
-            tuple(_shallow(torch, a, depth + 1) for a in value.args),
-            tuple((k, _shallow(torch, v, depth + 1)) for k, v in sorted(value.keywords.items())),
+            _shallow(torch, value.func, depth + 1, room),
+            tuple(_shallow(torch, a, depth + 1, room) for a in value.args),
+            tuple(
+                (k, _shallow(torch, v, depth + 1, room)) for k, v in sorted(value.keywords.items())
+            ),
         )
     function = getattr(value, "__func__", value)
     code = getattr(function, "__code__", None)
     if code is not None:
         cells = getattr(function, "__closure__", None) or ()
+        to = getattr(value, "__self__", None)
+        bound: object = None
+        if to is not None:
+            # The object it is bound to by what it is; one with no number of its own (a slotted
+            # object), by its fields.
+            its = _same(to)
+            bound = its if its is not None else _shallow(torch, to, depth + 1, room)
         return (
             "function",
-            id(code),
-            id(getattr(value, "__self__", None)),
-            tuple(_shallow(torch, c.cell_contents, depth + 1) for c in cells if _filled(c)),
+            _one(code),
+            bound,
+            tuple(_shallow(torch, c.cell_contents, depth + 1, room) for c in cells if _filled(c)),
         )
-    if isinstance(value, list | tuple | set | frozenset | dict):
-        if depth > 1 or len(value) > _SHALLOW_ITEMS or isinstance(value, set | frozenset):
-            return (type(value), id(value), len(value))
+    owner = getattr(value, "__self__", None)
+    named = getattr(value, "__name__", None)
+    if owner is not None and isinstance(named, str) and callable(value):
+        # A builtin's bound method is made anew at each access: by its name and its object.
+        number = _same(owner)
+        return (
+            "method",
+            named,
+            number if number is not None else _shallow(torch, owner, depth + 1, room),
+        )
+    if isinstance(value, set | frozenset):
+        return (type(value), _one(value), len(value))
+    if isinstance(value, list | tuple | dict):
+        if depth > 1 or len(value) > _SHALLOW_ITEMS:
+            _spend(room, len(value), value)
         items = value.items() if isinstance(value, dict) else enumerate(value)
-        return (type(value), tuple((k, _shallow(torch, v, depth + 1)) for k, v in items))
-    if depth > 1:
-        return (type(value), id(value))
+        return (type(value), tuple((k, _shallow(torch, v, depth + 1, room)) for k, v in items))
+    if depth > 1 and (own := _same(value)) is not None:
+        return (type(value), own)
     fields = getattr(value, "__dict__", None)
     if fields is None:
         slots = getattr(type(value), "__slots__", ())
+        slots = (slots,) if isinstance(slots, str) else slots
         fields = {n: getattr(value, n) for n in slots if hasattr(value, n)}
     if not fields:  # nothing to read: what it is
-        return (type(value), id(value))
+        return (type(value), _one(value))
+    if depth > 1:
+        _spend(room, len(fields), value)
     return (
         type(value),
-        tuple((n, _shallow(torch, v, depth + 1)) for n, v in sorted(fields.items())),
+        tuple((n, _shallow(torch, v, depth + 1, room)) for n, v in sorted(fields.items())),
     )
 
 
-#: the items a container (or a host tensor) may hold for `_shallow` to key each: more, by identity
-#: and length (a host tensor by address)
-_SHALLOW_ITEMS = 8
+#: the items a container (or a host tensor) may hold for `_shallow` to key each within two
+#: levels; the values one key part may read past that, in longer or deeper lists, tuples and
+#: dicts; and the levels it may go down at all
+_SHALLOW_ITEMS, _ROOM, _DEEP = 8, 256, 32
 
 
 def _moved(before: tuple[object, ...], after: tuple[object, ...]) -> str:
@@ -3091,6 +3340,14 @@ def _filled(cell: object) -> bool:
 #: the modules whose objects a context variable may hold without steering a forward: Python's,
 #: the Runtime's (its own context is keyed where it steers) and torch's
 _OURS = frozenset({"builtins", "cozy_runtime", "tensorfs", "torch"})
+
+
+def _hosted(torch: ModuleType, recorder: _Recorder, module: Module) -> tuple[object, ...]:
+    """`_host`; when a value in it can't be keyed now, a part equal to no key's that says so."""
+    try:
+        return _host(torch, recorder, module)
+    except _Unkeyed as unkeyed:
+        return ((f"a host value no key can hold ({unkeyed})", next(_NUMBER)),)
 
 
 def _host(torch: ModuleType, recorder: _Recorder, module: Module) -> tuple[object, ...]:
@@ -3196,12 +3453,29 @@ def _overlay_owner(factors: object) -> _Placed | None:
     return None
 
 
+def _guarded(torch: ModuleType, name: str, value: object) -> bool:
+    """Whether a module attribute is one a recording must leave as it found it, beside the
+    plain ones: a tensor held outside the module's parameters and buffers, a public list or
+    dict. The Runtime's own (`_cozy`) and a module's bookkeeping (`_INTERNAL`) are neither."""
+    if name in _INTERNAL or name.startswith("_cozy"):
+        return False
+    return isinstance(value, torch.Tensor) or (
+        not name.startswith("_") and isinstance(value, list | dict)
+    )
+
+
+def _items(value: object) -> object:
+    """A list's or a dict's items now (a copy); None for anything else."""
+    return list(value) if isinstance(value, list) else dict(value) if isinstance(value, dict) else None
+
+
 class _State:
-    """What an idle recording must leave as it found it: the component's modules' plain
-    attributes, its buffers (contents and version counters) and the RNG. Package
-    code may keep a counter or a table in them; recording runs the forward twice and captures
-    it once, so a change means the forward has state a replay would not keep (run 11226:
-    measuring must never change a later request)."""
+    """What a recording must leave as it found it: the component's modules' plain attributes,
+    the tensors, lists and dicts they hold (`_guarded`), its buffers (contents and version
+    counters) and the RNG. Package code may keep a counter, a table or a cache in them;
+    recording runs the forward once more than its call (twice at idle) and captures it once, so
+    each is put back, and a change means the forward has state a replay would not keep: its
+    path runs as written (run 11226: measuring must never change a later request)."""
 
     def __init__(
         self,
@@ -3217,6 +3491,16 @@ class _State:
         self.torch = torch
         self.modules = list(module.modules())
         self.plain = [{n: v for n, v in vars(m).items() if type(v) in _PLAIN} for m in self.modules]
+        #: beside those: the tensors its modules hold outside their parameters and buffers (a
+        #: cache a forward fills or swaps) and their public lists and dicts, each with a copy of
+        #: its items; and every attribute's name, since a forward may add one
+        self.kept: list[tuple[Module, str, object, object]] = [
+            (m, n, v, _items(v))
+            for m in self.modules
+            for n, v in vars(m).items()
+            if _guarded(torch, n, v)
+        ]
+        self.names = [frozenset(vars(m)) for m in self.modules]
         self.buffers: list[tuple[str, Tensor, int, Tensor | None]] = [
             (name, tensor, tensor._version, tensor.clone() if clone else None)
             for m in self.modules
@@ -3262,6 +3546,28 @@ class _State:
                     if vars(module).get(name, _EAGER) != value:
                         changed.add(name)
                         vars(module)[name] = value
+            for module, name, value, items in self.kept:
+                now = vars(module).get(name, _MISSING)
+                if now is not value:
+                    vars(module)[name] = value
+                    if not _alike(value, now):
+                        changed.add(name)
+                if items is not None and not _alike(items, _items(value)):
+                    changed.add(name)
+                    if isinstance(value, list):
+                        value[:] = cast("list[object]", items)
+                    else:
+                        mapping = cast("dict[object, object]", value)
+                        mapping.clear()
+                        mapping.update(cast("dict[object, object]", items))
+            for module, names in zip(self.modules, self.names, strict=True):
+                for name in [n for n in vars(module) if n not in names]:
+                    if name in _INTERNAL or name.startswith("_cozy"):
+                        continue  # the Runtime's own (a cut's mark), not the forward's
+                    added = vars(module)[name]
+                    if type(added) in _PLAIN or _guarded(self.torch, name, added):
+                        changed.add(name)  # an attribute its Python added
+                        del vars(module)[name]
             for table, name, tensor, version, saved, geometry in self.immutable:
                 current = (
                     tuple(tensor.shape),
