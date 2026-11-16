@@ -1,0 +1,1 @@
+A config section's `mapping()` hands a Transformers config its floats: a whole number the class its `model_type` names declares a float (Gemma 4's `final_logit_softcapping`, stored by canonical JSON as `30`) comes back `30.0`, sub-configs by their own class. Gemma 4 checkpoints load through `VisionLM` and a package's own `Gemma4…Config(**mapping)`.

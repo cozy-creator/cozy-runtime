@@ -21,8 +21,10 @@ ref, device/dtype override, offload/pin/eviction knob, compile hook or selection
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import io
+import sys
 import time
 import typing
 from collections import OrderedDict
@@ -378,9 +380,11 @@ class Config:
         field by field would mean restating a forty-field upstream schema in the package,
         which is the declaration surface §1.1 deletes. It carries no new authority: a
         source carrier was already refused at construction, and the result is a copy, so
-        this is still read-only configuration and never a path.
+        this is still read-only configuration and never a path. Canonical JSON stores 30.0
+        as 30; a whole number the config class a section names (`model_type`) declares a
+        float comes back a float, as that library's own loader reads it (`library_floats`).
         """
-        return cast("dict[str, object]", _canonical(self._data))
+        return library_floats(cast("dict[str, object]", _canonical(self._data)))
 
     def typed(self, schema: type[S]) -> S:
         """The author's own strict schema over this section — the fully typed door."""
@@ -411,6 +415,39 @@ class Config:
                 fields=[name],
             )
         return value
+
+
+def library_floats(config: Mapping[str, object], cls: type | None = None) -> dict[str, object]:
+    """`config` with each whole number its Transformers config class declares a float as a
+    float, sub-configs (`text_config`) by their own class. The class is `cls`, else the one
+    `model_type` names, read only when Transformers is already imported (its user imported it).
+    Canonical JSON stores 30.0 as 30, and Transformers 5's strict configs refuse an int for a
+    float field (Gemma 4's `final_logit_softcapping`, cr-301; CLIP's `initializer_factor`)."""
+    transformers = sys.modules.get("transformers")
+    if cls is None and transformers is not None:
+        known = transformers.CONFIG_MAPPING
+        model_type = config.get("model_type")
+        # Indexed: the lazy mapping's `get` reads its unloaded dict and answers None.
+        cls = known[model_type] if isinstance(model_type, str) and model_type in known else None
+    fields = dataclasses.fields(cls) if cls is not None and dataclasses.is_dataclass(cls) else ()
+    floats = {
+        f.name
+        for f in fields
+        if float in (typing.get_args(f.type) or (f.type,)) and int not in typing.get_args(f.type)
+    }
+    subs: Mapping[str, object] = getattr(cls, "sub_configs", None) or {}
+    out: dict[str, object] = {}
+    for name, value in config.items():
+        if isinstance(value, Mapping):
+            sub = subs.get(name)
+            # A sub-config naming its own `model_type` is read by it; else by its parent's class.
+            value = library_floats(
+                value, sub if "model_type" not in value and isinstance(sub, type) else None
+            )
+        elif type(value) is int and name in floats:
+            value = float(value)
+        out[name] = value
+    return out
 
 
 def _canonical(value: object) -> object:
