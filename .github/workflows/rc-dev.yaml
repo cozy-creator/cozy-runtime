@@ -3,8 +3,9 @@ name: rc-dev
 # kernels, as the minor it makes, a dev release (cl-952): pyproject 0.47.0.dev0 (set when 0.46.0 froze) builds
 # 0.47.0.dev<n>+g<sha8>, n the RC branch's first-parent commit count, and a release version (0.45.2) the next minor's; so a
 # package's floor can name its minor (`cozy-runtime>=0.47.0.dev0`), never a build. They go on the rolling
-# GitHub prerelease `rc-<x.y.z>`, never latest, in place of the last push's: nothing names an RC wheel by URL (xs-194), as
-# each lock takes the newest. Its SHA256SUMS names this push's; a dev home's Calcifer reads it and brings its rentals to it. By hand: gh workflow run rc-dev.yaml -R cozy-creator/cozy-runtime --ref rc/<x.y.z>
+# GitHub prerelease `rc-<x.y.z>`, never latest, beside the newest earlier pushes' (KEEP builds in all), so a lock made
+# minutes before a merge still resolves. Its SHA256SUMS names every wheel there, the newest version first: each reader
+# (Calcifer, packages' scripts/rc-runtime.sh, cozy-creator's e2e) takes the first line that fits, the newest build. By hand: gh workflow run rc-dev.yaml -R cozy-creator/cozy-runtime --ref rc/<x.y.z>
 on:
   push:
     branches: ['rc/*']
@@ -65,9 +66,11 @@ jobs:
         with:
           name: cozy-runtime-${{ github.sha }}
           path: dist
-      # New files first, SHA256SUMS next (a reader sees the old build or this one, whole), native files an hour stale last.
-      - name: The RC's prerelease holds this build
+      # New files first, SHA256SUMS next (a reader sees the last builds or these, whole), builds past the newest KEEP last.
+      - name: The RC's prerelease holds this build and the newest earlier ones
         working-directory: dist
+        env:
+          KEEP: 20
         run: |
           set -euo pipefail
           case $BRANCH in rc/*) ;; *) echo "::error::$BRANCH is no RC branch"; exit 1 ;; esac
@@ -75,20 +78,34 @@ jobs:
           shopt -s nullglob
           wheels=(*-manylinux_*.whl *-py3-none-any.whl)
           [ "${#wheels[@]}" -gt 1 ] || { echo "::error::the build made no native and pure wheel"; ls -la; exit 1; }
-          sha256sum "${wheels[@]}" > SHA256SUMS
-          cat SHA256SUMS
           if ! gh release view "$tag" -R "$REPO" >/dev/null 2>&1; then
             gh release create "$tag" -R "$REPO" --target "$SHA" --prerelease --latest=false \
-              --title "$BRANCH dev builds" --notes "The newest build of $BRANCH, for dev homes (cl-922). Replaced by each push."
+              --title "$BRANCH dev builds" --notes "The newest builds of $BRANCH, for dev homes (cl-922)."
           fi
           gh api -X PATCH "repos/$REPO/git/refs/tags/$tag" -f sha="$SHA" -F force=true >/dev/null
-          # A wheel goes an hour after the push that replaced it: a SHA256SUMS a reader holds (GitHub's CDN serves the old one
-          # for minutes; Calcifer keeps a read for a minute) still names files that are there (e2e 43206615800 read a 404).
-          stale=$(gh release view "$tag" -R "$REPO" --json assets --jq '.assets[] | select(.updatedAt < (now - 3600 | todate)) | .name')
+          held=$(gh release view "$tag" -R "$REPO" --json assets --jq '.assets[].name')
+          old=$(gh release download "$tag" -R "$REPO" -p SHA256SUMS -O - 2>/dev/null || true)
+          # This build's wheels and each earlier one the last SHA256SUMS names and the release holds, newest version first
+          # (by dev number, whatever order they were pushed in), of the newest KEEP builds. A wheel no SHA256SUMS named goes:
+          # every kept one has its sum.
+          {
+            for wheel in "${wheels[@]}"; do
+              echo "$(cut -d- -f2 <<< "$wheel") $(sha256sum "$wheel" | cut -d' ' -f1) $wheel"
+            done
+            while read -r sum file; do
+              file=${file#\*}
+              if [ -n "$file" ] && grep -qxF "$file" <<< "$held" && ! printf '%s\n' "${wheels[@]}" | grep -qxF "$file"; then
+                echo "$(cut -d- -f2 <<< "$file") $sum $file"
+              fi
+            done <<< "$old"
+          } | sort -s -k1,1 -V -r | awk -v keep="$KEEP" '$1 != last { n++; last = $1 } n <= keep { print $2 "  " $3 }' > SHA256SUMS
+          cat SHA256SUMS
+          grep -qF "  ${wheels[0]}" SHA256SUMS || { echo "::error::$tag holds $KEEP newer builds than this one"; exit 1; }
           gh release upload "$tag" -R "$REPO" --clobber "${wheels[@]}"
           gh release upload "$tag" -R "$REPO" --clobber SHA256SUMS
-          for name in $stale; do
-            case " ${wheels[*]} SHA256SUMS " in *" $name "*) ;; *) gh release delete-asset "$tag" "$name" -R "$REPO" -y ;; esac
+          listed=" $(awk '{print $2}' SHA256SUMS | tr '\n' ' ') SHA256SUMS "
+          for name in $held; do
+            case $listed in *" $name "*) ;; *) gh release delete-asset "$tag" "$name" -R "$REPO" -y ;; esac
           done
-          gh release edit "$tag" -R "$REPO" --notes "$BRANCH at $SHA, for dev homes (cl-922). Replaced by each push."
-          echo "$tag: $BRANCH at $SHA" >> "$GITHUB_STEP_SUMMARY"
+          gh release edit "$tag" -R "$REPO" --notes "$BRANCH at $SHA and its newest earlier builds (up to $KEEP), for dev homes (cl-922)."
+          echo "$tag: $BRANCH at $SHA, $(awk '{print $2}' SHA256SUMS | cut -d- -f2 | sort -u | wc -l) builds kept" >> "$GITHUB_STEP_SUMMARY"
