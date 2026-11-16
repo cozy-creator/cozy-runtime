@@ -1892,7 +1892,7 @@ def _calls(
                     reader.refuse(
                         found.module,
                         found.stmt,
-                        f"{package} is absent from uv.lock; lock it before generating calls",
+                        _unlocked(reader.project, package),
                         "unlocked_dependency",
                     )
                 interface = dependency_interface(reader, package)
@@ -2132,6 +2132,12 @@ def _decodes(sent: Json, taken: Json) -> bool:
     return True  # a prompt: what references it takes is the callee's to ignore
 
 
+def _unlocked(project: Path, distribution: str) -> str:
+    """Why a called package has no locked release: no lock at all, or one without it."""
+    where = "there is no uv.lock" if not (project / "uv.lock").is_file() else "uv.lock lacks it"
+    return f"{distribution} is not locked: {where}; `cozy run` locks it (or run `uv lock`)"
+
+
 def dependency_interface(reader: Reader, distribution: str) -> dict[str, Json]:
     """Read one locked dependency's actual source, never import its implementation."""
     normalized = locked.distribution(distribution)
@@ -2172,7 +2178,7 @@ def build_dependency(project: Path, distribution: str) -> dict[str, Json]:
     project = project.resolve()
     pinned = locked.read(project)
     if locked.distribution(distribution) not in pinned.names:
-        raise StaticRefusal(f"{distribution} is absent from uv.lock", code="unlocked_dependency")
+        raise StaticRefusal(_unlocked(project, distribution), code="unlocked_dependency")
     reader = Reader(
         project, dependency_roots=pinned.roots, pinned=pinned, own=source_tops(project)
     )
