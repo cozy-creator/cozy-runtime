@@ -105,6 +105,12 @@ BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypas
 #: Gates only, never a setting: every path records at its first sight, whatever it would save, so
 #: a gate build proves each model captures and replays (cr-297). False in every release.
 FORCE = False
+#: Diagnosis build only (cr-300, never merged): on a mismatch, sizes and the capture-stream test,
+#: the graph kept; the first replays of each region audited by size and served by the graph.
+DIAG = True
+#: Diagnosis fault control (never merged): from a graph's third replay its largest static input
+#: is not copied in, so it replays on a stale input (a real fault class the check must catch).
+DIAG_FAULT = False
 #: Under `FORCE`, every this-many-th replay of a region also runs as written from the same state
 #: and the two are compared (`_audit`): a graph that drifts from its call after its one check goes
 _AUDIT = 16
@@ -413,6 +419,7 @@ class _Recording:
     ) -> None:
         self.torch, self.graph, self.pool, self.owner = torch, graph, pool, owner
         self.inputs, self.outputs, self.layout = inputs, outputs, layout
+        self.served_replays = 0
         #: what showed memory pressure while it was recorded in its call (`_pressure`): an idle
         #: period records it again on resident weights and keeps the faster replay
         self.pressured = ""
@@ -514,9 +521,14 @@ class _Recording:
             held = self._pinned(stream) if self.retained else []
             # cast: a recording is called only until it closes
             vt.prepare_pool(cast("domain.Pool", self.pool).handle, 0, self.owner.device)
-            for static, value in zip(self.inputs, leaves, strict=True):
+            self.served_replays += 1
+            stale = -1
+            if DIAG_FAULT and self.served_replays > 2:
+                sized = [(s.numel(), i) for i, s in enumerate(self.inputs) if s is not None]
+                stale = max(sized)[1] if sized else -1
+            for index, (static, value) in enumerate(zip(self.inputs, leaves, strict=True)):
                 # Always: a pool's contents need not survive between replays.
-                if static is not None:
+                if static is not None and index != stale:
                     static.copy_(cast("Tensor", value))  # cast: a tensor leaf has a static input
                     copied += static.nbytes
             with self.owner.recovery_blocked(replay=True):
@@ -752,6 +764,8 @@ class _Recorder:
         self.first_seen: dict[tuple[object, ...], str] = {}
         #: what each idle re-recording of a graph recorded under pressure decided
         self.rerecorded: list[str] = []
+        self.diag: list[str] = []
+        self.audits = 0
         self.eager: _Timing = _Timing()
         self.replayed: _Timing = _Timing()
         #: calls a guard ran as written, by reason (`_region_call`'s `why`)
@@ -1237,6 +1251,7 @@ def _receipt(recorder: _Recorder) -> dict[str, object]:
         ],
         "saving_ms": None if saving is None else round(saving, 3),
         "rerecorded": recorder.rerecorded[-4:],
+        "diag": recorder.diag[-12:],
         "payback_calls": math.ceil(cost / saving) if saving and saving > 0 else None,
         "eager": sorted(
             {
@@ -1476,8 +1491,12 @@ def _region_path(
         recorder.began = recorder.latest
     if key in recorder.paths:
         audit: list[_Audit] | None = (
-            [] if FORCE and recorder.replays % _AUDIT == _AUDIT - 1 else None
+            []
+            if (FORCE and recorder.replays % _AUDIT == _AUDIT - 1) or (DIAG and recorder.audits < 3)
+            else None
         )
+        if audit is not None and DIAG:
+            recorder.audits += 1
         result = _replay_call(torch, module, recorder, key, leaves, placed, audit)
         if audit and result is not _EAGER and result is not _STALE:
             written = functools.partial(call, module, *args, **kwargs)
@@ -1703,6 +1722,31 @@ def _churning(recorder: _Recorder, key: tuple[object, ...]) -> str:
 _CHURN = 2
 
 
+def _sizes(torch: ModuleType, a: object, b: object) -> str:
+    """Diagnosis: the largest difference between two output trees, by relative L2 (cr-300)."""
+    xs = [t for t in torch.utils._pytree.tree_leaves(a) if isinstance(t, torch.Tensor)]
+    ys = [t for t in torch.utils._pytree.tree_leaves(b) if isinstance(t, torch.Tensor)]
+    worst: tuple[float, str] | None = None
+    for index, (x, y) in enumerate(zip(xs, ys, strict=False)):
+        if x.shape != y.shape or not x.is_floating_point():
+            continue
+        d = x.double() - y.double()
+        top = float(d.abs().max())
+        if top == 0.0:
+            continue
+        rel = float(d.norm()) / (float(y.double().norm()) or 1.0)
+        cos = float(
+            torch.nn.functional.cosine_similarity(x.double().flatten(), y.double().flatten(), dim=0)
+        )
+        row = (
+            rel,
+            f"out {index} {str(x.dtype).rsplit('.', 1)[-1]} n={x.numel()} max {top:.3g} "
+            f"mean {float(d.abs().mean()):.3g} relL2 {rel:.3g} cos {cos:.8f}",
+        )
+        worst = row if worst is None or row[0] > worst[0] else worst
+    return worst[1] if worst is not None else "equal"
+
+
 def _pressure(before: WorkingStats, after: WorkingStats) -> str:
     """What showed memory pressure between two of varena's readings ("" when nothing did):
     weights refilled, room reclaimed, allocations refused. A call recorded under it froze the
@@ -1863,6 +1907,22 @@ def _capture_call(
             differs = f"the state it writes outside the call: {state}"
         if not differs and (inputs := vt.replay_differs(written, replayed.inputs)):
             differs = f"the inputs it writes: {inputs}"
+        if differs and DIAG and not written and not recording.writes:
+            current = torch.cuda.current_stream()
+            notes = [f"replay vs as written: {_sizes(torch, out, result)}"]
+            again = call(module, *args, **kwargs)
+            notes.append(f"as written twice: {_sizes(torch, again, result)}")
+            capture_stream = cast("Stream", owner.stream)
+            capture_stream.wait_stream(current)
+            with torch.cuda.stream(capture_stream):
+                on_capture = call(module, *args, **kwargs)
+            current.wait_stream(capture_stream)
+            notes.append(f"capture stream vs replay: {_sizes(torch, on_capture, out)}")
+            notes.append(f"capture stream vs as written: {_sizes(torch, on_capture, result)}")
+            why = f"{differs}; " + "; ".join(notes)
+            recorder.diag.append(f"{_name(module)}: {why}")
+            safeguard("replay_mismatch", f"{_name(module)}: {why}"[:900])
+            differs = ""  # kept: later replays serve and are audited by size
         if differs:
             if not written:  # a second run would write its caller's inputs twice
                 served = [t.clone() for t in recording.writes]
@@ -2469,6 +2529,9 @@ class _Audit:
         for tensor, before in zip(tensors, saved, strict=True):
             tensor.copy_(before)
         result = recorder.eager.run(self.torch, call)
+        if DIAG:
+            recorder.diag.append(f"audit {recorder.audits}: replay vs as written: {_sizes(self.torch, replayed, result)}")
+            return replayed
         differs = vt.replay_differs(result, replayed)
         if not differs and (state := vt.replay_differs(entry.writes, wrote)):
             differs = f"the state it writes outside the call: {state}"
