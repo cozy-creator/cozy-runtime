@@ -1723,34 +1723,63 @@ _CHURN = 2
 
 
 class _Trace:
-    """Diagnosis (cr-300): each submodule's first tensor output (cloned: under capture, the clone
-    is in the graph and holds the replay's value) and each torch function's name, tensor dtypes
-    and autocast state, in order, for a call as written and a capture compared op by op."""
+    """Diagnosis (cr-300): every torch function in one pass, in order: its name, its tensor inputs' dtypes and shapes,
+    autocast, SDPA's backend choice, a clone of its first tensor output and of its small non-parameter tensor inputs.
+    For the capture, only the capture's own pass (`capturing`): its clones are in the graph and hold the replay's
+    values after the check's replay. Compared op by op against the call as written (`against`)."""
 
-    def __init__(self, torch: ModuleType, module: Module) -> None:
-        self.torch, self.module = torch, module
-        self.outputs: list[tuple[str, Tensor]] = []
-        self.ops: list[tuple[str, tuple[str, ...], bool]] = []
-        self.handles: list[object] = []
+    _SMALL = 1 << 18
+
+    def __init__(self, torch: ModuleType, module: Module, capturing: bool) -> None:
+        self.torch, self.module, self.capturing = torch, module, capturing
+        self.ops: list[tuple[str, str, Tensor | None, list[Tensor]]] = []
+        self.flags = ""
         self.mode: object | None = None
+
+    def _flags(self) -> str:
+        t = self.torch
+        b = t.backends
+        try:
+            sdp = (f"sdp flash {b.cuda.flash_sdp_enabled()} mem {b.cuda.mem_efficient_sdp_enabled()} "
+                   f"math {b.cuda.math_sdp_enabled()} cudnn {b.cuda.cudnn_sdp_enabled()}")
+        except Exception as e:  # noqa: BLE001
+            sdp = f"sdp ? {type(e).__name__}"
+        return (f"tf32 mm {b.cuda.matmul.allow_tf32} cudnn {b.cudnn.allow_tf32}, reduced bf16 "
+                f"{b.cuda.matmul.allow_bf16_reduced_precision_reduction} fp16 "
+                f"{b.cuda.matmul.allow_fp16_reduced_precision_reduction}, {sdp}, deterministic "
+                f"{t.are_deterministic_algorithms_enabled()}, f32 {t.get_float32_matmul_precision()}, "
+                f"stream {t.cuda.current_stream().cuda_stream}")
 
     def __enter__(self) -> _Trace:
         torch = self.torch
-        for name, sub in self.module.named_modules():
-            def hook(_m: Module, _i: object, o: object, name: str = name) -> None:
-                leaves = [t for t in torch.utils._pytree.tree_leaves(o) if isinstance(t, torch.Tensor)]
-                if leaves and leaves[0].is_floating_point():
-                    self.outputs.append((name or "<root>", leaves[0].detach().clone()))
-            self.handles.append(sub.register_forward_hook(hook))
-        ops = self.ops
+        trace = self
 
         class _Ops(torch.overrides.TorchFunctionMode):  # type: ignore[misc,name-defined]
             def __torch_function__(self, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
-                kinds = tuple(
-                    str(a.dtype).rsplit(".", 1)[-1] for a in args if isinstance(a, torch.Tensor)
-                )
-                ops.append((getattr(func, "__name__", str(func)), kinds, torch.is_autocast_enabled("cuda")))
-                return func(*args, **(kwargs or {}))
+                kwargs = kwargs or {}
+                out = func(*args, **kwargs)
+                if trace.capturing and not torch.cuda.is_current_stream_capturing():
+                    return out
+                if not trace.flags:
+                    trace.flags = trace._flags()
+                ins = [a for a in torch.utils._pytree.tree_leaves((args, kwargs)) if isinstance(a, torch.Tensor)]
+                name = f"{getattr(func, '__module__', '') or ''}.{getattr(func, '__name__', None) or func}"
+                meta = " ".join(f"{str(a.dtype).rsplit('.', 1)[-1]}{tuple(a.shape)}" for a in ins[:4])
+                meta += f" autocast {torch.is_autocast_enabled('cuda')}"
+                if "scaled_dot_product_attention" in name:
+                    try:
+                        choice = int(torch._fused_sdp_choice(*args, **kwargs))
+                        try:
+                            meta += f" sdpa {torch.nn.attention.SDPBackend(choice).name}"
+                        except Exception:  # noqa: BLE001
+                            meta += f" sdpa {choice}"
+                    except Exception as e:  # noqa: BLE001
+                        meta += f" sdpa ? {type(e).__name__}"
+                first = next((t for t in torch.utils._pytree.tree_leaves(out) if isinstance(t, torch.Tensor)), None)
+                small = [a.detach().clone() for a in ins
+                         if not isinstance(a, torch.nn.Parameter) and a.numel() <= _Trace._SMALL][:3]
+                trace.ops.append((name, meta, None if first is None else first.detach().clone(), small))
+                return out
 
         self.mode = _Ops()
         self.mode.__enter__()  # type: ignore[attr-defined]
@@ -1758,30 +1787,45 @@ class _Trace:
 
     def __exit__(self, *exc: object) -> None:
         self.mode.__exit__(*exc)  # type: ignore[attr-defined]
-        for h in self.handles:
-            h.remove()  # type: ignore[attr-defined]
 
     def against(self, other: _Trace) -> str:
-        """Where `self` (the capture, its clones holding the replay) and `other` (as written)
-        first part: the first op whose name, dtypes or autocast differ; the first module output
-        that differs, with its size; how many module outputs differ."""
+        """Where the capture's pass (`self`, its clones holding the replay) and the call as written (`other`) first
+        part: the first op whose name, inputs' dtypes and shapes, autocast or SDPA backend differ, and the first op
+        whose output differs, with its inputs compared and the ops before it."""
         torch = self.torch
-        first_op = next(
-            (f"op {i}: capture {a} / as written {b}" for i, (a, b) in enumerate(zip(self.ops, other.ops, strict=False)) if a != b),
-            f"ops equal ({len(self.ops)} / {len(other.ops)})",
-        )
-        differing = []
-        for (na, ta), (nb, tb) in zip(self.outputs, other.outputs, strict=False):
-            if na != nb or ta.shape != tb.shape:
-                differing.append(f"{na} vs {nb}: misaligned")
-                break
-            if not torch.equal(ta, tb):
-                differing.append(f"{na} ({type(dict(self.module.named_modules())[na if na != '<root>' else ''])}.__name__): {_sizes(torch, ta, tb)}")
-        first = differing[0] if differing else "all equal"
-        return (
-            f"{first_op}; module outputs {len(self.outputs)} / {len(other.outputs)}, "
-            f"{len(differing)} differ, first: {first}"
-        )
+
+        def same(a: Tensor | None, b: Tensor | None) -> bool:
+            if a is None or b is None:
+                return a is b
+            return a.shape == b.shape and a.dtype == b.dtype and bool(torch.equal(a, b))
+
+        def size(a: Tensor | None, b: Tensor | None) -> str:
+            if same(a, b):
+                return "equal"
+            if a is not None and b is not None and a.shape == b.shape and a.is_floating_point():
+                return _sizes(torch, a, b)
+            return "differs"
+
+        n = min(len(self.ops), len(other.ops))
+        meta = next((i for i in range(n) if self.ops[i][:2] != other.ops[i][:2]), None)
+        out = next((i for i in range(n) if not same(self.ops[i][2], other.ops[i][2])), None)
+
+        def show(i: int) -> str:
+            (na, ma, ta, sa), (nb, mb, tb, sb) = self.ops[i], other.ops[i]
+            ins = ", ".join(size(x, y) for x, y in zip(sa, sb, strict=False)) or "none small"
+            before = " < ".join(self.ops[j][0] for j in range(i - 1, max(-1, i - 5), -1))
+            return (f"op {i}: capture {na} [{ma}] / as written {nb} [{mb}]: output {size(ta, tb)}; small inputs "
+                    f"{ins}; before it: {before}")
+
+        parts = [f"ops {len(self.ops)} / {len(other.ops)}"]
+        parts.append(f"flags same" if self.flags == other.flags else f"flags capture [{self.flags}] / as written [{other.flags}]")
+        parts.append(f"first metadata difference: {show(meta)}" if meta is not None else "metadata equal")
+        if out is None:
+            parts.append("every output equal")
+        else:
+            later = sum(1 for i in range(out, n) if not same(self.ops[i][2], other.ops[i][2]))
+            parts.append(f"first differing output: {show(out)}; {later} of {n - out} outputs differ from there")
+        return "; ".join(parts)
 
 
 def _sizes(torch: ModuleType, a: object, b: object) -> str:
@@ -1953,7 +1997,7 @@ def _capture_call(
     began = time.perf_counter()
     before = vt.stats(owner.device)
     traced = DIAG and _name(module).endswith("text_encoder")
-    trace_capture = _Trace(torch, module) if traced else None
+    trace_capture = _Trace(torch, module, capturing=True) if traced else None
     if trace_capture is not None:
         with trace_capture:
             entry = _capture_verified(
@@ -1968,7 +2012,7 @@ def _capture_call(
     recording, out, replayed = entry
     # As written, last: what serves the call is eager's, whatever the check finds.
     args, kwargs = arguments
-    trace_written = _Trace(torch, module) if trace_capture is not None else None
+    trace_written = _Trace(torch, module, capturing=False) if trace_capture is not None else None
     if trace_written is not None:
         with trace_written:
             result = recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
