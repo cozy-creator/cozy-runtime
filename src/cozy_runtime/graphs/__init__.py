@@ -17,7 +17,10 @@ when the two match bit for bit (outputs, the inputs it writes and the state it w
 the call); every later call replays. Every path records, whatever it would save: a
 device-bound call replays as fast as it runs. What the capture reads outside its inputs, pool
 and weights (`observe`) must still be there at each replay, or the graph goes and the call
-records again. Recording changes no state of the model. An idle period records a short
+records again. Recording changes no state of the model, and records the call as written: a
+library that asks whether the stream is capturing hears no (`_CAPTURE_CHECKS`), and a value the
+call reads from the device is answered with the one its call as written read, which each replay
+checks again (`observe.reads`, `_Recording.values`). An idle period records a short
 signature its call could not (no room, a kernel building, its request's share spent), under
 its call's context (`capture_idle`), as the backup.
 Every graph has its own static buffers in its region's capture pool (`domain`), opened only for
@@ -110,6 +113,15 @@ FORCE = False
 _AUDIT = 16
 #: Set while a region warms up its capture: the regions under it run as written.
 _WARMING = contextvars.ContextVar("cozy_graphs_warming", default=False)
+#: Library functions that ask whether the stream is capturing, and then run another program than
+#: the call as written: while a capture runs a call's Python they answer as the call would
+#: (`_as_written`). Transformers' `is_tracing()` counts a capturing stream as tracing, and its
+#: masks then always build the causal mask that the call as written skips for SDPA's `is_causal`
+#: kernel (`masking_utils._ignore_causal_mask_sdpa`): Anima's text encoder replayed 2.85%
+#: (relative L2) from its call (cr-300).
+_CAPTURE_CHECKS = (("transformers.utils.import_utils", "is_cuda_stream_capturing"),)
+#: Set on a thread while its capture runs a call's Python (`_build`)
+_AS_WRITTEN = contextvars.ContextVar("cozy_graphs_as_written", default=False)
 #: The idle period recording on this thread (`capture_idle`): each region boundary checks it.
 _IDLE: contextvars.ContextVar[_Idle | None] = contextvars.ContextVar("cozy_graphs_idle")
 #: an idle job's cleanup (its model's state put back): ops there never yield
@@ -278,6 +290,28 @@ def close_pool(pool: domain.Pool, device: int) -> None:
     vt.pool_close(pool.handle, device)
 
 
+def _as_written() -> None:
+    """Each loaded library's capture check (`_CAPTURE_CHECKS`) answers False on a thread whose
+    capture runs a call's Python, and as before everywhere else. Torch's and the Runtime's own
+    checks still see the capture: theirs keep a recording possible (no kernel load, no sync)."""
+    for name, attribute in _CAPTURE_CHECKS:
+        library = sys.modules.get(name)
+        check = getattr(library, attribute, None)
+        if check is None or getattr(check, "_cozy_as_written", False):
+            continue
+
+        def answered(check: Callable[[], bool] = check) -> bool:
+            return not _AS_WRITTEN.get() and check()
+
+        answered._cozy_as_written = True  # type: ignore[attr-defined]  # marks it installed
+        setattr(library, attribute, answered)
+
+
+class _Diverged(Exception):
+    """A replay read a value from the device other than its capture's: the call as written takes
+    another path for these inputs."""
+
+
 @request_path.forbid("cuda graph capture")
 def capture(
     torch: ModuleType,
@@ -378,7 +412,9 @@ def _capture(
             )
             error.error_code = 999
             raise error from failure
-    if isinstance(failure, Building | Yielded) or (failure is not None and is_capacity(failure)):
+    if isinstance(failure, Building | Yielded | observe.HostRead) or (
+        failure is not None and is_capacity(failure)
+    ):
         raise failure
     if failure is not None:
         if fault(failure) in (Fault.STICKY, Fault.DEVICE):
@@ -434,6 +470,9 @@ class _Recording:
         self.arg_writes = sorted(observed.arg_writes)
         #: the foreign views it writes, held only until its check ends (`_capture_call`)
         self.writes = list(observed.writes.values())
+        #: each value its capture read from the device: the tensor in its pool, and the value
+        #: its call as written read there. A replay that reads another runs as written
+        self.values = list(zip(observed.read, observed.answers or (), strict=False))
         #: its region's attempt count at its last replay: the least recent goes first (`_admit`)
         self.used = 0
         #: the module attributes its capture read (`_reading`): (module, name, value, plain)
@@ -450,6 +489,7 @@ class _Recording:
         # Nothing reads a pool between replays, so the core may take its pages back when idle.
         held = [t for t in inputs if t is not None]
         held += [t for t in torch.utils._pytree.tree_leaves(outputs) if isinstance(t, torch.Tensor)]
+        held += [read for read, _ in self.values]
         # An output a forward returns as a view (a reshape, a slice) keeps its base tensor, which
         # shares its storage and is reached only through it: held too, or every such pool stays
         # mapped (43476403923, 43683255718: SDXL, Klein, Qwen-Image-2, Ideogram 4, Krea 2).
@@ -539,6 +579,11 @@ class _Recording:
                 else:
                     written.append(static.clone())
                 copied += static.nbytes
+            for at, (read, value) in enumerate(self.values):
+                # The call as written reads it too (a sync there as here); another value means it
+                # takes another path for these inputs. Such a graph writes nothing outside `out`.
+                if (now := read.item()) != value:
+                    raise _Diverged(f"value {at + 1} it reads from the device is {now}, was {value}")
             return out
         finally:
             del held  # each Use releases on the stream it consumed
@@ -550,7 +595,7 @@ class _Recording:
     def close(self) -> None:
         """After last use: release static tensors and executable before their pool."""
         self.inputs, self.outputs, self.writes, self.foreign, self.reads = [], None, [], [], ()
-        self.retained, self.overlays = [], ()
+        self.retained, self.overlays, self.values = [], (), []
         cast("CUDAGraph", self.graph).reset()  # cast: it closes once
         self.graph = self.pool = None
 
@@ -682,6 +727,9 @@ class _Recorder:
         self.failed: dict[tuple[object, ...], str] = {}
         #: why one runs as written for the process: its code can't be recorded
         self.judged: dict[tuple[object, ...], str] = {}
+        #: the signatures whose call reads values from the device: their call as written runs
+        #: before their capture, which is answered with its reads (`_capture_call`)
+        self.reading: set[tuple[object, ...]] = set()
         #: per signature, its idle recordings in a row that found no room (`_short`)
         self.short: dict[tuple[object, ...], int] = {}
         self.waiting: dict[tuple[object, ...], int] = {}
@@ -1488,12 +1536,6 @@ def _region_path(
             return result
         # No graph of this path holds now (what it read outside the call is gone, or a module
         # attribute it read has another value): this call records one.
-    if key not in recorder.judged and (held := _content_inputs(torch, leaves)):
-        # A path on token ids records nowhere until cr-300's cause is fixed: Anima's text encoder
-        # replays differ from the call as written on real ids, so its in-call check would refuse
-        # it on every warm second call (`replay_mismatch`).
-        with recorder.lock:
-            recorder.judged.setdefault(key, f"{held}; nor in a call, until cr-300 is fixed")
     if (
         FORCE
         and key not in recorder.seen
@@ -1852,15 +1894,46 @@ def _capture_call(
     recorder.capture_attempts += 1
     began = time.perf_counter()
     before = vt.stats(owner.device)
-    entry = _capture_verified(torch, module, recorder, call, key, spec, leaves, placed, seen, owner)
-    if entry is None:
-        recorder.capture_ms += (time.perf_counter() - began) * 1e3
-        _BUDGET.spend((time.perf_counter() - began) * 1e3)
-        return _EAGER
-    recording, out, replayed = entry
-    # As written, last: what serves the call is eager's, whatever the check finds.
     args, kwargs = arguments
-    result = recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
+    result: object = _EAGER
+    answers: list[object] | None = None
+
+    def reading() -> tuple[list[object], object]:
+        """The call as written, which serves, and the values it reads from the device."""
+        mode, values = observe.reads(torch)
+        with cast("AbstractContextManager[object]", mode):
+            return values, recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
+
+    entry: tuple[_Recording, object, _Replayed] | None = None
+    if key not in recorder.reading:
+        try:
+            entry = _capture_verified(
+                torch, module, recorder, call, key, spec, leaves, placed, seen, owner
+            )
+        except observe.HostRead as read:
+            # It decides by a value it reads from the device, which a capture can't read: its
+            # call as written runs first and serves, and the capture is answered with its reads.
+            # The stopped capture's tensors leave the pool first, or the next graph's scratch
+            # can't unmap (`scratch_declined`).
+            unwind(read)
+            with recorder.lock:
+                recorder.reading.add(key)
+    if key in recorder.reading:
+        answers, result = reading()
+        entry = _capture_verified(
+            torch, module, recorder, call, key, spec, leaves, placed, seen, owner, answers
+        )
+    if entry is None:
+        took = (time.perf_counter() - began) * 1e3
+        recorder.capture_ms += took
+        if result is not _EAGER:  # the call as written already served
+            took -= max(seen.host_ms, seen.device_ms() or 0.0)
+        _BUDGET.spend(took)
+        return result
+    recording, out, replayed = entry
+    if answers is None:
+        # As written, last: what serves the call is eager's, whatever the check finds.
+        result = recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
     kept = False
     try:
         written = [cast("Tensor", leaves[i]) for i in recording.arg_writes]
@@ -1943,10 +2016,12 @@ def _capture_verified(
     placed: _Placed | None,
     seen: _Seen,
     owner: domain.Domain,
+    answers: list[object] | None = None,
 ) -> tuple[_Recording, object, _Replayed] | None:
     """`key`'s graph recorded in its region's pool on this call's argument layout, and replayed
     once on its inputs: the graph, its outputs and the replay's timing, or None (its reason
-    recorded, or a later call tries again)."""
+    recorded, or a later call tries again). Its reads from the device are answered from `answers`;
+    with none, the first raises `observe.HostRead`."""
     current: Stream = torch.cuda.current_stream()
     scope = placed[0].graph_pass(placed[1], "") if placed is not None else nullcontext()
     entry: _Recording | None = None
@@ -2000,7 +2075,7 @@ def _capture_verified(
                 served = held.enter_context(attention_ulysses.observing())
                 entry = _build(
                     torch, module, recorder, key, owner, placed, call, spec, layout, pool,
-                    state, served, overlays=overlays,
+                    state, served, overlays=overlays, answers=answers,
                 )
             if entry is None:
                 return None
@@ -2021,6 +2096,8 @@ def _capture_verified(
             found = (entry, out, replayed)
             return found
     except Exception as exc:
+        if isinstance(exc, observe.HostRead):
+            raise  # its call as written runs first, then it records again (`_capture_call`)
         if isinstance(exc, Building | StaleBinding):
             _note(recorder, "building", str(exc))
             return None  # a kernel still building, or its weights left: a later call
@@ -2465,7 +2542,16 @@ def _replay_call(
             recorder.binding = placed[0].retain(placed[1], ("",))
         if audit is not None:
             audit.append(_Audit(torch, entry, leaves))
-        result = _replay(torch, leaves, placed, recorder, key, entry, attempt)
+        try:
+            result = _replay(torch, leaves, placed, recorder, key, entry, attempt)
+        except _Diverged as exc:
+            # These inputs take another path as written: the call serves as written, and the path
+            # runs as written for the process (it decides by its inputs' values).
+            _failed(module, recorder, key, str(exc), None)
+            for handle in list(recorder.paths.get(key, ())):
+                _remove(recorder, handle)
+            _drop_unused(recorder, owner)
+            return _EAGER
         if result is _STALE:
             _expire(recorder, handle, owner)
         return result
@@ -2768,11 +2854,15 @@ def _build(
     *,
     idle: bool = False,
     overlays: tuple[Binding, ...] = (),
+    answers: list[object] | None = None,
 ) -> _Recording | None:
     """`call` recorded on static inputs of `layout` in its region's pool, `reserve` bytes of it
     prepared first; None when it can't be kept, its reason recorded: the capture refused it
     (`capture_refused`), recording changed the model's state, or its output is no tensor tree.
-    The caller holds the region's weights, and `state` is the model's before recording."""
+    The caller holds the region's weights, and `state` is the model's before recording. Its
+    Python runs as written (`_as_written`), its reads from the device answered from `answers`,
+    its call as written's; with none, a call's capture raises `observe.HostRead` at the first,
+    for the call to run as written first (`_capture_call`), and an idle one is refused."""
     pool = recorder.pool
     if pool is None:
         pool = recorder.pool = (
@@ -2795,18 +2885,37 @@ def _build(
         try:
             statics.extend(_static(torch, v) if isinstance(v, _Leaf) else None for v in layout)
             sargs, skwargs = _arguments(torch, spec, layout, statics)
-            mode, seen = observe.observer(torch, statics, weights, retained)
+            mode, seen = observe.observer(torch, statics, weights, retained, answers)
             observed[:] = [seen]
-            with cast("AbstractContextManager[object]", mode), _reading(torch) as read:
-                outputs.append(call(module, *sargs, **skwargs))
+            written = _AS_WRITTEN.set(True)
+            try:
+                with cast("AbstractContextManager[object]", mode), _reading(torch) as read:
+                    outputs.append(call(module, *sargs, **skwargs))
+            finally:
+                _AS_WRITTEN.reset(written)
             reads[:] = read.values()
         except BaseException:  # a short capture's go before it runs again
             statics.clear()
             outputs.clear()
             raise
 
+    _as_written()
     host = _host(torch, recorder, module)
-    graph, why = capture(torch, step, pool, owner, reserve, alone=not recorder.recordings)
+    try:
+        graph, why = capture(torch, step, pool, owner, reserve, alone=not recorder.recordings)
+    except observe.HostRead as read:
+        if answers is None and not idle:
+            raise
+        graph, why = None, (
+            f"it reads a value from the device ({read}): a call records it"
+            if idle
+            else f"it reads a value from the device its call as written didn't ({read})"
+        )
+        unwind(read)  # the stopped capture's tensors leave its pool
+    unanswered = observed[0].unanswered if observed else ""
+    if graph is not None and unanswered and answers is None and not idle:
+        graph.reset()  # a library caught its `HostRead` and went on
+        raise observe.HostRead(unanswered)
     if graph is None:
         _failed(module, recorder, key, why, idle=idle)
         return None
