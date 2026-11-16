@@ -1904,17 +1904,21 @@ def _capture_call(
         with cast("AbstractContextManager[object]", mode):
             return values, recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
 
+    entry: tuple[_Recording, object, _Replayed] | None = None
+    if key not in recorder.reading:
+        try:
+            entry = _capture_verified(
+                torch, module, recorder, call, key, spec, leaves, placed, seen, owner
+            )
+        except observe.HostRead as read:
+            # It decides by a value it reads from the device, which a capture can't read: its
+            # call as written runs first and serves, and the capture is answered with its reads.
+            # The stopped capture's tensors leave the pool first, or the next graph's scratch
+            # can't unmap (`scratch_declined`).
+            unwind(read)
+            with recorder.lock:
+                recorder.reading.add(key)
     if key in recorder.reading:
-        answers, result = reading()
-    try:
-        entry = _capture_verified(
-            torch, module, recorder, call, key, spec, leaves, placed, seen, owner, answers
-        )
-    except observe.HostRead:
-        # It decides by a value it reads from the device, which a capture can't read: its call
-        # as written runs first and serves, and the capture is answered with what it read.
-        with recorder.lock:
-            recorder.reading.add(key)
         answers, result = reading()
         entry = _capture_verified(
             torch, module, recorder, call, key, spec, leaves, placed, seen, owner, answers
@@ -2907,6 +2911,7 @@ def _build(
             if idle
             else f"it reads a value from the device its call as written didn't ({read})"
         )
+        unwind(read)  # the stopped capture's tensors leave its pool
     unanswered = observed[0].unanswered if observed else ""
     if graph is not None and unanswered and answers is None and not idle:
         graph.reset()  # a library caught its `HostRead` and went on
