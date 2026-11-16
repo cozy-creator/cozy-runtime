@@ -109,6 +109,7 @@ try:
         StaticLayer,
         get_layer_types_and_kwargs,
     )
+    from transformers.generation.logits_process import NoRepeatNGramLogitsProcessor
 except ImportError as _absent:  # pragma: no cover - the base package has neither
     if TYPE_CHECKING:
         raise
@@ -261,6 +262,7 @@ def generate(
     draft: torch.nn.Module | None = None,
     allowed: Constraint | None = None,
     progress: Callable[[int], None] | None = None,
+    no_repeat_ngram: int | None = None,
 ) -> torch.Tensor:
     """Tokens after the prompt, `[batch, n]` (`model.generate(...)`'s tail): `inputs` as the
     processor returned them, generation ends at a `stop` token or after `max_new_tokens`, and a
@@ -273,6 +275,9 @@ def generate(
     `allowed.allowed(its tokens so far)` is out before `top_k`, the presence penalty, temperature
     and top-p, greedy or sampled, drafted or not. The host asks it between steps, so a
     constrained batch's steps do not queue ahead of it.
+    `no_repeat_ngram` n bans, in each row, every token that would complete an n-gram the row
+    already holds, its prompt included (Transformers' `no_repeat_ngram_size`), as `allowed`'s
+    bans come: before `top_k`, the presence penalty and sampling, drafted or not.
     `draft(embeds, hidden, position_ids, past_key_values, attention_mask, rotary) -> hidden` is
     the model's multi-token-prediction head (`Draft`): from a token's embedding and the state the
     model's head read before it, the state the head reads for the token after; `rotary` is the
@@ -293,6 +298,9 @@ def generate(
         raise ValueError(
             f"temperature {temperature}, top_p {top_p}, top_k {top_k}, seed {seed}: out of range"
         )
+    ngram = int(no_repeat_ngram or 0)
+    if ngram < 0:
+        raise ValueError(f"no_repeat_ngram {no_repeat_ngram}: none, or at least 1")
     if progress is None and (stage := stage_tokens()) is not None:
         progress = partial(_share, stage, max_new_tokens)
     sampling = _Sampling(float(temperature), float(top_p), int(seed), int(top_k))
@@ -309,13 +317,13 @@ def generate(
             WARNINGS.append(row)
         with contract.owned():  # the Runtime's own use of Transformers' loop and caches
             said = (model, inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell)
-            return _transformers(*said, allowed)
+            return _transformers(*said, allowed, ngram)
     with _ENGINES_LOCK:
         engine = _ENGINES.get(model)
         if engine is None:
             engine = _ENGINES[model] = _Engine(model)
     request = _Request(
-        inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell, allowed
+        inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell, allowed, ngram
     )
     token = BYPASS.set(True)  # the component's calls are this loop's, its graphs its own
     try:
@@ -890,6 +898,30 @@ def _ids(constraint: Constraint, tokens: Sequence[int], vocab: int) -> torch.Ten
     return ids
 
 
+def _grams(
+    tokens: Sequence[int], n: int, index: dict[tuple[int, ...], set[int]], start: int
+) -> int:
+    """`index` (each (n-1)-token prefix: the tokens that followed it) with `tokens`' n-grams
+    from position `start` on; where the next call starts."""
+    for i in range(start, len(tokens) - n + 1):
+        index.setdefault(tuple(tokens[i : i + n - 1]), set()).add(tokens[i + n - 1])
+    return max(start, len(tokens) - n + 1)
+
+
+def _repeats(tokens: Sequence[int], n: int, index: dict[tuple[int, ...], set[int]]) -> set[int]:
+    """The tokens that would complete an n-gram `tokens` holds, `index` being its n-grams
+    (Transformers' `no_repeat_ngram_size`: none before the row is n-1 tokens long)."""
+    if len(tokens) + 1 < n:
+        return set()
+    return set(index.get(tuple(tokens[len(tokens) - n + 1 :]), ()))
+
+
+def _ban(ids: Iterable[int], out: torch.Tensor) -> None:
+    """Clear `ids`' bits of `out` (`_pack`'s layout): token 8i + j is bit j of byte i."""
+    for token in ids:
+        out[token >> 3] &= ~(1 << (token & 7)) & 0xFF
+
+
 def _pack(ids: torch.Tensor, out: torch.Tensor) -> None:
     """`ids` as bits of `out` (`[ceil(vocab / 8)]` uint8, on the host): token 8i + j is bit j of
     byte i."""
@@ -1019,11 +1051,14 @@ def _transformers(
     sampling: _Sampling,
     tell: _Tell,
     allowed: Constraint | None = None,
+    ngram: int = 0,
 ) -> torch.Tensor:
     prompt = int(inputs["input_ids"].shape[1])
-    processors: list[_Allowed | _TopK | _Presence | _Draw] = (
+    processors: list[_Allowed | _TopK | _Presence | _Draw | NoRepeatNGramLogitsProcessor] = (
         [] if allowed is None else [_Allowed(prompt, allowed, stops)]
     )
+    if ngram:
+        processors.append(NoRepeatNGramLogitsProcessor(ngram))
     if sampling.temperature > 0 and sampling.top_k:
         processors.append(_TopK(sampling.top_k))
     if penalty:
@@ -1595,8 +1630,15 @@ class _Request:
         sampling: _Sampling,
         tell: _Tell,
         allowed: Constraint | None = None,
+        ngram: int = 0,
     ) -> None:
-        self.allowed = allowed
+        self.allowed, self.ngram = allowed, ngram
+        #: its rows' tokens the host decides on between steps (`allowed`, `ngram`)
+        self.constrained = allowed is not None or ngram > 0
+        #: each row's prompt, as the host bans repeats from it (padding included, as Transformers')
+        self.prompts: list[list[int]] = inputs["input_ids"].tolist() if ngram else []
+        #: each row's first token's bans, from its prompt alone
+        self.banned: list[list[int]] = []
         self.inputs, self.max_new, self.stops, self.pad, self.penalty, self.sampling = (
             inputs,
             max_new,
@@ -1653,6 +1695,9 @@ class _Row:
         #: a constrained row's tokens as the host knows them (`_took`), and this step's drafts
         self.generated: list[int] | None = None
         self.drafts: list[int] = []
+        #: an `ngram` row's n-grams over its prompt and `generated` (`_grams`), and where they end
+        self.grams: dict[tuple[int, ...], set[int]] = {}
+        self.counted = 0
 
     def ended(self) -> bool:
         """A constrained row the host knows done: at a stop token, or its limit."""
@@ -1816,6 +1861,7 @@ class _Engine:
                 request.sampling,
                 request.tell,
                 request.allowed,
+                request.ngram,
             )
         self._report(request)
         return request.result()
@@ -2160,6 +2206,11 @@ class _Engine:
             return False  # admitted once its blocks are held
         try:
             first = None if request.allowed is None else _ids(request.allowed, [], self.vocab)
+            if request.ngram and not request.banned:  # admission may ask again
+                for prompt in request.prompts:
+                    index: dict[tuple[int, ...], set[int]] = {}
+                    _grams(prompt, request.ngram, index, 0)
+                    request.banned.append(sorted(_repeats(prompt, request.ngram, index)))
         except Exception as exc:  # the call's own constraint, asked before anything of it ran
             request.error = exc
             return True
@@ -2362,6 +2413,10 @@ class _Engine:
                 allowed = torch.zeros(scores.shape[-1], dtype=torch.bool, device=scores.device)
                 allowed[first.to(scores.device)] = True
                 scores = scores.masked_fill(~allowed, float("-inf"))
+            for row, banned in enumerate(request.banned):
+                scores[row, torch.tensor(banned, dtype=torch.long, device=scores.device)] = float(
+                    "-inf"
+                )
             token = scores.argmax(-1)
             if request.sampling.temperature > 0:
                 if request.sampling.top_k:
@@ -2424,7 +2479,7 @@ class _Engine:
         prompt = request.prompt
         stops = torch.full((self.stops.shape[1],), -1, dtype=torch.long)
         stops[: len(request.stops)] = torch.tensor(request.stops, dtype=torch.long)
-        firsts = fresh.token.tolist() if request.allowed is not None else []
+        firsts = fresh.token.tolist() if request.constrained else []
         with _disable_current_modes():
             for row in range(int(fresh.token.shape[0])):
                 slot = free[row]
@@ -2756,15 +2811,30 @@ class _Engine:
                     row.drafts = []
                 tokens, stops = [*row.generated, *row.drafts[:at]], row.request.stops
                 if not row.ended() and not any(t in stops for t in row.drafts[:at]):
-                    try:  # a row with `generated` has its call's constraint
-                        allowed = _set(row.request.allowed)
-                        _pack(_ids(allowed, tokens, self.vocab), host[slot])
+                    try:  # a row with `generated` has its call's constraint or n-gram bans
+                        self._permit(row, tokens, host[slot])
                         free = False
                     except Exception as exc:  # the call's own constraint: only it fails
                         row.request.error = row.request.error or exc
             if free:
                 host[slot].fill_(255)
         self.allow[at, :size].copy_(host, non_blocking=True)
+
+    def _permit(self, row: _Row, tokens: list[int], out: torch.Tensor) -> None:
+        """`out` (`_pack`'s bits): what `row` may take after `tokens`, by its call's constraint
+        (any without one) less the tokens that would repeat one of its n-grams."""
+        request = row.request
+        if request.allowed is not None:
+            _pack(_ids(request.allowed, tokens, self.vocab), out)
+        else:
+            out.fill_(255)
+        if request.ngram:
+            n, held = request.ngram, [*request.prompts[row.row], *_set(row.generated)]
+            row.counted = _grams(held, n, row.grams, row.counted)
+            sequence = [*request.prompts[row.row], *tokens]
+            drafted: dict[tuple[int, ...], set[int]] = {}  # n-grams ending in this step's drafts
+            _grams(sequence, n, drafted, max(0, len(held) - n + 1))
+            _ban(_repeats(sequence, n, row.grams) | _repeats(sequence, n, drafted), out)
 
     def _drafted(self, size: int, part: int) -> None:
         """Each constrained row's draft from part `part`, which the host has caught up with."""
@@ -3052,7 +3122,7 @@ class _Engine:
 
     def _constrained(self) -> bool:
         """Whether a held row has a constraint: its step reads `allow` and reports its tokens."""
-        return any(row is not None and row.request.allowed is not None for row in self.slots)
+        return any(row is not None and row.request.constrained for row in self.slots)
 
     def _allowed(
         self, scores: torch.Tensor, size: int, at: int | slice[int | None, int | None, int | None]
