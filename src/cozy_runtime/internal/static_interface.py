@@ -457,8 +457,8 @@ class Reader:
         #: site-packages.
         self.own = own
         self.roots = (*self.project_roots, *dependency_roots)
-        #: The root caller's lock is authoritative for the entire managed dependency graph.
-        #: A nested package's directory (or installed copy) does not select a different lock.
+        #: The root project's lock pins every package it reads, its dependencies' dependencies too:
+        #: a dependency's own directory (or installed copy) selects no other lock.
         self.pinned = pinned
         #: published callees, read from the wheels the project's uv.lock pins when needed
         self.wheels = locked.Wheels(pinned.wheels if pinned is not None else {})
@@ -1869,8 +1869,9 @@ def _calls(
     locked_packages: frozenset[str] | None = None,
 ) -> None:
     """Each entry's `calls`: the functions it reaches, through its own package's helpers, that
-    run as their own calls (`call(fn, ...)`): its package's own, and another package's public
-    functions, read from the release this one locked (decision 5). A branch may never take one."""
+    run as their own calls (`call(target, request)`): its package's own, and another package's
+    public operations through generated references, read from the release this one locked
+    (decision 5). A branch may never take one."""
     entries = typing.cast(list[dict[str, Json]], body["entrypoints"])
     docs = {str(doc["name"]): doc for doc in entries}
     exported = {_export_of(doc): doc for doc in docs.values()}
@@ -1948,8 +1949,9 @@ def _call_row(package: str, doc: Mapping[str, Json]) -> dict[str, Json]:
 
 
 def _callees(reader: Reader, registration: Registration) -> list[Definition | Assigned]:
-    """The functions a registration's body reaches that run as calls: the first argument of each
-    `call(fn, ...)`. Its own package's other functions run inline, so their bodies are read too."""
+    """What a registration's body reaches that runs as calls: the target of each `call(target,
+    request)`, its package's own function or a generated reference. Its own package's other
+    functions run inline, so their bodies are read too."""
     found: list[Definition | Assigned] = []
     pending = [(registration.module, registration.fn)]
     seen: set[tuple[Path, int]] = set()
