@@ -1488,6 +1488,12 @@ def _region_path(
             return result
         # No graph of this path holds now (what it read outside the call is gone, or a module
         # attribute it read has another value): this call records one.
+    if key not in recorder.judged and (held := _content_inputs(torch, leaves)):
+        # A path on token ids records nowhere until cr-300's cause is fixed: Anima's text encoder
+        # replays differ from the call as written on real ids, so its in-call check would refuse
+        # it on every warm second call (`replay_mismatch`).
+        with recorder.lock:
+            recorder.judged.setdefault(key, f"{held}; nor in a call, until cr-300 is fixed")
     if (
         FORCE
         and key not in recorder.seen
