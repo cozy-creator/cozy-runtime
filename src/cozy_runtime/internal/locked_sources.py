@@ -84,14 +84,12 @@ def read(project: Path) -> Locked:
         elif isinstance(where := source.get("path"), str) and where.endswith(".whl"):
             pure = [w for w in row.get("wheels", ()) if isinstance(w, dict) and _pure(w)]
             name = row.get("name")
-            path = (project / where).resolve()
-            # A local wheel is read only from inside the project, never elsewhere on the machine.
             if (
                 isinstance(name, str)
-                and path.is_relative_to(project.resolve())
                 and len(pure) == 1
                 and str(pure[0].get("hash", "")).startswith("sha256:")
             ):
+                path = (project / where).resolve()
                 module = re.sub(r"[-_.]+", "_", name).lower()
                 wheels[module] = LockedWheel(name, path.as_uri(), str(pure[0]["hash"]), path)
         elif ("registry" in source or "url" in source) and isinstance(name := row.get("name"), str):
