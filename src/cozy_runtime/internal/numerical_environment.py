@@ -8,6 +8,8 @@ policy; it must never inspect distributions, RECORD files, or native binaries.
 
 from __future__ import annotations
 
+import os
+
 import functools
 import hashlib
 import threading
@@ -83,6 +85,7 @@ def apply(torch: ModuleType, kind: str) -> None:
     selection is kept). TF32 goes through the `allow_tf32` setters: in torch 2.15 setting
     `fp32_precision` makes the `cudnn.allow_tf32` getter raise, and stage memos and recorded
     loops read it."""
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # DIAGNOSIS ONLY (cr-300): one workspace config
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = True
