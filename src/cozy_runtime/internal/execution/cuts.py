@@ -669,7 +669,7 @@ def windows(
     name: str, key: str, needs: Sequence[int]
 ) -> tuple[int, Callable[[], AbstractContextManager[None]]]:
     """A package's `windows` (`cozy_runtime.author.windows`): which of its layouts, fewest
-    windows first, a loop keeps (`needs`: each one's peak bytes), chosen once before it, and the
-    context its every window's work runs in, so the choice is measured for the next call."""
+    windows first, a loop keeps (`needs`: each one's whole bytes), chosen once before it, and the
+    context its every window's work runs in (`catch.Fixed.piece`)."""
     chosen = catch.fixed(f"windows:{key}", len(needs) - 1, lambda n: (needs[n],))
     return chosen.level, chosen.piece
