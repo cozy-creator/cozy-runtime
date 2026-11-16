@@ -53,6 +53,7 @@ from cozy_runtime.author._model import Model, component_method, component_set
 from cozy_runtime.author._model_defaults import (
     model_components,
     model_defaults,
+    model_needs,
     model_on_demand,
 )
 from cozy_runtime.author._recipes import CALIBRATED_ENTRYPOINT, canonical, fingerprint, outputs
@@ -418,6 +419,7 @@ _ENTRYPOINT_KEYWORDS = frozenset(
         "components",
         "memoize",
         "on_demand",
+        "needs",
         "accelerator",
         "weights",
         "private",
@@ -1577,6 +1579,8 @@ class Registration:
     model_classes: Mapping[str, ModelSpec] = field(default_factory=dict)
     #: `app.tool`'s own options.
     tool: author.Tool | None = None
+    #: `needs=`: a Model argument or a called function -> its CEL rule over `request`.
+    model_needs: Mapping[str, str] = field(default_factory=dict)
 
     def declaration(
         self,
@@ -1605,6 +1609,7 @@ class Registration:
             model_defaults=self.model_defaults,
             model_components=self.model_components,
             model_on_demand=self.model_on_demand,
+            model_needs=self.model_needs,
             payload_type=payload_type,
             result_type=result_type,
             contexts=contexts,
@@ -1919,8 +1924,34 @@ def _calls(
             callee, package = exported.get((found.module.name, found.node.name)), distribution
             if callee is not None and callee is not doc:
                 rows[(package, str(callee["name"]))] = _call_row(package, callee)
+        _call_rules(reader, registration, doc, rows)
         if rows:
             doc["calls"] = [rows[key] for key in sorted(rows)]
+
+
+def _call_rules(
+    reader: Reader,
+    registration: Registration,
+    doc: Mapping[str, Json],
+    rows: Mapping[tuple[str, str], dict[str, Json]],
+) -> None:
+    """Each `needs=` rule that names a function this one calls goes on that call's row. A key
+    is a constructed Model argument or one called function, never both and never neither."""
+    models = typing.cast(list[dict[str, Json]], doc.get("models", []))
+    slots = {str(m["path"]).rpartition(".")[2] for m in models if not m.get("weights")}
+    for name, rule in registration.model_needs.items():
+        called = [row for (_, function), row in rows.items() if function == name]
+        if name in slots and not called:
+            continue
+        if name in slots or len(called) != 1:
+            reader.refuse(
+                registration.module,
+                registration.fn,
+                f"needs names {name!r}: a rule is for one Model argument of "
+                f"{registration.name}, or one function it calls",
+                "model_needs",
+            )
+        called[0]["needs"] = rule
 
 
 def _export_of(doc: Mapping[str, Json]) -> tuple[str, str]:
@@ -2753,6 +2784,7 @@ def _registration(
     private = False
     weights: tuple[author.WeightsOutput, ...] = ()
     on_demand: tuple[str, ...] = ()
+    needs: dict[str, str] = {}
     box: dict[str, object] = {}
     for keyword in keywords:
         if method == "tool" and keyword.arg == "ui":
@@ -2786,6 +2818,8 @@ def _registration(
             used_components = model_components(value)
         elif keyword.arg == "on_demand":
             on_demand = model_on_demand(value)
+        elif keyword.arg == "needs":
+            needs = model_needs(value)
         elif keyword.arg == "name":
             name = str(value)
         elif keyword.arg in _TOOL_KEYWORDS:
@@ -2822,6 +2856,7 @@ def _registration(
         on_demand,
         model_components=used_components,
         tool=tool,
+        model_needs=needs,
     )
 
 

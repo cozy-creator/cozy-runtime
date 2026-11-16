@@ -372,6 +372,9 @@ class Declaration:
     """Model argument -> the components this callable runs; an absent argument runs all."""
     model_on_demand: tuple[str, ...] = ()
     """Model arguments built, and their weights fetched, on first use (`on_demand=`)."""
+    model_needs: Mapping[str, str] = field(default_factory=dict)
+    """A Model argument, or a function this one calls, -> the CEL rule over `request` that
+    says whether a request needs it (`needs=`)."""
     parameters: tuple[str, ...] | None = None
     """Its request's fields, when they are its own parameters; None: its request is its one
     struct parameter."""
@@ -379,6 +382,14 @@ class Declaration:
     identity: Mapping[str, str] = field(default_factory=dict)
     """Its operation identity, where the reader can state one."""
     capabilities: frozenset[str] = field(init=False)
+
+    @property
+    def deferred(self) -> tuple[str, ...]:
+        """The constructed Model arguments built when the function first reads them: those
+        `on_demand=` lists and those a `needs=` rule names."""
+        constructed = {slot.parameter for slot in self.slots if not slot.weights}
+        ruled = (name for name in self.model_needs if name in constructed)
+        return tuple(dict.fromkeys((*self.model_on_demand, *ruled)))
 
     def __post_init__(self) -> None:
         if self.accelerator is None:
@@ -555,6 +566,7 @@ def analyze(
     model_defaults: Mapping[str, str] | None = None,
     model_components: Mapping[str, tuple[str, ...]] | None = None,
     model_on_demand: tuple[str, ...] = (),
+    model_needs: Mapping[str, str] | None = None,
     model_classes: Mapping[str, type[Model[object]]] | None = None,
 ) -> Surface:
     """Derive the whole surface from the signature. Every refusal here is a BUILD refusal.
@@ -732,6 +744,7 @@ def analyze(
         model_defaults=model_defaults or {},
         model_components=model_components or {},
         model_on_demand=model_on_demand,
+        model_needs=model_needs or {},
         parameters=tuple(callers) if keyword else None,
         parameter_defaults={
             name: signature.parameters[name].default

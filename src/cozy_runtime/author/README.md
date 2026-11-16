@@ -44,8 +44,8 @@ def generate(ctx: Context, payload: Request, model: Flow, tel: Telemetry) -> Res
 ## The core
 
 - **`App`**: `@app.entrypoint` publishes a function; `@app.tool` publishes one that is also a canvas
-  box. Options: `name`, `defaults`, `memoize`, `on_demand`, `accelerator`, `weights`, `private`,
-  `components`, `preflight`.
+  box. Options: `name`, `defaults`, `memoize`, `on_demand`, `needs`, `accelerator`, `weights`,
+  `private`, `components`, `preflight`.
   A constructed `Model` parameter selects the GPU by default; other handlers use CPU.
   Set `accelerator=True` for custom GPU work with only raw `Weights` or ordinary inputs,
   or `accelerator=False` to keep a model handler on CPU. Explicit settings always win.
@@ -97,6 +97,34 @@ defaults don't matter) and refuses a stale one (`stale_call_reference`): regener
   can read its encoded bytes after the child or publication consumed it. `image.probe()`
   reads captured geometry even before encoding. `Outputs.save_image` has been removed;
   `Outputs` handles explicit publication, encoded artifacts and bounded audio/video streams.
+
+## Which requests need a model
+
+A function with several model arguments rarely uses all of them for one request. Say which
+requests need one with a rule, and the machine fetches it before the function starts only for
+those, and never for the rest:
+
+```python
+@app.entrypoint(defaults=DEFAULTS, needs={
+    "upsampler": "request.prompt_upsampling",
+    "edit_model": "size(request.prompt.references) > 0",
+})
+def generate(ctx: Context, payload: Request, model: Flow, upsampler: Upsampler, edit_model: Edit) -> Result: ...
+```
+
+- A rule is one [CEL](https://cel.dev) boolean expression over `request`: the request as JSON,
+  each field it leaves out at its default. `&&`, `||`, `!`, comparisons, `size(x)`,
+  `x != null`, and `list.exists(e, ...)` / `list.all(e, ...)`. `cozy` checks it against the
+  request when the package is read: a field that isn't there refuses the package.
+- A model argument with a rule is built when the function first reads it. One with no rule is
+  always needed.
+- A function that loads no model and calls others names a function it calls:
+  `needs={"edit_segment": "request.plate != null"}`.
+- Err toward true: a rule that is true for a request that doesn't read the model only fetches
+  too much. One that is false for a request that does read it makes that request wait for the
+  download when it reads it, and the run warns.
+- `ctx.need("edit_model")`: what only the run itself learns. The fetch starts at once, ahead of
+  every other download, while the function goes on.
 
 ## Optional
 

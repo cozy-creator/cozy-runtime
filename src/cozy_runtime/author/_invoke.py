@@ -139,6 +139,8 @@ class Invocation:
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
     observations alike. Best-effort, never authoritative."""
+    need: Callable[[str], None] | None = None
+    """`Context.need`: asks the machine for a deferred model argument's weights now."""
     calls: _Broker | None = None
     publish: Callable[[Publish], Answer] | None = None
     """`Outputs.publish`'s exchange with the machine, which journals the run's output log."""
@@ -323,6 +325,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt.outputs = surface.outputs
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel)
     ctx._recipes = inv.recipes
+    ctx._need = functools.partial(_need, surface, inv)
     telemetry = Telemetry(record, ctx)
     ctx._progress, ctx._called = telemetry.loop_progress()
     if inv.previewing is not None and inv.preview is not None:
@@ -881,7 +884,7 @@ def _inject(
         elif param.role == "preflight":
             kwargs[param.name] = facts
         elif param.role in ("model", "weights"):
-            model = _model(param, inv, param.name in surface.model_on_demand)
+            model = _model(param, inv, param.name in surface.deferred)
             keyword = surface.parameters is not None
             artifact = getattr(overlay.payload, param.name, None) if keyword else None
             if artifact is not None and (
@@ -901,6 +904,18 @@ def _inject(
         else:
             kwargs[param.name] = _service(param, attempt, ctx)
     return kwargs
+
+
+def _need(surface: Surface, inv: Invocation, slot: str) -> None:
+    """`Context.need(slot)`: only a model argument built on first use has anything to ask."""
+    if slot not in surface.model_params:
+        raise CapabilityError(
+            f"need names {slot!r}, which is no Model argument of {surface.name}",
+            code="need_unknown",
+            fields=[slot],
+        )
+    if inv.need is not None and slot in surface.deferred:
+        inv.need(slot)
 
 
 def _model(param: Param, inv: Invocation, on_demand: bool) -> object:
