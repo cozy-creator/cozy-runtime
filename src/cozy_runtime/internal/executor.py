@@ -348,7 +348,8 @@ class CallBindings(Mapping[tuple[str, str], _CallType]):
             if key not in self._installed:
                 raise KeyError(key)
             raise CapabilityError(
-                "another package's managed call requires a generated Operation reference",
+                f"{key[0]}:{key[1]} is another package's function: call its generated reference "
+                "(`cozy-runtime calls <distribution> <file.py>`)",
                 code="child_reference_required",
             )
         return binding

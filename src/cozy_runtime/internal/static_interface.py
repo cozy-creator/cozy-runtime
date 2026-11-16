@@ -1961,9 +1961,22 @@ def _callees(reader: Reader, registration: Registration) -> list[Definition | As
             continue
         seen.add((module.path, fn.lineno))
         named: set[int] = set()  # a callee named to `call` or `prefetch` does not run inline
+        outputs = _outputs_parameters(reader, module, fn)
         for node in (n for stmt in fn.body for n in ast.walk(stmt)):
             if id(node) in named:
                 continue
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == "save_image"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in outputs
+            ):
+                reader.refuse(
+                    module,
+                    node,
+                    "Outputs.save_image was removed: return ImageFile.from_image(image)",
+                    "author_api_removed",
+                )
             managed = (
                 _managed(reader, module, node) if isinstance(node, ast.Call) and node.args else ""
             )
@@ -1976,7 +1989,10 @@ def _callees(reader: Reader, registration: Registration) -> list[Definition | As
                     reader.refuse(
                         module,
                         node,
-                        "call takes (target, request) and only models=/assets=; prefetch takes a target and models=",
+                        "call takes its request positionally, call(target, Request(...)), with only "
+                        "models= and assets= as keywords"
+                        if managed == "author.call"
+                        else "prefetch takes a target and models= only",
                         "call_signature",
                     )
                 named.add(id(node.args[0]))
@@ -1995,10 +2011,13 @@ def _callees(reader: Reader, registration: Registration) -> list[Definition | As
                     and not runtime
                     and not reader._own(callee.module.name.split(".")[0])
                 ):
+                    owner = _package_at(reader, callee.module.path)
+                    dist = owner.distribution if owner is not None else "<distribution>"
                     reader.refuse(
                         module,
                         node.args[0],
-                        "another package's managed call needs a generated Operation reference",
+                        f"{callee.node.name} is {dist}'s function: call its generated reference "
+                        f"(`cozy-runtime calls {dist} <file.py>`)",
                         "child_reference_required",
                     )
                 if managed == "author.call" and not runtime:
@@ -2024,6 +2043,21 @@ class Reference:
     models: tuple[str, ...]
 
 
+def _outputs_parameters(
+    reader: Reader, module: Module, fn: ast.FunctionDef | ast.AsyncFunctionDef
+) -> frozenset[str]:
+    """The parameters a function annotates as `Outputs`."""
+    names: set[str] = set()
+    for arg in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs):
+        try:
+            found = None if arg.annotation is None else reader.resolve(module, arg.annotation)
+        except StaticRefusal:
+            continue
+        if isinstance(found, Vocab) and found.key == "author.Outputs":
+            names.add(arg.arg)
+    return frozenset(names)
+
+
 def _operation(reader: Reader, found: Assigned) -> Reference | None:
     node = found.value
     if not isinstance(node, ast.Call):
@@ -2035,6 +2069,16 @@ def _operation(reader: Reader, found: Assigned) -> Reference | None:
     if not isinstance(target, Vocab) or target.key != "author.Operation":
         return None
     keywords = {kw.arg: kw.value for kw in node.keywords}
+    if set(keywords) - {"distribution", "module", "export", "request", "result", "models"}:
+        named = keywords.get("distribution")
+        dist = named.value if isinstance(named, ast.Constant) else "<distribution>"
+        reader.refuse(
+            found.module,
+            node,
+            f"an older cozy-runtime generated this reference: regenerate it "
+            f"(`cozy-runtime calls {dist} {reader.spell(found.module.path)}`)",
+            "stale_call_reference",
+        )
 
     def text(name: str) -> str:
         value = keywords.get(name)
