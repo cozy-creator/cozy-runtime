@@ -13,13 +13,18 @@ WATCHER = "~"
 _PR_SET_NAME = 15
 
 
+def native_name(name: str) -> None:
+    """The calling thread's name in the kernel too (the kernel keeps 15 bytes)."""
+    if sys.platform == "linux":
+        ctypes.CDLL(None).prctl(_PR_SET_NAME, name.encode()[:15], 0, 0, 0)
+
+
 def thread(target: Callable[[], object], name: str) -> threading.Thread:
-    """An unstarted daemon thread running `target`, named `~name` (the kernel keeps 15 bytes)."""
+    """An unstarted daemon thread running `target`, named `~name`."""
     named = f"{WATCHER}{name}"
 
     def run() -> None:
-        if sys.platform == "linux":
-            ctypes.CDLL(None).prctl(_PR_SET_NAME, named.encode()[:15], 0, 0, 0)
+        native_name(named)
         target()
 
     return threading.Thread(target=run, name=named, daemon=True)
