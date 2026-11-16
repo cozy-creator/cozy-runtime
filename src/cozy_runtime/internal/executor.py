@@ -105,13 +105,24 @@ class _ModelNeed(Protocol):
 #: None in a TensorFS before it.
 _MODEL_NEED: _ModelNeed | None = getattr(tensorfs.executor, "ModelNeed", None)
 
+
+class _Vigil(Protocol):
+    """TensorFS's native vigil (cl-977): a thread outside the GIL that answers TensorD's hang
+    watch on `fd` with this process's own threads, which TensorD may not be allowed to read."""
+
+    def __call__(self, fd: int) -> None: ...
+
+
+#: None in a TensorFS before it.
+_VIGIL: _Vigil | None = getattr(tensorfs.executor, "vigil", None)
+
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
 from cozy_runtime.accel import stepcache
 from cozy_runtime.accel.attention import _close as close_producer_states
 from cozy_runtime.accel.kernels import _SETS as KERNEL_SETS
 from cozy_runtime.accel.kernels import Launch, Plan, TritonKernels
-from cozy_runtime.author import _activity, _phases, _split
+from cozy_runtime.author import _activity, _phases, _split, _watchers
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._artifacts import ModelChoice
@@ -1160,6 +1171,8 @@ class Executor:
         self.imported = False
         #: children forked from this import-only process and not reaped yet (`fork/1`)
         self.forked: set[int] = set()
+        #: the vigil's line for TensorD, until it follows the device Start's reply (cl-977)
+        self.vigil_line: socket.socket | None = None
         self.package_warmed = False
         #: rank 0 only: each follower's own start ledger, in rank order
         self.follower_stages: list[list[object]] = []
@@ -1332,6 +1345,8 @@ class Executor:
             "world": self.world,
             # TensorD may send `preview` (a client watches a call's previews): `author.preview`.
             "previews": 1,
+            # A device Start that asks for it hands TensorD its vigil's line (cl-977).
+            "vigil": int(_VIGIL is not None),
         }
 
     # ------------------------------------------------------------- the group (cr-068)
@@ -2041,7 +2056,15 @@ class Executor:
 
     def start(self, command: Start) -> Reply:
         with self._device_work():
-            return self._start(command)
+            reply = self._start(command)
+        # The vigil starts with the device (an import-only parent stays single-threaded to fork),
+        # its line following this reply (`_answer`).
+        vigil = _VIGIL if getattr(command, "vigil", False) and self.rank == 0 else None
+        if vigil is not None and reply.get("ok") and self.started and self.vigil_line is None:
+            ours, self.vigil_line = socket.socketpair()
+            vigil(ours.detach())
+            reply["descriptor"] = True
+        return reply
 
     def _start(self, command: Start) -> Reply:
         """Bring EVERY rank up before any construction: seal, group, torch, package, warmup.
@@ -5565,7 +5588,7 @@ def serve(executor: Executor, channel: Channel) -> int:
     request_path.told = functools.partial(_waiting, channel)
     _phases.command = functools.partial(_command_teller, channel)
     # Runtime-owned workers, none before the first is needed.
-    pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=crash.arm)
+    pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=_call_thread)
     order = executor.order = _Order()
     idle = False
     while True:
@@ -5598,7 +5621,24 @@ def serve(executor: Executor, channel: Channel) -> int:
             reply = _reply(executor, frame)
         if reply is None:
             return _shut(executor, channel)
+        _answer(executor, channel, reply)
+
+
+def _call_thread() -> None:
+    """A call pool thread, named `call_<n>` in the kernel too: TensorD's hang watch tells the call's
+    own threads from the rest by it (cl-977)."""
+    _watchers.native_name(threading.current_thread().name)
+    crash.arm()
+
+
+def _answer(executor: Executor, channel: Channel, reply: Reply) -> None:
+    """A reply, and the vigil's line after the device Start's that says it follows (cl-977)."""
+    with channel.sending:
         _send_reply(channel, reply)
+        if reply.get("descriptor") is True and (line := executor.vigil_line) is not None:
+            executor.vigil_line = None
+            channel.send_descriptor(line)
+            line.close()
 
 
 def _shut(executor: Executor, channel: Channel) -> int:
@@ -5627,7 +5667,7 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
                 os._exit(code)
             if frame.get("cmd") in {"invoke", "map"} and call:
                 executor.mux.forget(call)
-            _send_reply(executor.channel, {**reply, "request_id": call} if call else reply)
+            _answer(executor, executor.channel, {**reply, "request_id": call} if call else reply)
     except BaseException as exc:
         if call in _TOLD:  # its traceback is in its own log (`Executor._call`)
             print(f"call {call} ended this executor: {type(exc).__name__}", file=sys.stderr)
