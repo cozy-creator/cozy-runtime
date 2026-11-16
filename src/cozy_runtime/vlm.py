@@ -479,6 +479,7 @@ class VisionLM(Model[Pipeline]):
         top_p: float,
         seed: int,
         progress: Callable[[int], None] | None = None,
+        no_repeat_ngram: int | None = None,
     ) -> list[str]:
         """One answer per question, all at once: one prefill over the rows, left-padded, and one
         decode of them together (the decoding arguments are `lm.generate`'s). Each video's
@@ -511,6 +512,7 @@ class VisionLM(Model[Pipeline]):
             "top_p": top_p,
             "seed": seed,
             "progress": progress,
+            "no_repeat_ngram": no_repeat_ngram,
         }
         # A thought may say a stop string: then stops cut only the answer, after decoding.
         replies = self._generate(
@@ -595,6 +597,7 @@ class _Decoding(TypedDict):
     top_p: float
     seed: int
     progress: Callable[[int], None] | None
+    no_repeat_ngram: int | None
 
 
 def _cut(text: str, stop: list[str]) -> str:
