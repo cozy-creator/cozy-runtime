@@ -351,7 +351,7 @@ class VisionLM(Model[Pipeline]):
     """A Qwen-VL model answering questions about text, images and videos, greedily or sampled
     from a seed. Runtime may serve encoded lanes' linears natively."""
 
-    serving = Serving(min_bits=4, phase="decode")
+    serving = Serving(phase="decode")
 
     pipe: Pipeline
     processor: ProcessorMixin
