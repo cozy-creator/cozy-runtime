@@ -23,7 +23,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from cozy_runtime.author import _activity
+from cozy_runtime.author import _activity, _watchers
 
 #: A phase shows once it has held its call this long.
 SHOWN_S = 1.0
@@ -146,7 +146,7 @@ def _register(phase: Phase) -> None:
     with _LOCK:
         _LIVE.append(phase)
         if not _WATCHING:
-            watcher = threading.Thread(target=_watch, name="phases", daemon=True)
+            watcher = _watchers.thread(_watch, "phases")
             _WATCHING.append(watcher)
             watcher.start()
         _LOCK.notify()
