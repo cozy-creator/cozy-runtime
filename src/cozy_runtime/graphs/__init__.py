@@ -1722,6 +1722,68 @@ def _churning(recorder: _Recorder, key: tuple[object, ...]) -> str:
 _CHURN = 2
 
 
+class _Trace:
+    """Diagnosis (cr-300): each submodule's first tensor output (cloned: under capture, the clone
+    is in the graph and holds the replay's value) and each torch function's name, tensor dtypes
+    and autocast state, in order, for a call as written and a capture compared op by op."""
+
+    def __init__(self, torch: ModuleType, module: Module) -> None:
+        self.torch, self.module = torch, module
+        self.outputs: list[tuple[str, Tensor]] = []
+        self.ops: list[tuple[str, tuple[str, ...], bool]] = []
+        self.handles: list[object] = []
+        self.mode: object | None = None
+
+    def __enter__(self) -> _Trace:
+        torch = self.torch
+        for name, sub in self.module.named_modules():
+            def hook(_m: Module, _i: object, o: object, name: str = name) -> None:
+                leaves = [t for t in torch.utils._pytree.tree_leaves(o) if isinstance(t, torch.Tensor)]
+                if leaves and leaves[0].is_floating_point():
+                    self.outputs.append((name or "<root>", leaves[0].detach().clone()))
+            self.handles.append(sub.register_forward_hook(hook))
+        ops = self.ops
+
+        class _Ops(torch.overrides.TorchFunctionMode):  # type: ignore[misc,name-defined]
+            def __torch_function__(self, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
+                kinds = tuple(
+                    str(a.dtype).rsplit(".", 1)[-1] for a in args if isinstance(a, torch.Tensor)
+                )
+                ops.append((getattr(func, "__name__", str(func)), kinds, torch.is_autocast_enabled("cuda")))
+                return func(*args, **(kwargs or {}))
+
+        self.mode = _Ops()
+        self.mode.__enter__()  # type: ignore[attr-defined]
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.mode.__exit__(*exc)  # type: ignore[attr-defined]
+        for h in self.handles:
+            h.remove()  # type: ignore[attr-defined]
+
+    def against(self, other: _Trace) -> str:
+        """Where `self` (the capture, its clones holding the replay) and `other` (as written)
+        first part: the first op whose name, dtypes or autocast differ; the first module output
+        that differs, with its size; how many module outputs differ."""
+        torch = self.torch
+        first_op = next(
+            (f"op {i}: capture {a} / as written {b}" for i, (a, b) in enumerate(zip(self.ops, other.ops, strict=False)) if a != b),
+            f"ops equal ({len(self.ops)} / {len(other.ops)})",
+        )
+        differing = []
+        for (na, ta), (nb, tb) in zip(self.outputs, other.outputs, strict=False):
+            if na != nb or ta.shape != tb.shape:
+                differing.append(f"{na} vs {nb}: misaligned")
+                break
+            if not torch.equal(ta, tb):
+                differing.append(f"{na} ({type(dict(self.module.named_modules())[na if na != '<root>' else ''])}.__name__): {_sizes(torch, ta, tb)}")
+        first = differing[0] if differing else "all equal"
+        return (
+            f"{first_op}; module outputs {len(self.outputs)} / {len(other.outputs)}, "
+            f"{len(differing)} differ, first: {first}"
+        )
+
+
 def _sizes(torch: ModuleType, a: object, b: object) -> str:
     """Diagnosis: the largest difference between two output trees, by relative L2 (cr-300)."""
     xs = [t for t in torch.utils._pytree.tree_leaves(a) if isinstance(t, torch.Tensor)]
@@ -1890,7 +1952,15 @@ def _capture_call(
     recorder.capture_attempts += 1
     began = time.perf_counter()
     before = vt.stats(owner.device)
-    entry = _capture_verified(torch, module, recorder, call, key, spec, leaves, placed, seen, owner)
+    traced = DIAG and _name(module).endswith("text_encoder")
+    trace_capture = _Trace(torch, module) if traced else None
+    if trace_capture is not None:
+        with trace_capture:
+            entry = _capture_verified(
+                torch, module, recorder, call, key, spec, leaves, placed, seen, owner
+            )
+    else:
+        entry = _capture_verified(torch, module, recorder, call, key, spec, leaves, placed, seen, owner)
     if entry is None:
         recorder.capture_ms += (time.perf_counter() - began) * 1e3
         _BUDGET.spend((time.perf_counter() - began) * 1e3)
@@ -1898,7 +1968,12 @@ def _capture_call(
     recording, out, replayed = entry
     # As written, last: what serves the call is eager's, whatever the check finds.
     args, kwargs = arguments
-    result = recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
+    trace_written = _Trace(torch, module) if trace_capture is not None else None
+    if trace_written is not None:
+        with trace_written:
+            result = recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
+    else:
+        result = recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
     kept = False
     try:
         written = [cast("Tensor", leaves[i]) for i in recording.arg_writes]
@@ -1919,6 +1994,8 @@ def _capture_call(
             current.wait_stream(capture_stream)
             notes.append(f"capture stream vs replay: {_sizes(torch, on_capture, out)}")
             notes.append(f"capture stream vs as written: {_sizes(torch, on_capture, result)}")
+            if trace_capture is not None and trace_written is not None:
+                notes.append(f"trace: {trace_capture.against(trace_written)}")
             why = f"{differs}; " + "; ".join(notes)
             recorder.diag.append(f"{_name(module)}: {why}")
             safeguard("replay_mismatch", f"{_name(module)}: {why}"[:900])
