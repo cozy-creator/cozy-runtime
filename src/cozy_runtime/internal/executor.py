@@ -774,11 +774,13 @@ def _serving(module: str, export: str, surface: Surface) -> _CallType:
     # Both are Struct classes: checked just above.
     request, result = cast("type[msgspec.Struct]", payload), cast("type[msgspec.Struct]", answer)
     fields = msgspec.structs.fields(request)
-    if any(field.name in slots for field in fields):
+    # Model choices and a `Files` input travel beside the request (TensorD puts files back).
+    beside = slots | ({surface.assets.parameter} if surface.assets is not None else set())
+    if any(field.name in beside for field in fields):
         request = msgspec.defstruct(
             request.__name__,
             # Request parameters' defaults are immutable scalars (`_wire_default`), never factories.
-            [(f.name, f.type, f.default) for f in fields if f.name not in slots],
+            [(f.name, f.type, f.default) for f in fields if f.name not in beside],
             module=module,
             kw_only=True,
             frozen=True,
@@ -795,8 +797,7 @@ def _serving(module: str, export: str, surface: Surface) -> _CallType:
     call = msgspec.defstruct(
         f"{export}Call", [("payload", request), ("models", models)], module=module, frozen=True
     )
-    assets = "" if surface.assets is None else surface.assets.parameter
-    return _CallType("", module, export, call, result, models=slots, assets_parameter=assets)
+    return _CallType(module, export, call, result, models=slots)
 
 
 # --------------------------------------------------------------------------- state

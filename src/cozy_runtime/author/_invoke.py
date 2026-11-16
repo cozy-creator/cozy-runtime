@@ -1062,8 +1062,11 @@ def _check_result_bounds(surface: Surface, result: object, attempt: Attempt) -> 
 
 
 def _fills(value: object, annotation: type) -> bool:
-    """A value of the declared type, or a file of its kind (a saved file in a `Latents` field)."""
+    """A value of the declared type, an int for a float (as Python takes one), or a file of its
+    kind (a saved file in a `Latents` field)."""
     if isinstance(value, annotation):
+        return True
+    if annotation is float and isinstance(value, int) and not isinstance(value, bool):
         return True
     return (
         isinstance(value, File) and issubclass(annotation, File) and value.kind == annotation.kind

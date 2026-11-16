@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import logging
 import math
@@ -98,12 +99,9 @@ class Operation[Q: msgspec.Struct, R: msgspec.Struct]:
     distribution: str
     module: str
     export: str
-    declaration: str
     request: type[Q]
     result: type[R]
     models: tuple[str, ...] = ()
-    assets_parameter: str = ""
-    wire_request: type[msgspec.Struct] | None = None
 
 
 # Only target/return typing differs: every target has the same mandatory request and selectors.
@@ -150,10 +148,9 @@ def call(  # type: ignore[explicit-any]  # injected handler parameters are not c
 ) -> PendingCall[object]:
     """Run a typed request as a managed child, returning its typed result.
 
-    Foreign operations use generated references. Registered functions of this package,
-    including private functions, and Runtime builtins can be named directly. A plain
-    function invocation remains local. Model selectors and granted Files are separate
-    typed inputs; request fields are supplied only by the request struct.
+    Another package's operation is a generated reference. Registered functions of this package,
+    private ones too, and Runtime builtins are named directly. A plain function call stays
+    local. Model choices (`models`) and a `Files` input (`assets`) travel beside the request.
     """
     if not isinstance(request, msgspec.Struct):
         raise ConformanceError("call requires a typed request struct", code="child_arguments")
@@ -169,25 +166,7 @@ def call(  # type: ignore[explicit-any]  # injected handler parameters are not c
                 "an operation takes its generated request", code="child_arguments"
             )
         module, name = target.module, target.export
-        model_type = msgspec.defstruct(
-            f"{name}Models",
-            [(slot, ModelChoice | None, None) for slot in target.models],
-            kw_only=True,
-        )
-        envelope = msgspec.defstruct(
-            f"{name}Call",
-            [("payload", target.wire_request or target.request), ("models", model_type)],
-            kw_only=True,
-        )
-        binding = _CallType(
-            target.declaration,
-            module,
-            name,
-            envelope,
-            target.result,
-            models=frozenset(target.models),
-            assets_parameter=target.assets_parameter,
-        )
+        binding = _operation_binding(target)
     else:
         module, name = getattr(target, "__module__", ""), getattr(target, "__name__", "")
         bound = broker.bindings.get((module, name))
@@ -198,10 +177,24 @@ def call(  # type: ignore[explicit-any]  # injected handler parameters are not c
         binding = bound
     if set(selected) - (binding.models or frozenset()):
         raise ConformanceError("a call names an unknown model slot", code="child_arguments")
-    if assets is not None and not binding.assets_parameter:
-        raise ConformanceError("this operation has no Files input", code="child_arguments")
     return broker.reserve(
         module, name, {"payload": request, "models": selected}, reference=binding, assets=assets
+    )
+
+
+@functools.cache
+def _operation_binding(target: Operation[msgspec.Struct, msgspec.Struct]) -> _CallType:
+    """A generated reference's wire types, built once per reference."""
+    models = msgspec.defstruct(
+        f"{target.export}Models",
+        [(slot, ModelChoice | None, None) for slot in target.models],
+        kw_only=True,
+    )
+    envelope = msgspec.defstruct(
+        f"{target.export}Call", [("payload", target.request), ("models", models)], kw_only=True
+    )
+    return _CallType(
+        target.module, target.export, envelope, target.result, models=frozenset(target.models)
     )
 
 
@@ -266,7 +259,6 @@ def prefetch[**P, R](
 
 @dataclass(frozen=True, slots=True)
 class _CallType:
-    interface_digest: str
     module: str
     export: str
     request: type[msgspec.Struct]
@@ -275,8 +267,6 @@ class _CallType:
     unavailable: str = ""
     #: The declared model slots, supplied separately from the typed request.
     models: frozenset[str] | None = None
-    #: The separately injected Files parameter, when the handler declares one.
-    assets_parameter: str = ""
 
 
 class PendingCall[R](Awaitable[R]):
@@ -460,10 +450,6 @@ class _Broker:
                 return _input_ref(value, ctx.request_id)
 
             wire = msgspec.to_builtins(dict(arguments), enc_hook=asset_value)
-            if binding.assets_parameter:
-                wire["payload"][binding.assets_parameter] = msgspec.to_builtins(
-                    assets if assets is not None else Files(), enc_hook=asset_value
-                )
             plain, ignored, moved = fit(binding.request, wire)
             row: tuple[str, dict[str, Scalar]]
             for change in moved:
@@ -498,6 +484,9 @@ class _Broker:
                     value.ref if isinstance(value, (File, Tree)) else asset_value(value)
                 ),
             )
+            if assets is not None:
+                # TensorD puts them in the callee's own `Files` parameter.
+                encoded["assets"] = msgspec.to_builtins(assets, enc_hook=asset_value)
         except (TypeError, ValueError, msgspec.ValidationError) as exc:
             raise ConformanceError(
                 "package call arguments do not match its interface", code="child_arguments"

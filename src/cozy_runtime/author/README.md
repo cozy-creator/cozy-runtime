@@ -58,23 +58,13 @@ def generate(ctx: Context, payload: Request, model: Flow, tel: Telemetry) -> Res
 - **Errors**: raise `InvalidRequest` (the request is wrong), `UnsupportedInput` (this model can't)
   or `OutputError` (the result is bad). Any other exception fails the run with its first line.
 
-## Calling another package without importing its implementation
+## Calling another package
 
-Keep managed-only dependencies in the standard `cozy-calls` optional extra in
-`pyproject.toml`, and lock them with the rest of the project:
-
-```toml
-[project.optional-dependencies]
-cozy-calls = ["example-child[cozy-calls]>=1"]
-```
-
-Generate ordinary Python declarations from that locked package's canonical interface:
+Depend on it as usual and lock it, then generate typed references from its locked interface:
 
 ```sh
 cozy-runtime calls example-child my_package/child_calls.py
 ```
-
-Then use the generated request and non-callable operation reference explicitly:
 
 ```python
 from cozy_runtime.author import call
@@ -83,18 +73,11 @@ from .child_calls import Request, generate
 result = await call(generate, Request(prompt="a lighthouse"))
 ```
 
-Model choices are passed in `models={"slot": ModelChoice(...)}`; returned media and
-`ChildCallError` retain
-their ordinary managed-call behavior. Regenerate declarations after changing the locked
-dependency. Ordinary implementation imports and local function calls remain ordinary Python.
-Each managed requirement requests its callee’s `cozy-calls` extra too, so ordinary wheel
-metadata and uv follow the managed dependency chain recursively. A child without that
-extra still supplies its ordinary dependencies. The platform prepares this closure for
-child execution separately from the caller.
-
-Python environments continue to expose the machine's shared Torch layer. Managed dependency
-separation removes the callee's implementation and its additional dependencies from the
-caller; it does not remove that existing platform layer or imply that available Torch was imported.
+`generate` is an `Operation[Request, Result]`: the callee's module, export, request and result
+types and model slots. Calling it never imports the callee. Model choices go in
+`models={"slot": ModelChoice(...)}`, a `Files` input in `assets=`. Describe checks each
+reference's request, result and model slots against the locked callee (its docs, labels and
+defaults don't matter) and refuses a stale one (`stale_call_reference`): regenerate it.
 
 ## What the Runtime does for you
 
