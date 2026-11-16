@@ -1778,7 +1778,8 @@ class _Trace:
                     except Exception as e:  # noqa: BLE001
                         meta += f" sdpa ? {type(e).__name__}"
                 first = next((t for t in torch.utils._pytree.tree_leaves(out) if isinstance(t, torch.Tensor)), None)
-                trace.ops.append((name, meta, None if first is None else trace._keep(first), []))
+                if first is not None and not name.endswith(("__get__", "__set__")):
+                    trace.ops.append((name, meta, trace._keep(first), []))
                 return out
 
         self.mode = _Ops()
@@ -1802,8 +1803,8 @@ class _Trace:
 
     def against(self, other: _Trace) -> str:
         """Where the capture's pass (`self`, its clones holding the replay) and the call as written (`other`) first
-        part: the first op whose name, inputs' dtypes and shapes, autocast or SDPA backend differ, and the first op
-        whose output differs, with its inputs compared and the ops before it."""
+        part. The as-written ops are found in the capture's by their first names (the capture may run more around
+        them); from each place they start, the first op whose metadata differs and the first whose output differs."""
         torch = self.torch
 
         def same(a: Tensor | None, b: Tensor | None) -> bool:
@@ -1818,24 +1819,37 @@ class _Trace:
                 return _sizes(torch, a, b)
             return "differs"
 
-        n = min(len(self.ops), len(other.ops))
-        meta = next((i for i in range(n) if self.ops[i][:2] != other.ops[i][:2]), None)
-        out = next((i for i in range(n) if not same(self.ops[i][2], other.ops[i][2])), None)
+        def short(name: str) -> str:
+            return name.rsplit(".", 1)[-1]
 
-        def show(i: int) -> str:
-            (na, ma, ta, sa), (nb, mb, tb, sb) = self.ops[i], other.ops[i]
-            before = " < ".join(self.ops[j][0] for j in range(i - 1, max(-1, i - 5), -1))
-            return f"op {i}: capture {na} [{ma}] / as written {nb} [{mb}]: output {size(ta, tb)}; before it: {before}"
-
-        parts = [f"ops {len(self.ops)} / {len(other.ops)}"]
-        parts.append(f"flags same" if self.flags == other.flags else f"flags capture [{self.flags}] / as written [{other.flags}]")
-        parts.append(f"first metadata difference: {show(meta)}" if meta is not None else "metadata equal")
-        if out is None:
-            parts.append("every output equal")
-        else:
-            later = sum(1 for i in range(out, n) if not same(self.ops[i][2], other.ops[i][2]))
-            parts.append(f"first differing output: {show(out)}; {later} of {n - out} outputs differ from there")
-        return "; ".join(parts)
+        an = [o[0] for o in self.ops]
+        bn = [o[0] for o in other.ops]
+        k = min(48, len(bn))
+        starts = [i for i in range(len(an) - k + 1) if an[i:i + k] == bn[:k]] if k else []
+        parts = [f"ops {len(an)} / {len(bn)}",
+                 "flags same" if self.flags == other.flags else f"flags capture [{self.flags}] / as written [{other.flags}]",
+                 f"as written starts at capture op {starts[:6]}"]
+        if not starts:
+            parts.append(f"capture head: {' '.join(short(n) for n in an[:40])}")
+            parts.append(f"as written head: {' '.join(short(n) for n in bn[:40])}")
+        for start in starts[:3]:
+            n = min(len(bn), len(an) - start)
+            meta = next((i for i in range(n) if self.ops[start + i][:2] != other.ops[i][:2]), None)
+            out = next((i for i in range(n) if not same(self.ops[start + i][2], other.ops[i][2])), None)
+            line = [f"from {start}: {n} ops compared"]
+            if meta is not None:
+                (na, ma, _, _), (nb, mb, _, _) = self.ops[start + meta], other.ops[meta]
+                line.append(f"first metadata difference at {meta}: capture {na} [{ma}] / as written {nb} [{mb}]")
+            if out is None:
+                line.append("every output equal")
+            else:
+                (na, ma, ta, _), (nb, mb, tb, _) = self.ops[start + out], other.ops[out]
+                before = " < ".join(f"{short(other.ops[j][0])} [{other.ops[j][1]}]" for j in range(out - 1, max(-1, out - 4), -1))
+                later = sum(1 for i in range(out, n) if not same(self.ops[start + i][2], other.ops[i][2]))
+                line.append(f"first differing output at {out}: capture {na} [{ma}] / as written {nb} [{mb}]: "
+                            f"{size(ta, tb)}; before it: {before}; {later} of {n - out} differ from there")
+            parts.append("; ".join(line))
+        return " | ".join(parts)
 
 
 def _sizes(torch: ModuleType, a: object, b: object) -> str:
