@@ -80,8 +80,11 @@ class ModelSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     components: tuple[str, ...] | msgspec.UnsetType = msgspec.UNSET
     #: a `Weights[M]` argument: raw checkpoint data, never constructed
     weights: bool = False
-    #: built, and its weights fetched, when the function first reads it (`on_demand=`)
+    #: built, and its weights fetched, when the function first reads it (`on_demand=`, or a
+    #: `needs=` rule)
     on_demand: bool = False
+    #: the CEL rule over `request` that says whether a request needs it (`needs=`); unset: always
+    needs: str | msgspec.UnsetType = msgspec.UNSET
 
     @property
     def parameter(self) -> str:
@@ -314,7 +317,8 @@ def model_slot(declared: Declaration, slot: Slot) -> dict[str, Json]:
     the precision tolerances, and the per-public-method component sets are the
     ComponentUseContracts. `default` is an unresolved release; the machine resolves it and
     picks its lane. `components` names the components the slot fetches: the function's own
-    `components=`, else its class's hints (`ModelSpec.selects`); absent means all."""
+    `components=`, else its class's hints (`ModelSpec.selects`); absent means all. `needs` is
+    its rule: a reader that evaluates none takes the slot as on demand."""
     spec, parameter = slot.spec, slot.parameter
     doc: dict[str, Json] = {
         "path": f"{declared.name}.models.{parameter}",
@@ -345,8 +349,10 @@ def model_slot(declared: Declaration, slot: Slot) -> dict[str, Json]:
         doc["placeable"] = sorted(spec.placeable)
     if slot.weights:
         doc["weights"] = True
-    if parameter in declared.model_on_demand:
+    if parameter in declared.deferred:
         doc["on_demand"] = True
+    if rule := declared.model_needs.get(parameter):
+        doc["needs"] = rule
     return doc
 
 

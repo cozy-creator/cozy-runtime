@@ -153,6 +153,7 @@ class Context:
     _tensorfs_output: Callable[[str, Derivation], Output] | None = field(default=None, repr=False)
     _tensorfs_adopt: Callable[[Output], ModelArtifact] | None = field(default=None, repr=False)
     _release_gpus: Callable[[], None] | None = field(default=None, repr=False)
+    _need: Callable[[str], None] | None = field(default=None, repr=False)
     _recipes: tuple[DeclaredRecipe, ...] = field(default=(), repr=False)
     _pause_stall_watch: Callable[[], AbstractContextManager[None]] | None = field(
         default=None, repr=False
@@ -213,6 +214,16 @@ class Context:
         """
         if self._release_gpus is not None:
             self._release_gpus()
+
+    def need(self, slot: str) -> None:
+        """Say this request will read the model argument `slot`, which its `needs=` rule (or
+        `on_demand=`) left for later: its weights come first in every download from now, while
+        the call goes on, and the first read builds it. For what only the run itself learns;
+        the machine notes it on the run, so a rule that keeps missing shows. A model already
+        built takes nothing."""
+        self.raise_if_cancelled()
+        if self._need is not None:
+            self._need(slot)
 
     @property
     def cancelled(self) -> bool:

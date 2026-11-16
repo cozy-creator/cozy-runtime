@@ -1022,10 +1022,22 @@ class _OnDemand:
     reads it. Until then the runtime's probes see no model, and a request that never reads it
     builds and fetches nothing of it."""
 
-    def __init__(self, build: Callable[[], Model[object] | _OnDemand]) -> None:
+    def __init__(
+        self,
+        build: Callable[[], Model[object] | _OnDemand],
+        need: Callable[[str], None] | None = None,
+    ) -> None:
         self._build = build
+        self._need = need
         self._model: Model[object] | _OnDemand | None = None
         self._lock = threading.Lock()
+
+    def _cozy_need(self, request_id: str) -> None:
+        """`ctx.need`: its weights asked of the machine now, for call `request_id`; its first
+        read still builds it. Nothing once it is built."""
+        if self._model is None and self._need is not None:
+            with contextlib.suppress(SeamError):
+                self._need(request_id)
 
     @property
     def _cozy_residency(self) -> Residency | None:
@@ -3343,7 +3355,9 @@ class Executor:
             if self._deferred(binding):
                 # Built inside the attempt that reads it.
                 build = functools.partial(self._build_on_demand, child, load)
-                child.models = {parameter: _OnDemand(build)}
+                child.models = {
+                    parameter: _OnDemand(build, functools.partial(self._needing, load))
+                }
                 children.append((parameter, child, {}))
                 continue
             # A group's followers are told which model of the set this is.
@@ -3521,15 +3535,25 @@ class Executor:
             cast("_CompositeResidency", self.residency).rows[parameter] = member.residency
         return member.models[parameter]
 
-    def _needing(self, load: Load) -> None:
+    def _needing(self, load: Load, request_id: str | None = None) -> None:
         """`load`'s models from TensorD, which fetches what of them isn't on disk before every other download and answers once
         it has (cl-966): the build then reads them from disk. A machine before it answers unavailable, and the build fetches
-        them itself as before."""
+        them itself as before. For call `request_id`, else the one running here."""
         context = CURRENT.get()
-        if context is None or _MODEL_NEED is None:
+        request_id = request_id or (context.request_id if context is not None else None)
+        if request_id is None or _MODEL_NEED is None:
             return
         for binding in load.models:
-            self._ask(_MODEL_NEED(manifest=binding.snapshot, components=list(binding.components)), context.request_id)
+            self._ask(_MODEL_NEED(manifest=binding.snapshot, components=list(binding.components)), request_id)
+
+    def _need_now(self, request_id: str, parameter: str) -> None:
+        """`ctx.need`: a model this call builds at its first read, asked of TensorD now on a thread of its own, so what of
+        it isn't on disk comes first in every download while the call goes on (cl-1103)."""
+        model = self.models.get(parameter)
+        if isinstance(model, _OnDemand):
+            threading.Thread(
+                target=model._cozy_need, args=(request_id,), name="model-need", daemon=True
+            ).start()
 
     def _discover_provisioned(self, application: str, path: str) -> None:
         """Import the installed release and bind its PackageInterface (at `path`). No elapsed-time
@@ -4008,6 +4032,7 @@ class Executor:
                         # An on-demand proxy stands for its model (`_OnDemand.__getattr__`).
                         models=cast("Mapping[str, Model[object]]", self.models),
                         unbound=_unbound(command),
+                        need=functools.partial(self._need_now, command.request_id),
                         recipes=cast("Discovered", self.discovered).recipes,  # started
                         progress=boundary,
                         # cr-012: the inputs the WORKER already fetched, verified and spooled.

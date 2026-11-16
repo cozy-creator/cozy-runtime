@@ -113,6 +113,36 @@ def model_on_demand(value: object) -> tuple[str, ...]:
     return tuple(value)
 
 
+#: The longest rule: one small boolean expression, never a program.
+MAX_NEEDS_RULE = 1024
+
+
+def model_needs(value: object) -> dict[str, str]:
+    """Copy a `needs=` declaration: a Model argument, or a function this one calls, -> the
+    CEL expression over `request` that says whether a request needs it."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or len(value) > 16:
+        raise ConformanceError(
+            "needs must map at most 16 Model arguments or called functions to rules",
+            code="model_needs",
+        )
+    out = {}
+    for name, rule in value.items():
+        if not isinstance(name, str) or not name.isidentifier():
+            raise ConformanceError(
+                "needs keys must be Model argument or function names", code="model_needs"
+            )
+        if not isinstance(rule, str) or not rule.strip() or len(rule) > MAX_NEEDS_RULE:
+            raise ConformanceError(
+                f"needs[{name!r}] must be one CEL expression over `request`, at most "
+                f"{MAX_NEEDS_RULE} characters",
+                code="model_needs",
+            )
+        out[name] = rule.strip()
+    return out
+
+
 def check_model_arguments(
     declared: Mapping[str, object], parameters: Sequence[str], *, what: str = "defaults"
 ) -> None:

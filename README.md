@@ -518,7 +518,7 @@ model — and it is what the end-to-end suite builds, installs and runs.
 one only its own package's calls run; `await call(target, request, models=..., assets=...)` runs either as its own job
 ([docs/managed-calls.md](docs/managed-calls.md)). Both take `weights=`, `accelerator=` (absent:
 the machine's GPU when the function has a constructed `Model` argument, else CPU), `preflight=`, `defaults=`,
-`components=`, `on_demand=` and `memoize=`. A writer (`weights=`) is never memoized
+`components=`, `on_demand=`, `needs=` and `memoize=`. A writer (`weights=`) is never memoized
 (`memoized_writer`); TensorFS derivation replay answers a repeat.
 
 **A tool is a struct plus a function** ([design/tools.md](https://github.com/cozy-creator/tracker/blob/master/design/tools.md)).
