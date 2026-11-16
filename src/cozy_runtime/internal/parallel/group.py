@@ -674,7 +674,7 @@ class RankGroup:
         self.path = os.path.join(self.directory, str(self.formations))
         self.store = rendezvous(torch, self.path, self.degree)
         done = threading.Event()
-        _watchers.thread(self._watch, "formation", (done, attempt)).start()
+        _watchers.thread(lambda: self._watch(done, attempt), "formation").start()
         try:
             pg = self._form(torch, again, exchange, formed)
         except Exception as exc:
