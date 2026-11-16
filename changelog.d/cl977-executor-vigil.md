@@ -1,1 +1,2 @@
 An executor hands TensorD its vigil (cl-977): after a device Start that asks for it, the Start reply carries a line to a native `~vigil` thread (TensorFS's, outside the GIL) that answers TensorD's hang watch with this process's own threads, which a host that denies ptrace (Yama `ptrace_scope` 2, no CAP_SYS_PTRACE) keeps TensorD from reading. Hello says `vigil: 1` when its TensorFS has one. An import-only parent starts none, so it still forks.
+The call pool's threads are named `call_<n>` in the kernel too, so TensorD's hang watch can tell the call's own threads from the rest.

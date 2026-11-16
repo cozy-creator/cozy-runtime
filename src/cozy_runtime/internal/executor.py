@@ -122,7 +122,7 @@ from cozy_runtime.accel import stepcache
 from cozy_runtime.accel.attention import _close as close_producer_states
 from cozy_runtime.accel.kernels import _SETS as KERNEL_SETS
 from cozy_runtime.accel.kernels import Launch, Plan, TritonKernels
-from cozy_runtime.author import _activity, _phases, _split
+from cozy_runtime.author import _activity, _phases, _split, _watchers
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._artifacts import ModelChoice
@@ -5588,7 +5588,7 @@ def serve(executor: Executor, channel: Channel) -> int:
     request_path.told = functools.partial(_waiting, channel)
     _phases.command = functools.partial(_command_teller, channel)
     # Runtime-owned workers, none before the first is needed.
-    pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=crash.arm)
+    pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=_call_thread)
     order = executor.order = _Order()
     idle = False
     while True:
@@ -5622,6 +5622,13 @@ def serve(executor: Executor, channel: Channel) -> int:
         if reply is None:
             return _shut(executor, channel)
         _answer(executor, channel, reply)
+
+
+def _call_thread() -> None:
+    """A call pool thread, named `call_<n>` in the kernel too: TensorD's hang watch tells the call's
+    own threads from the rest by it (cl-977)."""
+    _watchers.native_name(threading.current_thread().name)
+    crash.arm()
 
 
 def _answer(executor: Executor, channel: Channel, reply: Reply) -> None:
