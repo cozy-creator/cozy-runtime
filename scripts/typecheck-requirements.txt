@@ -45,7 +45,7 @@ safetensors==0.8.0
 setuptools==84.2.1
 shellingham==1.5.4
 sympy==1.14.0
-tensorfs @ https://github.com/cozy-creator/cozy-creator/releases/download/xs-198-tensorfs-0.27.0-95d567d3/tensorfs-0.27.0%2Bdev.g95d567d3-cp311-abi3-manylinux_2_28_x86_64.whl#sha256=650a72ddda60622966c0053129f61dd0270fe5df2c3cba21e1aa9887e6e56a2a
+tensorfs==0.25.0
 tokenizers==0.23.3
 torch @ https://download.pytorch.org/whl/cpu/torch-2.15.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl
 tqdm==4.70.1

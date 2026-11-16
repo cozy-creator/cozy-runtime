@@ -516,8 +516,8 @@ model — and it is what the end-to-end suite builds, installs and runs.
 
 **Registration (xs-040).** `@app.entrypoint` registers a public function and `@app.entrypoint(private=True)`
 one only its own package's calls run; `await call(target, request, models=..., assets=...)` runs either as its own job
-([docs/managed-calls.md](docs/managed-calls.md)). Both take `weights=`, `accelerator=` (False:
-CPU only; True or absent: the machine's GPU when it has one), `preflight=`, `defaults=`,
+([docs/managed-calls.md](docs/managed-calls.md)). Both take `weights=`, `accelerator=` (absent:
+the machine's GPU when the function has a constructed `Model` argument, else CPU), `preflight=`, `defaults=`,
 `components=`, `on_demand=` and `memoize=`. A writer (`weights=`) is never memoized
 (`memoized_writer`); TensorFS derivation replay answers a repeat.
 
