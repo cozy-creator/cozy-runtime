@@ -320,7 +320,8 @@ def bind(
         snapshot=prepared_snapshot or artifact.snapshot,
         variant=prepared_snapshot or artifact.variant,
         _selection_snapshot=artifact._selection_snapshot or artifact.snapshot,
-        config=ModelConfig(artifact.config.mapping(), tensor_dtypes=dtypes, tensor_shapes=shapes),
+        config=ModelConfig(artifact.config._data, tensor_dtypes=dtypes, tensor_shapes=shapes,
+                           absent=artifact.config._absent),
         _prepare=composer(graph, magnitudes),
         _adapters=graph.adapters,
     )

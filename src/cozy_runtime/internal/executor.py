@@ -2955,7 +2955,7 @@ class Executor:
             binding.view,
         )
         config_bytes = model_config.construction_config(config_checkpoint.configs())
-        config_document = canonical.parse_canonical(config_bytes)
+        config_document = {} if config_bytes is None else canonical.parse_canonical(config_bytes)
         if not isinstance(config_document, dict):
             raise RuntimeError("the CozyTensors construction config is not an object")
         stage("construction_config")
@@ -3032,7 +3032,7 @@ class Executor:
         artifact = Artifact(
             reference.snapshot,
             tensor_schema_of(rows),
-            Config(config_document, "model.config"),
+            Config(config_document, "model.config", absent=config_bytes is None),
             assets=config_checkpoint.assets(),
             # CUSTODY is a BINDING fact: canonical refuses a serve-time extra key, local
             # tiers it (§1.1).
