@@ -2071,7 +2071,11 @@ def _operation(reader: Reader, found: Assigned) -> Reference | None:
     keywords = {kw.arg: kw.value for kw in node.keywords}
     if set(keywords) - {"distribution", "module", "export", "request", "result", "models"}:
         named = keywords.get("distribution")
-        dist = named.value if isinstance(named, ast.Constant) else "<distribution>"
+        dist = (
+            named.value
+            if isinstance(named, ast.Constant) and isinstance(named.value, str)
+            else "<distribution>"
+        )
         reader.refuse(
             found.module,
             node,
