@@ -2315,7 +2315,13 @@ def _queue(
     placed: _Placed | None,
 ) -> None:
     """A new signature waits for an idle period to record it (`capture_idle`), with the plain
-    context variables its call ran under (`_context`), which the recording runs under too."""
+    context variables its call ran under (`_context`), which the recording runs under too; unless
+    seeded inputs can't stand in for its own (`_content_inputs`, cr-300): then only a call records
+    it, checked on its real inputs."""
+    if why := _content_inputs(torch, leaves):
+        with recorder.lock:
+            recorder.idle_failed.setdefault(key, why)
+        return
     layout: list[object] = [
         _Leaf(tuple(v.shape), v.stride(), v.dtype, v.device) if isinstance(v, torch.Tensor) else v
         for v in leaves
@@ -2338,6 +2344,23 @@ def _queue(
             torch, weakref.ref(module), call, key, spec, layout, context
         )
     IDLE.add(pending)
+
+
+def _content_inputs(torch: ModuleType, leaves: list[object]) -> str:
+    """Why an idle recording can't check this signature ("" when it can): an idle recording
+    replays on seeded inputs (integers zero), so a call whose path depends on its token ids would
+    pass that check and replay unchecked on real ones. Anima's text encoder did: its graph,
+    recorded at idle, served outputs 2.85% (relative L2) from the call as written on real ids
+    (cr-300, pod-session 43795665114)."""
+    for leaf in leaves:
+        if (
+            isinstance(leaf, torch.Tensor)
+            and leaf.dim() >= 2
+            and not (leaf.is_floating_point() or leaf.is_complex())
+            and leaf.dtype != torch.bool
+        ):
+            return f"integer input {tuple(leaf.shape)} (token ids): seeded inputs can't check it"
+    return ""
 
 
 #: `_replay`'s answer when the call runs as written

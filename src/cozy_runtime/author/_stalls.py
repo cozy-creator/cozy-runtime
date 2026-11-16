@@ -18,6 +18,8 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from types import FrameType
 
+from cozy_runtime.author import _watchers
+
 PERIOD = 0.1
 FLOOR_MS = 1000.0
 _LIBRARY = frozenset(sys.stdlib_module_names) | {"torch"}
@@ -45,7 +47,7 @@ class Watch:
         self.counts: Counter[str] = Counter()
         self.lock = threading.RLock()
         self.done = threading.Event()
-        threading.Thread(target=self._run, name="cozy-host-stalls", daemon=True).start()
+        _watchers.thread(self._run, "host-stalls").start()
 
     def _run(self) -> None:
         while not self.done.wait(PERIOD) and self.alive():
