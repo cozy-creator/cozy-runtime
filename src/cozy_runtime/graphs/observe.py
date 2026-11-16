@@ -12,7 +12,10 @@ caller's tensor after each replay (the graph wrote the copy), and one into a for
 the call as written each start from the same state. A kernel launched outside torch's
 dispatcher (a ctypes or Triton launch) is not seen: only the capture's one check, replay
 against the call as written, sees what it does. An op that reads a host tensor (a pinned copy
-in, a CPU scalar) is refused: the graph would replay the value it read at capture.
+in, a CPU scalar) is refused: the graph would replay the value it read at capture. A value the
+call reads from the device (`.item()`, `bool()` of a CUDA tensor) can't be read while capturing:
+it is answered with the value its call as written read (`reads`), and the tensor it read is kept,
+so each replay can check it still has that value.
 """
 
 from __future__ import annotations
@@ -40,10 +43,21 @@ RETAINED = -4
 WRITE_LIMIT = 256 << 20
 
 
+class HostRead(Exception):
+    """A capture read a value from the device with none to answer it: its call as written runs
+    first, its reads kept (`reads`), and the capture is answered with them."""
+
+
 class Observed:
     """A captured call's foreign storages, the static inputs it wrote and its foreign writes."""
 
-    def __init__(self) -> None:
+    def __init__(self, answers: Sequence[object] | None = None) -> None:
+        #: the values its call as written read from the device, in order (`reads`); None: none
+        self.answers = answers
+        #: each tensor whose value the capture read, answered from `answers` in order
+        self.read: list[Tensor] = []
+        #: a read it found no value for (a library that swallowed the `HostRead`)
+        self.unanswered = ""
         self.foreign: list[StorageWeakRef] = []
         self.arg_writes: set[int] = set()
         #: each foreign view written in place, once by its layout (held until its check ends)
@@ -55,6 +69,15 @@ class Observed:
         #: the ops that read a host tensor: a graph replays the value it had at capture
         self.host: set[str] = set()
 
+    def answer(self, tensor: Tensor) -> object:
+        """The value the call as written read at this read, or `HostRead`."""
+        at = len(self.read)
+        if self.answers is None or at >= len(self.answers):
+            self.unanswered = f"read {at + 1} of a {tuple(tensor.shape)} {tensor.dtype}"
+            raise HostRead(self.unanswered)
+        self.read.append(tensor)
+        return self.answers[at]
+
     def refusal(self) -> str:
         """Why the capture can't be kept ("" when it can)."""
         if self.weight_writes:
@@ -62,6 +85,16 @@ class Observed:
         if self.host:
             ops = ", ".join(sorted(self.host)[:3])
             return f"it reads host tensors, which a replay would freeze ({ops})"
+        if self.unanswered:
+            return f"it reads a value from the device with no answer ({self.unanswered})"
+        if self.answers is not None and len(self.read) != len(self.answers):
+            return (
+                f"it read {len(self.read)} values from the device, its call as written "
+                f"{len(self.answers)}"
+            )
+        if self.read and (self.arg_writes or self.writes):
+            # Its call as written ran first (`reads`), so the replay would start from what it wrote.
+            return "it reads values from the device and writes its inputs or state outside the call"
         written = sum(t.nbytes for t in self.writes.values())
         if written > WRITE_LIMIT:
             return f"it writes {written / (1 << 20):.0f} MiB of state outside the call"
@@ -94,19 +127,46 @@ def merge(spans: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+def reads(torch: ModuleType) -> tuple[object, list[object]]:
+    """A dispatch mode over a call as written and the values it reads from the device, in
+    order: what its capture's own reads are answered with (`observer`'s `answers`)."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    values: list[object] = []
+    scalar, tensor_type = torch.ops.aten._local_scalar_dense.default, torch.Tensor
+
+    class Reads(TorchDispatchMode):
+        def __torch_dispatch__(
+            self,
+            func: object,
+            types: tuple[type, ...],
+            args: tuple[object, ...] = (),
+            kwargs: dict[str, object] | None = None,
+        ) -> object:
+            out = func(*args, **(kwargs or {}))  # type: ignore[operator]  # an OpOverload
+            if func is scalar and isinstance(args[0], tensor_type) and args[0].is_cuda:
+                values.append(out)
+            return out
+
+    return Reads(), values  # type: ignore[no-untyped-call]  # TorchDispatchMode's __init__
+
+
 def observer(
     torch: ModuleType,
     statics: Sequence[Tensor | None],
     weights: list[tuple[int, int]],
     retained: Sequence[tuple[int, int, object]] = (),
+    answers: Sequence[object] | None = None,
 ) -> tuple[object, Observed]:
     """A dispatch mode for one capture over `statics` (by position), `weights` and `retained`
-    states (address ranges), and what it observes."""
+    states (address ranges), and what it observes. Its reads from the device are answered from
+    `answers`, its call as written's (`reads`); with none, the first raises `HostRead`."""
     from torch.multiprocessing.reductions import StorageWeakRef
     from torch.utils._python_dispatch import TorchDispatchMode
     from torch.utils._pytree import tree_leaves
 
-    seen = Observed()
+    seen = Observed(answers)
+    scalar = torch.ops.aten._local_scalar_dense.default
     kind: dict[int, int] = {}
     for index, static in enumerate(statics):
         if static is not None and (ptr := static.untyped_storage().data_ptr()):
@@ -155,6 +215,8 @@ def observer(
             kwargs: dict[str, object] | None = None,
         ) -> object:
             kwargs = kwargs or {}
+            if func is scalar and isinstance(args[0], tensor_type) and args[0].is_cuda:
+                return seen.answer(args[0])  # reading it would end the capture
             if any(
                 isinstance(v, tensor_type) and v.device.type == "cpu"
                 for v in tree_leaves((args, kwargs))
