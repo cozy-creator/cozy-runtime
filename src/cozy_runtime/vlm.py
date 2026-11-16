@@ -376,8 +376,9 @@ def processor(
     extra = held("processor_config.json") or (given if "image_processor" in given else {})
     images = dict(extra.pop("image_processor", None) or held("preprocessor_config.json") or given)
     video = dict(extra.pop("video_processor", None) or held("video_preprocessor_config.json"))
+    audio = dict(extra.pop("feature_extractor", None) or {})
     named = extra.pop("processor_class", None) or images.get("processor_class", "Qwen3VLProcessor")
-    for settings in (images, video):
+    for settings in (images, video, audio):
         settings.pop("processor_class", None)
     for key, value in (image or {}).items():
         if value is None:
@@ -387,6 +388,9 @@ def processor(
     if video:
         kind = video.pop("video_processor_type", "Qwen3VLVideoProcessor")
         extra["video_processor"] = getattr(transformers, kind)(**video)
+    if audio:  # Gemma 4 hears too: its feature extractor, as `processor_config.json` names it
+        kind = audio.pop("feature_extractor_type")
+        extra["feature_extractor"] = getattr(transformers, kind)(**audio)
     kind = images.pop("image_processor_type", "Qwen2VLImageProcessor")
     image_processor = getattr(transformers, kind)(**images)
     tokenizer_config: dict[str, Any] = json.loads(read("tokenizer_config.json"))  # type: ignore[explicit-any]  # as `held`'s
