@@ -1728,12 +1728,14 @@ class _Trace:
     For the capture, only the capture's own pass (`capturing`): its clones are in the graph and hold the replay's
     values after the check's replay. Compared op by op against the call as written (`against`)."""
 
-    _SMALL = 1 << 18
+    _SMALL = 1 << 19
+    _KEEP_BYTES = 1 << 30
 
     def __init__(self, torch: ModuleType, module: Module, capturing: bool) -> None:
         self.torch, self.module, self.capturing = torch, module, capturing
         self.ops: list[tuple[str, str, Tensor | None, list[Tensor]]] = []
         self.flags = ""
+        self.kept = 0
         self.mode: object | None = None
 
     def _flags(self) -> str:
@@ -1776,14 +1778,24 @@ class _Trace:
                     except Exception as e:  # noqa: BLE001
                         meta += f" sdpa ? {type(e).__name__}"
                 first = next((t for t in torch.utils._pytree.tree_leaves(out) if isinstance(t, torch.Tensor)), None)
-                small = [a.detach().clone() for a in ins
-                         if not isinstance(a, torch.nn.Parameter) and a.numel() <= _Trace._SMALL][:3]
-                trace.ops.append((name, meta, None if first is None else first.detach().clone(), small))
+                trace.ops.append((name, meta, None if first is None else trace._keep(first), []))
                 return out
 
         self.mode = _Ops()
         self.mode.__enter__()  # type: ignore[attr-defined]
         return self
+
+    def _keep(self, t: Tensor) -> Tensor:
+        """A clone of a small output (an activation), else its sum, absolute sum and sum of squares (a weight or
+        a workspace), within a budget: what a pass keeps stays far under the card."""
+        torch = self.torch
+        t = t.detach()
+        small = t.numel() <= self._SMALL and not isinstance(t, torch.nn.Parameter)
+        if small and self.kept + t.numel() * t.element_size() <= self._KEEP_BYTES:
+            self.kept += t.numel() * t.element_size()
+            return t.clone()
+        x = t.double() if (t.is_floating_point() or t.is_complex()) else t.to(torch.float64)
+        return torch.stack([x.sum(), x.abs().sum(), (x * x).sum()])
 
     def __exit__(self, *exc: object) -> None:
         self.mode.__exit__(*exc)  # type: ignore[attr-defined]
@@ -1812,10 +1824,8 @@ class _Trace:
 
         def show(i: int) -> str:
             (na, ma, ta, sa), (nb, mb, tb, sb) = self.ops[i], other.ops[i]
-            ins = ", ".join(size(x, y) for x, y in zip(sa, sb, strict=False)) or "none small"
             before = " < ".join(self.ops[j][0] for j in range(i - 1, max(-1, i - 5), -1))
-            return (f"op {i}: capture {na} [{ma}] / as written {nb} [{mb}]: output {size(ta, tb)}; small inputs "
-                    f"{ins}; before it: {before}")
+            return f"op {i}: capture {na} [{ma}] / as written {nb} [{mb}]: output {size(ta, tb)}; before it: {before}"
 
         parts = [f"ops {len(self.ops)} / {len(other.ops)}"]
         parts.append(f"flags same" if self.flags == other.flags else f"flags capture [{self.flags}] / as written [{other.flags}]")
@@ -2043,7 +2053,8 @@ def _capture_call(
             why = f"{differs}; " + "; ".join(notes)
             recorder.diag.append(f"{_name(module)}: {why}")
             safeguard("replay_mismatch", f"{_name(module)}: {why}"[:900])
-            differs = ""  # kept: later replays serve and are audited by size
+            if trace_capture is None:
+                differs = ""  # kept: later replays serve and are audited by size
         if differs:
             if not written:  # a second run would write its caller's inputs twice
                 served = [t.clone() for t in recording.writes]
