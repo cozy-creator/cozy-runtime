@@ -1,10 +1,15 @@
 """Qwen-VL vision-language models served from their as-is upload: one request (`AskRequest`), one
 result (`AskResult`), the model class (`VisionLM`) and the call (`ask`) a package's entrypoint
-returns. Qwen3.5 and Qwen3.6, dense and mixture-of-experts, load through it.
+returns; and a box of words (`TextBox`, `TextResult`) a tool writes (`write`). Qwen3.5 and Qwen3.6,
+dense and mixture-of-experts, load through it.
 
     @app.entrypoint(defaults={"model": "qwen3.6-35b-a3b@0.1.0"}, memoize=True)
     def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> AskResult:
         return vlm.ask(ctx, payload, model, tel)
+
+    @app.tool(label="Write", named="text", defaults={"model": ...}, memoize=True)
+    def write(ctx: Context, payload: TextBox, model: VisionLM, tel: Telemetry) -> TextResult:
+        return vlm.write(ctx, payload, model, tel)
 
 The construction config is the repository's `config.json`; the tokenizer, processor and chat
 template are the checkpoint's assets; parameters load in their stored dtype. Fused experts are
@@ -14,9 +19,10 @@ split into per-expert blocks (`moe.split`): the checkpoint stores them per exper
 from __future__ import annotations
 
 import json
+import secrets
 import sys
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 
@@ -45,6 +51,7 @@ from cozy_runtime.author import (
     Loader,
     Model,
     ModelAssets,
+    Seed,
     Serving,
     Telemetry,
     UnsupportedInput,
@@ -52,7 +59,9 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._model import WARNINGS
-from cozy_runtime.fields import FileBound
+from cozy_runtime.author._tool import spoken
+from cozy_runtime.fields import MENTION, Advanced, FileBound, Prompt, Video
+from cozy_runtime.fields import Image as Picture
 from cozy_runtime.media import DecodedVideoFrame, ImageFile, VideoFile
 
 if TYPE_CHECKING:
@@ -133,6 +142,30 @@ class AskResult(msgspec.Struct):
     texts: list[str]
 
 
+class TextBox(msgspec.Struct, kw_only=True):
+    """A box of words a model writes: one answer to its instructions (`write`)."""
+
+    #: What to write, and the pictures and videos it mentions, each shown where first mentioned.
+    instructions: Prompt[Picture | Video] = Prompt()
+    #: Think before answering (`VisionLM._chat`); only the answer is the box's (`VisionLM.ask`).
+    thinking: Annotated[bool, Advanced()] = False
+    #: The system turn (`VisionLM._chat`).
+    system: Annotated[Text, Advanced()] = ""
+    #: `lm.generate`'s `max_new_tokens`.
+    max_tokens: Annotated[int, msgspec.Meta(ge=1, le=16384), Advanced()] = 1024
+    #: `lm.generate`'s sampling. The defaults are Qwen's for instruct VL tasks (its model cards);
+    #: 0 answers greedily.
+    temperature: Annotated[float, msgspec.Meta(ge=0, le=2), Advanced()] = 0.7
+    top_p: Annotated[float, msgspec.Meta(gt=0, le=1), Advanced()] = 0.8
+    presence_penalty: Annotated[float, msgspec.Meta(ge=-2, le=2), Advanced()] = 1.5
+    #: `lm.generate`'s draw; unset, a new one each render.
+    seed: Annotated[Seed | None, Advanced()] = None
+
+
+class TextResult(msgspec.Struct):
+    text: str
+
+
 @dataclass(frozen=True)
 class Watched:
     """A video as the model watches it: its frames and the second each shows."""
@@ -143,11 +176,9 @@ class Watched:
 
 @dataclass(frozen=True)
 class Question:
-    """One single-turn question: its text after its images and videos."""
+    """One single-turn question: its text, pictures and videos in the order the model reads them."""
 
-    text: str
-    images: list[Image] = field(default_factory=list)
-    videos: list[Watched] = field(default_factory=list)
+    parts: Sequence[str | Image | Watched]
 
 
 def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> AskResult:
@@ -158,6 +189,55 @@ def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> A
     prompts = payload.prompts or [AskPrompt(payload.prompt, payload.images, payload.videos)]
     if not prompts[0].text:
         raise InvalidRequest("prompt is empty", code="ask_prompts")
+    return AskResult(
+        _answers([[*p.images, *p.videos, p.text] for p in prompts], payload, model, tel)
+    )
+
+
+def write(ctx: Context, payload: TextBox, model: VisionLM, tel: Telemetry) -> TextResult:
+    """The box's words: its instructions answered as one question, each picture or video it
+    mentions shown right after its first mention (Qwen-VL's chat template takes them anywhere)."""
+    ctx.raise_if_cancelled()
+    if not payload.instructions.text.strip():
+        raise InvalidRequest("instructions are empty", code="ask_prompts")
+    asked = AskRequest(
+        system=payload.system,
+        thinking=payload.thinking,
+        max_tokens=payload.max_tokens,
+        temperature=payload.temperature,
+        top_p=payload.top_p,
+        presence_penalty=payload.presence_penalty,
+        seed=secrets.randbits(53) if payload.seed is None else payload.seed,
+    )
+    (text,) = _answers([_parts(payload.instructions)], asked, model, tel)
+    return TextResult(text)
+
+
+def _parts(prompt: Prompt[Picture | Video]) -> list[str | ImageFile | VideoFile]:
+    """The prompt's text, mentions as the model reads them (`spoken`), each reference's file right
+    after its first mention."""
+    parts: list[str | ImageFile | VideoFile] = []
+    shown: set[str] = set()
+    at = 0
+    for found in MENTION.finditer(prompt.text):
+        key = found[1]
+        if key in shown or key not in prompt.references:
+            continue
+        shown.add(key)
+        parts += [spoken(prompt.text[at : found.end()]), prompt.references[key].file]
+        at = found.end()
+    parts.append(spoken(prompt.text[at:]))
+    return [part for part in parts if part != ""]
+
+
+def _answers(
+    questions: list[list[str | ImageFile | VideoFile]],
+    payload: AskRequest,
+    model: VisionLM,
+    tel: Telemetry,
+) -> list[str]:
+    """Each question's pictures read and videos watched as `payload` says, then all answered in
+    one pass."""
     video = model.processor.video_processor
     fps = payload.fps or float(video.fps)
     lo, hi = (
@@ -167,16 +247,17 @@ def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> A
     if lo > hi:
         tel.log(f"min_frames {lo} is above max_frames {hi}: swapped", level="warning")
         lo, hi = hi, lo
-    questions = []
+
+    def read(part: str | ImageFile | VideoFile) -> str | Image | Watched:
+        if isinstance(part, VideoFile):
+            return watch(part, fps, (lo, hi), payload.max_edge, payload.video_end)
+        return part.read() if isinstance(part, ImageFile) else part
+
     with tel.stage("reading"):
-        for p in prompts:
-            watched = [
-                watch(v, fps, (lo, hi), payload.max_edge, payload.video_end) for v in p.videos
-            ]
-            questions.append(Question(p.text, [image.read() for image in p.images], watched))
+        read_questions = [Question([read(part) for part in question]) for question in questions]
     with tel.stage("answering"):
-        texts = model.ask(
-            questions,
+        return model.ask(
+            read_questions,
             system=payload.system,
             thinking=payload.thinking,
             stop=list(payload.stop),
@@ -187,7 +268,6 @@ def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> A
             seed=payload.seed,
             progress=lambda tokens: tel._tokens(tokens, payload.max_tokens, stage="answering"),
         )
-    return AskResult(texts)
 
 
 def watch(
@@ -393,8 +473,9 @@ class VisionLM(Model[Pipeline]):
         before its first `stop`; with `thinking`, only what follows the thought is the answer,
         and a thought `max_new_tokens` cut short is returned as it stands, with a run warning."""
         texts = [self._chat(question, system, thinking) for question in questions]
-        images = [image for question in questions for image in question.images]
-        videos = [video for question in questions for video in question.videos]
+        parts = [part for question in questions for part in question.parts]
+        images = [part for part in parts if isinstance(part, Image)]
+        videos = [part for part in parts if isinstance(part, Watched)]
         kwargs: dict[str, object] = {"images": images} if images else {}
         if videos:
             # The processor stamps a block with frame index / fps: millisecond indices keep seconds.
@@ -441,9 +522,10 @@ class VisionLM(Model[Pipeline]):
 
     def _chat(self, question: Question, system: str, thinking: bool) -> str:
         content = [
-            *({"type": "image"} for _ in question.images),
-            *({"type": "video"} for _ in question.videos),
-            {"type": "text", "text": question.text},
+            {"type": "text", "text": part}
+            if isinstance(part, str)
+            else {"type": "video" if isinstance(part, Watched) else "image"}
+            for part in question.parts
         ]
         messages = [{"role": "system", "content": system}] if system else []
         text: str = self.processor.apply_chat_template(
