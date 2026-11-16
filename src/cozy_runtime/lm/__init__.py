@@ -742,10 +742,10 @@ def _unsupported(model: PreTrainedModel) -> str:
     if attention not in ("sdpa", "eager"):
         return f"attention {attention!r} (SDPA and eager are served)"
     types, _ = get_layer_types_and_kwargs(text)
-    other = sorted(set(types) - {"full_attention", "linear_attention"})
+    other = sorted(set(types) - {*_ATTENTION, "linear_attention"})
     if other:
         return f"layer types {other}"
-    if why := _shapes(text)[1]:
+    if why := _shapes(model)[1]:
         return why
     extras = [
         name
@@ -766,20 +766,32 @@ _DELTA_NET = (
 )
 
 
-def _shapes(text: PreTrainedConfig) -> tuple[list[_Shape], str]:
-    """Each cache layer's state for one row, from the config alone, before any forward: a
-    full-attention layer's `("keys", heads, key width, value width)`, a gated delta net's
-    `("state", (conv channels, kernel), (heads, key width, value width))`. "" or why not."""
+#: Attention layer types whose keys the engine keeps (`_Keys`): a sliding layer keeps all of its
+#: keys too, and its step's mask closes those more than its window behind (`_Engine._masks`).
+_ATTENTION = ("full_attention", "sliding_attention")
+
+
+def _shapes(model: torch.nn.Module) -> tuple[list[_Shape], str]:
+    """Each cache layer's state for one row, before any forward: an attention layer's
+    `("keys", heads, key width, value width)`, its own attention module's (Gemma 4's widths and
+    heads differ by layer type), a gated delta net's `("state", (conv channels, kernel), (heads,
+    key width, value width))` from the config. "" or why not."""
+    text = cast("PreTrainedModel", model).config.get_text_config(decoder=True)
     types, kwargs = get_layer_types_and_kwargs(text)
     if isinstance(kwargs, dict):  # type: ignore[unreachable]  # before 5.19, a dict
         kwargs = [kwargs] * len(types)  # type: ignore[unreachable]  # before 5.19, a dict
-    heads = getattr(text, "num_key_value_heads", None) or text.num_attention_heads
-    width = getattr(text, "head_dim", None) or text.hidden_size // text.num_attention_heads
+    decoder = getattr(_lm(cast("PreTrainedModel", model)).get_decoder(), "layers", None)
     linear = [getattr(text, f"linear_{name}", None) for name in _DELTA_NET]
     layers: list[_Shape] = []
-    for kind, extra in zip(types, kwargs, strict=True):
-        if kind == "full_attention":
-            layers.append(("keys", int(heads), int(width), int(width)))
+    for i, (kind, extra) in enumerate(zip(types, kwargs, strict=True)):
+        if kind in _ATTENTION:
+            attention = getattr(decoder[i], "self_attn", None) if decoder is not None else None
+            width = getattr(attention, "head_dim", None)
+            groups = getattr(attention, "num_key_value_groups", None)
+            if not isinstance(width, int) or not isinstance(groups, int):
+                return [], f"layer {i}'s attention states no head_dim and num_key_value_groups"
+            heads = int(text.num_attention_heads) // groups
+            layers.append(("keys", heads, width, width))
         elif None in linear or extra.get("number_of_states", 1) != 1:
             return [], "its linear-attention state is not a gated delta net's (Qwen3-Next, Qwen3.5)"
         else:
@@ -1545,7 +1557,7 @@ class _StaticCache(Cache):
         if isinstance(kwargs, dict):  # type: ignore[unreachable]  # before 5.19, one set for all
             kwargs = [kwargs] * len(types)  # type: ignore[unreachable]  # before 5.19, a dict
         layers: list[CacheLayerMixin | LinearAttentionCacheLayerMixin] = [
-            _Keys(self.size, capacity, rows) if kind == "full_attention" else _State(**extra)
+            _Keys(self.size, capacity, rows) if kind in _ATTENTION else _State(**extra)
             for kind, extra in zip(types, kwargs, strict=True)
         ]
         super().__init__(layers=layers)
@@ -1745,6 +1757,9 @@ class _Engine:
         self.text = model.config.get_text_config(decoder=True)
         parameters = set(inspect.signature(model.forward).parameters)
         self.keep, self.positional = "logits_to_keep" in parameters, "position_ids" in parameters
+        types, _ = get_layer_types_and_kwargs(self.text)
+        #: a sliding layer's window (0: none slides): its keys more than this far behind are masked
+        self.slide = int(self.text.sliding_window) if "sliding_attention" in types else 0
         self.cond = threading.Condition(threading.RLock())
         self.pending: deque[_Request] = deque()
         #: calls taken from `pending` that the driver is prefilling or splicing
@@ -2549,7 +2564,7 @@ class _Engine:
         """What `size` slots of `capacity` positions hold, from the config alone (`_shapes`),
         each tensor as (shape, dtype, fill): every cache layer's, the head's keys, the rest."""
         dtype, long, f32 = self.model.dtype, torch.long, torch.float32
-        shapes = _shapes(self.text)[0]
+        shapes = _shapes(self.model)[0]
         layers: list[list[_Spec]] = []
         for shape in shapes:
             if shape[0] == "keys":
@@ -3194,14 +3209,29 @@ class _Engine:
         self.flag[:size].copy_(done, non_blocking=True)
         return live
 
+    def _masks(
+        self, mask: torch.Tensor, first: torch.Tensor
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        """`mask` (`[rows, 1, queries, keys]`, the queries at positions `first`, `first` + 1, ...)
+        as the model's masks by layer type when a layer slides (Transformers' own form, which its
+        forward takes as given): full attention's, and a sliding layer's with each query's keys at
+        or before its position less the window closed."""
+        if not self.slide:
+            return mask
+        keys = torch.arange(mask.shape[-1], device=mask.device)
+        queries = first[:, None] + torch.arange(mask.shape[-2], device=mask.device)
+        far = keys[None, None, :] <= (queries - self.slide)[..., None]
+        sliding = mask.masked_fill(far[:, None], self.closed)
+        return {"full_attention": mask, "sliding_attention": sliding}
+
     def _step(self, size: int) -> None:
         """One token a row: attend to the window, write the row's keys at its length, select."""
         view, window_ = self._view(size), _set(self.cache).window
         length = self.length[:size]
         self.mask[:size].scatter_(3, length.view(size, 1, 1, 1), self.open)
-        kwargs: dict[str, torch.Tensor | _StaticCache | bool | int] = {
+        kwargs: dict[str, torch.Tensor | _StaticCache | bool | int | dict[str, torch.Tensor]] = {
             "input_ids": self.ids[:size],
-            "attention_mask": self.mask[:size, ..., :window_],
+            "attention_mask": self._masks(self.mask[:size, ..., :window_], length),
             "past_key_values": view,
             "use_cache": True,
             "return_dict": True,
@@ -3282,9 +3312,9 @@ class _Engine:
             keys[None, None] <= (L + steps[None])[..., None]
         )
         mask = torch.where(open_[:, None], self.open, self.mask[:size, ..., :w])
-        kwargs: dict[str, torch.Tensor | _StaticCache | bool | int] = {
+        kwargs: dict[str, torch.Tensor | _StaticCache | bool | int | dict[str, torch.Tensor]] = {
             "input_ids": torch.cat([self.ids[:size], drafted], dim=1),
-            "attention_mask": mask,
+            "attention_mask": self._masks(mask, length),
             "past_key_values": view,
             "use_cache": True,
             "return_dict": True,
