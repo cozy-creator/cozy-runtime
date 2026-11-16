@@ -345,8 +345,8 @@ _OPEN_MAX = 10240
 
 
 class CallBindings(Mapping[tuple[str, str], _CallType]):
-    """Each callable an attempt may call, by (module, export). Another package's function is bound
-    from its own code at its first call, so a dependency nothing calls is never imported."""
+    """Admitted identities, with function bindings only for this package and Runtime builtins.
+    Foreign calls supply generated declarations and never import their implementation."""
 
     def __init__(
         self, bound: dict[tuple[str, str], _CallType], installed: Collection[tuple[str, str]]
@@ -358,19 +358,11 @@ class CallBindings(Mapping[tuple[str, str], _CallType]):
         if binding is None:
             if key not in self._installed:
                 raise KeyError(key)
-            module, export = key
-            try:
-                function = getattr(importlib.import_module(module), export, None)
-            except ImportError as exc:
-                raise CapabilityError(
-                    f"{module}:{export} can't be imported here: {exc}", code="child_interface"
-                ) from exc
-            if not callable(function):
-                raise CapabilityError(
-                    f"{module}:{export} is not installed in this environment",
-                    code="child_interface",
-                )
-            binding = self._bound[key] = _serving(module, export, analyze(function, name=export))
+            raise CapabilityError(
+                f"{key[0]}:{key[1]} is another package's function: call its generated reference "
+                "(`cozy-runtime calls <distribution> <file.py>`)",
+                code="child_reference_required",
+            )
         return binding
 
     def __iter__(self) -> Iterator[tuple[str, str]]:
@@ -480,8 +472,7 @@ def _scratch(command: Invoke) -> Path | None:
 
 
 def _call_store(command: Invoke) -> Path | None:
-    """The TensorFS store the call's own checkpoints are read from and written to (its sources,
-    its weights outputs); none: the executor's."""
+    """The TensorFS store this call writes its weights outputs into; none: the executor's."""
     value = getattr(command, "store", None)
     return Path(value) if value else None
 
@@ -787,8 +778,7 @@ def _granted(input_id: str, file: InputFile) -> GrantedInput:
 
 
 def _serving(module: str, export: str, surface: Surface) -> _CallType:
-    """A callable bound from its own code, called as every function is: `{payload, models}`.
-    Its direct caller passes the model slots beside the request fields (`_CallType.models`)."""
+    """A local/builtin handler's canonical wire envelope and separately declared input planes."""
     slots = frozenset(binding.param for binding in surface.model_bindings)
     payload, answer = surface.payload_type, surface.result_type
     if not all(isinstance(t, type) and issubclass(t, msgspec.Struct) for t in (payload, answer)):
@@ -796,11 +786,13 @@ def _serving(module: str, export: str, surface: Surface) -> _CallType:
     # Both are Struct classes: checked just above.
     request, result = cast("type[msgspec.Struct]", payload), cast("type[msgspec.Struct]", answer)
     fields = msgspec.structs.fields(request)
-    if any(field.name in slots for field in fields):
+    # Model choices and a `Files` input travel beside the request (TensorD puts files back).
+    beside = slots | ({surface.assets.parameter} if surface.assets is not None else set())
+    if any(field.name in beside for field in fields):
         request = msgspec.defstruct(
             request.__name__,
             # Request parameters' defaults are immutable scalars (`_wire_default`), never factories.
-            [(f.name, f.type, f.default) for f in fields if f.name not in slots],
+            [(f.name, f.type, f.default) for f in fields if f.name not in beside],
             module=module,
             kw_only=True,
             frozen=True,
@@ -817,8 +809,7 @@ def _serving(module: str, export: str, surface: Surface) -> _CallType:
     call = msgspec.defstruct(
         f"{export}Call", [("payload", request), ("models", models)], module=module, frozen=True
     )
-    struct = next((p.name for p in surface.params if p.role == "payload"), "")
-    return _CallType("", module, export, call, result, models=slots, request_parameter=struct)
+    return _CallType(module, export, call, result, models=slots)
 
 
 # --------------------------------------------------------------------------- state
@@ -3965,10 +3956,10 @@ class Executor:
         }
         exchange = self._exchange(command.request_id)
         connection = _connection(command.tensorfs, command.actor, self.bearers)
-        store = _call_store(command) or self._store()
+        output_store = _call_store(command) or self._store()
         weight_outputs = (
             weights_store.Outputs(
-                store,
+                output_store,
                 request_id=command.request_id,
                 actor=command.actor,
                 code=_replay_code(command, prepared.overlay.digest),
@@ -4031,10 +4022,12 @@ class Executor:
                         sources=sources,
                         weights_bytes=weights_store.read_into,
                         weights_values=functools.partial(read_values_into, self.torch),
+                        # TensorD admits these source refs in the sealed model store.
+                        # The call's store override owns its outputs.
                         tensorfs_source=(
                             functools.partial(
                                 weights_store.open_checkpoint,
-                                store,
+                                self._store(),
                                 connection=connection,
                             )
                             if sources
@@ -4833,7 +4826,7 @@ class Executor:
                     )
                 bindings[(module, export)] = _serving(module, export, own_surface)
             else:
-                # Another package's function, installed beside this one: bound at its first call.
+                # Another package is admitted by identity; callers use generated references.
                 installed.add((module, export))
         for export in own:
             key = (effect_interfaces.MODULE, export)

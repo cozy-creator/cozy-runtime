@@ -1,8 +1,9 @@
 """The typed services. A signature that names one IS the declaration of that capability.
 
 `describe` derives the AuthorCapabilitySet from these parameter types (§1.3), so there is
-no capability list to drift from the code: a handler without `Outputs` structurally
-cannot save, one without `Secrets` structurally cannot read a secret. The set names powers
+no capability list to drift from the code: a handler without `Outputs` cannot explicitly
+save or publish, one without `Secrets` cannot read a secret. Final image values are saved
+by the runtime after the handler returns. The set names powers
 granted to AUTHOR code — the runtime still journals, fetches, stages and emits telemetry
 under its own policy, and none of that appears in an author-facing schema.
 
@@ -26,7 +27,6 @@ from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import (
-    TYPE_CHECKING,
     Literal,
     Protocol,
     TypedDict,
@@ -70,9 +70,6 @@ from cozy_runtime.author._observations import (
     Scalar,
 )
 from cozy_runtime.canonical_json import JsonValue
-
-if TYPE_CHECKING:
-    from PIL.Image import Image
 
 T = TypeVar("T")
 S = TypeVar("S")
@@ -491,8 +488,37 @@ class _AuthorEvents(Iterator[DecodedMediaEvent]):
             raise
 
 
+def _adopt_image(attempt: Attempt, asset: File) -> None:
+    """Register an image value once at a result, child-input or publish boundary.
+
+    Copies share the pending value. Its actual file remains in the invocation's ordinary
+    pending inventory; adopting in another invocation never changes that ownership.
+    """
+    if not isinstance(asset, ImageFile) or asset._image is None:
+        return
+    image = asset._image
+    if image.saved is None:
+        attempt.check_open("image value")
+        out = Outputs(attempt)
+        frame = image.frame
+        assert frame is not None
+        image.saved = (
+            out._register_frame(
+                type(asset),
+                image.format,
+                (frame.pixels,),
+                {"width": frame.width, "height": frame.height, "mode": frame.mode},
+                charge=len(frame.pixels),
+            )
+            if attempt.writes
+            else out._unwritten_file(type(asset), image.format)
+        )
+        image.frame = None
+    asset._sync_image()
+
+
 class Outputs(_Bound):
-    """Transactional outputs (``out``). Save registers a bounded pending handle.
+    """Explicit publication, bounded streams and encoded artifacts (``out``).
 
     Returning a saved value completes it with the invocation. Passing a saved file to a child
     call gives the child its bytes, and the result need not return it then.
@@ -505,23 +531,6 @@ class Outputs(_Bound):
         """The fixed audio codec quantum used by ``save_video_stream``."""
 
         return _codec.AAC_FRAME_SAMPLES
-
-    def save_image(self, image: ImageFrame | Image, *, format: str = "png") -> ImageFile:
-        if format not in ("png", "webp"):
-            raise OutputError(
-                f"image format {format!r} has no encoder: choose png or lossless webp",
-                code="encoder_unavailable",
-            )
-        if not self._attempt.writes:
-            return self._unwritten_file(ImageFile, format)
-        frame = as_frame(image)
-        return self._register_frame(
-            ImageFile,
-            format,
-            (frame.pixels,),
-            {"width": frame.width, "height": frame.height, "mode": frame.mode},
-            charge=len(frame.pixels),
-        )
 
     def save_audio(
         self, waveform: _codec.Samples, *, sample_rate: int, format: str = "flac"
@@ -1078,11 +1087,12 @@ class Outputs(_Bound):
         Returning the result is the last publish, so the returned value keeps what was
         published (a list extends it). `label` is for people: its first 256 characters,
         printable ASCII (others read "?"). A child call's publishes are not shown; its parent
-        publishes what it wants seen."""
+        publishes what it wants seen. An `ImageFile.from_image` value is encoded here."""
         attempt = self._attempt
         attempt.check_open("Outputs.publish")
         if not isinstance(asset, File):
             raise OutputError("publish takes one saved or received asset", code="output_kind")
+        _adopt_image(attempt, asset)
         # The log carries printable ASCII: anything else reads as "?", never a refusal.
         label = "".join(char if 0x20 <= ord(char) <= 0x7E else "?" for char in label[:256])
         # Published or dropped, the author meant it as a product, never an unreturned save.
@@ -1093,6 +1103,7 @@ class Outputs(_Bound):
             return
         if asset.ref in attempt.frames:
             settle_frame(attempt, asset.ref)
+            _adopt_image(attempt, asset)
         request = Publish(
             output=output,
             label=label,

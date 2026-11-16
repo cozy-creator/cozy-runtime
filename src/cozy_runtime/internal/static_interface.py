@@ -45,6 +45,7 @@ import cozy_runtime
 import cozy_runtime.internal.locked_sources as locked
 import cozy_runtime.internal.memo_identity as memo_identity
 import cozy_runtime.internal.package_interface as package_interface
+import cozy_runtime.internal.schema as schema
 import cozy_runtime.internal.static_contract as static_contract
 from cozy_runtime import _interpreter
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
@@ -446,7 +447,7 @@ class Reader:
         project: Path,
         *,
         dependency_roots: Sequence[Path] = (),
-        wheels: Mapping[str, locked.LockedWheel] | None = None,
+        pinned: locked.Locked | None = None,
         own: frozenset[str],
     ) -> None:
         self.project = project
@@ -456,14 +457,17 @@ class Reader:
         #: site-packages.
         self.own = own
         self.roots = (*self.project_roots, *dependency_roots)
+        #: The root project's lock pins every package it reads, its dependencies' dependencies too:
+        #: a dependency's own directory (or installed copy) selects no other lock.
+        self.pinned = pinned
         #: published callees, read from the wheels the project's uv.lock pins when needed
-        self.wheels = locked.Wheels(wheels or {})
+        self.wheels = locked.Wheels(pinned.wheels if pinned is not None else {})
         self.runtime_root = Path(cozy_runtime.__file__).resolve().parent.parent
         self.installed = _installed_packages(_site_packages(self.runtime_root))
         self.modules: dict[str, Module] = {}
         #: callee packages read so far: an unpacked wheel's root, and a package's interface
         self.fetched: dict[str, Path] = {}
-        self.callees: dict[Path, dict[str, Json] | None] = {}
+        self.callees: dict[tuple[Path, str], dict[str, Json] | None] = {}
         self.sites: dict[Path, dict[str, CozyPackage] | None] = {}
         self.structs: dict[tuple[Path, str], type[msgspec.Struct] | None] = {}
         self.enums: dict[tuple[Path, str], type[enum.Enum]] = {}
@@ -1566,7 +1570,7 @@ class Registration:
     memoize: bool = False
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     child_task: bool = False
-    accelerator: bool = True
+    accelerator: bool | None = None
     model_on_demand: tuple[str, ...] = ()
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     #: A model argument's class where the registration names it, not its annotation.
@@ -1644,7 +1648,7 @@ def build(
     pinned = locked.read(project)
     roots = (*environment_roots(environment_python, project=project), *pinned.roots)
     own = source_tops(project)
-    reader = Reader(project, dependency_roots=roots, wheels=pinned.wheels, own=own)
+    reader = Reader(project, dependency_roots=roots, pinned=pinned, own=own)
     name = tomllib.loads((project / "pyproject.toml").read_text())["project"]["name"]
     return _build(reader, application, closures=closures, distribution=name, pinned=pinned)
 
@@ -1839,7 +1843,7 @@ def _build(
                 closures[f"{registration.module.name}:{registration.fn.name}"] = closure
         declared[registration.name] = row
     body = package_interface.assemble(application, list(declared.values()), recipes=recipes)
-    _calls(reader, registrations, body, distribution)
+    _calls(reader, registrations, body, distribution, pinned.names if pinned is not None else None)
     return body
 
 
@@ -1858,11 +1862,16 @@ class CozyPackage:
 
 
 def _calls(
-    reader: Reader, registrations: Sequence[Registration], body: dict[str, Json], distribution: str
+    reader: Reader,
+    registrations: Sequence[Registration],
+    body: dict[str, Json],
+    distribution: str,
+    locked_packages: frozenset[str] | None = None,
 ) -> None:
     """Each entry's `calls`: the functions it reaches, through its own package's helpers, that
-    run as their own calls (`call(fn, ...)`): its package's own, and another package's public
-    functions, read from the release this one locked (decision 5). A branch may never take one."""
+    run as their own calls (`call(target, request)`): its package's own, and another package's
+    public operations through generated references, read from the release this one locked
+    (decision 5). A branch may never take one."""
     entries = typing.cast(list[dict[str, Json]], body["entrypoints"])
     docs = {str(doc["name"]): doc for doc in entries}
     exported = {_export_of(doc): doc for doc in docs.values()}
@@ -1872,18 +1881,42 @@ def _calls(
             continue
         rows: dict[tuple[str, str], dict[str, Json]] = {}
         for found in _callees(reader, registration):
-            key = (found.module.name, found.node.name)
-            if reader._own(key[0].split(".")[0]):
-                callee, package = exported.get(key), distribution
-            else:
-                where = _package_at(reader, found.module.path)
-                interface = None if where is None else _callee_interface(reader, where)
-                callee = None if interface is None else next(
-                    (d for d in typing.cast(list[dict[str, Json]], interface["entrypoints"])
-                     if _export_of(d) == key and not d.get("internal")),
+            if isinstance(found, Assigned):
+                reference = _operation(reader, found)
+                assert reference is not None
+                package = reference.distribution
+                if (
+                    locked_packages is not None
+                    and locked.distribution(package) not in locked_packages
+                ):
+                    reader.refuse(
+                        found.module,
+                        found.stmt,
+                        _unlocked(reader.project, package),
+                        "unlocked_dependency",
+                    )
+                interface = dependency_interface(reader, package)
+                callee = next(
+                    (
+                        d
+                        for d in typing.cast(list[dict[str, Json]], interface["entrypoints"])
+                        if _export_of(d) == (reference.module, reference.export)
+                        and not d.get("internal")
+                    ),
                     None,
-                )  # fmt: skip
-                package = "" if where is None else where.distribution
+                )
+                if callee is None or not _takes(callee, reference):
+                    reader.refuse(
+                        found.module,
+                        found.stmt,
+                        f"{package}'s {reference.export} no longer takes this call; "
+                        "regenerate its calls",
+                        "stale_call_reference",
+                    )
+                rows[(package, str(callee["name"]))] = _call_row(package, callee)
+                continue
+            # Another package's function is refused in `_callees`: this is the package's own.
+            callee, package = exported.get((found.module.name, found.node.name)), distribution
             if callee is not None and callee is not doc:
                 rows[(package, str(callee["name"]))] = _call_row(package, callee)
         if rows:
@@ -1915,10 +1948,11 @@ def _call_row(package: str, doc: Mapping[str, Json]) -> dict[str, Json]:
     return row
 
 
-def _callees(reader: Reader, registration: Registration) -> list[Definition]:
-    """The functions a registration's body reaches that run as calls: the first argument of each
-    `call(fn, ...)`. Its own package's other functions run inline, so their bodies are read too."""
-    found: list[Definition] = []
+def _callees(reader: Reader, registration: Registration) -> list[Definition | Assigned]:
+    """What a registration's body reaches that runs as calls: the target of each `call(target,
+    request)`, its package's own function or a generated reference. Its own package's other
+    functions run inline, so their bodies are read too."""
+    found: list[Definition | Assigned] = []
     pending = [(registration.module, registration.fn)]
     seen: set[tuple[Path, int]] = set()
     while pending:
@@ -1927,16 +1961,65 @@ def _callees(reader: Reader, registration: Registration) -> list[Definition]:
             continue
         seen.add((module.path, fn.lineno))
         named: set[int] = set()  # a callee named to `call` or `prefetch` does not run inline
+        outputs = _outputs_parameters(reader, module, fn)
         for node in (n for stmt in fn.body for n in ast.walk(stmt)):
             if id(node) in named:
                 continue
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == "save_image"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in outputs
+            ):
+                reader.refuse(
+                    module,
+                    node,
+                    "Outputs.save_image was removed: return ImageFile.from_image(image)",
+                    "author_api_removed",
+                )
             managed = (
                 _managed(reader, module, node) if isinstance(node, ast.Call) and node.args else ""
             )
             if isinstance(node, ast.Call) and managed:
+                accepted = {"models", "assets"} if managed == "author.call" else {"models"}
+                arity = 2 if managed == "author.call" else 1
+                if len(node.args) != arity or any(
+                    keyword.arg not in accepted for keyword in node.keywords
+                ):
+                    reader.refuse(
+                        module,
+                        node,
+                        "call takes its request positionally, call(target, Request(...)), with only "
+                        "models= and assets= as keywords"
+                        if managed == "author.call"
+                        else "prefetch takes a target and models= only",
+                        "call_signature",
+                    )
                 named.add(id(node.args[0]))
+                try:
+                    reference = reader.resolve(module, node.args[0])
+                except StaticRefusal:
+                    reference = None
+                if isinstance(reference, Assigned) and _operation(reader, reference) is not None:
+                    if managed == "author.call":
+                        found.append(reference)
+                    continue
                 callee = _function(reader, module, node.args[0])
                 runtime = callee is None or callee.module.name.split(".")[0] == "cozy_runtime"
+                if (
+                    callee is not None
+                    and not runtime
+                    and not reader._own(callee.module.name.split(".")[0])
+                ):
+                    owner = _package_at(reader, callee.module.path)
+                    dist = owner.distribution if owner is not None else "<distribution>"
+                    reader.refuse(
+                        module,
+                        node.args[0],
+                        f"{callee.node.name} is {dist}'s function: call its generated reference "
+                        f"(`cozy-runtime calls {dist} <file.py>`)",
+                        "child_reference_required",
+                    )
                 if managed == "author.call" and not runtime:
                     found.append(typing.cast(Definition, callee))
                 continue
@@ -1946,6 +2029,208 @@ def _callees(reader: Reader, registration: Registration) -> list[Definition]:
             if reader._own(target.module.name.split(".")[0]):
                 pending.append((target.module, typing.cast(ast.FunctionDef, target.node)))
     return found
+
+
+@dataclass(frozen=True, slots=True)
+class Reference:
+    """A generated `Operation`: what a caller names and sends, read from its source."""
+
+    distribution: str
+    module: str
+    export: str
+    request: Json
+    result: Json
+    models: tuple[str, ...]
+
+
+def _outputs_parameters(
+    reader: Reader, module: Module, fn: ast.FunctionDef | ast.AsyncFunctionDef
+) -> frozenset[str]:
+    """The parameters a function annotates as `Outputs`."""
+    names: set[str] = set()
+    for arg in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs):
+        try:
+            found = None if arg.annotation is None else reader.resolve(module, arg.annotation)
+        except StaticRefusal:
+            continue
+        if isinstance(found, Vocab) and found.key == "author.Outputs":
+            names.add(arg.arg)
+    return frozenset(names)
+
+
+def _operation(reader: Reader, found: Assigned) -> Reference | None:
+    node = found.value
+    if not isinstance(node, ast.Call):
+        return None
+    try:
+        target = reader.resolve(found.module, node.func)
+    except StaticRefusal:
+        return None
+    if not isinstance(target, Vocab) or target.key != "author.Operation":
+        return None
+    keywords = {kw.arg: kw.value for kw in node.keywords}
+    if set(keywords) - {"distribution", "module", "export", "request", "result", "models"}:
+        named = keywords.get("distribution")
+        dist = (
+            named.value
+            if isinstance(named, ast.Constant) and isinstance(named.value, str)
+            else "<distribution>"
+        )
+        reader.refuse(
+            found.module,
+            node,
+            f"an older cozy-runtime generated this reference: regenerate it "
+            f"(`cozy-runtime calls {dist} {reader.spell(found.module.path)}`)",
+            "stale_call_reference",
+        )
+
+    def text(name: str) -> str:
+        value = keywords.get(name)
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            reader.refuse(found.module, node, f"an operation's {name}= is a generated string")
+        return value.value
+
+    def struct(name: str) -> Json:
+        value = keywords.get(name)
+        resolved = None if value is None else reader.resolve(found.module, value)
+        if not isinstance(resolved, Definition) or not isinstance(resolved.node, ast.ClassDef):
+            reader.refuse(found.module, node, f"an operation's {name}= is a generated struct")
+        return schema.render(reader.class_type(resolved.module, resolved.node, node))
+
+    slots = keywords.get("models", ast.Tuple(elts=[]))
+    models = tuple(
+        slot.value
+        for slot in (slots.elts if isinstance(slots, ast.Tuple) else ())
+        if isinstance(slot, ast.Constant) and isinstance(slot.value, str)
+    )
+    if not isinstance(slots, ast.Tuple) or len(models) != len(slots.elts):
+        reader.refuse(found.module, node, "an operation's models= is a tuple of slot names")
+    return Reference(
+        text("distribution"),
+        text("module"),
+        text("export"),
+        struct("request"),
+        struct("result"),
+        models,
+    )
+
+
+def _takes(callee: Mapping[str, Json], reference: Reference) -> bool:
+    """Whether the locked callee takes what a generated reference sends and returns what it reads:
+    names and types only, so a callee's docs, labels, defaults and bounds never break a caller."""
+    request = typing.cast(dict[str, Json], callee["request"])
+    assets = callee.get("assets")
+    if isinstance(assets, dict):
+        # A `Files` parameter travels beside the request (`call(..., assets=)`), never in it.
+        fields = typing.cast(list[dict[str, Json]], request["fields"])
+        request = {**request, "fields": [f for f in fields if f["name"] != assets["parameter"]]}
+    slots = {
+        str(slot["path"]).rpartition(".")[2]
+        for slot in typing.cast(list[dict[str, Json]], callee.get("models", []))
+    }
+    return (
+        set(reference.models) <= slots
+        and _decodes(reference.request, request)
+        and _decodes(callee["result"], reference.result)
+    )
+
+
+#: Schema members that name a value's kind: equal, or one value can't decode as the other.
+_KIND = ("tag", "tag_field", "media", "asset", "input", "opaque")
+
+
+def _decodes(sent: Json, taken: Json) -> bool:
+    """Whether a value of schema `sent` decodes as schema `taken`, as msgspec reads it: every
+    field `taken` requires is sent, shared fields decode, unknown ones are ignored, an int is a
+    float, and a value is any union member it decodes as."""
+    if isinstance(taken, dict) and "union" in taken:
+        options = typing.cast(list[Json], taken["union"])
+        members = (
+            typing.cast(list[Json], sent["union"])
+            if isinstance(sent, dict) and "union" in sent
+            else [sent]
+        )
+        return all(any(_decodes(member, option) for option in options) for member in members)
+    if isinstance(sent, dict) and "union" in sent:
+        return all(_decodes(member, taken) for member in typing.cast(list[Json], sent["union"]))
+    if not isinstance(sent, dict) or not isinstance(taken, dict):
+        return sent == taken or (sent, taken) == ("int", "float")
+    if sent.keys() != taken.keys() or any(sent.get(key) != taken.get(key) for key in _KIND):
+        return False
+    if "fields" in taken:
+        given = {f["name"]: f["type"] for f in typing.cast(list[dict[str, Json]], sent["fields"])}
+        return all(
+            _decodes(given[name], f["type"]) if (name := f["name"]) in given else "wire" in f
+            for f in typing.cast(list[dict[str, Json]], taken["fields"])
+        )
+    if "literal" in taken:
+        allowed = typing.cast(list[Json], taken["literal"])
+        return all(value in allowed for value in typing.cast(list[Json], sent["literal"]))
+    if "tuple" in taken:
+        mine, theirs = (typing.cast(list[Json], node["tuple"]) for node in (sent, taken))
+        return len(mine) == len(theirs) and all(map(_decodes, mine, theirs))
+    if "map" in taken:
+        mine_map, theirs_map = (typing.cast(dict[str, Json], node["map"]) for node in (sent, taken))
+        return _decodes(mine_map["key"], theirs_map["key"]) and _decodes(
+            mine_map["value"], theirs_map["value"]
+        )
+    if "list" in taken or "pickup" in taken:
+        nested = "list" if "list" in taken else "pickup"
+        return _decodes(sent[nested], taken[nested])
+    return True  # a prompt: what references it takes is the callee's to ignore
+
+
+def _unlocked(project: Path, distribution: str) -> str:
+    """Why a called package has no locked release: no lock at all, or one without it."""
+    where = "there is no uv.lock" if not (project / "uv.lock").is_file() else "uv.lock lacks it"
+    return f"{distribution} is not locked: {where}; `cozy run` locks it (or run `uv lock`)"
+
+
+def dependency_interface(reader: Reader, distribution: str) -> dict[str, Json]:
+    """Read one locked dependency's actual source, never import its implementation."""
+    normalized = locked.distribution(distribution)
+    pinned = reader.pinned or locked.Locked()
+    top = normalized.replace("-", "_")
+    reader._fetched(top)
+    roots = (
+        [*pinned.roots, *([reader.fetched[top]] if top in reader.fetched else [])]
+        if pinned.names
+        else list(reader.roots)
+    )
+    packages: dict[Path, CozyPackage] = {}
+    for root in roots:
+        for candidate in (root, root.parent):
+            project = candidate / "pyproject.toml"
+            if project.is_file():
+                table = tomllib.loads(project.read_text()).get("project", {})
+                if locked.distribution(table.get("name", "")) == normalized:
+                    packages[candidate] = CozyPackage(
+                        distribution, read_application(candidate), candidate, source_tops(candidate)
+                    )
+        for package in (_installed_apps(reader, root) or {}).values():
+            if locked.distribution(package.distribution) == normalized:
+                packages[package.project] = package
+    if len(packages) != 1 or (pinned.names and normalized not in pinned.names):
+        raise StaticRefusal(
+            f"{distribution} must name one locked package source", code="unlocked_dependency"
+        )
+    interface = _callee_interface(reader, next(iter(packages.values())))
+    if interface is None:
+        raise StaticRefusal(
+            f"{distribution} has a cyclic managed declaration", code="static_unsupported"
+        )
+    return interface
+
+
+def build_dependency(project: Path, distribution: str) -> dict[str, Json]:
+    project = project.resolve()
+    pinned = locked.read(project)
+    if locked.distribution(distribution) not in pinned.names:
+        raise StaticRefusal(_unlocked(project, distribution), code="unlocked_dependency")
+    reader = Reader(
+        project, dependency_roots=pinned.roots, pinned=pinned, own=source_tops(project)
+    )
+    return dependency_interface(reader, distribution)
 
 
 def _managed(reader: Reader, module: Module, node: ast.Call) -> str:
@@ -1983,10 +2268,14 @@ def _function(reader: Reader, module: Module, node: ast.AST) -> Definition | Non
 
 def _callee_interface(reader: Reader, package: CozyPackage) -> dict[str, Json] | None:
     """Another package's interface, read from its source as this one locked it; once each."""
-    if package.project in reader.callees:
-        return reader.callees[package.project]
-    reader.callees[package.project] = None  # a package that calls back reads as no calls
-    callee = Reader(package.project, dependency_roots=reader.roots, own=package.own)
+    # Several installed Apps share one site-packages directory.
+    key = (package.project, package.distribution)
+    if key in reader.callees:
+        return reader.callees[key]
+    reader.callees[key] = None  # a package that calls back reads as no calls
+    callee = Reader(
+        package.project, dependency_roots=reader.roots, pinned=reader.pinned, own=package.own
+    )
     callee.wheels, callee.fetched, callee.callees = reader.wheels, reader.fetched, reader.callees
     try:
         interface = _build(
@@ -1997,7 +2286,7 @@ def _callee_interface(reader: Reader, package: CozyPackage) -> dict[str, Json] |
             f"{package.distribution}, which this package calls, can't be read: {exc}",
             code=exc.code,
         ) from exc
-    reader.callees[package.project] = interface
+    reader.callees[key] = interface
     return interface
 
 
@@ -2460,7 +2749,8 @@ def _registration(
     used_components: dict[str, tuple[str, ...]] = {}
     module = declaration or module
     name = fn.name
-    accelerator, private = True, False
+    accelerator: bool | None = None
+    private = False
     weights: tuple[author.WeightsOutput, ...] = ()
     on_demand: tuple[str, ...] = ()
     box: dict[str, object] = {}
@@ -2500,6 +2790,8 @@ def _registration(
             name = str(value)
         elif keyword.arg in _TOOL_KEYWORDS:
             box[keyword.arg] = value
+        elif keyword.arg == "accelerator" and value is None:
+            accelerator = None
         elif keyword.arg in ("accelerator", "private", "memoize"):
             if type(value) is not bool:
                 reader.refuse(module, keyword.value, f"{keyword.arg} is True or False")
