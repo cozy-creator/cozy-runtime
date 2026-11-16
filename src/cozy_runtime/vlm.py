@@ -127,7 +127,7 @@ class AskRequest(msgspec.Struct):
         list[Annotated[str, msgspec.Meta(min_length=1, max_length=256)]], msgspec.Meta(max_length=8)
     ] = []
     #: Video reading, as Qwen-VL's: about `fps` frames a second, at least `min_frames` and at most
-    #: `max_frames`; null takes the checkpoint's video processor (2, 4, 768).
+    #: `max_frames`; null takes the checkpoint's video processor, else (2, 4, 768).
     fps: Annotated[float, msgspec.Meta(gt=0, le=30)] | None = None
     min_frames: Annotated[int, msgspec.Meta(ge=2, le=768)] | None = None
     max_frames: Annotated[int, msgspec.Meta(ge=2, le=768)] | None = None
@@ -238,11 +238,12 @@ def _answers(
 ) -> list[str]:
     """Each question's pictures read and videos watched as `payload` says, then all answered in
     one pass."""
+    # The checkpoint's video reading, else Qwen-VL's (2, 4, 768): Gemma 4's processor states none.
     video = model.processor.video_processor
-    fps = payload.fps or float(video.fps)
+    fps = payload.fps or float(getattr(video, "fps", None) or 2)
     lo, hi = (
-        payload.min_frames or int(video.min_frames),
-        payload.max_frames or int(video.max_frames),
+        payload.min_frames or int(getattr(video, "min_frames", None) or 4),
+        payload.max_frames or int(getattr(video, "max_frames", None) or 768),
     )
     if lo > hi:
         tel.log(f"min_frames {lo} is above max_frames {hi}: swapped", level="warning")
