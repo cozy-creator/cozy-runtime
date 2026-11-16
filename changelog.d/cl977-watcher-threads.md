@@ -1,0 +1,1 @@
+The Runtime's ticking watcher threads (the step's host-stall sampler, the phase ticker, a kernel build's reporter, a group's formation watch) are named `~<name>`, in the kernel too. TensorD's hang watch (cl-977) reads no life in them, so a call that deadlocks inside a step is caught.

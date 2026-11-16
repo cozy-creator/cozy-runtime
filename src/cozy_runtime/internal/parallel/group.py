@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 
 import msgspec
 
+from cozy_runtime.author import _watchers
 from cozy_runtime.internal import execution_evidence, spawn
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.config import inherited_environment, update_environment
@@ -673,9 +674,7 @@ class RankGroup:
         self.path = os.path.join(self.directory, str(self.formations))
         self.store = rendezvous(torch, self.path, self.degree)
         done = threading.Event()
-        threading.Thread(
-            target=self._watch, args=(done, attempt), name="formation", daemon=True
-        ).start()
+        _watchers.thread(self._watch, "formation", (done, attempt)).start()
         try:
             pg = self._form(torch, again, exchange, formed)
         except Exception as exc:
