@@ -18,8 +18,10 @@ class ModelConfigRefusal(Exception):
 ADAPTERS = "model_adapters.json"
 
 
-def construction_config(configs: Mapping[str, Mapping[str, object]]) -> bytes:
-    """One exact config document: a single component's, or one mapping of them by name."""
+def construction_config(configs: Mapping[str, Mapping[str, object]]) -> bytes | None:
+    """One exact config document: a single component's, or one mapping of them by name; None
+    for a checkpoint of weights alone, which constructs only a model that builds its modules
+    itself (`Config(absent=True)` refuses a model that reads one)."""
     held: dict[str, bytes] = {}
     for name, document in sorted(configs.items()):
         try:
@@ -27,7 +29,7 @@ def construction_config(configs: Mapping[str, Mapping[str, object]]) -> bytes:
         except canonical.CanonicalError as exc:
             raise ModelConfigRefusal(f"config {name!r} has no canonical JSON form: {exc}") from exc
     if not held:
-        raise ModelConfigRefusal("the checkpoint carries no construction config")
+        return None
     if len(held) == 1:
         return next(iter(held.values()))
     return canonical.write({name: dict(configs[name]) for name in held})
