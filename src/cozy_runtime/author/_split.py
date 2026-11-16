@@ -175,8 +175,8 @@ def split[W](
 @dataclass(frozen=True)
 class Windows:
     """A window layout a loop keeps throughout (`windows`): `spans`, the `(start, stop)` of each
-    window along its cut. Run each window's work inside `piece()`, so the layout's memory is
-    measured and the next call chooses from what it held."""
+    window along its cut. Run each window's work inside `piece()`: its sites cut inside it, and
+    a window refused memory once they can cut no finer makes the next call take more windows."""
 
     spans: tuple[tuple[int, int], ...]
     _piece: Callable[[], AbstractContextManager[None]] = nullcontext
@@ -202,12 +202,13 @@ def windows(
 ) -> Windows:
     """The fewest windows along `cut` of a tensor of `shape` that fit the device, chosen once
     for a whole loop, as `split` chooses a call's: a layout the loop's tables and labels are
-    built for before it starts. `per_element_bytes` is what a window's work holds at its peak, in
-    bytes per element of the window (every axis whole but the cut's); the device's choice starts
-    from it and then from what earlier calls measured. Starts fall on `cut.align`, neighbours share
-    `cut.overlap`, and with `equal` every window has one length (the fewest equal windows at
-    least as many as chosen). With `most`, the fewest of at most `most` elements, from the shape
-    alone, on every device. Without a managing memory, one window unless `most` says more."""
+    built for before it starts. `per_element_bytes` is what a window's work holds whole at its
+    peak, in bytes per element of the window (every axis whole but the cut's): the attention, FFN
+    and other sites inside it cut themselves to what is left. Starts fall on `cut.align`,
+    neighbours share `cut.overlap`, and with `equal` every window has one length (the fewest
+    equal windows at least as many as chosen). With `most`, the fewest of at most `most`
+    elements, from the shape alone, on every device. Without a managing memory, one window
+    unless `most` says more."""
     shape = tuple(int(n) for n in shape)
     length = shape[cut.dim]
     rest = math.prod(shape) // max(length, 1)
