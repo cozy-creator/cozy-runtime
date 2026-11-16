@@ -1620,11 +1620,11 @@ _SEQUENCE = itertools.count()
 
 class _Budget:
     """This process's request and the capture work it paid: a capture runs its call twice on the
-    device (the check's replay, then the call as written), so a request records while its capture
-    work is under `_SHARE` of its length (this request's so far, or the last one's), at least
-    `_FLOOR_MS`: the capture that crosses it is the last. More waits for a later request or an
-    idle period: H3's dense steps differ in shape step to step, and on a card their pools fit,
-    request 2 recording each at once would run every ~34 s step twice."""
+    device (the check's replay, then the call as written), so no capture, the first included, may
+    take a request's capture work past `_SHARE` of its length (this request's so far, or the last
+    one's), at least `_FLOOR_MS`. One that would waits for a later step of the call, a later
+    request or an idle period: Krea 2's first capture took 4.4 s of a 28.6 s request for a graph
+    it never replayed (43756065600), and H3's ~34 s dense steps would each run twice."""
 
     __slots__ = ("began", "last", "previous", "request", "spent")
 
@@ -1641,12 +1641,12 @@ class _Budget:
             self.request, self.began, self.spent = request, now, 0.0
         self.last = now
 
-    def over(self) -> str:
-        """Why this request records no more ("" while its share lasts)."""
+    def over(self, cost: float) -> str:
+        """Why a capture costing about `cost` ms waits ("" when it fits this request's share)."""
         share = max(_SHARE * max((self.last - self.began) * 1e3, self.previous), _FLOOR_MS)
-        if self.spent < share:
+        if self.spent + cost <= share:
             return ""
-        return f"its request's captures took {self.spent:.0f} ms of a {share:.0f} ms share"
+        return f"a ~{cost:.0f} ms capture after {self.spent:.0f} ms passes its {share:.0f} ms share"
 
     def spend(self, ms: float) -> None:
         self.spent += max(ms, 0.001)
@@ -1654,6 +1654,16 @@ class _Budget:
 
 #: the share of a request its captures may take beyond its calls, and the least they may take
 _SHARE, _FLOOR_MS = 0.10, 1000.0
+#: a capture's own work beyond its replay and submission: its pool, instantiation and check
+_CAPTURE_MS = 150.0
+
+
+def _capture_cost(recorder: _Recorder, seen: _Seen) -> float:
+    """What capturing `seen`'s path adds to its call: its region's last capture, else its call's
+    longer time (the check's replay) and its submission (the capture) and `_CAPTURE_MS`."""
+    if recorder.capture_each:
+        return recorder.capture_each[-1]
+    return max(seen.host_ms, seen.device_ms() or 0.0) + seen.submit_ms + _CAPTURE_MS
 _BUDGET = _Budget()
 
 
@@ -1820,7 +1830,7 @@ def _capture_call(
         recorder.gap = "its key moved since its last request's graphs: an idle period records it"
         _note(recorder, "deferred", recorder.gap)
         return _EAGER
-    if not FORCE and (why := _BUDGET.over()):
+    if not FORCE and (why := _BUDGET.over(_capture_cost(recorder, seen))):
         recorder.gap = why
         _note(recorder, "deferred", why)
         return _EAGER
