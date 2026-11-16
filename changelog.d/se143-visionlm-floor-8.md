@@ -1,0 +1,1 @@
+`VisionLM` (Qwen-VL asks, captions, prompt enhancers and reasoners) serves at the default 8-bit floor: it no longer declares `min_bits=4`, so a published 4-bit lane is a pin, never its default (Paul, 11-16: "all models are int8 convrot lanes by default … including … prompt enhancers").
