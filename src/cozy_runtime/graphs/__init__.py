@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from types import ModuleType
     from typing import Protocol
 
+    from tensorfs.varena._facts import WorkingStats
     from torch import Generator, Tensor
     from torch import device as TorchDevice
     from torch import dtype as TorchDtype
@@ -412,6 +413,9 @@ class _Recording:
     ) -> None:
         self.torch, self.graph, self.pool, self.owner = torch, graph, pool, owner
         self.inputs, self.outputs, self.layout = inputs, outputs, layout
+        #: what showed memory pressure while it was recorded in its call (`_pressure`): an idle
+        #: period records it again on resident weights and keeps the faster replay
+        self.pressured = ""
         self.served = [(b, i) for b, impls in served.items() for i in impls]
         self.refused = dict(served.refused)
         self.bands = [(site, band, b) for (site, band), held in served.bands.items() for b in held]
@@ -743,6 +747,11 @@ class _Recorder:
         #: recording for the process (`_churning`)
         self.recorded_in = self.replayed_in = self.checked_in = self.churned = ""
         self.churn = 0
+        #: per signature, the request it was first seen in: one first seen in this request after
+        #: an earlier request's graphs (and no replay of them) is a moved key (`_key_moved`)
+        self.first_seen: dict[tuple[object, ...], str] = {}
+        #: what each idle re-recording of a graph recorded under pressure decided
+        self.rerecorded: list[str] = []
         self.eager: _Timing = _Timing()
         self.replayed: _Timing = _Timing()
         #: calls a guard ran as written, by reason (`_region_call`'s `why`)
@@ -1227,6 +1236,7 @@ def _receipt(recorder: _Recorder) -> dict[str, object]:
             for submit, warm_up, waited, replayed in recorder.bound.values()
         ],
         "saving_ms": None if saving is None else round(saving, 3),
+        "rerecorded": recorder.rerecorded[-4:],
         "payback_calls": math.ceil(cost / saving) if saving and saving > 0 else None,
         "eager": sorted(
             {
@@ -1589,7 +1599,15 @@ def _first[T](
     elif peak is not None and last is not None and last.peak is not None:
         peak = max(peak, last.peak)
     recorder.seen[key] = _Seen(submit, host, start, end, peak)
+    if key not in recorder.first_seen:
+        if len(recorder.first_seen) >= _FIRST_SEEN:
+            del recorder.first_seen[next(iter(recorder.first_seen))]
+        recorder.first_seen[key] = _BUDGET.request
     return result
+
+
+#: the signatures a region remembers the first request of (`_key_moved`)
+_FIRST_SEEN = 4096
 
 
 #: the longest call idle capture records (`_queue`): a longer one would hold the device through
@@ -1639,16 +1657,28 @@ _SHARE, _FLOOR_MS = 0.10, 1000.0
 _BUDGET = _Budget()
 
 
-def _churning(recorder: _Recorder) -> str:
-    """Why a region records no more in this process ("" while it may): its paths changed in
-    `_CHURN` requests in a row, each recording again before any graph of an earlier request
-    replayed, so its graphs never outlive their request and each capture is pure cost (a key part
+def _key_moved(recorder: _Recorder, key: tuple[object, ...]) -> bool:
+    """`key` was first seen in this request, after the region recorded in an earlier one, and no
+    graph of an earlier request replayed in this one: the path moved between requests. It
+    records only at idle: a key that moves every request then costs one capture in a call
+    (Qwen-Image-2 turbo, Krea 2: a capture in each of their first two requests, never replayed)."""
+    request = _BUDGET.request
+    return (
+        recorder.recorded_in not in ("", request)
+        and recorder.replayed_in != request
+        and recorder.first_seen.get(key) == request
+    )
+
+
+def _churning(recorder: _Recorder, key: tuple[object, ...]) -> str:
+    """Why a region records no more in this process ("" while it may): its paths moved in
+    `_CHURN` requests in a row (`_key_moved`), so its graphs never outlive their request (a key part
     rebuilt per request: H3's loop slots and rope presentation, by address). Checked at a
     request's first capture of the region; named by the key part that moved most."""
     request = _BUDGET.request
     if not recorder.churned and recorder.checked_in != request:
         recorder.checked_in = request
-        again = recorder.recorded_in not in ("", request) and recorder.replayed_in != request
+        again = _key_moved(recorder, key)
         recorder.churn = recorder.churn + 1 if again else 0
         if recorder.churn >= _CHURN:
             moved = max(recorder.changes, key=recorder.changes.__getitem__, default="its key")
@@ -1661,6 +1691,62 @@ def _churning(recorder: _Recorder) -> str:
 
 #: requests in a row a region may record again with no earlier graph replayed
 _CHURN = 2
+
+
+def _pressure(before: WorkingStats, after: WorkingStats) -> str:
+    """What showed memory pressure between two of varena's readings ("" when nothing did):
+    weights refilled, room reclaimed, allocations refused. A call recorded under it froze the
+    path memory forced on it (SDXL at 6 GiB, 43756065600: replays at 108 ms a step, the same
+    path recorded at idle 80 ms)."""
+    filled = after["weights_filled"] - before["weights_filled"]
+    reclaimed = after["reclaim_ns"] - before["reclaim_ns"]
+    refused = after["ooms"] - before["ooms"]
+    found = [
+        f"{filled / 2**20:.0f} MiB of weights refilled" if filled > 0 else "",
+        f"{reclaimed / 1e6:.1f} ms reclaiming" if reclaimed > 0 else "",
+        f"{refused} allocations refused" if refused > 0 else "",
+    ]
+    return ", ".join(f for f in found if f)
+
+
+def _faster(
+    torch: ModuleType,
+    recorder: _Recorder,
+    key: tuple[object, ...],
+    entry: _Recording,
+    inputs: list[Tensor | None],
+) -> bool:
+    """Whether an idle recording of `key` is kept beside its call's graph recorded under memory
+    pressure, which goes when this one replays faster; True when there is none (held: lock)."""
+    prior = next(
+        ((h, e) for h, e in recorder.recordings.items() if h[0] == key and e.pressured), None
+    )
+    if prior is None:
+        return True
+    handle, old = prior
+    pressured, old.pressured = old.pressured, ""
+    if old.overlays:  # its overlay components' leases are its call's to prepare
+        return False
+    IDLE.check()
+    fresh, held = _replay_ms(torch, entry, inputs), _replay_ms(torch, old, inputs)
+    if fresh >= 0.98 * held:
+        recorder.rerecorded.append(f"kept: {held:.1f} ms a replay, at idle {fresh:.1f} ms")
+        return False
+    _remove(recorder, handle)
+    recorder.rerecorded.append(f"replaced ({pressured}): {fresh:.1f} ms a replay, not {held:.1f}")
+    return True
+
+
+def _replay_ms(torch: ModuleType, entry: _Recording, inputs: list[Tensor | None]) -> float:
+    """One replay's device time on `inputs`, after one more that warms it."""
+    out = entry.output()
+    entry(inputs, out)
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    entry(inputs, out)
+    end.record()
+    _settled(end)
+    return float(start.elapsed_time(end))
 
 
 def _over_card(device: int, placed: _Placed, recorder: _Recorder, pool: int) -> str:
@@ -1726,17 +1812,30 @@ def _capture_call(
             recorder.codes[key] = "refused"
         _note(recorder, "refused", why)
         return _EAGER
-    if not FORCE and (why := _churning(recorder)):
+    if not FORCE and (why := _churning(recorder, key)):
         recorder.gap = why
         _note(recorder, "refused", why)
+        return _EAGER
+    if not FORCE and _key_moved(recorder, key):
+        recorder.gap = "its key moved since its last request's graphs: an idle period records it"
+        _note(recorder, "deferred", recorder.gap)
         return _EAGER
     if not FORCE and (why := _BUDGET.over()):
         recorder.gap = why
         _note(recorder, "deferred", why)
         return _EAGER
+    # Admission before anything is made for a capture: a declined path leaves no capture streams
+    # or library workspaces behind, which a capped card's weights would otherwise lose to.
+    if placed is not None and not FORCE:
+        pool = vt.pool_bytes(seen.peak or 0)
+        if over := _over_card(torch.cuda.current_device(), placed, recorder, pool):
+            with recorder.lock:
+                _short(module, recorder, key, over)
+            return _EAGER
     owner = _owner(torch, module, recorder, placed)
     recorder.capture_attempts += 1
     began = time.perf_counter()
+    before = vt.stats(owner.device)
     entry = _capture_verified(torch, module, recorder, call, key, spec, leaves, placed, seen, owner)
     if entry is None:
         recorder.capture_ms += (time.perf_counter() - began) * 1e3
@@ -1772,6 +1871,7 @@ def _capture_call(
             recorder.bound[key] = (seen.submit_ms, seen.host_ms, seen.device_ms() or 0.0, replay)
             if recorder.landed != LANDED[0] or _find(recorder, key) is not None:
                 return result  # a kernel landed meanwhile: its graphs go
+            recording.pressured = _pressure(before, vt.stats(owner.device))
             _admit(recorder, key, recording)
             recorder.recorded_in = _BUDGET.request
             kept = True
@@ -1781,6 +1881,8 @@ def _capture_call(
             recorder.gap = ""
             recorder.capture_each.append(round((time.perf_counter() - began) * 1e3, 3))
             _note(recorder, "recorded", f"capture and check {recorder.capture_each[-1]:.0f} ms")
+        if recording.pressured and (seen.device_ms() or 0.0) <= _IDLE_MS:
+            _queue(torch, module, recorder, call, key, spec, leaves, placed)
         return result
     finally:
         took = (time.perf_counter() - began) * 1e3
@@ -2215,7 +2317,12 @@ def _queue(
     )
     _owner(torch, module, recorder, placed)
     with recorder.lock:
-        if key in recorder.queued or key in recorder.failed or key in recorder.judged:
+        if (
+            key in recorder.queued
+            or key in recorder.failed
+            or key in recorder.judged
+            or recorder.churned
+        ):
             return
         pending = recorder.queued[key] = _Pending(
             torch, weakref.ref(module), call, key, spec, layout, context
@@ -2570,6 +2677,8 @@ def _record(
                 replayed = entry(inputs, entry.output())
                 if differs := vt.replay_differs(eager, replayed):
                     _failed(module, recorder, key, differs, "replay_mismatch", idle=True)
+                    return True
+                if not _faster(torch, recorder, key, entry, inputs):
                     return True
         _admit(recorder, key, entry)
         entry = None
