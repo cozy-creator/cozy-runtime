@@ -3116,12 +3116,17 @@ class _Engine:
             start, at = [value.clone() for value in state], self.length[:size].clone()
             vt.replay(graph, stream=stream)  # its pool is held since its capture
             replayed = [*(value.clone() for value in state), *self._written(size, at)]
+            for tensor, value in zip(state, start, strict=True):
+                tensor.copy_(value)
+            self._advance(size)
         except Exception as exc:
             if not is_capacity(exc):
                 raise
             # No room to check it beside its held pool (cr-319: Qwen3.6-27B on a 4090 failed the
-            # run here): the graph goes, and this token and its key's later ones decode eagerly.
-            if start is not None:  # the replay ran: the token starts again from before it
+            # run here): the graph and its pool go, and this token and its key's later ones
+            # decode eagerly, from the state before it (what a step wrote at its slot is written
+            # again).
+            if start is not None:
                 for tensor, value in zip(state, start, strict=True):
                     tensor.copy_(value)
             start = None
@@ -3133,9 +3138,6 @@ class _Engine:
             self._advance(size)
             self.eager += 1
             return
-        for tensor, value in zip(state, start, strict=True):
-            tensor.copy_(value)
-        self._advance(size)
         self.eager += 1
         why = vt.replay_differs([*state, *self._written(size, at)], replayed)
         if why:
