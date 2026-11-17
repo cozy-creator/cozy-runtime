@@ -139,6 +139,18 @@ def matrix(shape: Sequence[int]) -> tuple[int, int]:
     return rows, int(shape[-1]) if shape else 0
 
 
+def conv_declared(shape: Sequence[int]) -> tuple[int, ...]:
+    """The shape an `int8.convrot` conv weight is stored under (cr-327): a Conv's `[O, I, *k]` filter with its input
+    channels last, `[O, *k, I]`. The scheme's matrix view then has a row for each (output channel, tap), rotated over
+    the input channels and scaled on its own, as the NDHWC kernels read it; the rotation is exact per tap."""
+    return (int(shape[0]), *(int(v) for v in shape[2:]), int(shape[1]))
+
+
+def is_conv_declared(stored: Sequence[int], built: Sequence[int]) -> bool:
+    """`stored` is the conv filter `built` stored channels-last (`conv_declared`), not `built` itself."""
+    return len(built) >= 3 and tuple(stored) != tuple(built) and tuple(stored) == conv_declared(built)
+
+
 def _blocked_shape(rows: int, cols: int) -> tuple[int, int]:
     return -(-rows // 128) * 128, -(-cols // 4) * 4
 
@@ -544,6 +556,15 @@ class RowwiseDequant:
         return "a per-column scale is a rank-2 weight's"
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
+        size = int(str(dict(self.params)["rotation_size"]))
+        if destination.dim() >= 3 and int(destination.shape[-1]) % size:
+            # A conv filter stored channels-last (`conv_declared`): decoded so, then moved back.
+            stored = torch.empty(
+                conv_declared(destination.shape), dtype=destination.dtype, device=destination.device
+            )
+            self.decode(torch, parts, stored)
+            destination.copy_(stored.movedim(-1, 1))
+            return
         rows, cols = matrix(destination.shape)
         destination = destination.view(rows, cols)
         payload = parts["weight"].view(rows, cols)
@@ -624,6 +645,15 @@ class MicroScaledDequant:
         return why
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
+        size = int(str(dict(self.params)["rotation_size"]))
+        if destination.dim() >= 3 and int(destination.shape[-1]) % size:
+            # A conv filter stored channels-last (`conv_declared`): decoded so, then moved back.
+            stored = torch.empty(
+                conv_declared(destination.shape), dtype=destination.dtype, device=destination.device
+            )
+            self.decode(torch, parts, stored)
+            destination.copy_(stored.movedim(-1, 1))
+            return
         rows, cols = matrix(destination.shape)
         destination = destination.view(rows, cols)
         payload = parts["weight"].view(rows, cols)
@@ -719,11 +749,19 @@ class Int8ConvRotDequant:
         )
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
+        size = int(str(dict(self.params)["rotation_size"]))
+        if destination.dim() >= 3 and int(destination.shape[-1]) % size:
+            # A conv filter stored channels-last (`conv_declared`): decoded so, then moved back.
+            stored = torch.empty(
+                conv_declared(destination.shape), dtype=destination.dtype, device=destination.device
+            )
+            self.decode(torch, parts, stored)
+            destination.copy_(stored.movedim(-1, 1))
+            return
         rows, cols = matrix(destination.shape)
         destination = destination.view(rows, cols)
         payload = parts["weight"].view(rows, cols)
         scale = parts["scale"].to(torch.float32).reshape(rows, 1)
-        size = int(str(dict(self.params)["rotation_size"]))
         stride = max(1, _CHUNK_BYTES // max(cols * 4, 1))
         for start in range(0, rows, stride):
             stop = min(start + stride, rows)

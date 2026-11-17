@@ -54,7 +54,7 @@ from functools import partial
 from types import FrameType, ModuleType
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
-from cozy_runtime.accel.fusion import _conv, _kernels
+from cozy_runtime.accel.fusion import _conv, _conv8, _kernels
 from cozy_runtime.accel.fusion._conv import Padding as Padding
 from cozy_runtime.accel.kernels import (
     KernelsUnavailable,
@@ -370,10 +370,21 @@ if TYPE_CHECKING:
         _cozy_eager: Callable[[Tensor, Tensor | None], Tensor]
 
     class _FusedConvBlock(nn.Module):
-        """A conv or block `install_encoder` took over."""
+        """A conv or block `install_encoder` or `install_conv_blocks` took over."""
 
         _cozy_conv: _ConvSite
+        _cozy_blocks: _BlocksSite
         _cozy_eager: _Eager
+
+    class _Int8Conv(nn.Module):
+        """An int8 conv leaf (`encoding.leaves.Int8ConvRotConvLeaf`) as `ConvBlocks` reads it."""
+
+        provider: str
+
+        def served(self, x: Tensor) -> bool: ...
+        def convolve(
+            self, module: ModuleType, q: Tensor, qs: Tensor, residual: Tensor | None, dtype: torch.dtype
+        ) -> Tensor | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -811,6 +822,10 @@ def _fused[M: nn.Module](cls: type[M], kind: str) -> type[M]:
             body["forward"] = _residual_forward
         elif kind == "padded-conv":
             body["forward"] = _padded_forward
+        elif kind == "int8-residual":
+            body["forward"] = _int8_residual_forward
+        elif kind == "int8-temporal":
+            body["forward"] = _int8_temporal_forward
         else:
             body |= {"forward": _head_norm_forward, "_cozy_rope": None}
         _FUSED[(cls, kind)] = type(f"Fused{cls.__name__}", (cls,), body)
@@ -1193,13 +1208,36 @@ class CausalConv:
 
 
 @dataclass(frozen=True, slots=True)
+class ConvModulation:
+    """A block's second argument `emb` modulating one step's norm (cr-327): `norm(h) * (1 + scale) + shift` before its
+    SiLU, `scale, shift = rows(emb).chunk(2, dim=1)` in the block's dtype (`rows` a module's name, say an adaLN's
+    SiLU + Linear)."""
+
+    step: int
+    rows: str
+
+
+@dataclass(frozen=True, slots=True)
 class ConvResidual:
     """A block whose forward is `shortcut(x) + convN(silu(normN(... conv1(silu(norm1(x))))))`: `steps`, its (norm, conv)
-    pairs by name; `shortcut`, the module the residual passes through (absent, or None on a block, for none)."""
+    pairs by name; `shortcut`, the module the residual passes through (absent, or None on a block, for none);
+    `modulation`, a step's norm modulated by the block's second argument (`ConvBlocks` only)."""
 
     block: type[nn.Module]
     steps: tuple[tuple[str, str], ...]
     shortcut: str | None = None
+    modulation: ConvModulation | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TemporalMix:
+    """A block whose forward is `x + pointwise(depthwise(silu(norm(x))))` (cr-327): `depthwise` a Conv3d over time
+    alone (kernel (5, 1, 1), one group a channel, zero padding (2, 0, 0)), `pointwise` a 1x1x1 Conv3d."""
+
+    block: type[nn.Module]
+    norm: str
+    depthwise: str
+    pointwise: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1499,10 +1537,242 @@ def _block_site(
     return "conv-residual", _ConvSite(layout, index, tuple(steps), shortcut)
 
 
+@dataclass(frozen=True)
+class ConvBlocks:
+    """A conv network's residual blocks on int8-convrot convs, NDHWC from one to the next (cr-327): each block's convs
+    are the int8 conv leaves of an int8 lane (`encoding.leaves.Int8ConvRotConvLeaf`), and each `silu(norm(x))` in front
+    of one is a single pass that also rotates and quantizes it (`accel.fusion._conv8`): a GroupNorm over the whole
+    sample (all its frames), its affine and any modulation folded into one per-channel affine. A residual rides the
+    conv's epilogue. `blocks` declare the forwards Runtime takes over: `ConvResidual` (with a `ConvModulation`, its
+    forward takes `(x, emb)`) and `TemporalMix`. A block whose convs are not int8 leaves (a 16-bit lane), a card or
+    shape the kernels do not serve, runs eager."""
+
+    blocks: tuple[ConvResidual | TemporalMix, ...]
+
+    @property
+    def name(self) -> str:
+        return "fused.conv-blocks.int8"
+
+    def contract(self) -> dict[str, object]:
+        def named(item: object) -> str:
+            return f"{getattr(item, '__module__', '')}:{getattr(item, '__qualname__', '')}"
+
+        return {
+            "blocks": [
+                {
+                    "block": named(b.block),
+                    "steps": [list(st) for st in b.steps],
+                    "shortcut": b.shortcut,
+                    "modulation": None
+                    if b.modulation is None
+                    else {"step": b.modulation.step, "rows": b.modulation.rows},
+                }
+                if isinstance(b, ConvResidual)
+                else {
+                    "block": named(b.block),
+                    "norm": b.norm,
+                    "depthwise": b.depthwise,
+                    "pointwise": b.pointwise,
+                }
+                for b in self.blocks
+            ]
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _BlocksSite:
+    """An installed `ConvBlocks` block: its declaration and the device it serves on."""
+
+    declared: ConvResidual | TemporalMix
+    index: int
+
+
+def _int8_leaf(module: nn.Module | None) -> bool:
+    return getattr(module, "provider", None) == "cozy.int8-convrot.conv-leaf/1"
+
+
+def _blocks_kernels(x: Tensor, site: _BlocksSite) -> ModuleType | None:
+    """The int8 conv kernels for this call, None where the eager forward serves: not half NDHWC-able 512 channels on
+    CUDA, or the kernels not serving this card."""
+    if not (x.is_cuda and x.dtype in (torch.float16, torch.bfloat16) and x.dim() == 5):
+        return None
+    if int(x.shape[1]) != _conv8.CHANNELS:
+        return None
+    return _conv8.kernels(site.index)
+
+
+def _rows(x: Tensor) -> Tensor:
+    """`x` [N, C, D, H, W] as its NDHWC rows [N, D, H, W, C] (a view of `channels_last_3d` memory)."""
+    return x.contiguous(memory_format=torch.channels_last_3d).permute(0, 2, 3, 4, 1)
+
+
+def _int8_residual_forward(self: nn.Module, x: Tensor, *args: object, **kwargs: object) -> Tensor:
+    site: _BlocksSite = vars(self)["_cozy_blocks"]
+    declared = cast("ConvResidual", site.declared)
+    eager = cast("_FusedConvBlock", self)._cozy_eager
+    modulated = declared.modulation is not None
+    module = None if kwargs or len(args) != int(modulated) else _blocks_kernels(x, site)
+    steps = [
+        (cast("torch.nn.GroupNorm", self.get_submodule(n)), cast("_Int8Conv", self.get_submodule(c)))
+        for n, c in declared.steps
+    ]
+    if module is None or not all(_int8_leaf(conv) and conv.served(x) for _, conv in steps):
+        return cast("Tensor", eager(x, *args, **kwargs))
+    rows = _rows(x)
+    h = rows
+    for at, (norm, conv) in enumerate(steps):
+        scale = shift = None
+        if declared.modulation is not None and at == declared.modulation.step:
+            emb = cast("Tensor", args[0])
+            made = cast("Tensor", self.get_submodule(declared.modulation.rows)(emb)).to(x.dtype)
+            scale, shift = made.reshape(made.shape[0], -1).chunk(2, dim=1)
+        mean, rstd = _conv8.stats(module, h, norm.num_groups, norm.eps)
+        a, b = _conv8.affine(mean, rstd, norm.weight, norm.bias, scale, shift)
+        q, qs = _conv8.quantize(module, h, a, b, silu=True)
+        residual = None
+        if at == len(steps) - 1:
+            shortcut = None if declared.shortcut is None else self.get_submodule(declared.shortcut)
+            residual = rows
+            if shortcut is not None and type(shortcut) is not torch.nn.Identity:
+                residual = _rows(cast("Tensor", shortcut(x)))
+        out = conv.convolve(module, q, qs, residual, x.dtype)
+        if out is None:
+            raise RuntimeError(f"cozy conv8: a served conv of {type(self).__name__} was refused")
+        h = out
+    return h.permute(0, 4, 1, 2, 3)
+
+
+def _int8_temporal_forward(self: nn.Module, x: Tensor, *args: object, **kwargs: object) -> Tensor:
+    site: _BlocksSite = vars(self)["_cozy_blocks"]
+    declared = cast("TemporalMix", site.declared)
+    eager = cast("_FusedConvBlock", self)._cozy_eager
+    module = None if args or kwargs else _blocks_kernels(x, site)
+    norm = cast("torch.nn.GroupNorm", self.get_submodule(declared.norm))
+    depthwise = cast("torch.nn.Conv3d", self.get_submodule(declared.depthwise))
+    pointwise = cast("_Int8Conv", self.get_submodule(declared.pointwise))
+    if module is None or not (_int8_leaf(pointwise) and pointwise.served(x)):
+        return cast("Tensor", eager(x, *args, **kwargs))
+    rows = _rows(x)
+    mean, rstd = _conv8.stats(module, rows, norm.num_groups, norm.eps)
+    a, b = _conv8.affine(mean, rstd, norm.weight, norm.bias)
+    taps = depthwise.weight.float().reshape(_conv8.CHANNELS, _conv8.TEMPORAL_TAPS)
+    bias = None if depthwise.bias is None else depthwise.bias.float()
+    q, qs = _conv8.temporal(module, rows, a, b, taps, bias)
+    out = pointwise.convolve(module, q, qs, rows, x.dtype)
+    if out is None:
+        raise RuntimeError(f"cozy conv8: the pointwise conv of {type(self).__name__} was refused")
+    return out.permute(0, 4, 1, 2, 3)
+
+
+def _check_blocks(declared: ConvResidual | TemporalMix, block: nn.Module, path: str) -> None:
+    def child(name: str) -> nn.Module:
+        try:
+            return block.get_submodule(name)
+        except AttributeError:
+            raise _Mismatch(f"{path}: no {name}") from None
+
+    def group(name: str) -> None:
+        norm = child(name)
+        if not isinstance(norm, torch.nn.GroupNorm) or not norm.affine:
+            raise _Mismatch(f"{path}.{name}: not an affine GroupNorm")
+        if norm.num_channels != _conv8.CHANNELS or (_conv8.CHANNELS // norm.num_groups) % 8:
+            raise _Mismatch(f"{path}.{name}: {norm.num_channels} channels in {norm.num_groups} groups")
+
+    if isinstance(declared, TemporalMix):
+        group(declared.norm)
+        dw = child(declared.depthwise)
+        if not (
+            isinstance(dw, torch.nn.Conv3d)
+            and tuple(dw.kernel_size) == (_conv8.TEMPORAL_TAPS, 1, 1)
+            and dw.groups == _conv8.CHANNELS
+            and tuple(dw.padding) == (_conv8.TEMPORAL_TAPS // 2, 0, 0)
+            and tuple(dw.stride) == (1, 1, 1)
+            and dw.padding_mode == "zeros"
+        ):
+            raise _Mismatch(f"{path}.{declared.depthwise}: not a depthwise (5, 1, 1) conv over time")
+        child(declared.pointwise)
+        return
+    for norm, conv in declared.steps:
+        group(norm)
+        child(conv)
+    if declared.modulation is not None:
+        if not 0 <= declared.modulation.step < len(declared.steps):
+            raise _Mismatch(f"{path}: modulation of step {declared.modulation.step}")
+        child(declared.modulation.rows)
+    if declared.shortcut is not None:
+        child(declared.shortcut)
+
+
+def install_conv_blocks(plan: Plan, layout: ConvBlocks, *roots: nn.Module) -> str:
+    """`layout` on every declared block under `roots`: the plan's identity, or "" when the eager blocks serve (no int8
+    conv kernels on this card, no int8 conv leaves under `roots`, or a block that is not the declaration; reported).
+    The kernels pass their probe on this card before a call serves fused (`accel.fusion._conv8`)."""
+    device = torch.device(plan.device)
+    document: dict[str, object] = {"blocks": [b.block.__qualname__ for b in layout.blocks]}
+
+    def report(reason: str = "", **counts: int) -> str:
+        outcome = {**document, "applied": not reason, **({"reason": reason} if reason else counts)}
+        plan.report(layout.name, outcome)
+        print(f"[cozy] {layout.name}: {json.dumps(outcome, sort_keys=True)}", file=sys.stderr)
+        return ""
+
+    if device.type != "cuda":
+        return report(f"int8 convs serve CUDA, not {device}")
+    missing = _kernels_absent()
+    if missing:
+        return report(f"kernels_absent: {missing}")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    found = [(f"{i}.{path}", m) for i, root in enumerate(roots) for path, m in root.named_modules()]
+    if not any(_int8_leaf(m) for _, m in found):
+        return report("no int8 conv leaves: a 16-bit lane runs eager")
+    sites: list[tuple[nn.Module, str, _BlocksSite]] = []
+    try:
+        for declared in layout.blocks:
+            kind = "int8-temporal" if isinstance(declared, TemporalMix) else "int8-residual"
+            for path, block in found:
+                if getattr(type(block), "_cozy_fused", None) == kind:
+                    continue  # installed already
+                if type(block) is not declared.block or "forward" in vars(block):
+                    continue
+                _check_blocks(declared, block, path)
+                sites.append((block, kind, _BlocksSite(declared, index)))
+    except _Mismatch as exc:
+        return report(str(exc))
+    read = [
+        block.get_submodule(name)
+        for block, _, site in sites
+        for name in (
+            [n for step in site.declared.steps for n in step]
+            if isinstance(site.declared, ConvResidual)
+            else [site.declared.norm, site.declared.depthwise, site.declared.pointwise]
+        )
+    ]
+    if any(_hooked(m) for m in read):
+        return report("a hook on a norm or conv the fused blocks read instead of calling")
+    name = f"cozy conv8 cuda:{index}"
+    kernel_ready.ready(name, partial(_conv8._open, index))
+    refused = kernel_ready.failed(name)
+    if refused is not None:
+        return report(f"kernels_failed: {refused}")
+    before = [_census(root) for root in roots]
+    for module, kind, site in sites:
+        module.__class__ = _fused(type(module), kind)
+        cast("_FusedConvBlock", module)._cozy_blocks = site  # its class is the fused one now
+    if [_census(root) for root in roots] != before:
+        raise RuntimeError("the fused substitution moved a parameter or buffer")
+    counts = Counter(kind for _, kind, _ in sites)
+    report(residuals=counts["int8-residual"], temporal=counts["int8-temporal"])
+    document = {"kernels": prebuilt.artifact("_conv"), "layout": layout.contract()}
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(b"cozy.fusion.conv-blocks\0" + encoded).hexdigest()
+
+
 __all__ = [
     "CausalConv",
     "CausalConvEncoder",
     "ChannelNorm",
+    "ConvBlocks",
+    "ConvModulation",
     "ConvResidual",
     "DiTBlock",
     "GatedMLP",
@@ -1511,7 +1781,9 @@ __all__ = [
     "PaddedConv",
     "Padding",
     "Rope",
+    "TemporalMix",
     "install",
+    "install_conv_blocks",
     "install_encoder",
     "install_lone_frame",
     "install_norms",

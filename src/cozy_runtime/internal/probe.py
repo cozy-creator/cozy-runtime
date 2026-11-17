@@ -51,6 +51,7 @@ from cozy_runtime.internal.encoding.formats import (
     NVFP4_BLOCK,
     TORCH_DTYPES,
     Encoded,
+    Int8ConvRotDequant,
     LeafProvider,
     Provider,
     Tensor,
@@ -623,6 +624,50 @@ def _native_agreement(
     )
 
 
+def _conv_agreement(
+    torch: ModuleType, provider: LeafProvider, device: torch.device, dtype: torch.dtype
+) -> NativeAgreement:
+    """A CONV LEAF's oracle (cr-327): its forward on a real Conv3d's filter, stored as its producer stores it (channels
+    last, `formats.conv_declared`, `encode_int8_convrot256` per (output channel, tap) row), against an f64 conv3d over
+    the exactly-dequantized filter and the un-quantized activation, its padding at every border."""
+    generator = torch.Generator(device="cpu").manual_seed(0x511C)
+    conv = torch.nn.Conv3d(512, 128, 3, padding=1)
+    weight = torch.randn(128, 3, 3, 3, 512, generator=generator) * 0.02
+    encoded = encode_int8_convrot256("probe", weight.reshape(-1, 512).numpy())
+    (scale,) = encoded.companions
+    roles = {
+        "weight": torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8).reshape(128, 3, 3, 3, 512).to(device),
+        "scale": torch.frombuffer(bytearray(scale.raw), dtype=torch.float32).reshape(128, 3, 3, 3).to(device),
+    }
+    exact = Int8ConvRotDequant(params=(("rotation", "kron_regular_h4"), ("rotation_size", 256)))
+    filt = torch.empty(128, 512, 3, 3, 3, dtype=torch.float64, device=device)
+    exact.decode(torch, roles, filt)
+    bias = torch.randn(128, generator=generator).to(device, dtype)
+    conv.bias = torch.nn.Parameter(bias)
+    x = torch.randn(1, 512, 3, 9, 11, generator=generator).to(device, dtype)
+    reference = torch.nn.functional.conv3d(x.double(), filt, bias.double(), padding=1)
+    try:
+        got = provider.leaf(torch, roles, conv, dtype)(x)
+    except Exception as exc:  # the kernel, the dtype or the arch says no — verbatim
+        return NativeAgreement(
+            passed=False,
+            kernel=f"{type(exc).__module__}.{type(exc).__name__}: {exc}",
+            note="the native kernel refused on this device",
+        )
+    deviation = _relative(torch, got, reference)
+    finite = bool(torch.isfinite(got).all())
+    contract = str(got.dtype) == str(x.dtype)
+    return NativeAgreement(
+        passed=within(deviation, NATIVE_DEVIATION_BOUND) and finite and contract,
+        shape=[1, 128, 512, 3, 3, 3],
+        deviation_rel=deviation,
+        tolerance=NATIVE_DEVIATION_BOUND,
+        finite=finite,
+        out_dtype=str(got.dtype).removeprefix("torch."),
+        out_dtype_is_contract=contract,
+    )
+
+
 class _StandIn:
     """The module a leaf stands in for, during conformance only.
 
@@ -993,6 +1038,7 @@ NATIVE_SUITES = frozenset(
     {
         "fp8-rowwise-native",
         "int8-convrot256-native",
+        "int8-convrot-conv",
         "nvfp4-native",
         "mxfp8-native",
         "w4a8-native",
@@ -1089,7 +1135,9 @@ def _evidence(
 ) -> Evidence:
     """One (implementation, output dtype)'s evidence."""
     if isinstance(provider, LeafProvider) and provider.suite in NATIVE_SUITES:
-        agreement = _native_agreement(torch, provider, target, dtype)
+        agreement = (_conv_agreement if provider.suite == "int8-convrot-conv" else _native_agreement)(
+            torch, provider, target, dtype
+        )
         return NativeEvidence(numerics=agreement, passed=agreement.passed)
     suite = DECODE_SUITES.get(provider.suite)
     if suite is None:
