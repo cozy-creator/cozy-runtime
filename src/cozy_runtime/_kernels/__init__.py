@@ -46,6 +46,14 @@ except ModuleNotFoundError:  # Linux aarch64 (cr-200), Windows (cr-201) and the 
 except ImportError as broken:
     NO_SAGE3 = f"this cozy-runtime wheel's SageAttention3 does not load ({broken})"
 try:
+    import cozy_runtime._kernels._conv as _conv
+
+    NO_CONV = ""
+except ModuleNotFoundError:  # the pure wheel
+    NO_CONV = "this cozy-runtime wheel carries no causal-conv encoder kernels"
+except ImportError as broken:
+    NO_CONV = f"this cozy-runtime wheel's causal-conv encoder kernels do not load ({broken})"
+try:
     import cozy_runtime._kernels._attn4 as _attn4
 
     NO_ATTN4 = ""
@@ -89,6 +97,11 @@ ARCHS: dict[str, dict[str, tuple[str, ...]]] = {
     # INT4 Q·Kᵀ attention runs on the cards with s4 tensor cores: Ampere (8.0's serves 8.7) and Ada.
     "_attn4": {"cubin": ("sm_80", "sm_86", "sm_89"), "ptx": ()},
     "_norm": {
+        "cubin": ("sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_103", "sm_120", "sm_121"),
+        "ptx": ("compute_80",),
+    },
+    # comfy-kitchen's GroupNorm + SiLU + pad pass and fp16-accumulate conv3d (mma.sync): every target.
+    "_conv": {
         "cubin": ("sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_103", "sm_120", "sm_121"),
         "ptx": ("compute_80",),
     },
@@ -147,5 +160,5 @@ def rms_rope_split_half(
     return q_out, k_out
 
 
-# The modules are `internal.prebuilt`'s to call; `rms_rope_split_half` is `accel.kernels`'.
-__all__ = ["_attn4", "_fa3", "_gemm", "_norm", "_sage3", "rms_rope_split_half"]
+# The modules are `internal.prebuilt`'s to call, `_conv` `accel.fusion`'s; `rms_rope_split_half` is `accel.kernels`'.
+__all__ = ["_attn4", "_conv", "_fa3", "_gemm", "_norm", "_sage3", "rms_rope_split_half"]

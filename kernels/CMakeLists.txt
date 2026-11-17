@@ -244,6 +244,20 @@ set_target_properties(rms_rope PROPERTIES CUDA_ARCHITECTURES "${EVERY}")
 target_compile_options(rms_rope PRIVATE --expt-extended-lambda --use_fast_math)
 kernel_module(_norm norm.cpp rms_rope)
 
+# A causal-conv video encoder's GroupNorm + SiLU + padding pass and its fp16-accumulate NDHWC conv3d: comfy-kitchen's (#167),
+# unmodified, at the pin above (`csrc/conv/UPSTREAM.md`), with upstream's nvcc flags. The conv is CUTLASS's Sm80 implicit
+# GEMM on mma.sync, so every target runs it.
+add_library(conv_units OBJECT "${KITCHEN}/ops/group_norm_pad3d.cu" "${KITCHEN}/ops/cutlass_conv3d_fp16.cu")
+set_target_properties(conv_units PROPERTIES CUDA_ARCHITECTURES "${EVERY}")
+target_include_directories(conv_units PRIVATE "${KITCHEN}" "${CUTLASS_DIR}/include")
+target_compile_definitions(conv_units PRIVATE COMFY_HAVE_CUTLASS)
+target_compile_options(conv_units PRIVATE -O3 --use_fast_math --expt-relaxed-constexpr --expt-extended-lambda
+                       -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__
+                       -U__CUDA_NO_BFLOAT16_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__
+                       $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>
+                       $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus -Xcompiler=/Zc:preprocessor>)
+kernel_module(_conv conv.cpp conv_units)
+
 # The executor's record of a fatal signal (`csrc/crash.c`, cr-275): plain C on the stable ABI, Linux only.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     enable_language(C)
