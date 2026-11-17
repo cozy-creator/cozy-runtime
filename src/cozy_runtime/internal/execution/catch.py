@@ -121,7 +121,9 @@ def _gib(n: int) -> str:
 
 
 def _holders(device: int) -> str:
-    """What holds `device`'s memory now: live tensors, weights in use, graph pools and caches."""
+    """What holds `device`'s memory now: live tensors, the working pages mapped beside them (free
+    but in pages a live tensor shares, or freed and awaiting their stream), weights in use, graph
+    pools and caches."""
     room, stats = vt.room(device), vt.stats(device)
     pools, caches = stats["pools_bytes"], stats["cache_mapped_bytes"]
     held = (
@@ -129,11 +131,18 @@ def _holders(device: int) -> str:
         if pools or caches
         else "no graph pools or caches"
     )
+    beside = max(stats["mapped_bytes"] - room["working_live"], 0)
     return (
-        f"{_gib(room['working_live'])} of live tensors, {_gib(room['pinned'])} of weights in use "
-        f"({_gib(room['weights_resident'])} resident), {held}, of {_gib(room['capacity'])} on "
-        f"GPU {device}"
+        f"{_gib(room['working_live'])} of live tensors and {_gib(beside)} mapped beside them "
+        f"({_gib(stats['pending_bytes'])} awaiting their stream), {_gib(room['pinned'])} of "
+        f"weights in use ({_gib(room['weights_resident'])} resident), {held}, of "
+        f"{_gib(room['capacity'])} on GPU {device}"
     )
+
+
+def room(device: int) -> str:
+    """`device`'s room now, as a device OOM's line says it."""
+    return _holders(device)
 
 
 def _room_line() -> str:
@@ -152,10 +161,15 @@ if not ROOM:
     ROOM.append(_room_line)
 
 
-def refuse(device: int, name: str, level: str, need: int, exc: BaseException) -> DoesNotFit:
+class Unplaced(DoesNotFit):
+    """No level of a cut can be given room before it runs (or, for a pure op, runs again): its
+    caller may run it another way."""
+
+
+def refuse(device: int, name: str, level: str, need: int, exc: BaseException) -> Unplaced:
     """Native selection cannot make room for `name` at `level` (`need` bytes) with everything
     evictable gone, before any piece ran."""
-    return DoesNotFit(
+    return Unplaced(
         f"{name}: {level} needs {_gib(need)} beside {_holders(device)} ({exc}): run it smaller, "
         "or rent a larger card: `cozy run … --on new`"
     )
