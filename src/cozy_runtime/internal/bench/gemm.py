@@ -360,6 +360,11 @@ def _ggml(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
         calls[f"ggml-matmul{GGML_GRAPHED}:{name}"] = _graphed(matmul)
         calls[f"ggml-linear{GGML_GRAPHED}:{name}"] = _graphed(partial(_ggml_linear, ops, x, blocks, scheme, s.n))
         rules[f"kernel:{name}"] = ggml_linear.kernel(torch, 0, scheme, s.k, s.n, s.m)
+    if card.ops is not None and card.row.int8 and s.k % CONVROT_GROUP == 0:
+        # Our own 8-bit linear at the same rows, graphed alike: int8.convrot's GEMV (its rotation fused) beside MMVQ.
+        data = torch.randint(-127, 128, (s.n, s.k), generator=g, device="cuda:0", dtype=torch.int8)
+        scale = _rand(g, s.n, scale=1e-3, add=5e-4)
+        calls[f"ggml-int8{GGML_GRAPHED}:convrot"] = _graphed(partial(card.ops.int8_linear, x, data, scale, None, BF16))
     return calls, rules
 
 
