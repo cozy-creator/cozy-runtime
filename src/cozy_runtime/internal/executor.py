@@ -1173,8 +1173,9 @@ class Executor:
         self.store: Path | None = None
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
         self.on_demand: frozenset[str] = frozenset()
-        #: each on-demand model built so far, by parameter: its prepare facts (the run record's)
-        self.built_on_demand: dict[str, Reply] = {}
+        #: each request's on-demand models, by its id, then by parameter: their prepare facts
+        #: (its run record's `on_demand`)
+        self.built_on_demand: dict[str, dict[str, Reply]] = {}
         self.active = ""
         self.started = False
         #: torch, the Runtime and the package are imported (`Start.import_only`); no device yet
@@ -1468,6 +1469,7 @@ class Executor:
 
     def _execution(
         self,
+        request_id: str,
         pin: str,
         choices: attention.Applied | None,
         start_us: int,
@@ -1476,7 +1478,7 @@ class Executor:
         segments: Sequence[Mapping[str, object]] = (),
         seen: attention_ulysses.Seen | None = None,
     ) -> Reply:
-        """The attempt's execution record: degree, every GPU, and the setup it ran on."""
+        """`request_id`'s attempt's execution record: degree, every GPU, and the setup it ran on."""
         gpus = [
             execution_evidence.record(
                 self._rank_identity() if self.torch is not None else {"pid": os.getpid()},
@@ -1527,8 +1529,12 @@ class Executor:
                 for k, v in m.plan_reports.items()
             },
             "construction": _construction_record(facts),
-            # Each on-demand model's build, made inside the stage that first read it.
-            "on_demand": {p: _construction_record(f) for p, f in self.built_on_demand.items()},
+            # Each on-demand model this request built, inside the stage that first read it; one an
+            # earlier request built is that one's (cl-1103: a call answers for its own request).
+            "on_demand": {
+                p: _construction_record(f)
+                for p, f in self.built_on_demand.pop(request_id, {}).items()
+            },
         }
 
     def _follow_display(self, command: Invoke) -> None:
@@ -3537,7 +3543,9 @@ class Executor:
             detail = f"model {parameter} refused: {reply.get('detail', '')}"
             raise RuntimeFailure(detail[:900], code=str(reply.get("code") or "runtime_failure"))
         member.load_reply = reply
-        self.built_on_demand[parameter] = member.facts
+        context = CURRENT.get()
+        request_id = context.request_id if context is not None else ""
+        self.built_on_demand.setdefault(request_id, {})[parameter] = member.facts
         self.torch = self.torch or member.torch
         if member.residency is not None:
             # An on-demand member's parent serves the many-model composite (`_load_group`).
@@ -4253,6 +4261,7 @@ class Executor:
             in (served_attention.totals() if served_attention else {}),
             "execution": {
                 **self._execution(
+                    command.request_id,
                     requested,
                     served_attention,
                     started_us,
