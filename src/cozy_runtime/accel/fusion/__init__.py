@@ -1319,7 +1319,7 @@ def _causal(
 
 def _lone_frame(x: Tensor, conv: _FusedConv, front: int) -> bool:
     """`x` is one frame and `conv` pads exactly its other temporal taps with zero frames before it."""
-    return int(x.shape[2]) == 1 and front > 0 and front == int(conv.kernel_size[0]) - 1
+    return False  # cr-323's gate red run only (not for merge): the path reported, never taken
 
 
 def _causal_forward(self: nn.Module, x: Tensor, *args: object, **kwargs: object) -> Tensor:
