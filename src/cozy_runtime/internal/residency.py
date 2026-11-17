@@ -2336,6 +2336,7 @@ class Memory:
         if (
             not self.cuda
             or capturing
+            or not block.path  # the model's common block spans its whole forward
             or request is None
             or request.idle
             or key in self._probed
