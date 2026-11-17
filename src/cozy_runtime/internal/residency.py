@@ -1155,6 +1155,10 @@ class Memory:
         self._executing: dict[Model, int] = {}
         #: the birth site last set on this device (`_born`)
         self._site = 0
+        #: (model, pass shape) whose first block this process measured (`_Probe`), and the one
+        #: measuring now
+        self._probed: set[tuple[str, int]] = set()
+        self._probe: _Probe | None = None
         if self.cuda:
             try:
                 if budget_bytes is not None:
@@ -2318,9 +2322,66 @@ class Memory:
                     block.saved.append((site, site.table[site.name]))
                     site.table[site.name] = value
             self._used(block)
+            if not nested and self._probe is None:
+                self._start_probe(block, capturing)
         except BaseException:
             self._exit(block)
             raise
+
+    def _start_probe(self, block: _Block, capturing: bool) -> None:
+        """Measure `block` if it is its model's first at this pass shape in this process: the
+        working peak resets here, and `_end_probe` reads it with the driver's free bytes (cr-305)."""
+        request = _REQUEST.get()
+        key = (block.model.name, PASS_SHAPE.get())
+        if (
+            not self.cuda
+            or capturing
+            or request is None
+            or request.idle
+            or key in self._probed
+            or not torch.cuda.is_initialized()
+        ):
+            return
+        device = self.device.index or 0
+        request.sample()  # the request keeps its peak so far
+        free = int(torch.cuda.mem_get_info(device)[0])
+        stats, room = vt.stats(device), vt.room(device)
+        vt.reset_peak(device)
+        self._probe = _Probe(
+            block,
+            key,
+            free,
+            int(stats["mapped_bytes"]),
+            int(stats["allocated_bytes"]),
+            int(room["weights_resident"]),
+            int(room["capacity"]),
+        )
+
+    def _end_probe(self, probe: _Probe) -> None:
+        self._probe = None
+        self._probed.add(probe.key)
+        device = self.device.index or 0
+        request = _REQUEST.get()
+        if request is None:
+            return
+        free = int(torch.cuda.mem_get_info(device)[0])
+        stats, room = vt.stats(device), vt.room(device)
+        mapped, weights = int(stats["mapped_bytes"]), int(room["weights_resident"])
+        peak, allocated = int(stats["allocated_peak"]), int(stats["allocated_bytes"])
+        request.first_blocks.append(
+            {
+                "block": f"{probe.block.model.component}/{probe.block.path}",
+                "shape": probe.key[1],
+                "non_torch": (probe.free - free) - (mapped - probe.mapped) - (weights - probe.weights),
+                "peak_above_entry": peak - probe.allocated,
+                "transient": peak - allocated,
+                "fragmentation": int(stats["mapped_peak"]) - peak,
+                "live_at_entry": probe.allocated,
+                "weights_at_entry": probe.weights,
+                "capacity_at_entry": probe.capacity,
+                "capacity": int(room["capacity"]),
+            }
+        )
 
     def _used(self, block: _Block) -> None:
         if self.cuda:
@@ -2339,6 +2400,7 @@ class Memory:
         finally:
             with self.lock:
                 block.count -= 1
+                probe = self._probe if block.count == 0 and self._probe is not None else None
                 if block.count == 0:
                     for site, previous in reversed(block.saved):
                         site.table[site.name] = previous
@@ -2348,6 +2410,8 @@ class Memory:
                         block.born_before = None
                     block.last = time.monotonic_ns()
                     self._idle(block)
+            if probe is not None and probe.block is block:
+                self._end_probe(probe)
 
     def _read(
         self, block: _Block, site: _Site, raw_view: tuple[int, _Part] | None = None
@@ -2678,6 +2742,8 @@ class RequestStats(TypedDict):
     retries: int
     #: `Request.hosted`
     hosted: dict[str, str]
+    #: `Request.first_blocks`
+    first_blocks: list[FirstBlock]
     regrown: int
     swallowed_ooms: int
     retained_bytes: int
@@ -2692,6 +2758,37 @@ class RequestStats(TypedDict):
     #: "completed", the core's ahead-of-demand counters (`_ahead`) and "scope"
     prefetch: NotRequired[dict[str, int | str]]
     measurement: NotRequired[str]
+
+
+class FirstBlock(TypedDict):
+    """A model's first block at a pass shape, measured as vLLM's profile run splits a forward, in
+    bytes: what the driver lost beyond varena's own pages (`non_torch`: context, library
+    workspaces, kernel modules), the working peak above entry, its `transient` part (the peak less
+    what the block left allocated), and mapped less allocated at the peaks (`fragmentation`)."""
+
+    block: str
+    shape: int
+    non_torch: int
+    peak_above_entry: int
+    transient: int
+    fragmentation: int
+    live_at_entry: int
+    weights_at_entry: int
+    capacity_at_entry: int
+    capacity: int
+
+
+@dataclass(slots=True)
+class _Probe:
+    """`Memory._start_probe`'s readings at the block's entry."""
+
+    block: _Block
+    key: tuple[str, int]
+    free: int
+    mapped: int
+    allocated: int
+    weights: int
+    capacity: int
 
 
 class SplitChoice(TypedDict):
@@ -2920,6 +3017,8 @@ class Request:
         #: refusals a CUDA graph capture answered by recording again with room for them
         #: (`graphs.capture`): what runs is the same
         self.regrown = 0
+        #: each model's first block measured at a pass shape (`Memory._start_probe`)
+        self.first_blocks: list[FirstBlock] = []
         #: refusals a package scope returned past (`contract._Scopes`): zero in a conforming run
         self.swallowed_ooms = 0
         #: cross-step state its loops declared (`author.retained`)
@@ -3068,6 +3167,7 @@ class Request:
             "escaped": list(self.escaped),
             "retries": self.retries,
             "hosted": dict(self.hosted),
+            "first_blocks": list(self.first_blocks),
             "regrown": self.regrown,
             "swallowed_ooms": self.swallowed_ooms,
             "retained_bytes": self.retained_bytes,
