@@ -22,6 +22,7 @@ from cozy_runtime.author._loader import TENSORFS_NAMES
 from cozy_runtime.internal import call_scope
 from cozy_runtime.weights_store import Checkpoint, Output, ReusedQuantization
 
+from . import ggml
 from .microscale import CONVROT_GROUP, NVFP4_BLOCK, W4A8_GROUP
 
 if TYPE_CHECKING:
@@ -47,6 +48,7 @@ _STRATEGIES = {
     "svdq.nvfp4": SVDQ_STRATEGY,
     "fp8.rowwise": "fp8-rowwise-rne/1",
     "w4a8.convrot": "w4a8-convrot256-fixed/1",
+    **dict.fromkeys(ggml.BLOCKS, ggml.STRATEGY),
 }
 _NVFP4: dict[str, MetadataInput] = {
     "block_size": NVFP4_BLOCK,
@@ -65,6 +67,7 @@ PARAMS: dict[str, dict[str, MetadataInput]] = {
         "rotation_size": CONVROT_GROUP,
     },
     "svdq.nvfp4": dict(_NVFP4),
+    **{scheme: {"block_size": n} for scheme, n in ggml.BLOCKS.items()},
 }
 #: Encodings a derivation reads through the serving decoder (`model_values`): per-row scaled
 #: codes, whose exact values a lane is written from (Ideogram 4 ships only fp8.rowwise).
