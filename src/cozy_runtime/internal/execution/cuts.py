@@ -950,7 +950,7 @@ def split[T](
         return (*[int(window(level) * item_bytes)] * holds,)
 
     request = catch.CURRENT.get()
-    if request is None or not request.memory.cuda:
+    if request is None or not request.memory.cuda or _capturing():  # a capture allocates no host
         hostable = False
     if not (hostable and request is not None and site in request.hosted):
         try:
@@ -958,7 +958,7 @@ def split[T](
                 site, deepest, need, lambda level: run(window(level), False), pure=pure
             )
         except catch.Unplaced as exc:  # refused before a window ran (or the op is pure)
-            if not hostable or request is None or _capturing():
+            if not hostable or request is None:
                 raise
             unwind(exc)
             _hosted(request, site, name)
