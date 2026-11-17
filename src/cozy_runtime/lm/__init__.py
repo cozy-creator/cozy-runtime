@@ -3255,7 +3255,15 @@ class _Engine:
             self._discard(key, graph, stream)
             self._unrecorded(key, why, "replay_mismatch")
         elif _graphs.AUDIT and len(held) > len(state):
-            self.partial.append(self._partial(size, state, held, start, at, graph, stream))
+            try:
+                self.partial.append(self._partial(size, state, held, start, at, graph, stream))
+            except Exception as exc:  # a dev machine's diagnosis never fails the call it rides on
+                if not is_capacity(exc):
+                    raise
+                self.partial.append(f"no room to check without them: {exc}"[:200])
+                for tensor, value in zip(held, start, strict=True):
+                    tensor.copy_(value)
+                self._advance(size)
 
     def _partial(
         self,
@@ -3273,7 +3281,7 @@ class _Engine:
         for tensor, value in zip(held, start, strict=True):
             tensor.copy_(value)
         vt.replay(graph, stream=stream)
-        for tensor, value in zip(state, start, strict=True):
+        for tensor, value in zip(state, start[: len(state)], strict=True):
             tensor.copy_(value)
         self._advance(size)
         old = [*(value.clone() for value in state), *self._written(size, at)]
