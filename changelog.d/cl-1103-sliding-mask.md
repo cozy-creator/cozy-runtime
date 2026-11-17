@@ -1,0 +1,1 @@
+The decode engine serves a model whose every layer slides (Mistral with a `sliding_window`) again: it takes the sliding mask itself, not masks by layer type, which Mistral's forward does not read (since cr-303 its decode failed with `'dict' object has no attribute 'ndim'`, as FLUX.2's tiny upsampler did in the cpu suite).
