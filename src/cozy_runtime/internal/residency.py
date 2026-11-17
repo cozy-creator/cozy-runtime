@@ -359,11 +359,11 @@ def split(module: nn.Module, paths: Sequence[str], sizes: Mapping[str, int]) -> 
     largest children that hold no block, one at a time, until under. A new block over the bound splits
     the same way, down to single layers; one tensor over it stays whole. `sizes` are the stored bytes
     by module-relative tensor name. Hunyuan-Image-3 kept 10 GB of attention and dense layers in common
-    beside its expert blocks. Linear in tensors and modules: each module's weighted bytes are summed
-    once, and a unit's bytes move with the blocks (Qwen3.6's 10,240 expert blocks took ~25 s a scan)."""
+    beside its expert blocks. Linear in tensors and modules: each module's bytes are summed once,
+    and a unit's bytes move with its blocks (Qwen3.6's 10,240 expert blocks were a scan each)."""
     modules = dict(module.named_modules())
     blocks = set(paths)
-    #: every module path's stored bytes below it, and the paths that hold a block (a block and its parents)
+    #: each module path's stored bytes below it; the paths that hold a block (it and its parents)
     below: dict[str, int] = {}
     for name, n in sizes.items():
         for prefix in _prefixes(name):
