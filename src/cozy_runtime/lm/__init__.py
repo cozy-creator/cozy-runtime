@@ -26,13 +26,13 @@ call's keys and state for its prompt and `max_new_tokens`, sized from the config
 pool are decided before its prefill (`_Engine._enter`): allocated or mapped then, else it waits for
 decoding rows to leave. Running short never ends a call while a lever remains: graphs whose pool
 has no room go (decode runs eagerly, captured again where room allows), a draft head's keys go,
-and slots or a prefill that still do not fit beside the leased weights decode through
-Transformers' loop, its weights streamed and its cache only as long as its tokens. Only slots
-larger than the whole card are `DoesNotFit` up front, naming what would fit. Errors after
-execution starts are final; package code is never restarted. On a CPU, or after a safe
-capture refusal (a run warning), the same step runs eagerly. A model this does not
-serve (a layer type other than full or linear attention, an attention other than SDPA or eager, a
-generation config that adds logits processors) generates through Transformers, said once.
+and slots or a prefill that still do not fit beside the leased weights (an allocation refused, or
+a split level that has no room) decode through Transformers' loop, its weights streamed and its
+cache only as long as its tokens. Only slots larger than the whole card are `DoesNotFit` up front,
+naming what would fit. Errors after execution starts are final; package code is never restarted.
+On a CPU, or after a safe capture refusal (a run warning), the same step runs eagerly. A model this
+does not serve (a layer type other than full or linear attention, an attention other than SDPA or
+eager, a generation config that adds logits processors) generates through Transformers, said once.
 
 With `allowed` (a `Constraint`), each step's tokens are read back to the host, which asks the
 constraint what may follow and writes that into a bit mask the next step's graph reads: one sync a
@@ -2356,7 +2356,11 @@ class _Engine:
         try:
             fresh = self._prefill(request, kwargs, mask, position, first)
         except Exception as exc:
-            if not is_capacity(exc) or request.inputs["input_ids"].device.type != "cuda":
+            # A split level refused room (`DoesNotFit`) was judged beside this engine's own leased
+            # weights and slots, which no reclaim takes: the prefill is short, as when an
+            # allocation is (cr-331: an edit's vision tower, 21.4 GiB leased on a 4090).
+            short = is_capacity(exc) or isinstance(exc, DoesNotFit)
+            if not short or request.inputs["input_ids"].device.type != "cuda":
                 raise
             # Nothing of the engine's changed: the prompt went into a cache of its own. Its slots
             # and leased weights go, and Transformers' loop streams the weights beside its prompt.
@@ -3705,8 +3709,10 @@ def _unwind(exc: BaseException) -> None:
 def _answered(exc: BaseException) -> None:
     """A refusal varena counted (`vt.ooms`) that the Runtime answered by running another way, so
     the package's scope is not judged to have swallowed it. `Exhausted` (a preparation refused
-    before anything ran) is not one it counted."""
-    if isinstance(exc, Exhausted):
+    before anything ran) is not one it counted, nor a split level refused before it ran
+    (`DoesNotFit`) unless a refused allocation caused it (`catch.retry`)."""
+    counted = exc.__cause__ if isinstance(exc, DoesNotFit) else exc
+    if counted is None or isinstance(counted, Exhausted):
         return
     from cozy_runtime.internal.execution.catch import CURRENT as SERVING
 
