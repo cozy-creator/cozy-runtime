@@ -796,7 +796,7 @@ def _derived(leaf: Leaf, parts: Mapping[str, Tensor]) -> tuple[str, ...]:
 
 def _same(kept: Tensor, stored: Tensor) -> bool:
     """`kept` is `stored`'s bytes as they are: one storage and offset, dtype, shape and strides."""
-    return kept is stored or (
+    return kept is stored or bool(
         kept.dtype == stored.dtype
         and kept.shape == stored.shape
         and kept.stride() == stored.stride()

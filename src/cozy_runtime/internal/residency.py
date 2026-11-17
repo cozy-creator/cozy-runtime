@@ -2488,15 +2488,15 @@ class Memory:
                         return nn.Parameter(value, requires_grad=False) if site.parameter else value
             self._enter(block)
             try:
-                value = site.table[site.name]
-                if isinstance(value, Placeholder):
+                held = site.table[site.name]
+                if isinstance(held, Placeholder):
                     raise ResidencyError(
                         f"{model.name}: {site.name} has no value: no stored tensor binds it. A "
                         "buffer no checkpoint stores keeps its constructed value only when "
                         "construction computed one (from config or a constant), not from a "
                         "weightless parameter"
                     )
-                return cast(Tensor, value)  # a site is a slot that held a tensor
+                return cast(Tensor, held)  # a site is a slot that held a tensor
             finally:
                 self._exit(block)
         finally:
