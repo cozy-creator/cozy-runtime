@@ -432,53 +432,6 @@ def split(module: nn.Module, paths: Sequence[str], sizes: Mapping[str, int]) -> 
     return sorted(blocks, key=order.__getitem__)
 
 
-#: A unit whose page rounding wastes more than 1/`_PADDED` of its bytes joins its parent (`joined`).
-_PADDED = 8
-#: Working room `joined` leaves beside a component's weights, at most: 1/8 of a smaller card.
-_WORKING = 4 << 30
-
-
-def joined(
-    module: nn.Module, paths: Sequence[str], sizes: Mapping[str, int], granularity: int, room: int
-) -> list[str]:
-    """`paths` with the units too small for the card's pages joined into their parent module
-    (each unit is one Region, rounded up to `granularity`) where that is what lets the component fit
-    `room` beside its working memory. Qwen3.6-35B-A3B's 10,496 int8 experts are 3.01 MiB each and
-    took 4 MiB: 45.2 GiB of a 48 GB card for 35.0 GiB of weights, too little left to decode
-    (cl-1119). Joined, each layer's experts are one 771 MiB unit. Where it fits unit by unit, or
-    doesn't fit either way, each unit pages alone: the padding is what streaming only a token's own
-    experts costs."""
-
-    def padded(n: int) -> int:
-        return -(-n // granularity) * granularity
-
-    def units(blocks: Collection[str]) -> dict[str, int]:
-        held: dict[str, int] = {}
-        for name, n in sizes.items():
-            unit = _unit(name, blocks)
-            held[unit] = held.get(unit, 0) + n
-        return held
-
-    blocks = set(paths)
-    held = units(blocks)
-    small: dict[str, set[str]] = {}
-    for path in paths:
-        n = held.get(path, 0)
-        if n and (padded(n) - n) * _PADDED > n:
-            small.setdefault(path.rpartition(".")[0], set()).add(path)
-    for parent, children in small.items():
-        inside = {b for b in blocks if b.startswith(parent + ".")}
-        within = sum(n for name, n in sizes.items() if name.startswith(parent + "."))
-        if parent and inside == children and within <= _SPLIT_UNIT:
-            blocks = (blocks - children) | {parent}
-    fits = room - min(room // 8, _WORKING)
-    alone, together = sum(map(padded, held.values())), sum(map(padded, units(blocks).values()))
-    if blocks == set(paths) or alone <= fits or together > fits:
-        return list(paths)
-    order = {path: i for i, path in enumerate(dict(module.named_modules()))}
-    return sorted(blocks, key=order.__getitem__)
-
-
 def unpaged(module: nn.Module, rule: str, groups: Mapping[str, int]) -> str | None:
     """Why this component cannot page on a small card, or None: a unit over `_LARGEST_UNIT` (the
     whole component, when it has no blocks). `groups` are the bytes by block path ("" common, its
