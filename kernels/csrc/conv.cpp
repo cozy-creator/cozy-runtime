@@ -10,7 +10,6 @@
 #include <array>
 #include <cstdint>
 #include <cuda_runtime.h>
-#include <exception>
 #include <string>
 
 extern "C" void launch_group_norm_silu_pad3d(
@@ -30,19 +29,24 @@ namespace {
 
 void *at(uintptr_t p) { return reinterpret_cast<void *>(p); }
 
-// The kernel's launch, then CUDA's error code: 0 when it launched. A refused shape raises ValueError.
+// The kernel's launch, then CUDA's error code: 0 when it launched. A shape the launcher refuses raises ValueError
+// here, before it: MSVC assumes an extern "C" function never throws (/EHsc), so its throw is never caught across it.
 int norm_pad(uintptr_t x, uintptr_t gamma, uintptr_t beta, uintptr_t out, uintptr_t workspace, int batch,
              int channels, int frames, int height, int width, int groups, float eps, int left, int right,
              int top, int bottom, int front, bool silu, bool zero_pad, int64_t row_stride, bool bf16,
              uintptr_t stream) {
-  try {
-    launch_group_norm_silu_pad3d(at(x), gamma ? at(gamma) : nullptr, beta ? at(beta) : nullptr, at(out),
-                                 at(workspace), nullptr, batch, channels, frames, height, width, groups, eps,
-                                 left, right, top, bottom, front, silu, zero_pad, row_stride, bf16 ? 2 : 1,
-                                 reinterpret_cast<cudaStream_t>(stream));
-  } catch (const std::exception &refused) {
-    throw nb::value_error(refused.what());
-  }
+  if (channels % 8 != 0 || channels / 8 > 256 || (gamma && (groups < 1 || channels % groups != 0 || groups > 1024)))
+    throw nb::value_error("norm_pad: unsupported channel/group count");
+  if (left < 0 || right < 0 || top < 0 || bottom < 0 || front < 0)
+    throw nb::value_error("norm_pad: padding must be non-negative");
+  if (!zero_pad && (left >= width || right >= width || top >= height || bottom >= height))
+    throw nb::value_error("norm_pad: reflect padding must be smaller than the input");
+  if (static_cast<int64_t>(batch) * (frames + front) > 65535)
+    throw nb::value_error("norm_pad: batch * frames must be <= 65535");
+  launch_group_norm_silu_pad3d(at(x), gamma ? at(gamma) : nullptr, beta ? at(beta) : nullptr, at(out),
+                               at(workspace), nullptr, batch, channels, frames, height, width, groups, eps, left,
+                               right, top, bottom, front, silu, zero_pad, row_stride, bf16 ? 2 : 1,
+                               reinterpret_cast<cudaStream_t>(stream));
   return cudaGetLastError();
 }
 
