@@ -1760,8 +1760,12 @@ class _Engine:
         types, _ = get_layer_types_and_kwargs(self.text)
         #: a sliding layer's window (0: none slides): its keys more than this far behind are masked
         self.slide = int(self.text.sliding_window) if "sliding_attention" in types else 0
-        #: every attention layer slides (Mistral's window): one mask, as Mistral takes no masks by type
-        self.slides_all = "full_attention" not in types
+        #: its forward reads masks by layer type (a dict), as a config declaring `layer_types` says;
+        #: Mistral's, Phi-3's and Starcoder2's declare none and take one mask, the window's
+        self.by_type = any(
+            "layer_types" in vars(kind).get("__annotations__", {})
+            for kind in type(self.text).__mro__
+        )
         self.cond = threading.Condition(threading.RLock())
         self.pending: deque[_Request] = deque()
         #: calls taken from `pending` that the driver is prefilling or splicing
@@ -3217,15 +3221,15 @@ class _Engine:
         """`mask` (`[rows, 1, queries, keys]`, the queries at positions `first`, `first` + 1, ...)
         as the model's masks by layer type when a layer slides (Transformers' own form, which its
         forward takes as given): full attention's, and a sliding layer's with each query's keys at
-        or before its position less the window closed. Where every layer slides, the sliding mask
-        alone: a 4D mask every forward takes as given, and Mistral's reads no dict."""
+        or before its position less the window closed. A forward that reads no dict (its config
+        declares no `layer_types`) takes the sliding mask alone: it applies one to every layer."""
         if not self.slide:
             return mask
         keys = torch.arange(mask.shape[-1], device=mask.device)
         queries = first[:, None] + torch.arange(mask.shape[-2], device=mask.device)
         far = keys[None, None, :] <= (queries - self.slide)[..., None]
         sliding = mask.masked_fill(far[:, None], self.closed)
-        if self.slides_all:
+        if not self.by_type:
             return sliding
         return {"full_attention": mask, "sliding_attention": sliding}
 

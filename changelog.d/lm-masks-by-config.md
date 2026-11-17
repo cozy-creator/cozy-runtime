@@ -1,0 +1,1 @@
+The decode engine hands a model masks by layer type only when its config declares `layer_types` (its forward reads them so); Mistral, Phi-3 and Starcoder2, whose configs declare none, get the one sliding mask their forwards apply to every layer. Before, every-layer-slides decided it.
