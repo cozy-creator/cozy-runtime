@@ -38,6 +38,9 @@ class Describe(msgspec.Struct, tag="describe", tag_field="kind"):
 
     project: str
     environment_python: str | None = None
+    #: The callee wheels its uv.lock pins that the machine holds, by sha256 hex to the file: read in
+    #: place of their URLs, so a description needs no Hub (cl-1127).
+    wheels: dict[str, str] = {}
 
 
 class DescribeInstalled(msgspec.Struct, tag="describe_installed", tag_field="kind"):
@@ -200,8 +203,9 @@ def describe() -> int:
         else:
             python = Path(request.environment_python) if request.environment_python else None
             closures: dict[str, str] = {}
+            held = {digest: Path(path) for digest, path in request.wheels.items()}
             document = static_interface.build(
-                Path(request.project), environment_python=python, closures=closures
+                Path(request.project), environment_python=python, closures=closures, held=held
             )
             reply = Described(msgspec.Raw(msgspec.json.encode(document)), closures)
     except AuthorError as exc:

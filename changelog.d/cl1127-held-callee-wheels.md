@@ -1,0 +1,1 @@
+The static reader reads a callee wheel the project's uv.lock pins from the machine's own copy when the machine names one (`machine-describe`'s `wheels`, by sha256), held to the lock's hash, and fetches it by URL only otherwise: local code that calls a Hub package describes with the Hub unreachable (cl-1127).
