@@ -961,7 +961,7 @@ def split[T](
             if not hostable or request is None:
                 raise
             unwind(exc)
-            _hosted(request, site, name)
+            _hosted(request, site, name, "")
     return catch.cut(
         f"{site}:host", deepest, windows_only, lambda level: run(window(level), True), pure=pure
     )
@@ -979,6 +979,7 @@ def whole(part: Tensor, shape: Sequence[int], key: str, host: bool) -> Tensor:
         request = catch.CURRENT.get()
         if request is None or not part.is_cuda or not is_capacity(exc) or _capturing():
             raise
+        room = catch.room(part.device.index or 0)  # beside the refused bytes, for the record
         try:
             out = pinned.empty(shape, part.dtype, part.device)
         except Exception as failed:
@@ -986,7 +987,7 @@ def whole(part: Tensor, shape: Sequence[int], key: str, host: bool) -> Tensor:
             raise exc from None
         unwind(exc)
         request.retries += 1
-        _hosted(request, f"split:{key}", key)
+        _hosted(request, f"split:{key}", key, room)
         return out
 
 
@@ -1000,11 +1001,11 @@ def read[X](window: X) -> X:
     return cast("X", pinned.read(window)) if isinstance(window, Tensor) else window
 
 
-def _hosted(request: Request, site: str, name: str) -> None:
-    request.hosted.add(site)
+def _hosted(request: Request, site: str, name: str, room: str) -> None:
+    request.hosted[site] = room
     print(
         f"cozy-runtime: {name}: no room for its whole output beside its windows; it is kept in "
-        "host memory",
+        f"host memory{f' (refused beside {room})' if room else ''}",
         file=sys.stderr,
     )
 

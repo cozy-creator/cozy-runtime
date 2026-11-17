@@ -122,7 +122,10 @@ def _gib(n: int) -> str:
 
 def _holders(device: int, refused: Mapping[str, int] | None = None) -> str:
     """What holds `device`'s memory: live tensors, weights in use, graph pools and caches, as the
-    refused allocation found them (`refused`, `vt.refusal`), else now."""
+    refused allocation found them (`refused`, `vt.refusal`), else now, with the working pages
+    mapped beside the live tensors (free but in pages a live tensor shares, or freed and awaiting
+    their stream)."""
+    beside = ""
     if refused is None:
         room, stats = vt.room(device), vt.stats(device)
         refused = {
@@ -133,6 +136,9 @@ def _holders(device: int, refused: Mapping[str, int] | None = None) -> str:
             "pools": stats["pools_bytes"],
             "caches": stats["cache_mapped_bytes"],
         }
+        mapped = max(stats["mapped_bytes"] - room["working_live"], 0)
+        pending = _gib(stats["pending_bytes"])
+        beside = f" and {_gib(mapped)} mapped beside them ({pending} awaiting their stream)"
     pools, caches = refused["pools"], refused["caches"]
     held = (
         f"{_gib(pools)} of graph pools, {_gib(caches)} of caches"
@@ -140,10 +146,15 @@ def _holders(device: int, refused: Mapping[str, int] | None = None) -> str:
         else "no graph pools or caches"
     )
     return (
-        f"{_gib(refused['working_live'])} of live tensors, {_gib(refused['pinned'])} of weights in "
-        f"use ({_gib(refused['weights_resident'])} resident), {held}, of "
+        f"{_gib(refused['working_live'])} of live tensors{beside}, {_gib(refused['pinned'])} of "
+        f"weights in use ({_gib(refused['weights_resident'])} resident), {held}, of "
         f"{_gib(refused['capacity'])} on GPU {device}"
     )
+
+
+def room(device: int) -> str:
+    """`device`'s room now, as a device OOM's line says it."""
+    return _holders(device)
 
 
 def _room_line() -> str:
