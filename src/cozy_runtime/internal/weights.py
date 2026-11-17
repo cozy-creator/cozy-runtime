@@ -785,10 +785,24 @@ def _float32(torch: ModuleType, root: Module) -> None:
 
 
 def _derived(leaf: Leaf, parts: Mapping[str, Tensor]) -> tuple[str, ...]:
-    """The stored roles `leaf` keeps as other tensors than the stored ones (cast, swizzled): a
-    bind makes them again from the stored bytes. A stored role it does not read is neither."""
+    """The stored roles `leaf` keeps as other bytes than the stored ones (cast, swizzled): a bind
+    makes them again from the stored bytes. A role it keeps as a view of its stored bytes, in the
+    stored dtype and shape, is stored (nvfp4's `view(uint8)` of its U8 payload was a second copy of
+    every payload, 8 GiB on Qwen3.6-27B: cr-319). A stored role it does not read is neither."""
     kept = leaf.roles()
-    return tuple(sorted(role for role in kept if role in parts and kept[role] is not parts[role]))
+    derived = (role for role in kept if role in parts and not _same(kept[role], parts[role]))
+    return tuple(sorted(derived))
+
+
+def _same(kept: Tensor, stored: Tensor) -> bool:
+    """`kept` is `stored`'s bytes as they are: one storage and offset, dtype, shape and strides."""
+    return kept is stored or bool(
+        kept.dtype == stored.dtype
+        and kept.shape == stored.shape
+        and kept.stride() == stored.stride()
+        and kept.storage_offset() == stored.storage_offset()
+        and kept.untyped_storage()._cdata == stored.untyped_storage()._cdata
+    )
 
 
 def _bound(
