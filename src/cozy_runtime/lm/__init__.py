@@ -241,6 +241,17 @@ def _lm(model: PreTrainedModel) -> _Generating:
     return cast("_Generating", model)  # cast: `generate` serves causal LMs (GenerationMixin's)
 
 
+def _decoding(model: torch.nn.Module) -> tuple[str, ...]:
+    """The module paths a decode step reads: the language model's decoder, its head and a draft
+    head. A vision tower only a prefill reads stays out, evictable once the prefill is done: held
+    with the rest, Qwen3.6-27B's decode pinned 21.8 of a 4090's 22.9 GiB (cr-319)."""
+    lm = _lm(model)  # type: ignore[arg-type]  # a model `generate` was given
+    reads = (lm.get_decoder(), lm.get_output_embeddings(), getattr(model, "mtp", None))
+    wanted = {id(m) for m in reads if m is not None}
+    paths = tuple(name for name, module in model.named_modules() if name and id(module) in wanted)
+    return paths or ("",)
+
+
 def _set[T](value: T | None) -> T:
     """`value`, which the engine's state has set where it is read (its slots' cache and
     device, its head, its graphs' domain and pool, a row's tokens once it ended)."""
@@ -2046,7 +2057,8 @@ class _Engine:
                     binding.close()
                     binding = None
                 if binding is None:
-                    binding = self.addresses[id(module)] = residency.retain(name, ("",))
+                    reads = _decoding(module) if module is self.model else ("",)
+                    binding = self.addresses[id(module)] = residency.retain(name, reads)
                 try:
                     leases.enter_context(binding.prepare())
                 except Exception as exc:
@@ -3099,24 +3111,47 @@ class _Engine:
         state, last so that what serves the call is eager's. A difference discards the graph."""
         domain = _set(self.domain)
         state, stream = self._token_state(key[2]), torch.cuda.current_stream(domain.device)
-        start, at = [value.clone() for value in state], self.length[:size].clone()
-        vt.replay(graph, stream=stream)  # its pool is held since its capture
-        replayed = [*(value.clone() for value in state), *self._written(size, at)]
+        start: list[torch.Tensor] | None = None
+        try:
+            start, at = [value.clone() for value in state], self.length[:size].clone()
+            vt.replay(graph, stream=stream)  # its pool is held since its capture
+            replayed = [*(value.clone() for value in state), *self._written(size, at)]
+        except Exception as exc:
+            if not is_capacity(exc):
+                raise
+            # No room to check it beside its held pool (cr-319: Qwen3.6-27B on a 4090 failed the
+            # run here): the graph goes, and this token and its key's later ones decode eagerly.
+            if start is not None:  # the replay ran: the token starts again from before it
+                for tensor, value in zip(state, start, strict=True):
+                    tensor.copy_(value)
+            start = None
+            self._discard(key, graph, stream)
+            why = no_room(domain.device, "its graph's check", 0, exc)
+            _unwind(exc)
+            _answered(exc)
+            self._unrecorded(key, f"{why}: it decodes eagerly")
+            self._advance(size)
+            self.eager += 1
+            return
         for tensor, value in zip(state, start, strict=True):
             tensor.copy_(value)
         self._advance(size)
         self.eager += 1
         why = vt.replay_differs([*state, *self._written(size, at)], replayed)
         if why:
-            stream.synchronize()
-            if len(self.graphs) == 1:
-                self._pool(False)  # the pool's last graph goes: its use ends while it owns it
-            del self.graphs[key]
-            graph.reset()
-            if not self.graphs:
-                close_pool(_set(self.pool), domain.device)
-                self.pool = None
+            self._discard(key, graph, stream)
             self._unrecorded(key, why, "replay_mismatch")
+
+    def _discard(self, key: _Key, graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> None:
+        """A recorded graph goes, and its pool with the last of them."""
+        stream.synchronize()
+        if len(self.graphs) == 1:
+            self._pool(False)  # the pool's last graph goes: its use ends while it owns it
+        del self.graphs[key]
+        graph.reset()
+        if not self.graphs:
+            close_pool(_set(self.pool), _set(self.domain).device)
+            self.pool = None
 
     def _forget(self) -> None:
         """Release recordings only at the driver's already-drained step boundary."""
