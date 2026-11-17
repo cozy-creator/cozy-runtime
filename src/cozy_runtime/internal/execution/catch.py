@@ -152,10 +152,15 @@ if not ROOM:
     ROOM.append(_room_line)
 
 
-def refuse(device: int, name: str, level: str, need: int, exc: BaseException) -> DoesNotFit:
+class Unplaced(DoesNotFit):
+    """No level of a cut can be given room before it runs (or, for a pure op, runs again): its
+    caller may run it another way."""
+
+
+def refuse(device: int, name: str, level: str, need: int, exc: BaseException) -> Unplaced:
     """Native selection cannot make room for `name` at `level` (`need` bytes) with everything
     evictable gone, before any piece ran."""
-    return DoesNotFit(
+    return Unplaced(
         f"{name}: {level} needs {_gib(need)} beside {_holders(device)} ({exc}): run it smaller, "
         "or rent a larger card: `cozy run … --on new`"
     )
