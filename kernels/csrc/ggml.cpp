@@ -74,6 +74,6 @@ NB_MODULE(_ggml, m) {
     m.def("error_name", [](int code) { return cudaGetErrorName(cudaError_t(code)); });
     m.def("error", [] { return cozy_ggml::error(); });
     m.def("kernel", &kernel, "device"_a, "type"_a, "K"_a, "N"_a, "M"_a);
-    m.def("matmul", &matmul, "device"_a, "type"_a, "w"_a, "x"_a, "out"_a, "K"_a, "N"_a, "M"_a, "allocate"_a,
+    m.def("matmul", &matmul, "device"_a, "type"_a, "w"_a, "x"_a, "out"_a, "K"_a, "N"_a, "M"_a, "allocate"_a.none(),
           "stream"_a);
 }
