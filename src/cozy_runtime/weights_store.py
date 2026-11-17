@@ -29,6 +29,7 @@ from tensorfs import raw
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.derive import ggml
 
 if TYPE_CHECKING:
     from tensorfs._ext import ConfigInput, MetadataInput
@@ -527,6 +528,8 @@ class Output:
                         + columns * 4
                         + (rows + columns) * 32 * 2
                     )
+                case scheme if scheme in ggml.BYTES:
+                    required += rows * columns // ggml.BLOCKS[scheme] * ggml.BYTES[scheme]
                 case _:
                     raise CapabilityError("unsupported native quantizer", code="quantization_plan")
         self._spend(required)
