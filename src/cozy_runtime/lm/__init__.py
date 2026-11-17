@@ -72,6 +72,7 @@ from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import Cancelled, DoesNotFit, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, recovered
 from cozy_runtime.author._services import counting, stage_tokens
+from cozy_runtime import graphs as _graphs
 from cozy_runtime.graphs import (
     BYPASS,
     DECODERS,
@@ -404,6 +405,7 @@ def _graph_snapshot(
             "replays": engine.replayed,
             "eager_steps": engine.eager,
             "refused": sorted(set(engine.unrecorded.values())),
+            "partial_restore": engine.partial,
         },
         [engine.pool] if engine.pool is not None else [],
         engine.domain,
@@ -1864,6 +1866,8 @@ class _Engine:
         #: of those, each that took more than its warm-up's guess: the guess, and the room it
         #: was recorded in (`graphs.capture`)
         self.regrown: list[tuple[int, int]] = []
+        #: a dev machine's checks: what the eager step without the whole write set put back gave
+        self.partial: list[str] = []
         self.replayed = 0
         self.retired_graphs = 0
         #: `LANDED` when a capture met a kernel still building (none records until one lands),
@@ -3103,8 +3107,10 @@ class _Engine:
                 return
             capturing = time.perf_counter()
             reserve, why = vt.pool_bytes(self.peaks[key]), ""
-            # Its ops and kernels, set beside the step as written's when its check differs.
-            traced, ops = observe.trace(torch)
+            # Its ops and kernels, set beside the step as written's when its check differs, and
+            # what it writes in place, which its check puts back (cr-283).
+            writes: list[torch.Tensor] = []
+            traced, ops = observe.trace(torch, writes)
             launch = _STEPS[0]
 
             def step() -> None:
@@ -3163,7 +3169,7 @@ class _Engine:
                     vt.pool_scratch(_set(self.pool).handle, (), domain.device)
                 except (RuntimeError, ValueError) as exc:  # A live allocation: it stays mapped.
                     safeguard("scratch_declined", str(exc))
-                self._verify(key, graph, size, ops, launch)
+                self._verify(key, graph, size, ops, launch, writes)
                 return
             elif why:
                 self._unrecorded(key, why)
@@ -3203,18 +3209,22 @@ class _Engine:
         size: int,
         ops: list[tuple[object, ...]],
         launch: Launch | None,
+        writes: list[torch.Tensor],
     ) -> None:
         """A new graph's one check: its replay, then this token's eager step from the same
-        state, last so that what serves the call is eager's. A difference discards the graph and
-        explains itself (`_explain`)."""
+        state, last so that what serves the call is eager's. The same state is all the step writes
+        (`writes`, its capture's), not only `_token_state`: the draft head's keys and values, which
+        a replay writes ahead of the eager step, made Klein's check fail a sound graph (cr-283). A
+        difference discards the graph and explains itself (`_explain`)."""
         domain = _set(self.domain)
         state, stream = self._token_state(key[2]), torch.cuda.current_stream(domain.device)
+        held = [*state, *_beyond(writes, state)]
         start: list[torch.Tensor] | None = None
         try:
-            start, at = [value.clone() for value in state], self.length[:size].clone()
+            start, at = [value.clone() for value in held], self.length[:size].clone()
             vt.replay(graph, stream=stream)  # its pool is held since its capture
             replayed = [*(value.clone() for value in state), *self._written(size, at)]
-            for tensor, value in zip(state, start, strict=True):
+            for tensor, value in zip(held, start, strict=True):
                 tensor.copy_(value)
             self._advance(size)
         except Exception as exc:
@@ -3225,7 +3235,7 @@ class _Engine:
             # decode eagerly, from the state before it (what a step wrote at its slot is written
             # again).
             if start is not None:
-                for tensor, value in zip(state, start, strict=True):
+                for tensor, value in zip(held, start, strict=True):
                     tensor.copy_(value)
             start = None
             self._discard(key, graph, stream)
@@ -3240,16 +3250,47 @@ class _Engine:
         why = vt.replay_differs([*state, *self._written(size, at)], replayed)
         if why:
             why += "; " + self._explain(
-                key[2], size, state, start, at, replayed, ops, launch, graph
+                key[2], size, state, held, start, at, replayed, ops, launch, graph
             )
             self._discard(key, graph, stream)
             self._unrecorded(key, why, "replay_mismatch")
+        elif _graphs.AUDIT and len(held) > len(state):
+            self.partial.append(self._partial(size, state, held, start, at, graph, stream))
+
+    def _partial(
+        self,
+        size: int,
+        state: list[torch.Tensor],
+        held: list[torch.Tensor],
+        start: list[torch.Tensor],
+        at: torch.Tensor,
+        graph: torch.cuda.CUDAGraph,
+        stream: torch.cuda.Stream,
+    ) -> str:
+        """A dev machine's record of what the check before cr-283 would have found: the replay,
+        then the eager step with only `_token_state` put back. The last run serves as before."""
+        here = [*(value.clone() for value in state), *self._written(size, at)]
+        for tensor, value in zip(held, start, strict=True):
+            tensor.copy_(value)
+        vt.replay(graph, stream=stream)
+        for tensor, value in zip(state, start, strict=True):
+            tensor.copy_(value)
+        self._advance(size)
+        old = [*(value.clone() for value in state), *self._written(size, at)]
+        for tensor, value in zip(held, start, strict=True):
+            tensor.copy_(value)
+        self._advance(size)
+        extra = sum(t.nbytes for t in held[len(state) :])
+        said = vt.replay_differs(here, old) or "the same"
+        more = len(held) - len(state)
+        return f"{more} more tensors put back ({extra >> 20} MiB); without them: {said}"
 
     def _explain(
         self,
         drafted: bool,
         size: int,
         state: list[torch.Tensor],
+        held: list[torch.Tensor],
         start: list[torch.Tensor],
         at: torch.Tensor,
         replayed: list[torch.Tensor],
@@ -3264,7 +3305,7 @@ class _Engine:
         reads memory that changed). The last run is the check's eager step again, which serves."""
 
         def run(on_capture: bool, mode: object = None) -> list[torch.Tensor]:
-            for tensor, value in zip(state, start, strict=True):
+            for tensor, value in zip(held, start, strict=True):
                 tensor.copy_(value)
             with (
                 self._graph_memory(drafted) if on_capture else nullcontext(),
@@ -3277,7 +3318,7 @@ class _Engine:
         mode, written = observe.trace(torch)
         served = False
         try:
-            for tensor, value in zip(state, start, strict=True):
+            for tensor, value in zip(held, start, strict=True):
                 tensor.copy_(value)
             vt.replay(graph, stream=torch.cuda.current_stream())
             twice = [*(value.clone() for value in state), *self._written(size, at)]
@@ -3293,7 +3334,7 @@ class _Engine:
             return "no room to run the step again"
         finally:
             if not served:
-                for tensor, value in zip(state, start, strict=True):
+                for tensor, value in zip(held, start, strict=True):
                     tensor.copy_(value)
                 self._advance(size)
         if noise := vt.replay_differs(here, again):
@@ -3693,6 +3734,13 @@ class _Engine:
         pinned = ("flag", "allow_host", "took", "dtook")
         for name in (*type(self).__annotations__, *pinned, "rows_index", "bit", "dkeys", "dcache"):
             vars(self).pop(name, None)
+
+
+def _beyond(writes: list[torch.Tensor], state: list[torch.Tensor]) -> list[torch.Tensor]:
+    """What a step writes in place beyond `_token_state`'s storages (the draft head's keys and
+    values, the model's K/V buffers): its graph's check puts these back too."""
+    held = {value.untyped_storage().data_ptr() for value in state}
+    return [t for t in writes if t.untyped_storage().data_ptr() not in held]
 
 
 def _unwind(exc: BaseException) -> None:

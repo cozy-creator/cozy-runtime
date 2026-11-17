@@ -145,12 +145,25 @@ def step(torch: ModuleType, func: object, args: object) -> tuple[object, ...]:
     )
 
 
-def trace(torch: ModuleType) -> tuple[object, list[tuple[object, ...]]]:
-    """A dispatch mode over a call as written and each op it ran (`step`): what a capture's ops
-    are set beside (`diverged`)."""
+def trace(
+    torch: ModuleType, writes: list[Tensor] | None = None
+) -> tuple[object, list[tuple[object, ...]]]:
+    """A dispatch mode over a call and each op it ran (`step`): what a capture's ops are set
+    beside (`diverged`). With `writes`, each tensor it writes in place whose storage it didn't
+    make, once by layout: the state a check of its graph puts back (cr-283)."""
     from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_leaves
 
     ops: list[tuple[object, ...]] = []
+    made: set[int] = set()
+    seen: set[tuple[object, ...]] = set()
+    tensor_type = torch.Tensor
+
+    def ptr(tensor: Tensor) -> int:
+        try:
+            return int(tensor.untyped_storage().data_ptr())
+        except (RuntimeError, NotImplementedError):  # a wrapper with no storage
+            return 0
 
     class Trace(TorchDispatchMode):
         def __torch_dispatch__(
@@ -160,8 +173,35 @@ def trace(torch: ModuleType) -> tuple[object, list[tuple[object, ...]]]:
             args: tuple[object, ...] = (),
             kwargs: dict[str, object] | None = None,
         ) -> object:
-            ops.append(step(torch, func, (args, kwargs or {})))
-            return func(*args, **(kwargs or {}))  # type: ignore[operator]  # an OpOverload
+            kwargs = kwargs or {}
+            ops.append(step(torch, func, (args, kwargs)))
+            if writes is not None:
+                schema = func._schema  # type: ignore[attr-defined]  # an OpOverload
+                for at, argument in enumerate(schema.arguments):
+                    alias = argument.alias_info
+                    if alias is None or not alias.is_write:
+                        continue
+                    value = (
+                        kwargs.get(argument.name)
+                        if argument.kwarg_only or at >= len(args)
+                        else args[at]
+                    )
+                    for tensor in tree_leaves(value):
+                        if not isinstance(tensor, tensor_type) or (where := ptr(tensor)) in made:
+                            continue
+                        layout = (where, tensor.storage_offset(), tuple(tensor.shape),
+                                  tuple(tensor.stride()), tensor.dtype)  # fmt: skip
+                        if where and layout not in seen:
+                            seen.add(layout)
+                            writes.append(tensor)
+            out = func(*args, **kwargs)  # type: ignore[operator]  # an OpOverload
+            if writes is not None:  # storages new here: an in-place op's output is its input's
+                given = {ptr(t) for t in tree_leaves((args, kwargs)) if isinstance(t, tensor_type)}
+                made.update(
+                    where for t in tree_leaves(out)
+                    if isinstance(t, tensor_type) and (where := ptr(t)) not in given
+                )  # fmt: skip
+            return out
 
     return Trace(), ops  # type: ignore[no-untyped-call]  # TorchDispatchMode's __init__
 
