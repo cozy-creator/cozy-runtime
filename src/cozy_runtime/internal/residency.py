@@ -1889,7 +1889,9 @@ class Memory:
         if region is None:
             size = block.final_bytes if final else block.storage_bytes
             source = self._source(block, final=final)
-            region = self._device_native().region(size, source)
+            # Its set: varena packs a component's small units into shared pages (cr-317).
+            set_ = f"{block.model.content}/final" if final else block.model.content
+            region = self._device_native().region(size, source, set_)
             setattr(block, field, region)
             if not final:
                 self._sources[region] = source
