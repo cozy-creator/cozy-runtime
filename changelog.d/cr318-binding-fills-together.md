@@ -1,0 +1,1 @@
+A whole-model binding fills its absent blocks together, then binds them (cr-318): `Binding.prepare` asks TensorFS to fill every absent raw Region of a model with no bake in one store read, where each block filled alone. Qwen3.6-35B-A3B's per-expert load on an RTX A6000: 17 s → 2.5 s.

@@ -549,6 +549,9 @@ class _Block:
     )
     #: where its forward's allocations are born in the escaped-memory tally (`vt.set_site`)
     escape_site: int = 0
+    #: its raw Region's Use from a binding's fill of all its blocks together (`Memory._fill`),
+    #: which its next `_ensure` binds instead of filling it alone
+    prefilled: varena.Use | None = None
     #: the birth site its entry replaced, back at its exit: what runs after it is not its
     born_before: int | None = None
 
@@ -1042,6 +1045,7 @@ class Binding:
                             assert self.regions is not None
                             uses.update((region, region.pin()) for region in self.regions)
                         else:
+                            memory._fill(self.groups)
                             for block in self.groups:
                                 memory._enter(block)
                                 entered.append(block)
@@ -1057,6 +1061,8 @@ class Binding:
                             uses.clear()
                             for block in reversed(entered):
                                 memory._exit(block)
+                            for block in self.groups:
+                                block.prefilled = None  # a failure's: its pin goes
                             with memory.lock:
                                 for block in self.groups:
                                     block.retained -= 1
@@ -1996,6 +2002,9 @@ class Memory:
 
     def _use(self, block: _Block, *, final: bool = False) -> varena.Use:
         """`block`'s bytes pinned for this stream. An idle request takes only what is resident."""
+        if not final and (prefilled := block.prefilled) is not None:
+            block.prefilled = None
+            return prefilled
         request = _REQUEST.get()
         if request is not None and request.idle:
             region = block.final_region if final else block.region
@@ -2004,6 +2013,49 @@ class Memory:
                 raise StaleBinding("idle graph preparation cannot fill native weight backing")
             return use
         return self._native_region(block, final=final).use(self._cuda_stream().cuda_stream)
+
+    def _fill(self, groups: list[_Block]) -> None:
+        """`groups`' absent raw Regions filled together before their blocks bind (cr-318): one
+        store read for all TensorFS can read so, pieces pipelined across Regions, where a block at a
+        time read each alone, serialized (Qwen3.6's 10,541 expert blocks: 37.6 GB at ~1.3 GB/s).
+        Each one's Use waits on its block (`_use`). A model whose fill bakes (LoRAs) fills block by
+        block: its bake runs on the thread that binds it."""
+        together = getattr(varena, "fill", None)  # a newer TensorFS's
+        request = _REQUEST.get()
+        if together is None or not self.cuda or (request is not None and request.idle):
+            return
+        wanted = [
+            block
+            for block in groups
+            if block.model.fill is None
+            and block.data is None
+            and block.prefilled is None
+            and block.storage_bytes
+            and not block.final_only()
+            and not block.cached()
+        ]
+        if len(wanted) < 2:
+            return
+        pairs = [(block, self._native_region(block)) for block in wanted]
+        found = [(block, region, self._sources.get(region)) for block, region in pairs]
+        bound = [(block, region, source) for block, region, source in found if source is not None]
+        if len(bound) < 2:
+            return
+        wanted = [block for block, _, _ in bound]
+        regions = [region for _, region, _ in bound]
+        sources = [source for _, _, source in bound]
+        if request is not None:
+            for block in wanted:
+                request.first_read(block)
+        model = wanted[0].model
+        with _phases.loading(
+            model.component,
+            sum(block.nbytes for block in wanted),
+            functools.partial(self._unread, model),
+        ):
+            uses = together(regions, sources, self._cuda_stream().cuda_stream)
+        for block, use in zip(wanted, uses, strict=True):
+            block.prefilled = use
 
     def _note_phase_plan(self, status: str, reason: str = "", **facts: Unpack[_PlanNote]) -> None:
         request = _REQUEST.get()
