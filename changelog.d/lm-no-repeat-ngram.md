@@ -1,0 +1,1 @@
+`lm.generate` and `VisionLM.ask` take an optional `no_repeat_ngram` n: each row bans every token that would complete an n-gram it already holds, its prompt included (Transformers' `no_repeat_ngram_size`), before `top_k`, the presence penalty and sampling, in the decode engine (drafted or not) and in Transformers' loop. Unset, decoding is unchanged.

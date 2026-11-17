@@ -8,7 +8,8 @@ whatever card it lands on.
 import msgspec
 import torch
 from cozy_runtime import rng
-from cozy_runtime.author import App, Config, Context, Loader, Model, Outputs, Seed, Telemetry
+from cozy_runtime.author import App, Config, Context, Loader, Model, Seed, Telemetry
+from cozy_runtime.media import ImageFile
 
 app = App()
 
@@ -34,17 +35,20 @@ class Flow(Model[FlowGraph]):
 
 
 @app.entrypoint(defaults={"model": "acme/flow@1.0.0"})
-def generate(ctx: Context, payload: Request, model: Flow, out: Outputs, tel: Telemetry) -> Result:
+def generate(ctx: Context, payload: Request, model: Flow, tel: Telemetry) -> Result:
     with tel.stage("generating image"):
         latents = model.denoise(ctx, model.encode(payload.prompt), payload.steps, payload.seed)
-    return Result(out.save_image(model.decode(latents), format="png"))
+    return Result(ImageFile.from_image(model.decode(latents)))
 ```
 
 ## The core
 
 - **`App`**: `@app.entrypoint` publishes a function; `@app.tool` publishes one that is also a canvas
-  box. Options: `name`, `defaults`, `memoize`, `on_demand`, `accelerator`, `weights`, `private`,
-  `components`, `preflight`.
+  box. Options: `name`, `defaults`, `memoize`, `on_demand`, `needs`, `accelerator`, `weights`,
+  `private`, `components`, `preflight`.
+  A constructed `Model` parameter selects the GPU by default; other handlers use CPU.
+  Set `accelerator=True` for custom GPU work with only raw `Weights` or ordinary inputs,
+  or `accelerator=False` to keep a model handler on CPU. Explicit settings always win.
 - **Handler parameters** are injected by type: `Context`, a `msgspec.Struct` request, any `Model`,
   and the services `Outputs`, `Telemetry`, `Adjustments`.
 - **`Model`**: `load(loader)` builds the components. `loader.construct(factory)` takes a class or a
@@ -54,6 +58,27 @@ def generate(ctx: Context, payload: Request, model: Flow, out: Outputs, tel: Tel
 - **Errors**: raise `InvalidRequest` (the request is wrong), `UnsupportedInput` (this model can't)
   or `OutputError` (the result is bad). Any other exception fails the run with its first line.
 
+## Calling another package
+
+Depend on it as usual and lock it, then generate typed references from its locked interface:
+
+```sh
+cozy-runtime calls example-child my_package/child_calls.py
+```
+
+```python
+from cozy_runtime.author import call
+from .child_calls import Request, generate
+
+result = await call(generate, Request(prompt="a lighthouse"))
+```
+
+`generate` is an `Operation[Request, Result]`: the callee's module, export, request and result
+types and model slots. Calling it never imports the callee. Model choices go in
+`models={"slot": ModelChoice(...)}`, a `Files` input in `assets=`. Describe checks each
+reference's request, result and model slots against the locked callee (its docs, labels and
+defaults don't matter) and refuses a stale one (`stale_call_reference`): regenerate it.
+
 ## What the Runtime does for you
 
 - **Memory.** Each component is put on the device at its first forward, and evicted, streamed or
@@ -62,6 +87,44 @@ def generate(ctx: Context, payload: Request, model: Flow, out: Outputs, tel: Tel
   replayed for the same shapes, wherever it is called from.
 - **Cancellation.** Every component call checks for a cancel; `ctx.progress(i, n)` does too.
 - **Kernels.** Linear and attention modules get the best kernel for the card and the lane.
+- **Final images.** Return `ImageFile.from_image(pil_image_or_frame)` in an `ImageFile`
+  result field. The SDK snapshots host pixels, then encodes and stores them through the
+  ordinary output path. It defaults to lossless WebP, using PNG for a side over 16383 pixels;
+  `format="png"` or `format="webp"` keeps an explicit choice. Both keep alpha. Existing
+  result schemas, metadata and output bounds still apply. The same value can go directly
+  into a child request or `out.publish("image", image)`: the SDK registers it once and
+  encodes it when those bytes are needed. Labeled copies share that file, and the original
+  can read its encoded bytes after the child or publication consumed it. `image.probe()`
+  reads captured geometry even before encoding. `Outputs.save_image` has been removed;
+  `Outputs` handles explicit publication, encoded artifacts and bounded audio/video streams.
+
+## Which requests need a model
+
+A function with several model arguments rarely uses all of them for one request. Say which
+requests need one with a rule, and the machine fetches it before the function starts only for
+those, and never for the rest:
+
+```python
+@app.entrypoint(defaults=DEFAULTS, needs={
+    "upsampler": "request.prompt_upsampling",
+    "edit_model": "size(request.prompt.references) > 0",
+})
+def generate(ctx: Context, payload: Request, model: Flow, upsampler: Upsampler, edit_model: Edit) -> Result: ...
+```
+
+- A rule is one [CEL](https://cel.dev) boolean expression over `request`: the request as JSON,
+  each field it leaves out at its default. `&&`, `||`, `!`, comparisons, `size(x)`,
+  `x != null`, and `list.exists(e, ...)` / `list.all(e, ...)`. `cozy` checks it against the
+  request when the package is read: a field that isn't there refuses the package.
+- A model argument with a rule is built when the function first reads it. One with no rule is
+  always needed.
+- A function that loads no model and calls others names a function it calls:
+  `needs={"edit_segment": "request.plate != null"}`.
+- Err toward true: a rule that is true for a request that doesn't read the model only fetches
+  too much. One that is false for a request that does read it makes that request wait for the
+  download when it reads it, and the run warns.
+- `ctx.need("edit_model")`: what only the run itself learns. The fetch starts at once, ahead of
+  every other download, while the function goes on.
 
 ## Optional
 
@@ -91,3 +154,8 @@ Package code runs as plain Python too: with no executor, `retained` holds the te
 runs whole and a Model method is an ordinary method.
 
 More: `docs/package-extensions.md`.
+
+The request must be a positional `msgspec.Struct`; keyword request fields and dicts are not
+accepted. Same-package registered/private functions and Runtime builtins use the same form.
+Handlers with separately injected `Files` take them through `assets=...`. Other packages
+require generated operation references, even when their implementation is installed locally.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import logging
 import math
@@ -14,7 +15,7 @@ import time
 from collections.abc import Awaitable, Callable, Coroutine, Generator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeVar, cast, overload
+from typing import Protocol, TypeVar, cast, overload
 
 import msgspec
 from tensorfs.executor import (
@@ -43,6 +44,7 @@ from cozy_runtime.author._observations import Scalar
 from cozy_runtime.author._services import (
     Attempt,
     Telemetry,
+    _adopt_image,
     _progress_scope,
     _ProgressScope,
     settle_frame,
@@ -86,34 +88,133 @@ class ChildCallError(CapabilityError):
         self.child_traceback = child_traceback
 
 
+@dataclass(frozen=True, slots=True)
+class Operation[Q: msgspec.Struct, R: msgspec.Struct]:
+    """A generated, non-callable reference to a package operation.
+
+    Generate it from the locked package interface; pass its typed request to ``call``.
+    It grants no authority: the current attempt must already admit this exact export.
+    """
+
+    distribution: str
+    module: str
+    export: str
+    request: type[Q]
+    result: type[R]
+    models: tuple[str, ...] = ()
+
+
+# Only target/return typing differs: every target has the same mandatory request and selectors.
 @overload
-def call[R](  # type: ignore[explicit-any]  # any package function: call() names its arguments
-    fn: Callable[..., Coroutine[object, object, R]], /, **arguments: object
+def call[Q: msgspec.Struct, R: msgspec.Struct](
+    target: Operation[Q, R],
+    request: Q,
+    /,
+    *,
+    models: Mapping[str, ModelChoice | None] | None = None,
+    assets: Files[File] | None = None,
 ) -> PendingCall[R]: ...
 
 
 @overload
-def call[R](fn: Callable[..., R], /, **arguments: object) -> PendingCall[R]: ...  # type: ignore[explicit-any]  # any package function: call() names its arguments
+def call[R](  # type: ignore[explicit-any]  # injected handler parameters are not caller arguments
+    target: Callable[..., Coroutine[object, object, R]],
+    request: msgspec.Struct,
+    /,
+    *,
+    models: Mapping[str, ModelChoice | None] | None = None,
+    assets: Files[File] | None = None,
+) -> PendingCall[R]: ...
 
 
-def call(fn: Callable[..., object], /, **arguments: object) -> PendingCall[object]:  # type: ignore[explicit-any]  # any package function: call() names its arguments
-    """Run `fn` as a managed call: its own job on the machine, with its own models, memo and
-    progress. Awaiting it returns `fn`'s result.
+@overload
+def call[R](  # type: ignore[explicit-any]  # injected handler parameters are not caller arguments
+    target: Callable[..., R],
+    request: msgspec.Struct,
+    /,
+    *,
+    models: Mapping[str, ModelChoice | None] | None = None,
+    assets: Files[File] | None = None,
+) -> PendingCall[R]: ...
 
-    `arguments` are `fn`'s own parameters as a direct call names them, less what is injected
-    (Context, services): its request struct or fields, its `Files`, and a `ModelChoice` (or
-    None, its default) per model argument. `fn` is a registered function of this package or a
-    public one of a package this one depends on. A plain `fn(...)` is an ordinary Python call.
+
+def call(  # type: ignore[explicit-any]  # injected handler parameters are not caller arguments
+    target: Callable[..., object] | Operation[msgspec.Struct, msgspec.Struct],
+    request: msgspec.Struct,
+    /,
+    *,
+    models: Mapping[str, ModelChoice | None] | None = None,
+    assets: Files[File] | None = None,
+) -> PendingCall[object]:
+    """Run a typed request as a managed child, returning its typed result.
+
+    Another package's operation is a generated reference. Registered functions of this package,
+    private ones too, and Runtime builtins are named directly. A plain function call stays
+    local. Model choices (`models`) and a `Files` input (`assets`) travel beside the request.
     """
+    if not isinstance(request, msgspec.Struct):
+        raise ConformanceError("call requires a typed request struct", code="child_arguments")
+    if assets is not None and not isinstance(assets, Files):
+        raise ConformanceError("call assets must be granted Files", code="child_arguments")
     broker = _current.get()
     if broker is None:
         raise CapabilityError("a managed call has no admitted attempt", code="child_broker_absent")
-    module, name = getattr(fn, "__module__", ""), getattr(fn, "__name__", "")
-    return broker.reserve(module, name, arguments)
+    selected = _model_choices(models)
+    if isinstance(target, Operation):
+        if not isinstance(request, target.request):
+            raise ConformanceError(
+                "an operation takes its generated request", code="child_arguments"
+            )
+        module, name = target.module, target.export
+        binding = _operation_binding(target)
+    else:
+        module, name = getattr(target, "__module__", ""), getattr(target, "__name__", "")
+        bound = broker.bindings.get((module, name))
+        if bound is None:
+            raise CapabilityError(
+                "call needs a registered function of this package", code="child_undeclared"
+            )
+        binding = bound
+    if set(selected) - (binding.models or frozenset()):
+        raise ConformanceError("a call names an unknown model slot", code="child_arguments")
+    return broker.reserve(
+        module, name, {"payload": request, "models": selected}, reference=binding, assets=assets
+    )
+
+
+@functools.cache
+def _operation_binding(target: Operation[msgspec.Struct, msgspec.Struct]) -> _CallType:
+    """A generated reference's wire types, built once per reference."""
+    models = msgspec.defstruct(
+        f"{target.export}Models",
+        [(slot, ModelChoice | None, None) for slot in target.models],
+        kw_only=True,
+    )
+    envelope = msgspec.defstruct(
+        f"{target.export}Call", [("payload", target.request), ("models", models)], kw_only=True
+    )
+    return _CallType(
+        target.module, target.export, envelope, target.result, models=frozenset(target.models)
+    )
+
+
+def _model_choices(
+    models: Mapping[str, ModelChoice | None] | None,
+) -> dict[str, ModelChoice | None]:
+    selected = {} if models is None else dict(models)
+    if any(
+        not isinstance(key, str) or (value is not None and not isinstance(value, ModelChoice))
+        for key, value in selected.items()
+    ):
+        raise ConformanceError(
+            "model selectors require named ModelChoice values", code="child_arguments"
+        )
+    return selected
 
 
 def prefetch[**P, R](
-    callee: Callable[P, R],
+    callee: Callable[P, R] | Operation[msgspec.Struct, msgspec.Struct],
+    /,
     *,
     models: Mapping[str, ModelChoice | None] | None = None,
 ) -> None:
@@ -130,17 +231,23 @@ def prefetch[**P, R](
     if broker is None or broker.closed or broker.context is None:
         raise CapabilityError("model prefetch has no admitted attempt", code="child_broker_absent")
     broker.context.raise_if_cancelled()
-    module, name = getattr(callee, "__module__", ""), getattr(callee, "__name__", "")
-    if not callable(callee) or (module, name) not in broker.bindings:
+    module, name = (
+        (callee.module, callee.export)
+        if isinstance(callee, Operation)
+        else (getattr(callee, "__module__", ""), getattr(callee, "__name__", ""))
+    )
+    if not any(key == (module, name) for key in broker.bindings):
         raise CapabilityError("prefetch needs an exact locked callable", code="child_undeclared")
-    selected = {} if models is None else dict(models)
-    if any(
-        not isinstance(k, str) or (v is not None and not isinstance(v, ModelChoice))
-        for k, v in selected.items()
-    ):
-        raise ConformanceError(
-            "prefetch models require named ModelChoice values", code="child_arguments"
-        )
+    selected = _model_choices(models)
+    if isinstance(callee, Operation):
+        slots = frozenset(callee.models)
+    else:
+        binding = broker.bindings.get((module, name))
+        if binding is None:
+            raise CapabilityError("prefetch needs a registered function", code="child_undeclared")
+        slots = binding.models or frozenset()
+    if set(selected) - slots:
+        raise ConformanceError("prefetch names an unknown model slot", code="child_arguments")
     payload = canonical_json.encode(msgspec.to_builtins(selected))
     if len(payload) > MAX_CALL_BYTES:
         raise CapabilityError("model prefetch exceeds inline bound", code="child_payload_bound")
@@ -152,18 +259,14 @@ def prefetch[**P, R](
 
 @dataclass(frozen=True, slots=True)
 class _CallType:
-    interface_digest: str
     module: str
     export: str
     request: type[msgspec.Struct]
     result: type[msgspec.Struct]
     #: Why the machine cannot serve this operation; "" when it can.
     unavailable: str = ""
-    #: A callable bound from its own code: its model slots, which a caller passes beside its
-    #: request and the call carries as `{payload, models}`.
+    #: The declared model slots, supplied separately from the typed request.
     models: frozenset[str] | None = None
-    #: The parameter whose struct is the request; empty: the request is its other arguments.
-    request_parameter: str = ""
 
 
 class PendingCall[R](Awaitable[R]):
@@ -270,6 +373,7 @@ class _Broker:
         attempt = self.attempt
         if attempt is None or not isinstance(value, File):
             return None
+        _adopt_image(attempt, value)
         saved = attempt.pending.get(value.ref)
         if saved is None:
             return None
@@ -280,6 +384,7 @@ class _Broker:
             )
         if value.ref in attempt.frames:
             settle_frame(attempt, value.ref)
+            _adopt_image(attempt, value)
         attempt.shown.add(value.ref)
         digest = self.saved_sha256.get(value.ref)
         if digest is None:
@@ -294,12 +399,20 @@ class _Broker:
         module: str,
         export: str,
         arguments: Mapping[str, object],
+        *,
+        reference: _CallType | None = None,
+        assets: Files[File] | None = None,
     ) -> PendingCall[object]:
         ctx = self.context
         if self.closed or ctx is None or ctx.request_id != self.request_id:
             raise CapabilityError("package call escaped its attempt", code="escaped_handle")
         ctx.raise_if_cancelled()
-        binding = self.bindings.get((module, export))
+        # Iteration checks the admitted inventory without importing a lazy foreign binding.
+        binding = (
+            (reference if any(key == (module, export) for key in self.bindings) else None)
+            if reference is not None
+            else self.bindings.get((module, export))
+        )
         if binding is None:
             raise CapabilityError(
                 f"{module}:{export} is not a registered function of this package or of a "
@@ -310,13 +423,6 @@ class _Broker:
             raise CapabilityError(binding.unavailable, code="child_capability_unavailable")
         if len(self.calls) >= MAX_ACTIVE_CALLS:
             raise CapabilityError("active package call bound exceeded", code="child_fanout")
-        if binding.models is not None:
-            slots = binding.models
-            arguments = {
-                "payload": {k: v for k, v in arguments.items() if k not in slots},
-                "models": {k: v for k, v in arguments.items() if k in slots},
-            }
-        struct = binding.request_parameter
         if self.next_index > MAX_CALL_INDEX:
             raise CapabilityError("package call index is exhausted", code="child_index_exhausted")
         saved: dict[str, SavedFile] = {}
@@ -344,16 +450,6 @@ class _Broker:
                 return _input_ref(value, ctx.request_id)
 
             wire = msgspec.to_builtins(dict(arguments), enc_hook=asset_value)
-            if struct:
-                # The request struct's fields are the request; its Files argument joins them.
-                given = dict(wire["payload"])
-                fields = given.pop(struct, None)
-                if not isinstance(fields, dict):
-                    raise ConformanceError(
-                        f"{module}:{export} takes its request as {struct}=",
-                        code="child_arguments",
-                    )
-                wire["payload"] = {**fields, **given}
             plain, ignored, moved = fit(binding.request, wire)
             row: tuple[str, dict[str, Scalar]]
             for change in moved:
@@ -388,6 +484,9 @@ class _Broker:
                     value.ref if isinstance(value, (File, Tree)) else asset_value(value)
                 ),
             )
+            if assets is not None:
+                # TensorD puts them in the callee's own `Files` parameter.
+                encoded["assets"] = msgspec.to_builtins(assets, enc_hook=asset_value)
         except (TypeError, ValueError, msgspec.ValidationError) as exc:
             raise ConformanceError(
                 "package call arguments do not match its interface", code="child_arguments"

@@ -21,8 +21,10 @@ ref, device/dtype override, offload/pin/eviction knob, compile hook or selection
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import io
+import sys
 import time
 import typing
 from collections import OrderedDict
@@ -242,8 +244,9 @@ class Config:
     a dynamic `__getattr__` would be exactly the declared `Any` seam §1.7 deletes.
     """
 
-    __slots__ = ("_bound", "_data", "_tensor_dtypes", "_tensor_shapes", "_where")
+    __slots__ = ("_absent", "_bound", "_data", "_tensor_dtypes", "_tensor_shapes", "_where")
 
+    _absent: bool
     _data: Mapping[str, object]
     _where: str
     _tensor_dtypes: Mapping[str, str] | None
@@ -258,10 +261,12 @@ class Config:
         tensor_dtypes: Mapping[str, str] | None = None,
         tensor_shapes: Mapping[str, Sequence[int]] | None = None,
         bound: frozenset[str] | None = None,
+        absent: bool = False,
     ) -> None:
         """Freeze one in-memory construction config. `bound` names the components the
         binding selects (None: all); the others' tensors are not in `tensor_dtypes` or
-        `tensor_shapes`."""
+        `tensor_shapes`. `absent`: the checkpoint carries none (its weights alone), so a model
+        that reads one is refused; one that builds its modules itself constructs from it."""
         data = _without_bookkeeping(data)
         for key, value in data.items():
             carrier = _carrier(key, value)
@@ -291,6 +296,7 @@ class Config:
             else MappingProxyType({key: tuple(shape) for key, shape in tensor_shapes.items()}),
         )
         object.__setattr__(self, "_bound", bound)
+        object.__setattr__(self, "_absent", absent)
 
     def __setattr__(self, name: str, value: object) -> None:
         raise CapabilityError(
@@ -304,6 +310,14 @@ class Config:
 
     def keys(self) -> tuple[str, ...]:
         return tuple(sorted(self._data))
+
+    def _read(self) -> None:
+        if self._absent:
+            raise InvalidRequest(
+                f"{self._where}: the checkpoint carries no construction config, which this model "
+                "reads: upload the model with its config",
+                code="config_absent",
+            )
 
     def section(self, name: str) -> Config:
         value = self._value(name)
@@ -358,6 +372,7 @@ class Config:
         return self._scalar(name, int, default)
 
     def as_float(self, name: str, default: float | None = None) -> float:
+        self._read()
         value = self._data.get(name, default)
         if isinstance(value, int) and not isinstance(value, bool):
             return float(value)
@@ -378,12 +393,16 @@ class Config:
         field by field would mean restating a forty-field upstream schema in the package,
         which is the declaration surface §1.1 deletes. It carries no new authority: a
         source carrier was already refused at construction, and the result is a copy, so
-        this is still read-only configuration and never a path.
+        this is still read-only configuration and never a path. Canonical JSON stores 30.0
+        as 30; a whole number the config class a section names (`model_type`) declares a
+        float comes back a float, as that library's own loader reads it (`library_floats`).
         """
-        return cast("dict[str, object]", _canonical(self._data))
+        self._read()
+        return library_floats(cast("dict[str, object]", _canonical(self._data)))
 
     def typed(self, schema: type[S]) -> S:
         """The author's own strict schema over this section — the fully typed door."""
+        self._read()
         try:
             return msgspec.convert(self._data, type=schema)
         except (msgspec.ValidationError, TypeError) as exc:
@@ -393,6 +412,7 @@ class Config:
             ) from exc
 
     def _value(self, name: str) -> object:
+        self._read()
         try:
             return self._data[name]
         except KeyError:
@@ -403,6 +423,7 @@ class Config:
             ) from None
 
     def _scalar(self, name: str, kind: type[V], default: V | None) -> V:
+        self._read()
         value = self._data.get(name, default) if default is not None else self._value(name)
         if not isinstance(value, kind) or (kind is not bool and isinstance(value, bool)):
             raise InvalidRequest(
@@ -411,6 +432,39 @@ class Config:
                 fields=[name],
             )
         return value
+
+
+def library_floats(config: Mapping[str, object], cls: type | None = None) -> dict[str, object]:
+    """`config` with each whole number its Transformers config class declares a float as a
+    float, sub-configs (`text_config`) by their own class. The class is `cls`, else the one
+    `model_type` names, read only when Transformers is already imported (its user imported it).
+    Canonical JSON stores 30.0 as 30, and Transformers 5's strict configs refuse an int for a
+    float field (Gemma 4's `final_logit_softcapping`, cr-301; CLIP's `initializer_factor`)."""
+    transformers = sys.modules.get("transformers")
+    if cls is None and transformers is not None:
+        known = transformers.CONFIG_MAPPING
+        model_type = config.get("model_type")
+        # Indexed: the lazy mapping's `get` reads its unloaded dict and answers None.
+        cls = known[model_type] if isinstance(model_type, str) and model_type in known else None
+    fields = dataclasses.fields(cls) if cls is not None and dataclasses.is_dataclass(cls) else ()
+    floats = {
+        f.name
+        for f in fields
+        if float in (typing.get_args(f.type) or (f.type,)) and int not in typing.get_args(f.type)
+    }
+    subs: Mapping[str, object] = getattr(cls, "sub_configs", None) or {}
+    out: dict[str, object] = {}
+    for name, value in config.items():
+        if isinstance(value, Mapping):
+            sub = subs.get(name)
+            # A sub-config naming its own `model_type` is read by it; else by its parent's class.
+            value = library_floats(
+                value, sub if "model_type" not in value and isinstance(sub, type) else None
+            )
+        elif type(value) is int and name in floats:
+            value = float(value)
+        out[name] = value
+    return out
 
 
 def _canonical(value: object) -> object:
@@ -896,7 +950,7 @@ class Loader:
         config = self._artifact.config
         if self._artifact.tensor_schema:
             config = Config(
-                config.mapping(),
+                config._data,
                 config._where,
                 tensor_dtypes=config._tensor_dtypes
                 if config._tensor_dtypes is not None
@@ -905,6 +959,7 @@ class Loader:
                 if config._tensor_shapes is not None
                 else {key: spec.shape for key, spec in self._artifact.tensor_schema.items()},
                 bound=self._backend.bound,
+                absent=config._absent,
             )
         construction = CONSTRUCTION.set(object())
         try:

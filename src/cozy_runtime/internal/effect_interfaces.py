@@ -41,7 +41,7 @@ TYPES: dict[str, tuple[type[msgspec.Struct], type[msgspec.Struct]]] = {
 
 def bindings() -> dict[str, _CallType]:
     return {
-        name: _CallType("", MODULE, name, request, result)
+        name: _CallType(MODULE, name, request, result)
         for name, (request, result) in TYPES.items()
     }
 

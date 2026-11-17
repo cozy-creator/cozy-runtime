@@ -515,10 +515,10 @@ fill without the reader is a typed `reader_unavailable` refusal naming the insta
 model — and it is what the end-to-end suite builds, installs and runs.
 
 **Registration (xs-040).** `@app.entrypoint` registers a public function and `@app.entrypoint(private=True)`
-one only its own package's calls run; `await call(fn, ...)` runs either as its own job
-([docs/managed-calls.md](docs/managed-calls.md)). Both take `weights=`, `accelerator=` (False:
-CPU only; True or absent: the machine's GPU when it has one), `preflight=`, `defaults=`,
-`components=`, `on_demand=` and `memoize=`. A writer (`weights=`) is never memoized
+one only its own package's calls run; `await call(target, request, models=..., assets=...)` runs either as its own job
+([docs/managed-calls.md](docs/managed-calls.md)). Both take `weights=`, `accelerator=` (absent:
+the machine's GPU when the function has a constructed `Model` argument, else CPU), `preflight=`, `defaults=`,
+`components=`, `on_demand=`, `needs=` and `memoize=`. A writer (`weights=`) is never memoized
 (`memoized_writer`); TensorFS derivation replay answers a repeat.
 
 **A tool is a struct plus a function** ([design/tools.md](https://github.com/cozy-creator/tracker/blob/master/design/tools.md)).
@@ -542,7 +542,7 @@ field a box can't draw keeps its default, off the box, and so does an optional g
 required member a box can't draw. Marker arguments are read from source: literals, arithmetic and
 module-level constants (`STRENGTHS[0]` too), never a call, so write `Snap(first=124)`, not
 `Snap(first=frames_for(5))`. A keyword request's tuple fields are `tuple[int, ...]`. The interface carries each tool's `tool`
-record and each entry point's `calls`: the functions it reaches with `call(fn, ...)`, its own and
+record and each entry point's `calls`: the functions it reaches with `call(target, request)`, its own and
 other packages', read at the release it locked, with their models, `accelerator` and `gpus`.
 
 Model-producing functions declare `WeightsOutput` slots and use `Context.tensorfs_source`,

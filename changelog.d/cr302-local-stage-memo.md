@@ -1,0 +1,1 @@
+A package run from source serves its `@memoize` stages from the memo, as its release does: an editable install, which is how TensorD installs local code, is keyed by its package's files. Before, every memoized stage of local code recomputed on each call (Qwen-Image-2's text encode, 0.6 s a repeat at a 6 GiB cap) (cr-302).

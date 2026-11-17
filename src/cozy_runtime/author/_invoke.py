@@ -79,13 +79,14 @@ from cozy_runtime.author._preview import PreviewFrame, Previews
 from cozy_runtime.author._recipes import DeclaredRecipe
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
+    TELLING,
     AdjustmentRow,
     Adjustments,
     Attempt,
-    TELLING,
     Outputs,
     ProgressFrame,
     Telemetry,
+    _adopt_image,
 )
 from cozy_runtime.author._signature import Param, Surface
 from cozy_runtime.author._walker import field_values, strip, unwrap_optional, walk
@@ -138,6 +139,8 @@ class Invocation:
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
     observations alike. Best-effort, never authoritative."""
+    need: Callable[[str], None] | None = None
+    """`Context.need`: asks the machine for a deferred model argument's weights now."""
     calls: _Broker | None = None
     publish: Callable[[Publish], Answer] | None = None
     """`Outputs.publish`'s exchange with the machine, which journals the run's output log."""
@@ -322,6 +325,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt.outputs = surface.outputs
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel)
     ctx._recipes = inv.recipes
+    ctx._need = functools.partial(_need, surface, inv)
     telemetry = Telemetry(record, ctx)
     ctx._progress, ctx._called = telemetry.loop_progress()
     if inv.previewing is not None and inv.preview is not None:
@@ -353,6 +357,9 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
             CURRENT.reset(context)
             _current.reset(token)
             handles.__exit__(*sys.exc_info())
+
+    for asset in assets_in(result):
+        _adopt_image(attempt, asset)
 
     _validate_result(
         surface, result, attempt, grant_token=inv.calls.grant_token if inv.calls else None
@@ -642,17 +649,21 @@ def declares_trees(tp: object) -> bool:
     return _declares(tp, Tree)
 
 
-def trees_in(value: object) -> list[Tree]:
+def trees_in(value: object, _seen: set[int] | None = None) -> list[Tree]:
     """Every input tree reachable from a payload, in declaration order."""
     found: list[Tree] = []
     if isinstance(value, Tree):
         return [value]
+    seen = _seen if _seen is not None else set()
+    if id(value) in seen:
+        return []
+    seen = seen | {id(value)}
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [t for item in value for t in trees_in(item)]
+        return [t for item in value for t in trees_in(item, seen)]
     if isinstance(value, dict):
-        return [t for item in value.values() for t in trees_in(item)]
+        return [t for item in value.values() for t in trees_in(item, seen)]
     for member in field_values(value).values():
-        found += trees_in(member)
+        found += trees_in(member, seen)
     return found
 
 
@@ -856,8 +867,8 @@ def _inject(
     *,
     params: Sequence[Param] | None = None,
 ) -> dict[str, object]:
-    """Build the call kwargs. A service absent from the signature is never constructed —
-    which is precisely why a handler without `Outputs` structurally cannot save."""
+    """Build the call kwargs. A service absent from the signature is never injected;
+    the runtime still registers final image values after the handler returns."""
     kwargs: dict[str, object] = {}
     for param in surface.params if params is None else params:
         if param.role == "context":
@@ -873,7 +884,7 @@ def _inject(
         elif param.role == "preflight":
             kwargs[param.name] = facts
         elif param.role in ("model", "weights"):
-            model = _model(param, inv, param.name in surface.model_on_demand)
+            model = _model(param, inv, param.name in surface.deferred)
             keyword = surface.parameters is not None
             artifact = getattr(overlay.payload, param.name, None) if keyword else None
             if artifact is not None and (
@@ -893,6 +904,18 @@ def _inject(
         else:
             kwargs[param.name] = _service(param, attempt, ctx)
     return kwargs
+
+
+def _need(surface: Surface, inv: Invocation, slot: str) -> None:
+    """`Context.need(slot)`: only a model argument built on first use has anything to ask."""
+    if slot not in surface.model_params:
+        raise CapabilityError(
+            f"need names {slot!r}, which is no Model argument of {surface.name}",
+            code="need_unknown",
+            fields=[slot],
+        )
+    if inv.need is not None and slot in surface.deferred:
+        inv.need(slot)
 
 
 def _model(param: Param, inv: Invocation, on_demand: bool) -> object:
@@ -982,7 +1005,7 @@ def _call(
 def assets_in(value: object, _seen: set[int] | None = None) -> list[File]:
     """Every file reachable from a value, in declaration order.
 
-    Files are collected EVERY time they appear — the cycle guard covers containers only,
+    Files are collected EVERY time they appear — the cycle guard covers ancestors only,
     because "the same handle returned twice" is exactly what step 1 must catch.
     """
     seen = _seen if _seen is not None else set()
@@ -990,7 +1013,7 @@ def assets_in(value: object, _seen: set[int] | None = None) -> list[File]:
         return [value]
     if id(value) in seen:
         return []
-    seen.add(id(value))
+    seen = seen | {id(value)}
     if isinstance(value, (list, tuple, set, frozenset)):
         return [a for item in value for a in assets_in(item, seen)]
     if isinstance(value, dict):
@@ -1022,9 +1045,13 @@ def _check_result_bounds(surface: Surface, result: object, attempt: Attempt) -> 
                 code="result_bound",
                 fields=[item.input_id],
             )
+        frame = attempt.frames.get(asset.ref)
+        if bound.max_bytes is not None and frame is not None:
+            # Pending frames have no encoded length yet. Keep the authored field bound
+            # with the frame so the shared codec checks it before committing its blob.
+            frame.facts["max_bytes"] = bound.max_bytes
         if bound.max_decoded_bytes is None:
             continue
-        frame = attempt.frames.get(asset.ref)
         if frame is not None:
             decoded = frame.raw_bytes
         elif isinstance(asset, ImageFile) and asset._local is not None:
@@ -1050,8 +1077,11 @@ def _check_result_bounds(surface: Surface, result: object, attempt: Attempt) -> 
 
 
 def _fills(value: object, annotation: type) -> bool:
-    """A value of the declared type, or a file of its kind (a saved file in a `Latents` field)."""
+    """A value of the declared type, an int for a float (as Python takes one), or a file of its
+    kind (a saved file in a `Latents` field)."""
     if isinstance(value, annotation):
+        return True
+    if annotation is float and isinstance(value, int) and not isinstance(value, bool):
         return True
     return (
         isinstance(value, File) and issubclass(annotation, File) and value.kind == annotation.kind

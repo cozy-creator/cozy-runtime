@@ -1,0 +1,1 @@
+A component call whose inputs include token ids (an integer tensor of two or more dimensions) is no longer recorded as a CUDA graph at idle: idle recording checks a graph on seeded inputs, which can't stand in for real token ids, and Anima's text encoder served graph outputs that differed from the call as written (cr-300). Those calls run as written; the record says why.

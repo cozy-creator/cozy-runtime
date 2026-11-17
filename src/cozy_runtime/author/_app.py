@@ -22,6 +22,7 @@ from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import (
     model_components,
     model_defaults,
+    model_needs,
     model_on_demand,
 )
 from cozy_runtime.author._signature import Surface, analyze
@@ -40,6 +41,7 @@ class RegistrationOptions(TypedDict, total=False):
     components: Mapping[str, Sequence[str]] | None
     memoize: bool
     on_demand: Sequence[str]
+    needs: Mapping[str, str] | None
     accelerator: bool | None
     weights: tuple[WeightsOutput, ...]
     private: bool
@@ -62,14 +64,15 @@ class Registration:
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
+    model_needs: Mapping[str, str] = field(default_factory=dict)
     #: A model argument's class where the Runtime names it (`cozy_runtime.derive.recipes`).
     model_classes: Mapping[str, type[Model[object]]] = field(default_factory=dict)
     weights_outputs: tuple[WeightsOutput, ...] = ()
     preflight: Handler | None = None
     child_task: bool = False
     """`private=True`: called by this package's own code only; never a root request."""
-    accelerator: bool = True
-    """False: CPU only. True (the default): the machine's GPU when it has one."""
+    accelerator: bool | None = None
+    """An explicit resource override; otherwise constructed Model slots select the GPU."""
     tool: Tool | None = None
     """`app.tool`'s own options: this function is a box."""
     checked: bool = field(default=False, repr=False)
@@ -92,6 +95,7 @@ class Registration:
                 model_defaults=self.model_defaults,
                 model_components=self.model_components,
                 model_on_demand=self.model_on_demand,
+                model_needs=self.model_needs,
                 model_classes=self.model_classes,
             )
         return self._surface
@@ -129,7 +133,15 @@ class App:
           optional `Seed` field unset runs without the cache.
         - `on_demand=("upsampler",)`: model arguments a request may leave unused; each is
           built, and its weights fetched, when the function first reads it.
-        - `accelerator=False`: CPU only; otherwise it gets the machine's GPU when there is one.
+        - `needs={"upsampler": "request.prompt_upsampling"}`: which requests need a model
+          argument, one CEL boolean expression over `request` (the request as JSON, each field
+          it leaves out at its default). Where it is true the weights come before the function
+          starts; where false they aren't fetched. The argument is built when the function
+          first reads it. In a function that loads no model and calls others, a key names a
+          function it calls. No rule: always needed.
+        - `accelerator`: defaults to GPU for a constructed `Model` parameter, else CPU.
+          `True` selects the machine's GPU for custom compute without a `Model`; `False`
+          stays CPU only. Raw `Weights` inputs do not select a GPU.
         - `weights=`: the TensorFS model outputs it writes.
         - `private=True`: only this package's own calls run it, never a root request.
         - `preflight=`: the function that resolves a request's `Preflight[T]` before it runs.
@@ -188,6 +200,7 @@ class App:
         components: Mapping[str, Sequence[str]] | None = None,
         memoize: bool = False,
         on_demand: Sequence[str] = (),
+        needs: Mapping[str, str] | None = None,
         accelerator: bool | None = None,
         weights: tuple[WeightsOutput, ...] = (),
         private: bool = False,
@@ -205,6 +218,7 @@ class App:
         declared_defaults = model_defaults(defaults)
         declared_components = model_components(components)
         declared_on_demand = model_on_demand(on_demand)
+        declared_needs = model_needs(needs)
 
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
             if self._frozen:
@@ -224,11 +238,12 @@ class App:
                 model_defaults=declared_defaults,
                 model_components=declared_components,
                 model_on_demand=declared_on_demand,
+                model_needs=declared_needs,
                 model_classes=dict(model_classes or {}),
                 weights_outputs=weights,
                 preflight=preflight,
                 child_task=private,
-                accelerator=accelerator is not False,
+                accelerator=accelerator,
                 tool=tool,
             )
             return target

@@ -264,6 +264,24 @@ def _models(declared: Declaration) -> None:
     check_model_arguments(declared.model_defaults, slots)
     check_model_arguments(declared.model_components, slots, what="components")
     check_model_arguments(dict.fromkeys(declared.model_on_demand), constructed, what="on_demand")
+    # A rule's key that names no Model argument names a function this one calls, which only
+    # the source reader knows (`static_interface._calls`).
+    raw = sorted(set(declared.model_needs) & (set(slots) - set(constructed)))
+    if raw:
+        raise ConformanceError(
+            f"{declared.name}: needs names {', '.join(raw)}, raw Weights: a rule is for a "
+            "constructed Model argument",
+            code="model_needs",
+            fields=raw,
+        )
+    twice = sorted(set(declared.model_needs) & set(declared.model_on_demand))
+    if twice:
+        raise ConformanceError(
+            f"{declared.name}: {', '.join(twice)} has a needs rule, which already builds it "
+            "on first use: leave it out of on_demand",
+            code="model_needs",
+            fields=twice,
+        )
     degrees = [set(slot.spec.sequence_parallel) for slot in declared.slots]
     if any(degrees) and not set.intersection(*degrees):
         raise ConformanceError(

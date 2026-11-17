@@ -45,6 +45,7 @@ from cozy_runtime import __version__
 from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author import _watchers
 from cozy_runtime.canonical_json import JsonValue
 from cozy_runtime.internal import call_scope, config, filelock, kernel_cache, proctree
 
@@ -575,7 +576,7 @@ class Word:
         self.store, self.key = store, key
         self.word: dict[str, object] = {"pid": os.getpid(), "started_unix_ms": started_unix_ms}
         self.last, self.lock, self.built = (-1.0, ""), threading.Lock(), threading.Event()
-        self.thread = threading.Thread(target=self._working, name="build-work", daemon=True)
+        self.thread = _watchers.thread(self._working, "build-work")
 
     def tell(self, **changed: object) -> None:
         with self.lock:
