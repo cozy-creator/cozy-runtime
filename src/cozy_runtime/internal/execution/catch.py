@@ -228,7 +228,8 @@ def cut[T](
 ) -> T:
     """`run(level)` for a call that cuts itself into 2^level pieces down to `finest` (FFN tokens,
     attention pieces, a norm's or a conv's bands, a package's split). Without native memory, or
-    small, it runs whole; inside a capture or another site's leaf, at this key's last level."""
+    small, it runs whole; inside a capture, at this key's last level; inside another site's leaf,
+    at the level the card's free room takes now (`nested`)."""
     checkpoint()
     request = CURRENT.get()
     native = request is not None and request.memory.cuda
@@ -238,8 +239,11 @@ def cut[T](
         (str(level), row) for level, row in enumerate(useful([need(n) for n in range(finest + 1)]))
     )
     key = f"{name}:{hash(menu):x}"
-    if not native or not LEAF.acquire(blocking=False):
+    if not native or _capturing():
         return run(LEVELS.get(key, 0))
+    if not LEAF.acquire(blocking=False):
+        assert request is not None
+        return nested(request, key, name, menu, run, pure)
     assert request is not None
     try:
         device = request.memory.device.index or 0
@@ -267,6 +271,44 @@ def cut[T](
             return result
     finally:
         LEAF.release()
+
+
+#: A nested site's level a refusal moved it to, by key: its next call starts no coarser.
+_NESTED: dict[str, int] = {}
+
+
+def nested[T](
+    request: Request,
+    key: str,
+    name: str,
+    menu: Sequence[tuple[str, Sequence[int]]],
+    run: Callable[[int], T],
+    pure: bool,
+) -> T:
+    """A cut inside another site's leaf (an FFN or attention in a split's window), where native
+    selection can't open a second leaf: the coarsest level whose need the card's free room holds
+    now, no coarser than one refused before. A pure op refused there runs again a level finer,
+    the windows of the leaf around it kept (cr-305: H3's upscale ran its MLP whole inside a
+    window and ran out). The last level's refusal stands."""
+    device = request.memory.device.index or 0
+    free = int(vt.room(device)["free"])
+    fitting = next((at for at, (_, row) in enumerate(menu) if sum(row) <= free), len(menu) - 1)
+    level = max(fitting, _NESTED.get(key, 0))
+    while True:
+        LEVELS[key] = level
+        note(request, key, name, level)
+        try:
+            return run(level)
+        except BaseException as exc:
+            if not (pure and is_capacity(exc)) or level + 1 >= len(menu):
+                raise
+            _unwind(exc)
+        request.retries += 1
+        print(
+            f"cozy-runtime: {name} refused at level {level} inside another cut: level {level + 1}",
+            file=sys.stderr,
+        )
+        level = _NESTED[key] = level + 1
 
 
 def retry(
