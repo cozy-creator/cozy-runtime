@@ -327,9 +327,14 @@ def capture(
     reserve: int,
     *,
     alone: bool,
+    fits: Callable[[int], str] | None = None,
 ) -> tuple[CUDAGraph | None, str]:
     """Record a pure computation into Varena's capture pool, `reserve` bytes of it prepared first:
-    refused there (`varena.Exhausted`), nothing is captured.
+    refused there (`varena.Exhausted`), nothing is captured. `fits(bytes)` says why a pool of that
+    size can't sit beside its graph's weights ("" when it can): asked of each attempt's reserve
+    before it is prepared and of the pool it mapped after, it ends the capture (`_OverCard`), so
+    a graph never takes the room its weights need (Paul: the graph rung only when the measured
+    weights and pool fit, never forcing paging).
 
     `reserve` is a guess from an eager pass's peak, which sizes no layout in one run: the capture
     packs the same blocks there, and a small block left in the hole two freed large ones made has
@@ -347,8 +352,13 @@ def capture(
     mapped = -1  # the pool's bytes before this attempt
     while True:
         pool.prepared = reserve
+        if fits is not None and (why := fits(reserve)):
+            raise _OverCard(why)
         try:
             total = vt.prepare_pool(pool.handle, reserve, owner.device)
+            pool.mapped = total
+            if fits is not None and (why := fits(total)):
+                raise _OverCard(why)
         except BaseException:
             vt.cancel_preparation(pool.handle, owner.device)
             raise
@@ -1704,6 +1714,8 @@ class _Seen:
     start: Event
     end: Event
     peak: int | None
+    #: it made a host whole (a split's host rung, `execution.pinned`): its peak left that out
+    hosted: bool = False
 
     def device_ms(self) -> float | None:
         """Read once the device passed its end; None before (never a wait)."""
@@ -1737,9 +1749,11 @@ def _first[T](
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     began = time.perf_counter()
+    made = _made()
     result = recorder.eager.run(torch, run)
     host = (time.perf_counter() - began) * 1e3
     end.record()
+    hosted = _made() != made
     passed = recorder.eager.passed
     submit, peak = passed if passed is not None else (host, None)
     last = recorder.seen.get(key)
@@ -1750,7 +1764,7 @@ def _first[T](
     if last is None and len(recorder.seen) >= _FIRST_SEEN:
         del recorder.seen[next(iter(recorder.seen))]  # its next call is a first sight again
     recorder.seen.pop(key, None)  # the latest called last: the one longest uncalled goes first
-    recorder.seen[key] = _Seen(submit, host, start, end, peak)
+    recorder.seen[key] = _Seen(submit, host, start, end, peak, hosted)
     if key not in recorder.first_seen:
         if len(recorder.first_seen) >= _FIRST_SEEN:
             del recorder.first_seen[next(iter(recorder.first_seen))]
@@ -1878,6 +1892,79 @@ def _pressure(before: WorkingStats, after: WorkingStats) -> str:
     return ", ".join(f for f in found if f)
 
 
+def _paged(before: WorkingStats, after: WorkingStats) -> str:
+    """The weights refilled between two of varena's readings ("" when none were)."""
+    filled = after["weights_filled"] - before["weights_filled"]
+    return f"{filled / 2**20:.0f} MiB refilled" if filled > 0 else ""
+
+
+class _OverCard(Exception):
+    """A capture's pool can't sit beside its graph's weights (`_over_card`): it runs as written."""
+
+
+#: why a call that took a split's host rung records no graph (`_Seen.hosted`)
+_HOSTED = (
+    "a split in it kept its whole in host memory: a graph would need that whole on the card, "
+    "beside its weights, which had no room for it"
+)
+
+
+def _made() -> int:
+    from cozy_runtime.internal.execution import pinned  # with Torch: imported once a call runs
+
+    return pinned.made()
+
+
+def _pool_key(module: Module, leaves: Sequence[object], device: int) -> str:
+    """Where this machine keeps the pool a graph of `module` on `leaves`' layout measured: its
+    component, its tensors' shapes and dtypes and the request's models ("" outside a request)."""
+    from cozy_runtime.internal.execution import rungs  # with Torch
+    from cozy_runtime.internal.execution.catch import CURRENT as REQUEST
+
+    request = REQUEST.get()
+    if request is None:
+        return ""
+    shapes = ";".join(
+        f"{tuple(v.shape)}:{v.dtype}"
+        for v in cast("list[_Leaf]", [v for v in leaves if isinstance(v, _Leaf) or _tensor(v)])
+    )
+    return rungs.key(f"graph:{_name(module)}:{shapes}", sorted(request.current), device)
+
+
+def _tensor(value: object) -> bool:
+    return type(value).__module__.startswith("torch") and hasattr(value, "dtype")
+
+
+def _pool_need(module: Module, leaves: Sequence[object], peak: int, device: int) -> int:
+    """A capture's pool: the size an eager peak suggests, or the pool this machine measured for the
+    same graph, if larger (the next process never captures one that ran short of room)."""
+    from cozy_runtime.internal.execution import rungs  # with Torch
+
+    known = rungs.pool(key) if (key := _pool_key(module, leaves, device)) else 0
+    return max(vt.pool_bytes(peak), known)
+
+
+def _fits(
+    module: Module, recorder: _Recorder, device: int, placed: _Placed, leaves: Sequence[object]
+) -> Callable[[int], str]:
+    """`capture`'s judge of a pool's size, against the room before the capture: a pool found too
+    large is remembered (`rungs`), so the next process doesn't capture it."""
+    from cozy_runtime.internal.execution import rungs  # with Torch
+
+    live = vt.room(device)["working_live"]
+    key = _pool_key(module, leaves, device)
+
+    def fits(pool: int) -> str:
+        if FORCE:
+            return ""
+        why = _over_card(device, placed, recorder, pool, live)
+        if why and key and pool > rungs.pool(key):
+            rungs.put(key, pool)
+        return why
+
+    return fits
+
+
 def _faster(
     torch: ModuleType,
     recorder: _Recorder,
@@ -1918,7 +2005,9 @@ def _replay_ms(torch: ModuleType, entry: _Recording, inputs: list[Tensor | None]
     return float(start.elapsed_time(end))
 
 
-def _over_card(device: int, placed: _Placed, recorder: _Recorder, pool: int) -> str:
+def _over_card(
+    device: int, placed: _Placed, recorder: _Recorder, pool: int, live: int | None = None
+) -> str:
     """Why a graph of `placed`'s component would refill weights at every replay, "" when it fits.
     A replay needs all its weights on the card, and every other component its loop runs (called
     since this one's first call this attempt: Ideogram 4's two DiTs) reads its own each step: its
@@ -1941,7 +2030,7 @@ def _over_card(device: int, placed: _Placed, recorder: _Recorder, pool: int) -> 
         if held is not residency
     )
     room = vt.room(device)
-    capacity, live = room["capacity"], room["working_live"]
+    capacity, live = room["capacity"], room["working_live"] if live is None else live
     if loop + pool + live + max(capacity // 16, 512 << 20) <= capacity:
         return ""
     gib = 1 << 30
@@ -1974,6 +2063,12 @@ def _capture_call(
         recorder.gap = "its calls' working memory is not measured"
         _note(recorder, "building", recorder.gap)
         return _EAGER
+    if seen.hosted and not FORCE:
+        # The graph rung sits above the host rung: a call that had no room for a split's whole
+        # on the card has none for a pool holding it. A later call at the card rung records.
+        recorder.gap = _HOSTED
+        _note(recorder, "deferred", recorder.gap)
+        return _EAGER
     if len(recorder.paths.get(key, ())) >= _VARIANTS:
         why = f"a module attribute it reads changes between calls: {recorder.moved or '?'}"
         with recorder.lock:
@@ -1996,7 +2091,7 @@ def _capture_call(
     # Admission before anything is made for a capture: a declined path leaves no capture streams
     # or library workspaces behind, which a capped card's weights would otherwise lose to.
     if placed is not None and not FORCE:
-        pool = vt.pool_bytes(seen.peak or 0)
+        pool = _pool_need(module, leaves, seen.peak or 0, torch.cuda.current_device())
         if over := _over_card(torch.cuda.current_device(), placed, recorder, pool):
             with recorder.lock:
                 _short(module, recorder, key, over)
@@ -2044,8 +2139,10 @@ def _capture_call(
     recording, out, replayed = entry
     written = [cast("Tensor", leaves[i]) for i in recording.arg_writes]
     found = [t.clone() for t in written]  # as the call found them (a reading path writes none)
+    captured: WorkingStats | None = None
     if answers is None:
         # As written, last: what serves the call is eager's, whatever the check finds.
+        captured = vt.stats(owner.device)
         result = recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
     kept = False
     try:
@@ -2079,7 +2176,13 @@ def _capture_call(
             recorder.bound[key] = (seen.submit_ms, seen.host_ms, seen.device_ms() or 0.0, replay)
             if recorder.landed != LANDED[0] or _find(recorder, key) is not None:
                 return result  # a kernel landed meanwhile: its graphs go
-            recording.pressured = _pressure(before, vt.stats(owner.device))
+            after = vt.stats(owner.device)
+            if captured is not None and (paged := _paged(captured, after)):
+                # The call after its capture refilled weights: its pool took the room they need,
+                # so every replay would page them.
+                _short(module, recorder, key, f"its pool paged its weights ({paged})")
+                return result
+            recording.pressured = _pressure(before, after)
             _admit(recorder, key, recording)
             recorder.recorded_in = _BUDGET.request
             kept = True
@@ -2214,7 +2317,7 @@ def _capture_verified(
             owner.initialize()
             owner.prime_blas()
             # Before any weight moves for it: a pool that can't sit beside its loop's weights
-            pool = vt.pool_bytes(seen.peak or 0)
+            pool = _pool_need(module, leaves, seen.peak or 0, owner.device)
             if placed is not None and (over := _over_card(owner.device, placed, recorder, pool)):
                 _short(module, recorder, key, over)
                 return None
@@ -2271,6 +2374,10 @@ def _capture_verified(
         if isinstance(exc, Building | StaleBinding):
             _note(recorder, "building", str(exc))
             return None  # a kernel still building, or its weights left: a later call
+        if isinstance(exc, _OverCard):
+            with recorder.lock:
+                _short(module, recorder, key, str(exc))
+            return None
         if is_capacity(exc):
             need = recorder.pool.prepared if recorder.pool is not None else 0
             with recorder.lock:
@@ -2959,6 +3066,13 @@ def _record(
         if placed is not None and not placed[0].graph_accounted():
             _failed(module, recorder, key, "driver/context memory is unmeasured", idle=True)
             return True
+        if placed is not None and not FORCE:
+            # Before its weights or warm-up take room: a pool known not to fit beside them
+            seen = recorder.seen.get(key)
+            last = seen.peak if seen is not None and seen.peak is not None else 0
+            known = _pool_need(module, pending.leaves, last, owner.device)
+            if over := _over_card(owner.device, placed, recorder, known):
+                return _short(module, recorder, key, over, idle=True)
         scope = placed[0].graph_pass(placed[1], "") if placed is not None else nullcontext()
         lease = recorder.binding.prepare(current) if recorder.binding is not None else nullcontext()
         with ExitStack() as entered:
@@ -2982,6 +3096,7 @@ def _record(
                 for event in pending.copied:
                     event.synchronize()
                 warming = _WARMING.set(True)
+                made = _made()
                 try:
                     with _measured(owner.device) as peak:  # what its capture allocates
                         inputs: list[Tensor | None] = [
@@ -3004,8 +3119,11 @@ def _record(
                 if not peak:
                     recorder.idle_failed[key] = "its warm-up's working memory was not measured"
                     return True
+                if _made() != made and not FORCE:
+                    return _short(module, recorder, key, _HOSTED, idle=True)
                 IDLE.check()
-                stage, need = "its capture", vt.pool_bytes(peak[0])
+                stage = "its capture"
+                need = _pool_need(module, pending.leaves, peak[0], owner.device)
                 with attention_ulysses.observing() as served:
                     entry = _build(
                         torch, module, recorder, key, owner, placed, call, pending.spec,
@@ -3035,6 +3153,8 @@ def _record(
     except Exception as exc:
         if isinstance(exc, Building | StaleBinding):
             return False  # a kernel still building, or its weights left: a later period
+        if isinstance(exc, _OverCard):
+            return _short(module, recorder, key, str(exc), idle=True)
         if is_capacity(exc):
             if stage == "its capture" and recorder.pool is not None:
                 need = recorder.pool.prepared
@@ -3122,8 +3242,11 @@ def _build(
 
     _as_written()
     host = _hosted(torch, recorder, module)
+    fits = _fits(module, recorder, owner.device, placed, layout) if placed is not None else None
     try:
-        graph, why = capture(torch, step, pool, owner, reserve, alone=not recorder.recordings)
+        graph, why = capture(
+            torch, step, pool, owner, reserve, alone=not recorder.recordings, fits=fits
+        )
     except observe.HostRead as read:
         if answers is None:
             raise
@@ -3136,6 +3259,10 @@ def _build(
     if graph is None:
         _failed(module, recorder, key, why, idle=idle)
         return None
+    if placed is not None and (pool_key := _pool_key(module, layout, owner.device)):
+        from cozy_runtime.internal.execution import rungs  # with Torch
+
+        rungs.put(pool_key, pool.mapped)  # the measured pool: the next process judges by it
     if moved := _moved(host, _hosted(torch, recorder, module)):
         # Its Python changed host state as it ran (a cache it fills, a counter): a replay
         # would skip that. Only state it reads and leaves alone is safe to freeze.

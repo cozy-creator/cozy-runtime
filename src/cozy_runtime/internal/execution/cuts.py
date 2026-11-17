@@ -1124,7 +1124,7 @@ def _remembered(site: str, request: Request | None) -> tuple[str, int, rungs.Run
         return "", 0, None
     device = request.memory.device
     room = int(vt.room(device.index or 0)["capacity"])
-    rung_key = rungs.key(site, sorted(request.current), device)
+    rung_key = rungs.key(site, sorted(request.current), device.index or 0)
     return rung_key, room, rungs.get(rung_key, room)
 
 

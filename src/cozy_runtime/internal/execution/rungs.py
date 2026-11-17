@@ -1,13 +1,14 @@
-"""Each split site's rung, remembered per machine (cr-305, design `varena-activation-plan`): where its
-whole output lives (the card or pinned host memory), the whole's measured shape and dtype, and the room
-the rung was chosen in.
+"""Each split site's rung, remembered per machine (cr-305, design `varena-activation-plan`): where
+its whole output lives (the card or pinned host memory), the whole's measured shape and dtype, and
+the room the rung was chosen in. Each graph's measured capture pool is kept beside them (`pool`):
+the graph rung is chosen only when its weights and that pool fit.
 
 A rung is kept under a key naming everything its measure depends on: the GPU and its total memory,
-torch's and CUDA's builds, the Runtime's version, the running models' names (each carries its package
-release and checkpoint digest, so its lane) and the site with its shapes. A rung is trusted only while
-the room it was chosen in still holds: a card rung while the room is no smaller, a host rung while it
-is no larger; otherwise the site chooses again. The table lives beside the executor's kernels
-(`COZY_KERNEL_CACHE`), the machine's own namespace, which a fair A/B arm resets.
+torch's and CUDA's builds, the Runtime's version, the running models' names (each carries its
+package release and checkpoint digest, so its lane) and the site with its shapes. A rung is trusted
+only while the room it was chosen in still holds: a card rung while the room is no smaller, a host
+rung while it is no larger; otherwise the site chooses again. The table lives beside the
+executor's kernels (`COZY_KERNEL_CACHE`), the machine's own namespace, which a fair A/B arm resets.
 """
 
 from __future__ import annotations
@@ -46,12 +47,12 @@ class Rung:
 
 
 _LOCK = threading.Lock()
-_TABLE: dict[str, Rung] | None = None
+_TABLE: dict[str, Rung | int] | None = None
 
 
-def key(site: str, models: list[str], device: torch.device) -> str:
+def key(site: str, models: list[str], device: int) -> str:
     """The rung's key: everything the measure behind it depends on."""
-    parts = [*_machine(device.index or 0), *sorted(models), site]
+    parts = [*_machine(device), *sorted(models), site]
     return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:32]
 
 
@@ -71,11 +72,19 @@ def get(rung_key: str, room: int) -> Rung | None:
     """The rung kept for `rung_key`, if it holds in `room`."""
     with _LOCK:
         found = _table().get(rung_key)
-    return found if found is not None and found.trusted(room) else None
+    return found if isinstance(found, Rung) and found.trusted(room) else None
 
 
-def put(rung_key: str, rung: Rung) -> None:
-    """Keep `rung` for `rung_key`, on disk when the machine gives the executor a namespace."""
+def pool(rung_key: str) -> int:
+    """The capture pool a graph kept under `rung_key` measured, 0 when none did."""
+    with _LOCK:
+        found = _table().get(rung_key)
+    return found if isinstance(found, int) else 0
+
+
+def put(rung_key: str, rung: Rung | int) -> None:
+    """Keep `rung` (or a graph's measured pool) for `rung_key`, on disk when the machine gives the
+    executor a namespace."""
     with _LOCK:
         table = _table()
         if table.get(rung_key) == rung:
@@ -89,11 +98,15 @@ def put(rung_key: str, rung: Rung) -> None:
             on_disk[rung_key] = rung
             path.parent.mkdir(parents=True, exist_ok=True)
             partial = path.with_suffix(f".{os.getpid()}.tmp")
-            partial.write_text(json.dumps({k: asdict(v) for k, v in on_disk.items()}))
+            partial.write_text(json.dumps({k: _row(v) for k, v in on_disk.items()}))
             os.replace(partial, path)
 
 
-def _table() -> dict[str, Rung]:
+def _row(value: Rung | int) -> dict[str, object]:
+    return {"pool": value} if isinstance(value, int) else asdict(value)
+
+
+def _table() -> dict[str, Rung | int]:
     global _TABLE
     if _TABLE is None:
         path = _path()
@@ -106,14 +119,17 @@ def _path() -> Path | None:
     return Path(root) / "rungs.json" if root else None
 
 
-def _read(path: Path) -> dict[str, Rung]:
+def _read(path: Path) -> dict[str, Rung | int]:
     try:
         rows = json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
-    table: dict[str, Rung] = {}
+    table: dict[str, Rung | int] = {}
     for rung_key, row in rows.items() if isinstance(rows, dict) else ():
-        with contextlib.suppress(TypeError, ValueError):
+        with contextlib.suppress(TypeError, ValueError, KeyError):
+            if "pool" in row:
+                table[rung_key] = int(row["pool"])
+                continue
             table[rung_key] = Rung(
                 bool(row["host"]),
                 tuple(int(n) for n in row["shape"]),

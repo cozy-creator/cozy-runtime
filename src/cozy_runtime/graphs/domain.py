@@ -61,6 +61,8 @@ class Pool:
     handle: tuple[int, int]
     #: the room its latest capture was prepared with (`graphs.capture`)
     prepared: int = 0
+    #: the bytes the pool mapped for it: the measured pool
+    mapped: int = 0
 
 
 def cuda_graph() -> CUDAGraph:
