@@ -1313,7 +1313,20 @@ def _ggml_leaf_class(torch: ModuleType) -> _LeafClass:
                 functools.partial(GgmlNativeLeaf.decoded, torch, self.encoding, blocks, x.dtype),
             )  # fmt: skip
 
+    class GgmlEmbedding(_leaf_class(torch)):  # type: ignore[misc]
+        """A token table in ggml blocks, as llama.cpp's get_rows reads one: only the looked-up rows decode."""
+
+        def forward(
+            self, x: Tensor, *, prequantized: PreQuantized | None = None, out: Tensor | None = None
+        ) -> Tensor:
+            blocks = read(self.blocks)
+            rows = blocks.index_select(0, x.reshape(-1))
+            table = GgmlNativeLeaf.decoded(torch, self.encoding, rows, self.out_dtype)
+            looked: Tensor = table.view(*x.shape, -1)
+            return looked
+
     _ggml_leaf_class._cached = GgmlLinear  # type: ignore[attr-defined]
+    _ggml_leaf_class._embedding = GgmlEmbedding  # type: ignore[attr-defined]
     return GgmlLinear
 
 
@@ -1425,7 +1438,11 @@ class GgmlNativeLeaf:
         if (placed := placed_device()).type == "cuda":
             ggml_linear.prime(torch, placed.index or 0)
         rows, units = int(blocks.shape[0]), int(blocks.shape[1])
-        return _ggml_leaf_class(torch)(
+        # A token table (llama.cpp's token_embd) is looked up, not multiplied.
+        embedding = hasattr(replaced, "num_embeddings") and not hasattr(replaced, "in_features")
+        linear = _ggml_leaf_class(torch)
+        build = _ggml_leaf_class._embedding if embedding else linear  # type: ignore[attr-defined]
+        return build(
             None,
             {"blocks": blocks},
             getattr(replaced, "bias", None),
