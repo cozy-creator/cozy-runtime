@@ -5,8 +5,8 @@ Changing GEMM row geometry may change rounding; bitwise equivalence is not promi
 The results stay on the device, at the level native selection takes from each call's operands
 (`catch`, `sizing`). Level L is 2^L pieces, down to the finest.
 
-Call cuts: Diffusers' FFNs by token, a Runtime-fused block's gated MLP by token (`gated`), its
-channel RMS norms by rows, what Diffusers' attention
+Call cuts: Diffusers' FFNs, and any module shaped as one (`_ffn_like`), by token, a Runtime-fused
+block's gated MLP by token (`gated`), its channel RMS norms by rows, what Diffusers' attention
 processors run before dispatch (their q/k RMS norms by rows, their RoPE by sequence rows: `rope`),
 attention by head groups then query rows, a Transformers vision tower by pictures, a package's
 `split` by windows.
@@ -57,7 +57,9 @@ def install(module: nn.Module) -> int:
     Transformers vision tower that reads packed patches and each picture's
     grid (`forward(hidden_states, grid_thw)`: Qwen2.5-VL, Qwen3-VL, Qwen3.5) runs its pictures in
     groups. Diffusers' RMS norms (each attention processor's q/k norm) cut by rows, and the RoPE
-    functions Diffusers' processors call (`rope`). Returns how many it cut."""
+    functions Diffusers' processors call (`rope`). A module of linears and activations alone, up
+    projections from its input's width and one down projection (`_ffn_like`), is a feed-forward
+    whoever wrote it, and cuts by tokens. Returns how many it cut."""
     count = _ropes()
     for path, sub in module.named_modules():
         if _gated_mlp(sub) and "_cozy_cut" not in vars(sub):
@@ -89,6 +91,12 @@ def install(module: nn.Module) -> int:
         ):
             norm: nn.Module = sub
             norm.forward = catch.transparent(_norm(f"{path}:tokens", sub, _forward(sub)))
+            vars(sub)["_cozy_cut"] = True
+            count += 1
+            continue
+        if _ffn_like(sub) and "_cozy_cut" not in vars(sub):
+            library = type(sub).forward.__module__.startswith(_LIBRARIES)
+            sub.forward = catch.transparent(_ffn(f"{path}:tokens", sub, _forward(sub), library))
             vars(sub)["_cozy_cut"] = True
             count += 1
             continue
@@ -209,7 +217,9 @@ def _forward(module: nn.Module) -> Forward:
     return vars(module).get("forward") or catch.current(module)
 
 
-def _ffn(site: str, module: nn.Module, forward: Forward) -> Forward:
+def _ffn(site: str, module: nn.Module, forward: Forward, library: bool = True) -> Forward:
+    """A feed-forward by tokens. `library`: its forward is Diffusers' or Transformers', which a
+    refusal inside a piece may run again finer (`catch.cut`'s `pure`); a package's runs once."""
     whole: list[bool] = []  # a piece returned no tensor: it runs whole from then on
 
     def cut(x: object, *args: object, **kwargs: object) -> object:
@@ -221,28 +231,139 @@ def _ffn(site: str, module: nn.Module, forward: Forward) -> Forward:
             or x.dim() < 2
             or module.training
             or torch.is_grad_enabled()
-            or not type(module).forward.__module__.startswith(("diffusers.", "transformers."))
+            or (library and not type(module).forward.__module__.startswith(_LIBRARIES))
             or not _token_local(module)
         ):
             return forward(x, *args, **kwargs)
         tokens = x.numel() // max(x.shape[-1], 1)
         if tokens < 2:
             return forward(x)
-        shape = _ffn_shape(module, x)
+        shape = (_ffn_shape(module, x) if library else None) or _layout_shape(module, x)
         if shape is None:
-            whole.append(True)
-            print(
-                f"cozy-runtime: {site} has no feed-forward layout it reads: whole", file=sys.stderr
-            )
+            if library:
+                whole.append(True)
+                print(
+                    f"cozy-runtime: {site} has no feed-forward layout it reads: whole",
+                    file=sys.stderr,
+                )
             return forward(x)
         try:
-            run = functools.partial(_tokens, forward, x, tokens)
-            return catch.cut(site, levels(tokens), levelled(tokens, shape.need(tokens)), run)
+            run = functools.partial(_tokens, forward, x, tokens, rank=not library)
+            need = levelled(tokens, shape.need(tokens))
+            return catch.cut(site, levels(tokens), need, run, pure=library)
         except _Whole:
             whole.append(True)
         return forward(x)
 
     return cut
+
+
+#: the libraries whose modules' forwards the Runtime reads as written
+_LIBRARIES = ("diffusers.", "transformers.")
+#: modules a feed-forward holds beside its linears: activations and no-ops (torch's, and the
+#: libraries' own activation modules), which act on each element alone
+_ELEMENTWISE = (
+    nn.GELU, nn.SiLU, nn.ReLU, nn.LeakyReLU, nn.ELU, nn.SELU, nn.Mish, nn.Tanh, nn.Sigmoid,
+    nn.Hardswish, nn.Softplus, nn.Identity, nn.Dropout,
+)  # fmt: skip
+_ACTIVATION_MODULES = ("diffusers.models.activations", "transformers.activations")
+#: what a forward that mixes tokens names: reductions over any axis, attention and matmuls
+#: across rows, axis moves and convolutions. A feed-forward's forward names none of them.
+_MIXING = frozenset({
+    "mean", "sum", "prod", "var", "std", "norm", "amax", "amin", "max", "min", "argmax", "argmin",
+    "softmax", "log_softmax", "logsumexp", "cumsum", "cumprod", "sort", "topk", "roll", "flip",
+    "scaled_dot_product_attention", "matmul", "bmm", "baddbmm", "einsum", "mm", "transpose",
+    "permute", "movedim", "swapaxes", "mT", "T", "conv1d", "conv2d", "conv3d", "avg_pool1d",
+    "avg_pool2d", "max_pool1d", "max_pool2d", "interpolate", "group_norm", "batch_norm",
+})  # fmt: skip
+
+
+def _ffn_like(module: nn.Module) -> bool:
+    """A feed-forward by its shape, whoever wrote it: its own forward over one input, linears and
+    elementwise activations alone below it (`_layout`), and a forward that names nothing that mixes
+    tokens (`_MIXING`). RelayVSR's Wan FFN (`net.0.proj`, tanh GELU, `net.2`) is one."""
+    forward = type(module).forward
+    if _widths(module) is not None or forward is nn.Module.forward:
+        return False
+    if forward.__module__.startswith("cozy_runtime."):
+        return False
+    if isinstance(module, nn.ModuleList) or _layout(module) is None:
+        return False
+    return _screened(type(module).forward) and (
+        "forward" not in vars(module) or _screened(vars(module)["forward"])
+    )
+
+
+def _screened(forward: object) -> bool:
+    """Whether `forward`'s code, and the code nested in it, names nothing in `_MIXING`."""
+    while hasattr(forward, "__wrapped__"):
+        forward = forward.__wrapped__
+    code = getattr(forward, "__code__", None)
+    if not inspect.iscode(code):
+        return False
+    stack = [code]
+    while stack:
+        at = stack.pop()
+        if _MIXING.intersection(at.co_names):
+            return False
+        stack.extend(c for c in at.co_consts if inspect.iscode(c))
+    return True
+
+
+def _layout(module: nn.Module, width: int | None = None) -> tuple[int, int, tuple[int, int]] | None:
+    """A feed-forward's widths from the linears under `module`: (din, projected, (inner, dout)),
+    up projections from din (`width` where given; `projected` their outputs together) and one down
+    projection from `inner`, which is `projected` or half of it (gated). None where anything else
+    holds weights or computes: any module but a linear, an elementwise activation, a container,
+    or a holder of those without parameters or a forward of its own (RelayVSR's `GELU`)."""
+    linears: list[tuple[int, int]] = []
+    stack = [module]
+    while stack:
+        sub = stack.pop()
+        widths = _widths(sub) if sub is not module else None
+        if widths is not None:
+            linears.append(widths)
+            continue
+        if (
+            next(sub.parameters(recurse=False), None) is not None
+            or next(sub.buffers(recurse=False), None) is not None
+        ):
+            return None
+        if sub is module:
+            stack.extend(sub.children())
+            continue
+        elementwise = isinstance(sub, _ELEMENTWISE) or type(sub).__module__ in _ACTIVATION_MODULES
+        if not (
+            elementwise
+            or isinstance(sub, nn.ModuleList | nn.Sequential)
+            or type(sub).forward is nn.Module.forward
+        ):
+            return None
+        stack.extend(sub.children())
+    for din in sorted({i for i, _ in linears} if width is None else {width}):
+        ups = [o for i, o in linears if i == din]
+        down = [w for w in linears if w[0] != din]
+        if ups and len(down) == 1 and 2 * down[0][0] in (2 * sum(ups), sum(ups)):
+            return din, sum(ups), down[0]
+    return None
+
+
+def _layout_shape(module: nn.Module, x: Tensor) -> sizing.Ffn | None:
+    """A feed-forward found by its shape (`_ffn_like`), sized for `x`; None when `x` is not its
+    input's width. Its activation's temporaries are unknown: two, as an unfused one holds."""
+    layout = _layout(module, int(x.shape[-1]))
+    if layout is None:
+        return None
+    din, projected, (inner, dout) = layout
+    return sizing.Ffn(
+        din=din,
+        dout=dout,
+        inner=inner,
+        projected=projected,
+        temps=2,
+        itemsize=x.element_size(),
+        quantized=any(getattr(c, "provider", None) is not None for c in module.modules()),
+    )
 
 
 #: activations computing in one kernel (one `n x inner` temporary); the others hold two
@@ -436,14 +557,21 @@ def _join(parts: list[object]) -> object:
     raise _Whole
 
 
-def _tokens(forward: Forward, x: Tensor, tokens: int, level: int) -> object:
+def _tokens(forward: Forward, x: Tensor, tokens: int, level: int, rank: bool = False) -> object:
+    """`forward` over `x`'s token rows in 2^level pieces, each [n, width]; with `rank`, [1, …, n,
+    width] as `x`'s rank is (a package's forward may read its input's dims)."""
     if not level:
         return forward(x)
     size, flat, out = pieces(tokens, level), x.reshape(tokens, x.shape[-1]), None
+    lead = (1,) * (x.dim() - 2) if rank else ()
     for at in range(0, tokens, size):
         catch.checkpoint()
-        part = forward(flat[at : at + size])
-        if not isinstance(part, Tensor):
+        rows = flat[at : at + size]
+        part = forward(rows.view(*lead, *rows.shape))
+        if not isinstance(part, Tensor) or part.shape[: len(lead)] != lead:
+            raise _Whole
+        part = part.view(-1, *part.shape[len(lead) + 1 :]) if lead else part
+        if part.shape[0] != rows.shape[0]:
             raise _Whole
         out = part.new_empty((tokens, *part.shape[1:])) if out is None else out
         out[at : at + part.shape[0]].copy_(part)
