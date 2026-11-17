@@ -19,7 +19,7 @@ import weakref
 from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict, Unpack, cast
 
@@ -2485,9 +2485,8 @@ class Memory:
                 with torch.inference_mode(False):
                     use = pin()
                     if use is not None:
-                        value = (
-                            use.tensor[offset : offset + part.nbytes].view(stored).view(part.shape)
-                        )
+                        raw = use.tensor[offset : offset + part.nbytes]
+                        value = _view(site.name, part.role, part, raw)
                         if widen is not None:
                             value = value.to(widen)
                         block.last = time.monotonic_ns()
@@ -3464,6 +3463,11 @@ def _layout(
             dtype = getattr(torch, _DTYPES[layout.dtype])
             width = int(torch.empty((), dtype=dtype, device="meta").element_size())
             source = parts.get(layout.source) if layout.source is not None else None
+            if source is not None and source.dtype == "F4":
+                # Packed two a byte: a stored F4 [..., C] is the U8 [..., C/2] its leaves read
+                # (`_view`), not a second copy of it (cr-319).
+                carrier = (*source.shape[:-1], source.shape[-1] // 2)
+                source = replace(source, dtype="U8", shape=carrier)
             if (
                 source is not None
                 and source.dtype == layout.dtype
