@@ -189,10 +189,10 @@ def model(config: Mapping[str, object], shapes: Mapping[str, tuple[int, ...]]) -
 
 
 def _place(arch: Architecture, name: str, main: int) -> list[tuple[str, int]] | None:
-    """`name`'s GGUF tensors, each with the share of its rows it holds; None for mmproj's.
-    Raises nothing: an unplaced name is the caller's to judge."""
+    """`name`'s GGUF tensors, each with the share of its rows it holds: none for mmproj's, None
+    where the map does not place it."""
     if _MMPROJ.match(name):
-        return None
+        return []
     if re.fullmatch(rf"{_TEXT}embed_tokens\.weight", name):
         return [("token_embd.weight", 1)]
     if name == "lm_head.weight":
