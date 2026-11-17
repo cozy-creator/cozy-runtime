@@ -258,6 +258,27 @@ target_compile_options(conv_units PRIVATE -O3 --use_fast_math --expt-relaxed-con
                        $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus -Xcompiler=/Zc:preprocessor>)
 kernel_module(_conv conv.cpp conv_units)
 
+# llama.cpp's quantized matmuls for the ggml.* lanes (xs-213): MMVQ, few-row MMQ and MMQ from `csrc/ggml/ggml`,
+# vendored unmodified at b12466 (MIT, `csrc/ggml/UPSTREAM.md`), with ggml-cuda's own nvcc flags, through our shim
+# (`csrc/ggml/shim.cu`: no ggml graph, allocator, backend or cuBLAS). Built for the families the lanes serve, with
+# llama.cpp's own targets for them (`120a`, as its release builds Blackwell).
+set(GGML "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ggml")
+set(GGML_CUDA "${GGML}/ggml/src/ggml-cuda")
+set(GGML_ARCHS "80-real;86-real;89-real;120a-real")
+add_library(ggml_units OBJECT "${GGML}/shim.cu" "${GGML}/matmul.cu" "${GGML_CUDA}/mmvq.cu" "${GGML_CUDA}/mmq-few.cu"
+            "${GGML_CUDA}/quantize.cu")
+foreach(type q8_0 q5_0 q5_1 q4_k q5_k q6_k)
+    target_sources(ggml_units PRIVATE "${GGML_CUDA}/template-instances/mmq-instance-${type}.cu")
+endforeach()
+set_target_properties(ggml_units PROPERTIES CUDA_ARCHITECTURES "${GGML_ARCHS}")
+target_include_directories(ggml_units BEFORE PRIVATE "${GGML}/shim")
+target_include_directories(ggml_units PRIVATE "${GGML}" "${GGML}/ggml/include" "${GGML}/ggml/src" "${GGML_CUDA}")
+target_compile_options(ggml_units PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math -extended-lambda>
+                       $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>
+                       $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus -Xcompiler=/Zc:preprocessor>)
+kernel_module(_ggml ggml.cpp ggml_units)
+target_include_directories(_ggml PRIVATE csrc)
+
 # The executor's record of a fatal signal (`csrc/crash.c`, cr-275): plain C on the stable ABI, Linux only.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     enable_language(C)

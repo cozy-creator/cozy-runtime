@@ -37,6 +37,7 @@ from cozy_runtime.accel.kernels import (
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.internal import (
     fp8_linear,
+    ggml_linear,
     int8_linear,
     nvfp4_linear,
     prebuilt,
@@ -69,6 +70,7 @@ NVFP4 = "cozy.nvfp4.native-leaf/1"
 MXFP8 = "cozy.mxfp8.native-leaf/2"
 W4A8 = "cozy.w4a8-convrot256.native-leaf/1"
 SVDQ = "cozy.svdq-nvfp4.native-leaf/1"
+GGML = "cozy.ggml.native-leaf/1"
 
 
 class _Serving(Protocol):
@@ -174,6 +176,7 @@ FORMATS = {
     MXFP8: "mxfp8",
     W4A8: "w4a8",
     SVDQ: "svdq-nvfp4",
+    GGML: "ggml",
 }
 _MODULES: dict[str, _Serving] = {
     INT8_CONVROT: int8_linear,
@@ -182,6 +185,7 @@ _MODULES: dict[str, _Serving] = {
     MXFP8: _ScaledMm,
     W4A8: w4a8_linear,
     SVDQ: svdq_linear,
+    GGML: ggml_linear,
 }
 #: The activation operand each native leaf takes, by provider: a w4a8 leaf takes int8.convrot's,
 #: so it shares one quantization and a producer's prologue with the int8 leaves of its input.
@@ -376,7 +380,9 @@ def _native_leaf_class(torch: ModuleType) -> _LeafClass:
             if prequantized is None and few:
                 # A decode step's row or few: the op's one GEMV launch, which no shared operand
                 # serves (`int8_linear.quantize` declines so few rows).
-                return int8_linear.landed(ops.linear(torch, cast, data, scale, bias, out_dtype), out)
+                return int8_linear.landed(
+                    ops.linear(torch, cast, data, scale, bias, out_dtype), out
+                )
             if prequantized is None or prequantized.provider != self.provider:
                 capturing = x.is_cuda and torch.cuda.is_current_stream_capturing()
                 sibling = None if capturing else self
@@ -1283,4 +1289,149 @@ class MicroScaledNativeLeaf:
             self.encoding,
             in_features,
             out_features,
+        )
+
+
+def _ggml_leaf_class(torch: ModuleType) -> _LeafClass:
+    """`EncodedLinear` over a ggml weight's blocks: llama.cpp's matmuls (`ggml_linear`)."""
+    cached: _LeafClass | None = getattr(_ggml_leaf_class, "_cached", None)
+    if cached is not None:
+        return cached
+
+    class GgmlLinear(_leaf_class(torch)):  # type: ignore[misc]
+        def linear(
+            self, x: Tensor, prequantized: PreQuantized | None, out: Tensor | None = None
+        ) -> Tensor:
+            out_dtype = self.out_dtype
+            if torch.is_autocast_enabled(x.device.type):
+                out_dtype = torch.get_autocast_dtype(x.device.type)
+                x = x.to(out_dtype)
+            # It launches by pointer: a leaf run outside its model's forward has its blocks read in.
+            blocks, bias = read(self.blocks), read(self.bias)
+            return ggml_linear.linear(
+                torch, x, blocks, self.encoding, self.out_features, bias, out_dtype,
+                functools.partial(GgmlNativeLeaf.decoded, torch, self.encoding, blocks, x.dtype),
+            )  # fmt: skip
+
+    _ggml_leaf_class._cached = GgmlLinear  # type: ignore[attr-defined]
+    return GgmlLinear
+
+
+@dataclass(frozen=True, slots=True)
+class GgmlNativeLeaf:
+    """`ggml.*` ENCODED GEMM (xs-213): llama.cpp's block types as their own weights, multiplied by
+    llama.cpp's kernels (MMVQ, few-row MMQ, MMQ; `ggml_linear`) on a q8_1 activation, so a lane
+    llama-quantize's bytes make runs as llama.cpp runs it. Where the wheel has no kernel for the
+    card, the blocks decode to float (`wheel_refuses`)."""
+
+    encoding: str = "ggml.q4_k"
+    params: Params = ()
+
+    @property
+    def name(self) -> str:
+        return GGML
+
+    @property
+    def route(self) -> str:
+        return "encoded_gemm"
+
+    @property
+    def device_predicate(self) -> str:
+        return "cuda.sm80+"
+
+    @property
+    def schemes(self) -> frozenset[str]:
+        return frozenset(ggml_linear.TYPES)
+
+    @property
+    def code_revision(self) -> str:
+        return "1"
+
+    @property
+    def suite(self) -> str:
+        return "ggml-native"
+
+    @property
+    def formats(self) -> frozenset[str]:
+        return frozenset({"int8"})
+
+    @property
+    def out_dtypes(self) -> frozenset[str]:
+        return frozenset({"bfloat16", "float16", "float32"})
+
+    @property
+    def required(self) -> frozenset[str]:
+        return frozenset({"blocks"})
+
+    @property
+    def optional(self) -> frozenset[str]:
+        return frozenset()
+
+    @property
+    def output_dtype_rule(self) -> str:
+        return "contract"
+
+    @staticmethod
+    def wheel_refuses(sm: int) -> str:
+        """Why this card's wheel runs no ggml matmul, or ""."""
+        return ggml_linear.carried(sm)
+
+    def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
+        """Rank 2 in whole blocks; rows of whole 512-column chunks, which ggml's kernels read."""
+        why = _rank2(shape)
+        block = ggml_linear.BLOCK.get(self.encoding, 0)
+        if not why and dict(params) != {"block_size": block}:
+            why = f"{self.encoding} has block_size {block}; this weight's params are {dict(params)}"
+        if not why and int(shape[1]) % ggml_linear.ROW_PADDING:
+            why = (f"ggml's kernels read rows in {ggml_linear.ROW_PADDING}-column chunks; this "
+                   f"weight's rows are {shape[1]} long")  # fmt: skip
+        return why
+
+    def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
+        raise AssertionError(
+            "an encoded_gemm provider REPLACES the leaf; it never writes a float "
+            "destination — see LeafProvider.leaf"
+        )
+
+    def resident_bytes(self, parts: Mapping[str, RolePart]) -> int:
+        return sum(p.nbytes for p in parts.values())
+
+    def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
+        return 8.0 * self.resident_bytes(parts) / max(numel, 1)
+
+    def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
+        return 0
+
+    @staticmethod
+    def decoded(torch: ModuleType, scheme: str, blocks: Tensor, dtype: Dtype) -> Tensor:
+        """The weight as a float [N, K], by the decode cores: the fallback where no kernel serves."""
+        from cozy_runtime.internal.decode_schemes import BY_SCHEME
+        from cozy_runtime.internal.encoding.adapters import CoreDequant
+        from cozy_runtime.internal.encoding.formats import params_of
+
+        n = ggml_linear.BLOCK[scheme]
+        out: Tensor = torch.empty(
+            int(blocks.shape[0]), int(blocks.shape[1]) * n, dtype=dtype, device=blocks.device
+        )
+        CoreDequant(scheme, params_of(BY_SCHEME[scheme].probe_params)).decode(
+            torch, {"blocks": blocks}, out
+        )
+        return out
+
+    def leaf(
+        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: object, out_dtype: Dtype
+    ) -> Leaf:
+        blocks = parts["blocks"]
+        if (placed := placed_device()).type == "cuda":
+            ggml_linear.prime(torch, placed.index or 0)
+        rows, units = int(blocks.shape[0]), int(blocks.shape[1])
+        return _ggml_leaf_class(torch)(
+            None,
+            {"blocks": blocks},
+            getattr(replaced, "bias", None),
+            out_dtype,
+            self.name,
+            self.encoding,
+            units * ggml_linear.BLOCK[self.encoding],
+            rows,
         )

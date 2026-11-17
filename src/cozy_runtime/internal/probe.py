@@ -40,7 +40,7 @@ from tensorfs import UnsupportedError
 from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.author._numeric import within, worst
 from cozy_runtime.derive.microscale import encode_int8_convrot256, encode_nvfp4, encode_w4a8
-from cozy_runtime.internal import accel
+from cozy_runtime.internal import accel, ggml_linear
 from cozy_runtime.internal.decode_cores import Cores
 from cozy_runtime.internal.decode_schemes import run, sample
 from cozy_runtime.internal.encoding.adapters import CoreDequant
@@ -58,7 +58,7 @@ from cozy_runtime.internal.encoding.formats import (
     hadamard256,
     params_of,
 )
-from cozy_runtime.internal.encoding.leaves import Nvfp4NativeLeaf
+from cozy_runtime.internal.encoding.leaves import GgmlNativeLeaf, Nvfp4NativeLeaf
 from cozy_runtime.internal.encoding.selection import (
     DeviceFacts,
     RuntimeIdentity,
@@ -658,6 +658,10 @@ def _weight_roles(
         roles = {role: part.to(device) for role, part in roles.items()}
         return _exact_weight(torch, provider, roles), roles
     weight = torch.randn(rows, cols, generator=generator, dtype=torch.float32).to(device) * 0.05
+    if provider.suite == "ggml-native":  # ggml-ref/1's blocks, and their exact decode
+        blocks = ggml_linear.encode(torch, provider.encoding, weight.cpu()).to(device)
+        exact = GgmlNativeLeaf.decoded(torch, provider.encoding, blocks, torch.float32)
+        return exact, {"blocks": blocks}
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native"):
         scale = (weight.abs().amax(dim=-1) / 448.0).clamp(min=1e-12)
         payload = (weight / scale.unsqueeze(-1)).clamp(-448.0, 448.0)
@@ -997,6 +1001,7 @@ NATIVE_SUITES = frozenset(
         "mxfp8-native",
         "w4a8-native",
         "svdq-nvfp4-native",
+        "ggml-native",
     }
 )
 
