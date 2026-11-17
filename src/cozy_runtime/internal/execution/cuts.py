@@ -926,6 +926,7 @@ def split[T](
     run: Callable[[int, bool], T],
     pure: bool = False,
     hostable: bool = False,
+    exact: str = "",
 ) -> T:
     """A package's `split` (`cozy_runtime.author.split`): `run(most, host)` runs it in windows of
     at most `most` of its `total` elements; `finest` is the least a window can hold. Its author
@@ -943,17 +944,20 @@ def split[T](
     `hostable` and no level fits with the whole on the card, the whole goes to pinned host memory
     and the levels need only their windows. The rung is remembered per machine (`rungs`): a later
     process starts at it while the room it was chosen in holds. A refusal judged on the package's
-    estimate holds for this call only."""
+    estimate holds for this call only. `exact` names this call's input shape, which the whole's
+    measure and the rung are kept under; `key` leaves out the cut extents, so the levels learned
+    serve every length."""
     deepest = levels(-(-total // max(finest, 1)))
     site = f"split:{key}"
     request = catch.CURRENT.get()
     if request is None or not request.memory.cuda or _capturing():  # a capture allocates no host
         hostable = False
-    rung_key, room, kept = _remembered(site, request)
-    if kept is not None and key not in _WHOLES:
-        _WHOLES[key] = (kept.shape, _dtype(kept.dtype))
-    measured = _WHOLES.get(key)
-    whole_bytes = out_bytes if measured is None else _nbytes(*measured)
+    exact = exact or key
+    rung_key, room, kept = _remembered(f"split:{exact}", request)
+    if kept is not None and exact not in _WHOLES and request is not None:
+        _WHOLES[exact] = (kept.shape, _dtype(kept.dtype), request.memory.device)
+    measured = _WHOLES.get(exact)
+    whole_bytes = out_bytes if measured is None else _nbytes(measured[0], measured[1])
 
     def window(level: int) -> int:
         return max(pieces(total, level), finest)
@@ -964,32 +968,36 @@ def split[T](
     def windows_only(level: int) -> tuple[int, ...]:
         return (*[int(window(level) * item_bytes)] * holds,)
 
+    hsite = f"split:{exact}"  # a host decision holds for this shape: another may fit the card
     on_host = (
         hostable
         and request is not None
-        and (request.hosted.get(site, _ESTIMATED) != _ESTIMATED or (kept is not None and kept.host))
+        and (
+            request.hosted.get(hsite, _ESTIMATED) != _ESTIMATED or (kept is not None and kept.host)
+        )
     )
     if not on_host:
         try:
             result = catch.cut(
                 site, deepest, need, lambda level: run(window(level), False), pure=pure
             )
-            if rung_key and key in _WHOLES:
-                rungs.put(rung_key, _rung(False, key, room))
+            if rung_key and request is not None and _on_card(exact):
+                # a whole the card refused in the run went to host (`whole`): that is its rung
+                rungs.put(rung_key, _rung(hsite in request.hosted, exact, room))
             return result
         except catch.Unplaced as exc:  # refused before a window ran (or the op is pure)
             if not hostable or request is None:
                 raise
             unwind(exc)
-            _hosted(request, site, name, _ESTIMATED if measured is None else _MEASURED)
+            _hosted(request, hsite, name, _ESTIMATED if measured is None else _MEASURED)
     assert request is not None  # `hostable` holds only in a request
-    if site not in request.hosted:
-        _hosted(request, site, name, _REMEMBERED)
+    if hsite not in request.hosted:
+        _hosted(request, hsite, name, _REMEMBERED)
     result = catch.cut(
         f"{site}:host", deepest, windows_only, lambda level: run(window(level), True), pure=pure
     )
-    if rung_key and key in _WHOLES and request.hosted.get(site) != _ESTIMATED:
-        rungs.put(rung_key, _rung(True, key, room))
+    if rung_key and _on_card(exact) and request.hosted.get(hsite) != _ESTIMATED:
+        rungs.put(rung_key, _rung(True, exact, room))
     return result
 
 
@@ -997,8 +1005,11 @@ def whole(part: Tensor, shape: Sequence[int], key: str, host: bool, zeros: bool 
     """The whole output a package's `split` assembles its windows in, `part` its first (zeroed
     with `zeros`: a blended whole's accumulator): pinned host memory with `host`; else the
     device's, or pinned host memory when the device refuses it beside the windows (a Runtime
-    retry: no window runs again)."""
-    _WHOLES[key] = (tuple(int(n) for n in shape), part.dtype)
+    retry: no window runs again). A whole of windows the op returns on the host is plain host
+    memory: there is no card rung to choose."""
+    _WHOLES[key] = (tuple(int(n) for n in shape), part.dtype, part.device)
+    if not part.is_cuda:
+        return part.new_zeros(shape) if zeros else part.new_empty(shape)
     if host:
         return _pinned(shape, part.dtype, part.device, zeros)
     try:
@@ -1029,10 +1040,15 @@ def ahead(key: str, host: bool, zeros: bool) -> Tensor | None:
     window ran, and the split takes the host rung (a Runtime retry). None while it is unmeasured."""
     known = _WHOLES.get(key)
     request = catch.CURRENT.get()
-    if known is None or request is None or not request.memory.cuda or _capturing():
+    if known is None or request is None or _capturing():
         return None
-    shape, dtype = known
-    device = request.memory.device
+    shape, dtype, device = known
+    if device.type != "cuda":
+        return (
+            torch.zeros(shape, dtype=dtype, device=device)
+            if zeros
+            else torch.empty(shape, dtype=dtype, device=device)
+        )
     if host:
         return _pinned(shape, dtype, device, zeros)
     try:
@@ -1052,7 +1068,7 @@ def ahead(key: str, host: bool, zeros: bool) -> Tensor | None:
 
 def moved(out: Tensor) -> Tensor:
     """A split's partly written whole on host: the windows it finished come with it."""
-    if pinned.held(out):
+    if pinned.held(out) or not out.is_cuda:
         return out
     host = pinned.empty(out.shape, out.dtype, out.device)
     pinned.write(host, out)
@@ -1083,8 +1099,8 @@ def read[X](window: X) -> X:
     return cast("X", pinned.read(window)) if isinstance(window, Tensor) else window
 
 
-#: each split key's whole output, its shape and dtype, as its first allocation measured it
-_WHOLES: dict[str, tuple[tuple[int, ...], torch.dtype]] = {}
+#: each split call shape's whole output, its shape, dtype and device, as its allocation measured it
+_WHOLES: dict[str, tuple[tuple[int, ...], torch.dtype, torch.device]] = {}
 #: `Request.hosted`'s reason for a whole sent to host without a refusal in the run: selection
 #: judged the package's estimate (for that call only) or the measured whole (for the request), or
 #: the machine remembered the rung (`rungs`)
@@ -1110,8 +1126,14 @@ def _remembered(site: str, request: Request | None) -> tuple[str, int, rungs.Run
     return rung_key, room, rungs.get(rung_key, room)
 
 
+def _on_card(key: str) -> bool:
+    """Whether `key`'s measured whole is a card's: only those have a card or host rung."""
+    known = _WHOLES.get(key)
+    return known is not None and known[2].type == "cuda"
+
+
 def _rung(host: bool, key: str, room: int) -> rungs.Rung:
-    shape, dtype = _WHOLES[key]
+    shape, dtype, _ = _WHOLES[key]
     return rungs.Rung(host, shape, str(dtype), room)
 
 

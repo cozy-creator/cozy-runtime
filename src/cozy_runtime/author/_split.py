@@ -48,6 +48,7 @@ class Pieces(Protocol):
         run: Callable[[int, bool], T],
         pure: bool = False,
         hostable: bool = False,
+        exact: str = "",
     ) -> T: ...
 
     def piece(self) -> None: ...
@@ -162,6 +163,7 @@ def split[W](
     whole = 0 if out is not None or host else _bytes(shape, cuts, x) * widen
     hostable = bool(whole)
     key = _key(fn, shape, cuts, x.dtype)
+    exact = f"{key}|{shape}"  # what the memory measures this call's whole under: its shape too
     progress = _Progress()  # what a retry of this call keeps: the windows it finished
     if most is not None and cuts:
         windows = _windows(shape, cuts, most)
@@ -179,9 +181,10 @@ def split[W](
             whole,
             _item_bytes(cuts, x),
             holds,
-            lambda _, on_host: _run(fn, x, cuts, windows, runtime, key, out, on_host, progress),
+            lambda _, on_host: _run(fn, x, cuts, windows, runtime, exact, out, on_host, progress),
             pure,
             hostable,
+            exact,
         )
     if runtime is None or not cuts:
         entire = cast("W", x)  # run whole, `fn` takes `x` as its own window (`Sliceable`)
@@ -198,10 +201,11 @@ def split[W](
         _item_bytes(cuts, x),
         holds,
         lambda most, on_host: _run(
-            fn, x, cuts, _windows(shape, cuts, most), runtime, key, out, on_host, progress
+            fn, x, cuts, _windows(shape, cuts, most), runtime, exact, out, on_host, progress
         ),
         pure,
         hostable,
+        exact,
     )
 
 
