@@ -14,17 +14,22 @@ dense and mixture-of-experts, load through it.
 The construction config is the repository's `config.json`; the tokenizer, processor and chat
 template are the checkpoint's assets; parameters load in their stored dtype. Fused experts are
 split into per-expert blocks (`moe.split`): the checkpoint stores them per expert.
+
+Answers stream as they are made (xs-209): the engine hands each row's decoded text over as it comes
+(`Delta`, `on_delta`) and returns what it made (`Final`); above it, what may be shown of each answer
+(`_Words`) goes to the run's followers as its text output's deltas (`Context._text`).
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import secrets
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, TypedDict
 
 import msgspec
 import torch
@@ -57,6 +62,7 @@ from cozy_runtime.author import (
     UnsupportedInput,
     uses_components,
 )
+from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._model import WARNINGS
 from cozy_runtime.author._tool import spoken
@@ -96,6 +102,9 @@ Videos = Annotated[
     msgspec.Meta(max_length=4),
 ]
 Text = Annotated[str, msgspec.Meta(max_length=65536)]
+#: How long a model that reasons thinks before answering (the Responses API's `reasoning.effort`),
+#: as its chat template takes it: Qwen3.8's reads `reasoning_effort`; others ignore it.
+Effort = Literal["minimal", "low", "medium", "high", "xhigh"]
 
 
 class AskPrompt(msgspec.Struct):
@@ -114,6 +123,9 @@ class AskRequest(msgspec.Struct):
     #: Think before answering (the chat template's switch); only the answer after the thought is
     #: returned. A thought `max_tokens` cuts off is returned as it stands, with a warning.
     thinking: bool = False
+    #: How long it thinks, where its chat template takes `reasoning_effort` (Qwen3.8's); null: the
+    #: template's own.
+    reasoning_effort: Effort | None = None
     max_tokens: Annotated[int, msgspec.Meta(ge=1, le=16384)] = 1024
     #: 0 answers greedily; above it, each token is drawn from the `top_p` nucleus at this
     #: temperature, from `seed`: the same request and seed give the same answer.
@@ -149,6 +161,8 @@ class TextBox(msgspec.Struct, kw_only=True):
     instructions: Prompt[Picture | Video] = Prompt()
     #: Think before answering (`VisionLM._chat`); only the answer is the box's (`VisionLM.ask`).
     thinking: Annotated[bool, Advanced()] = False
+    #: How long it thinks, where its chat template takes `reasoning_effort` (`VisionLM._chat`).
+    reasoning_effort: Annotated[Effort | None, Advanced()] = None
     #: The system turn (`VisionLM._chat`).
     system: Annotated[Text, Advanced()] = ""
     #: `lm.generate`'s `max_new_tokens`.
@@ -164,6 +178,36 @@ class TextBox(msgspec.Struct, kw_only=True):
 
 class TextResult(msgspec.Struct):
     text: str
+
+
+@dataclass(frozen=True, slots=True)
+class Delta:
+    """A piece of one row's text as the engine decoded it: of its thought (`reasoning`) or of its
+    answer."""
+
+    row: int
+    text: str
+    channel: Literal["reasoning", "answer"]
+
+
+@dataclass(frozen=True, slots=True)
+class Usage:
+    #: tokens read (the rows' prompts) and made
+    prompt: int
+    completion: int
+
+
+@dataclass(frozen=True, slots=True)
+class Final:
+    """What an engine made: each row's answer and thought, each exactly the concatenation of its
+    `Delta`s of that channel (unstripped); why each row ended (`stop`, `length`, `cancelled`); the
+    tokens; and its timings in seconds, by name."""
+
+    texts: list[str]
+    thoughts: list[str]
+    finish_reasons: list[str]
+    usage: Usage
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -198,7 +242,9 @@ def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> A
     if not prompts[0].text:
         raise InvalidRequest("prompt is empty", code="ask_prompts")
     return AskResult(
-        _answers([[*p.images, *p.videos, p.text] for p in prompts], payload, model, tel)
+        _answers(
+            [[*p.images, *p.videos, p.text] for p in prompts], payload, model, tel, output="texts"
+        )
     )
 
 
@@ -211,13 +257,14 @@ def write(ctx: Context, payload: TextBox, model: VisionLM, tel: Telemetry) -> Te
     asked = AskRequest(
         system=payload.system,
         thinking=payload.thinking,
+        reasoning_effort=payload.reasoning_effort,
         max_tokens=payload.max_tokens,
         temperature=payload.temperature,
         top_p=payload.top_p,
         presence_penalty=payload.presence_penalty,
         seed=secrets.randbits(53) if payload.seed is None else payload.seed,
     )
-    (text,) = _answers([_parts(payload.instructions)], asked, model, tel)
+    (text,) = _answers([_parts(payload.instructions)], asked, model, tel, output="text")
     return TextResult(text)
 
 
@@ -243,9 +290,13 @@ def _answers(
     payload: AskRequest,
     model: VisionLM,
     tel: Telemetry,
+    *,
+    output: str,
 ) -> list[str]:
     """Each question's pictures read and videos watched as `payload` says, then all answered in
-    one pass."""
+    one pass, each answer's words to the run's followers as they come: `output`'s, an item of it
+    per question when there are several (its index from 1, as a list output's). While the model
+    thinks its stage says so, and nothing of the thought is shown."""
     # The checkpoint's video reading, else Qwen-VL's (2, 4, 768): Gemma 4's processor states none.
     video = model.processor.video_processor
     fps = payload.fps or float(getattr(video, "fps", None) or 2)
@@ -264,18 +315,30 @@ def _answers(
 
     with tel.stage("reading"):
         read_questions = [Question(parts=[read(part) for part in parts]) for parts in questions]
-    with tel.stage("answering"):
+    ctx = CURRENT.get()
+    sink = ctx._text if ctx is not None else None
+    stage = ["thinking" if payload.thinking else "answering"]
+    listed = output == "texts"
+
+    def words(row: int, delta: str) -> None:
+        stage[0] = "answering"
+        if sink is not None:
+            sink(output, row + 1 if listed else 0, delta)
+
+    with tel.stage(stage[0]):
         return model.ask(
             read_questions,
             system=payload.system,
             thinking=payload.thinking,
+            reasoning_effort=payload.reasoning_effort,
             stop=list(payload.stop),
             max_new_tokens=payload.max_tokens,
             presence_penalty=payload.presence_penalty,
             temperature=payload.temperature,
             top_p=payload.top_p,
             seed=payload.seed,
-            progress=lambda tokens: tel._tokens(tokens, payload.max_tokens, stage="answering"),
+            progress=lambda tokens: tel._tokens(tokens, payload.max_tokens, stage=stage[0]),
+            words=words,
         )
 
 
@@ -440,14 +503,48 @@ class Pipeline:
         self.components: dict[str, PreTrainedModel] = {COMPONENT: model}
 
 
+@dataclass(frozen=True, slots=True)
+class Params:
+    """How to answer: the system turn and the chat template's thinking (`reasoning_effort` where
+    it reads one), where an answer stops, and the decoding (`lm.generate`'s)."""
+
+    system: str
+    thinking: bool
+    reasoning_effort: str | None
+    stop: list[str]
+    max_new_tokens: int
+    temperature: float
+    top_p: float
+    presence_penalty: float
+    seed: int
+    no_repeat_ngram: int | None = None
+
+
+class Engine(Protocol):
+    """What answers questions: it reads them as the model does (its tokenizer, its image and video
+    processing), hands each row's decoded text to `on_delta` as it comes, from any thread and never
+    after it returns, and `progress` the tokens decoded (at most about four times a second); then
+    returns what it made. It may stop at a `stop` string itself; `VisionLM.ask` cuts at them too."""
+
+    def generate(
+        self,
+        questions: list[Question],
+        params: Params,
+        *,
+        on_delta: Callable[[Delta], None],
+        progress: Callable[[int], None] | None = None,
+    ) -> Final: ...
+
+
 class VisionLM(Model[Pipeline]):
     """A Qwen-VL model answering questions about text, images and videos, greedily or sampled
-    from a seed. Runtime may serve encoded lanes' linears natively."""
+    from a seed. Runtime may serve encoded lanes' linears natively. Its `engine` answers them."""
 
     serving = Serving(min_bits=4, phase="decode")
 
     pipe: Pipeline
     processor: ProcessorMixin
+    engine: Engine
 
     def load(self, loader: Loader) -> None:
         self.pipe = loader.construct(Pipeline)
@@ -457,13 +554,14 @@ class VisionLM(Model[Pipeline]):
             model.generation_config = GenerationConfig(  # type: ignore[no-untyped-call]  # unannotated in Transformers
                 **json.loads(loader.assets.read("generation_config.json"))
             )
+        self.engine = TransformersEngine(self.pipe, self.processor)
 
     def execution_plan(self, plan: Plan) -> str:
         model = self.pipe.components[COMPONENT]
         return "+".join(filter(None, (lm.install(plan, model), moe.install(plan, model))))
 
     def unload(self, loader: Loader) -> None:
-        del self.pipe
+        del self.pipe, self.engine
 
     @uses_components(COMPONENT)
     def ask(
@@ -480,13 +578,75 @@ class VisionLM(Model[Pipeline]):
         seed: int,
         progress: Callable[[int], None] | None = None,
         no_repeat_ngram: int | None = None,
+        reasoning_effort: str | None = None,
+        words: Callable[[int, str], None] | None = None,
     ) -> list[str]:
-        """One answer per question, all at once: one prefill over the rows, left-padded, and one
-        decode of them together (the decoding arguments are `lm.generate`'s). Each video's
-        blocks are stamped with their `<t seconds>` as the processor writes them. An answer ends
-        before its first `stop`; with `thinking`, only what follows the thought is the answer,
-        and a thought `max_new_tokens` cut short is returned as it stands, with a run warning."""
-        texts = [self._chat(question, system, thinking) for question in questions]
+        """One answer per question, all at once (the decoding arguments are `lm.generate`'s). An
+        answer ends before its first `stop`; with `thinking`, only what follows the thought is the
+        answer, and a thought with no answer after it (`max_new_tokens` cut it short) is returned
+        as it stands, with a run warning. `words(row, delta)` is told each answer as it may be
+        shown while it is made (`_Words`): what it tells of a row adds up to that row's answer."""
+        params = Params(
+            system=system,
+            thinking=thinking,
+            reasoning_effort=reasoning_effort,
+            stop=stop,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            presence_penalty=presence_penalty,
+            seed=seed,
+            no_repeat_ngram=no_repeat_ngram,
+        )
+        shown = [_Words(stop) for _ in questions]
+
+        def on_delta(delta: Delta) -> None:
+            if delta.channel == "answer" and words is not None:
+                more = shown[delta.row].add(delta.text)
+                if more:
+                    words(delta.row, more)
+
+        final = self.engine.generate(questions, params, on_delta=on_delta, progress=progress)
+        answers: list[str] = []
+        for row, (answer, thought) in enumerate(zip(final.texts, final.thoughts, strict=True)):
+            if thinking and not answer.strip():  # its thought never ended: it is all there is
+                WARNINGS.append(
+                    (
+                        "a thought had no answer after it (max_tokens cut it short, or the model "
+                        "ended there); it is returned",
+                        {"row": row, "max_tokens": max_new_tokens},
+                    )
+                )
+                answers.append(thought.strip())
+                continue
+            answers.append(_cut(answer, stop).strip())
+            more = shown[row].end(answers[-1])
+            if more and words is not None:
+                words(row, more)
+        return answers
+
+
+class TransformersEngine:
+    """The engine of a checkpoint's own Transformers model: its processor reads the questions
+    (each video's blocks stamped with their `<t seconds>`), one prefill over the rows, left-padded,
+    and one decode of them together through `lm.generate`, its rows' text told as it comes (at
+    most every `lm.STREAM_S`) and the rest as it ends."""
+
+    def __init__(self, pipe: Pipeline, processor: ProcessorMixin) -> None:
+        self.pipe, self.processor = pipe, processor
+
+    def generate(
+        self,
+        questions: list[Question],
+        params: Params,
+        *,
+        on_delta: Callable[[Delta], None],
+        progress: Callable[[int], None] | None = None,
+    ) -> Final:
+        texts = [
+            self._chat(question, params.system, params.thinking, params.reasoning_effort)
+            for question in questions
+        ]
         parts = [part for question in questions for part in question.read()]
         images = [part for part in parts if isinstance(part, Image)]
         videos = [part for part in parts if isinstance(part, Watched)]
@@ -506,36 +666,23 @@ class VisionLM(Model[Pipeline]):
                 "do_sample_frames": False,
             }
         decoding: _Decoding = {
-            "max_new_tokens": max_new_tokens,
-            "presence_penalty": presence_penalty,
-            "temperature": temperature,
-            "top_p": top_p,
-            "seed": seed,
+            "max_new_tokens": params.max_new_tokens,
+            "presence_penalty": params.presence_penalty,
+            "temperature": params.temperature,
+            "top_p": params.top_p,
+            "seed": params.seed,
             "progress": progress,
-            "no_repeat_ngram": no_repeat_ngram,
+            "no_repeat_ngram": params.no_repeat_ngram,
         }
         # A thought may say a stop string: then stops cut only the answer, after decoding.
-        replies = self._generate(
-            self._inputs(text=texts, **kwargs), [] if thinking else stop, decoding
+        stop = [] if params.thinking else params.stop
+        return self._decode(
+            self._inputs(text=texts, **kwargs), stop, decoding, params.thinking, on_delta
         )
-        if not thinking:
-            return [_cut(reply, stop).strip() for reply in replies]
-        answers = []
-        for row, reply in enumerate(replies):
-            thought, ended, answer = reply.partition(THOUGHT_END)
-            if ended:
-                answers.append(_cut(answer, stop).strip())
-                continue
-            WARNINGS.append(
-                (
-                    "a thought was cut short at max_tokens, before its answer; it is returned",
-                    {"row": row, "max_tokens": max_new_tokens},
-                )
-            )
-            answers.append(thought.strip())
-        return answers
 
-    def _chat(self, question: Question, system: str, thinking: bool) -> str:
+    def _chat(
+        self, question: Question, system: str, thinking: bool, effort: str | None = None
+    ) -> str:
         content = [
             {"type": "text", "text": part}
             if isinstance(part, str)
@@ -543,13 +690,16 @@ class VisionLM(Model[Pipeline]):
             for part in question.read()
         ]
         messages = [{"role": "system", "content": system}] if system else []
-        text: str = self.processor.apply_chat_template(
+        chat = functools.partial(
+            self.processor.apply_chat_template,
             # Transformers types a turn's content as text; a multimodal turn's is a list
             [*messages, {"role": "user", "content": content}],  # type: ignore[arg-type]  # see above
             add_generation_prompt=True,
             tokenize=False,
             enable_thinking=thinking,
         )
+        # A template that reads no `reasoning_effort` (all but Qwen3.8's) ignores it.
+        text: str = chat(reasoning_effort=effort) if thinking and effort else chat()
         return text
 
     def _inputs(self, **kwargs: object) -> BatchFeature:
@@ -562,8 +712,17 @@ class VisionLM(Model[Pipeline]):
                 inputs[name] = inputs[name].to(model.dtype)
         return inputs
 
-    def _generate(self, inputs: BatchFeature, stop: list[str], decoding: _Decoding) -> list[str]:
-        """Decoded answers. A stop string that is one token also ends its row's decode."""
+    def _decode(
+        self,
+        inputs: BatchFeature,
+        stop: list[str],
+        decoding: _Decoding,
+        thinking: bool,
+        on_delta: Callable[[Delta], None],
+    ) -> Final:
+        """Each row decoded, its text handed to `on_delta` as it comes; a stop string that is one
+        token also ends its row's decode. With `thinking`, what comes before the thought's end is
+        its thought (`reasoning`)."""
         model, tokenizer = self.pipe.components[COMPONENT], self.processor.tokenizer
         configured = model.generation_config.eos_token_id
         single = [
@@ -577,15 +736,100 @@ class VisionLM(Model[Pipeline]):
             *single,
         ]
         tokens = [token for token in dict.fromkeys(stops) if token is not None]
+        rows = int(inputs["input_ids"].shape[0])
+        told = [_Told(thinking) for _ in range(rows)]
+
+        def tell(row: int, text: str, ended: bool = False) -> None:
+            for delta in told[row].more(row, text, ended):
+                on_delta(delta)
+
+        def streamed(made: list[list[int]]) -> None:
+            for row, ids in enumerate(made):
+                tell(row, tokenizer.decode(ids, skip_special_tokens=True))
+
         out = lm.generate(
             model,
             inputs,
             stop=tokens,
             pad=tokenizer.pad_token_id or tokens[0],
+            streamed=streamed,
             **decoding,
         )
-        replies = self.processor.batch_decode(out, skip_special_tokens=True)  # type: ignore[no-untyped-call]  # unannotated in Transformers
-        return [str(reply) for reply in replies]
+        replies = [str(r) for r in self.processor.batch_decode(out, skip_special_tokens=True)]  # type: ignore[no-untyped-call]  # unannotated in Transformers
+        made: list[int] = []
+        reasons: list[str] = []
+        for row, ids in enumerate(out.tolist()):
+            tell(row, replies[row], ended=True)
+            end = next((i for i, token in enumerate(ids) if token in tokens), None)
+            made.append(len(ids) if end is None else end + 1)
+            reasons.append("length" if end is None else "stop")
+        read = int(inputs["attention_mask"].sum()) if "attention_mask" in inputs else 0
+        return Final(
+            texts=[t.answer for t in told],
+            thoughts=[t.thought for t in told],
+            finish_reasons=reasons,
+            usage=Usage(read, sum(made)),
+        )
+
+
+class _Told:
+    """One row's text as an engine that decodes whole rows hands it on: each time, what was not
+    told yet, split at the thought's end; a partial character, or what may be the start of the
+    thought's end, waits for the next."""
+
+    def __init__(self, thinking: bool) -> None:
+        self.thinking = thinking
+        self.thought = self.answer = ""
+
+    def more(self, row: int, text: str, ended: bool) -> list[Delta]:
+        if not ended:
+            text = text.rstrip("\ufffd")
+        thought, answer = "", text
+        if self.thinking:
+            thought, closed, answer = text.partition(THOUGHT_END)
+            if not closed:
+                thought, answer = text, ""
+                if not ended:
+                    thought = _firm(thought, [THOUGHT_END])
+        # A text decoded again that no longer starts as told (a token's bytes merged) is told no
+        # more: what it ends as is what `Final` says.
+        deltas: list[Delta] = []
+        if len(thought) > len(self.thought) and thought.startswith(self.thought):
+            deltas.append(Delta(row, thought[len(self.thought) :], "reasoning"))
+            self.thought = thought
+        if len(answer) > len(self.answer) and answer.startswith(self.answer):
+            deltas.append(Delta(row, answer[len(self.answer) :], "answer"))
+            self.answer = answer
+        if ended:
+            self.thought, self.answer = thought, answer
+        return deltas
+
+
+class _Words:
+    """One answer as it may be shown while it is made: stripped and cut at its first `stop` as the
+    answer is, less what may still change (trailing whitespace, what may be a stop string's start),
+    so what is shown only grows and ends as the answer does."""
+
+    def __init__(self, stop: list[str]) -> None:
+        self.stop, self.made, self.shown = stop, "", ""
+
+    def add(self, text: str) -> str:
+        """`text` made: what to show now beyond what was shown."""
+        self.made += text
+        words = self.made.lstrip()
+        cut = _cut(words, self.stop)
+        words = (cut if len(cut) < len(words) else _firm(words, self.stop)).rstrip()
+        return self._more(words)
+
+    def end(self, answer: str) -> str:
+        """The row ended as `answer`: what is left to show of it."""
+        return self._more(answer)
+
+    def _more(self, words: str) -> str:
+        if len(words) <= len(self.shown) or not words.startswith(self.shown):
+            return ""
+        more, self.shown = words[len(self.shown) :], words
+        return more
 
 
 class _Decoding(TypedDict):
@@ -603,3 +847,9 @@ class _Decoding(TypedDict):
 def _cut(text: str, stop: list[str]) -> str:
     """`text` before the first of the `stop` strings in it."""
     return text[: min((at for s in stop if (at := text.find(s)) >= 0), default=len(text))]
+
+
+def _firm(text: str, ends: list[str]) -> str:
+    """`text` less its longest tail that may be the start of one of `ends`."""
+    tail = max((n for end in ends for n in range(1, len(end)) if text.endswith(end[:n])), default=0)
+    return text[: len(text) - tail]

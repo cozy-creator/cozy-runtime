@@ -451,6 +451,7 @@ class Reader:
         dependency_roots: Sequence[Path] = (),
         pinned: locked.Locked | None = None,
         own: frozenset[str],
+        held: Mapping[str, Path] | None = None,
     ) -> None:
         self.project = project
         self.project_roots = (project / "src", project)
@@ -462,8 +463,9 @@ class Reader:
         #: The root project's lock pins every package it reads, its dependencies' dependencies too:
         #: a dependency's own directory (or installed copy) selects no other lock.
         self.pinned = pinned
-        #: published callees, read from the wheels the project's uv.lock pins when needed
-        self.wheels = locked.Wheels(pinned.wheels if pinned is not None else {})
+        #: published callees, read from the wheels the project's uv.lock pins when needed, the
+        #: machine's copies (`held`, by sha256) where it holds them
+        self.wheels = locked.Wheels(pinned.wheels if pinned is not None else {}, held)
         self.runtime_root = Path(cozy_runtime.__file__).resolve().parent.parent
         self.installed = _installed_packages(_site_packages(self.runtime_root))
         self.modules: dict[str, Module] = {}
@@ -1643,9 +1645,11 @@ def build(
     *,
     environment_python: Path | None = None,
     closures: dict[str, str] | None = None,
+    held: Mapping[str, Path] | None = None,
 ) -> dict[str, Json]:
     """The package interface from source alone. Executes nothing of the package. `closures`, when
-    given, gets each memoized callable's code closure (`_code_closure`)."""
+    given, gets each memoized callable's code closure (`_code_closure`). `held`: the pinned callee
+    wheels the machine holds, by sha256, read in place of their URLs."""
     project = project.resolve()
     application = read_application(project)
     # A callee package is read as source too: a local one from the directory the project's
@@ -1653,7 +1657,7 @@ def build(
     pinned = locked.read(project)
     roots = (*environment_roots(environment_python, project=project), *pinned.roots)
     own = source_tops(project)
-    reader = Reader(project, dependency_roots=roots, pinned=pinned, own=own)
+    reader = Reader(project, dependency_roots=roots, pinned=pinned, own=own, held=held)
     name = tomllib.loads((project / "pyproject.toml").read_text())["project"]["name"]
     return _build(reader, application, closures=closures, distribution=name, pinned=pinned)
 

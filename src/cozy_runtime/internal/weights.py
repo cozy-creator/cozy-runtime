@@ -25,8 +25,6 @@ from dataclasses import dataclass, field
 from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
-from tensorfs.raw import parts as stored_parts
-
 from cozy_runtime import graphs
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._loader import (
@@ -73,6 +71,8 @@ from cozy_runtime.internal.residency import (
     Request,
     TensorLayout,
     Weights,
+    _unit,
+    joined,
     paging,
     split,
     uncached,
@@ -464,12 +464,12 @@ class Backend:
         # The paging blocks, found once and split where a unit is too large: residency, the bakes
         # and the execution catch all read these (`Declared.blocks`).
         rule, found = paging(root)
-        sizes = {
-            bound[stored]: sum(part.length for part in stored_parts(checkpoint.ck, name, stored).values())
-            for stored in rows
-        }
+        sizes = {bound[stored]: row.stored_nbytes for stored, row in rows.items()}
         blocks = split(root, found, sizes)
         rule = rule if blocks == found else f"{rule}+split"
+        if self.memory.native is not None:
+            whole = joined(root, blocks, sizes, self.memory.granularity, self.memory.most_room()[0])
+            rule, blocks = (rule, blocks) if whole == blocks else (f"{rule}+joined", whole)
         bakes = self.bakes[name] = _Bakes(self, root, rows, set(blocks))
         routes = _Routes(self, rows)
         leg = self._leg(f"{name}.routes", leg)
@@ -785,10 +785,24 @@ def _float32(torch: ModuleType, root: Module) -> None:
 
 
 def _derived(leaf: Leaf, parts: Mapping[str, Tensor]) -> tuple[str, ...]:
-    """The stored roles `leaf` keeps as other tensors than the stored ones (cast, swizzled): a
-    bind makes them again from the stored bytes. A stored role it does not read is neither."""
+    """The stored roles `leaf` keeps as other bytes than the stored ones (cast, swizzled): a bind
+    makes them again from the stored bytes. A role it keeps as a view of its stored bytes, in the
+    stored dtype and shape, is stored (nvfp4's `view(uint8)` of its U8 payload was a second copy of
+    every payload, 8 GiB on Qwen3.6-27B: cr-319). A stored role it does not read is neither."""
     kept = leaf.roles()
-    return tuple(sorted(role for role in kept if role in parts and kept[role] is not parts[role]))
+    derived = (role for role in kept if role in parts and not _same(kept[role], parts[role]))
+    return tuple(sorted(derived))
+
+
+def _same(kept: Tensor, stored: Tensor) -> bool:
+    """`kept` is `stored`'s bytes as they are: one storage and offset, dtype, shape and strides."""
+    return kept is stored or bool(
+        kept.dtype == stored.dtype
+        and kept.shape == stored.shape
+        and kept.stride() == stored.stride()
+        and kept.storage_offset() == stored.storage_offset()
+        and kept.untyped_storage()._cdata == stored.untyped_storage()._cdata
+    )
 
 
 def _bound(
@@ -901,7 +915,7 @@ class _Bakes:
                 continue
             bake = _Bake(stored, repr((encoded.scheme, encoded.params)), leaf=leaf)
             hooks: list[object] = list(module._forward_hooks.values()) if module is not None else []
-            if any(site.startswith(block + ".") for block in blocks):
+            if _unit(site, blocks):  # a block holds it: a lookup per prefix, not a scan of them
                 bake.hooks = [hook for hook in hooks if isinstance(hook, LoRASource)]
             target = site.removesuffix(".base_layer")
             kron = cast("KronLayer | None", root.get_submodule(target) if target != site else None)

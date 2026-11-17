@@ -117,3 +117,14 @@ Website: https://github.com/nunchux-ai/nunchaku
 csrc/gemm/svdq.cu adapts Nunchaku's W4A4 GEMM (src/kernels/zgemm/gemm_w4a4.cuh and
 gemm_base.cuh at 302e0e9): its tile shape, register pipeline, fragment layouts and
 block-scaled MMA call. The changes are stated in that file's header.
+
+--------------------------------------------------------------------------------
+comfy-kitchen's MiniMax H3 VAE kernels
+--------------------------------------------------------------------------------
+Copyright (c) 2025 Comfy Org.
+License: Apache-2.0
+Website: https://github.com/Comfy-Org/comfy-kitchen
+
+_kernels._conv builds comfy_kitchen/backends/cuda/ops/group_norm_pad3d.cu and
+ops/cutlass_conv3d_fp16.cu (comfy-kitchen #167) unmodified, from tag v0.2.40
+(f8b7e97a1418d2e529bd5405fbf86312be198ae6): csrc/conv/UPSTREAM.md.

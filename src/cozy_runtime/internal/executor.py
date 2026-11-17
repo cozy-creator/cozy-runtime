@@ -4075,6 +4075,7 @@ class Executor:
                         calls=self.host._call_broker(command.request_id, self.host.call_interfaces),
                         previewing=functools.partial(self.host.mux.previewing, command.request_id),
                         preview=self._preview_sink(command.request_id),
+                        text=self._text_sink(command.request_id),
                     ),
                 )
                 if group_attempt is not None:
@@ -4997,6 +4998,23 @@ class Executor:
                 )
 
         return preview
+
+    def _text_sink(self, request_id: str) -> Callable[[str, int, str], None]:
+        """The lossy lane's words for one attempt: each text output's delta as it is made, which
+        TensorD appends to what it holds of that output and passes on (`response.output_text.delta`)."""
+
+        def text(output: str, index: int, delta: str) -> None:
+            with contextlib.suppress(SeamError):
+                self.channel.send(
+                    {
+                        "event": "progress",
+                        "request_id": request_id,
+                        "kind": "text",
+                        "text": {"output": output, "index": index, "delta": delta},
+                    }
+                )
+
+        return text
 
     def _result_schema_digest(self, surface: Surface) -> str:
         """The identity of the DECLARED annotated result surface — never of the value.

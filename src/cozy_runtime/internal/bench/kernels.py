@@ -77,6 +77,7 @@ NATIVE = {
     "_fa3": "attention:flash-attn3",
     "_sage3": "attention:sageattention3-fp4",
     "_attn4": "attention:kitchen-int4qk",
+    "_conv": "native:conv",
 }
 
 
@@ -234,7 +235,7 @@ def declared(row: arch.Row, sm: int) -> Declared:
             continue
         names.append(f"triton:{name}")
     # A format's kernels exist where its row has it; FP8 GEMMs only where the wheel carries them.
-    names += ["native:int8", "native:norm", "decode:conform", "kitchen:int8", "big:gemm-int8"]
+    names += ["native:int8", "native:norm", "native:conv", "decode:conform", "kitchen:int8", "big:gemm-int8"]
     if row.fp8:
         names += ["native:fp8", "big:gemm-fp8"]
     names.append("native:w4a8")
@@ -925,6 +926,14 @@ def _norm(index: int) -> Outcome:
     return {**_verdict(verdict), "shapes": str(freqs.shape)}
 
 
+def _conv(index: int) -> Outcome:
+    """The causal-conv encoder's GroupNorm + SiLU + pad pass and every fp16 conv3d tile config against float64
+    (`accel.fusion._conv`'s probe, the one it serves after)."""
+    from cozy_runtime.accel.fusion import _conv as conv
+
+    return _verdict(conv._probe(index, _kernels._conv))
+
+
 def _big_gemm(name: str, index: int) -> Outcome:
     """The 8-bit GEMM at H3's largest: past 2^31 elements of its activation, sampled rows against
     the product in float64 (M x K wraps an int32 in upstream's CUTLASS, if anywhere)."""
@@ -985,6 +994,7 @@ EXERCISES: dict[str, Callable[[int], Outcome]] = {
     "native:fp8": lambda i: _format(i, prebuilt.FP8),
     "native:w4a8": _w4a8,
     "native:norm": _norm,
+    "native:conv": _conv,
     "native:svdq": _svdq_native,
     "kitchen:int8": lambda i: _kitchen(i, int8_linear._probe_kitchen),
     "kitchen:nvfp4": lambda i: _kitchen(i, nvfp4_linear._probe_kitchen),
