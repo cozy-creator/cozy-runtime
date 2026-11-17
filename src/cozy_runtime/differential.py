@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -115,7 +115,7 @@ def arm(checks: Mapping[str, bool] | None = None, press: Press = "") -> None:
     catch.select = selected
     executor.Executor._execution = recorded  # type: ignore[assignment, method-assign]
     if press == "eager":
-        graphs._region_call = written  # type: ignore[assignment]
+        graphs._region_call = written
 
 
 def _bytes(torch: ModuleType, tensor: Tensor) -> bytes:
@@ -156,7 +156,8 @@ def _press(torch: ModuleType, module: Module, press: Press) -> None:
     _requests.append(request.id)
     if press in ("refill", "hold") and len(_requests) == 2:
         device = next(module.parameters()).device
-        size = unsealed(torch, "mem_get_info")(device)[1] - LEFT  # all but LEFT of the card
+        _, total = cast("tuple[int, int]", unsealed(torch, "mem_get_info")(device))
+        size = total - LEFT  # all but LEFT of the card
         held = torch.empty(size, dtype=torch.uint8, device=device)
         held.fill_(1)
         if press == "hold":
