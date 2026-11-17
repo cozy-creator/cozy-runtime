@@ -935,16 +935,21 @@ def split[T](
     op's peak holds: its author's estimate, which a completed pass's measured sample replaces.
 
     Where `hostable` and no level fits with the whole on the device (refused before any window
-    ran, or its allocation refused in the run: `whole`), the whole goes to pinned host memory
-    for the rest of the request: the levels then need only their windows (cr-305)."""
+    ran, or its allocation refused in the run: `whole`), the whole goes to pinned host memory: the
+    levels then need only their windows (cr-305). The whole's bytes are measured at its first
+    allocation and replace `out_bytes` from then on; a refusal judged on the measure, or one in the
+    run, keeps the whole on host for the rest of the request, one judged on the estimate only for
+    this call."""
     deepest = levels(-(-total // max(finest, 1)))
     site = f"split:{key}"
+    measured = _WHOLES.get(key)
+    whole_bytes = out_bytes if measured is None else measured
 
     def window(level: int) -> int:
         return max(pieces(total, level), finest)
 
     def need(level: int) -> tuple[int, ...]:
-        return (out_bytes, *[int(window(level) * item_bytes)] * holds)
+        return (whole_bytes, *[int(window(level) * item_bytes)] * holds)
 
     def windows_only(level: int) -> tuple[int, ...]:
         return (*[int(window(level) * item_bytes)] * holds,)
@@ -952,7 +957,9 @@ def split[T](
     request = catch.CURRENT.get()
     if request is None or not request.memory.cuda or _capturing():  # a capture allocates no host
         hostable = False
-    if not (hostable and request is not None and site in request.hosted):
+    if not (
+        hostable and request is not None and request.hosted.get(site, _ESTIMATED) != _ESTIMATED
+    ):
         try:
             return catch.cut(
                 site, deepest, need, lambda level: run(window(level), False), pure=pure
@@ -961,7 +968,7 @@ def split[T](
             if not hostable or request is None:
                 raise
             unwind(exc)
-            _hosted(request, site, name, "")
+            _hosted(request, site, name, _ESTIMATED if measured is None else _MEASURED)
     return catch.cut(
         f"{site}:host", deepest, windows_only, lambda level: run(window(level), True), pure=pure
     )
@@ -971,6 +978,7 @@ def whole(part: Tensor, shape: Sequence[int], key: str, host: bool) -> Tensor:
     """The whole output a package's `split` assembles its windows in, `part` its first: pinned
     host memory with `host`; else the device's, or pinned host memory when the device refuses it
     beside the windows (a Runtime retry: no window runs again)."""
+    _WHOLES[key] = math.prod(shape) * part.dtype.itemsize
     if host:
         return pinned.empty(shape, part.dtype, part.device)
     try:
@@ -1001,11 +1009,18 @@ def read[X](window: X) -> X:
     return cast("X", pinned.read(window)) if isinstance(window, Tensor) else window
 
 
-def _hosted(request: Request, site: str, name: str, room: str) -> None:
-    request.hosted[site] = room
+#: each split key's whole output, in bytes, as its first allocation measured it
+_WHOLES: dict[str, int] = {}
+#: `Request.hosted`'s reason for a whole chosen to go to host at selection: judged on the
+#: package's estimate (for that call only) or on the measured whole (for the request)
+_ESTIMATED, _MEASURED = "estimated", "measured"
+
+
+def _hosted(request: Request, site: str, name: str, why: str) -> None:
+    request.hosted[site] = why
     print(
         f"cozy-runtime: {name}: no room for its whole output beside its windows; it is kept in "
-        f"host memory{f' (refused beside {room})' if room else ''}",
+        f"host memory ({why if why in (_ESTIMATED, _MEASURED) else f'refused beside {why}'})",
         file=sys.stderr,
     )
 

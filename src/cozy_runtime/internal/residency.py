@@ -3139,7 +3139,8 @@ class Request:
         #: token decoded eagerly for a capture its pool couldn't hold): zero in a normal run
         self.retries = 0
         #: split sites whose whole output the card had no room for, kept in host memory (cr-305): the
-        #: card's room when its allocation was refused there, or "" when selection chose host
+        #: card's room when its allocation was refused there, else whether selection judged the
+        #: package's estimate of it or its measure (`execution.cuts._hosted`)
         self.hosted: dict[str, str] = {}
         #: refusals a CUDA graph capture answered by recording again with room for them
         #: (`graphs.capture`): what runs is the same
