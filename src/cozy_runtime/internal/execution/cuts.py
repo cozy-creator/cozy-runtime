@@ -957,7 +957,9 @@ def split[T](
     if kept is not None and exact not in _WHOLES and request is not None:
         _WHOLES[exact] = (kept.shape, _dtype(kept.dtype), request.memory.device)
     measured = _WHOLES.get(exact)
-    whole_bytes = out_bytes if measured is None else _nbytes(measured[0], measured[1])
+    whole_bytes = (  # a whole of windows the op returns on the host takes none of the card
+        out_bytes if measured is None else _nbytes(measured[0], measured[1]) * _on_card(exact)
+    )
 
     def window(level: int) -> int:
         return max(pieces(total, level), finest)
