@@ -130,13 +130,12 @@ void mul_mat_q(ggml_backend_cuda_context& ctx, const ggml_tensor* src0, const gg
 
 }  // namespace
 
-int kernel(int device, int type, int64_t K, int64_t N, int64_t M) {
+int kernel(int device, int type, const void* w, int64_t K, int64_t N, int64_t M) {
     try {
         if (!runs(type) || K <= 0 || N <= 0 || M <= 0) return kNone;
-        // Buffers as the caller's are: 256-byte aligned rows of whole blocks.
-        const auto aligned = reinterpret_cast<const void*>(uintptr_t(256));
-        const Node node(ggml_type(type), aligned, static_cast<const float*>(aligned),
-                        static_cast<float*>(const_cast<void*>(aligned)), K, N, M);
+        // The weight where it is; the activation and output as `matmul`'s caller allocates them, 256-byte aligned.
+        const auto aligned = reinterpret_cast<float*>(uintptr_t(256));
+        const Node node(ggml_type(type), w, aligned, aligned, K, N, M);
         return choose(device, node);
     } catch (const std::exception& failure) {
         last_error = failure.what();

@@ -66,7 +66,7 @@ if "_sage3" not in sys.argv[2:]:
 _attn4 = load("_attn4")
 assert _attn4.attention(0, *(0,) * 11, 1, 2, 2, 128, 128, 128, True, 1.0, *((0, 0, 0),) * 4, 0) != 0
 _ggml = load("_ggml")
-assert _ggml.kernel(0, 8, 4096, 4096, 1) == 0, "a ggml kernel chosen with no GPU"
+assert _ggml.kernel(0, 8, 4096, 4096, 1, 256) == 0, "a ggml kernel chosen with no GPU"
 assert _ggml.matmul(0, 8, 0, 0, 0, 4096, 4096, 1, None, 0) != 0, "a ggml matmul ran with no GPU"
 _conv = load("_conv")
 assert _conv.conv(0, 0, 0, 0, False, 0, 1, 3, 8, 8, 8, 8, 3, 3, 3, 1, 6, 6, 1, 1, 1, -1, (0,) * 4, (0,) * 4, 0) != 0

@@ -13,8 +13,8 @@ namespace cozy_ggml {
 // tuned to win, else MMVQ up to its batch, else MMQ.
 enum Kernel { kNone = 0, kMmvq = 1, kMmqFew = 2, kMmq = 3 };
 
-// The kernel for `type` weights [N, K] times M rows on `device`.
-int kernel(int device, int type, int64_t K, int64_t N, int64_t M);
+// The kernel for the `type` weights [N, K] at `w` times M rows of a 256-byte aligned activation on `device`.
+int kernel(int device, int type, const void* w, int64_t K, int64_t N, int64_t M);
 
 // out[M, N] (f32) = x[M, K] (f32) times the [N, K] ggml blocks at `w`, on `stream`; temporaries from
 // `allocate(bytes, context)`, held by the caller until this returns. A CUDA error code; a failure ggml itself

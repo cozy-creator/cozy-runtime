@@ -58,7 +58,7 @@ from cozy_runtime.internal.encoding.formats import (
     hadamard256,
     params_of,
 )
-from cozy_runtime.internal.encoding.leaves import GgmlNativeLeaf, Nvfp4NativeLeaf
+from cozy_runtime.internal.encoding.leaves import Nvfp4NativeLeaf
 from cozy_runtime.internal.encoding.selection import (
     DeviceFacts,
     RuntimeIdentity,
@@ -660,7 +660,7 @@ def _weight_roles(
     weight = torch.randn(rows, cols, generator=generator, dtype=torch.float32).to(device) * 0.05
     if provider.suite == "ggml-native":  # ggml-ref/1's blocks, and their exact decode
         blocks = ggml_linear.encode(torch, provider.encoding, weight.cpu()).to(device)
-        exact = GgmlNativeLeaf.decoded(torch, provider.encoding, blocks, torch.float32)
+        exact = ggml_linear.decoded(torch, provider.encoding, blocks, torch.float32)
         return exact, {"blocks": blocks}
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native"):
         scale = (weight.abs().amax(dim=-1) / 448.0).clamp(min=1e-12)

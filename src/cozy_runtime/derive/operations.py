@@ -181,8 +181,6 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
             source, components=plan.components, block=column_block(encoding)
         )
         selection.tensors.sort(key=lambda row: plan.components.index(row.component))
-    if encoding in ggml.MIXES:
-        _mix(selection, rows, encoding)
     schema = []
     for item in selection.tensors:
         tensor = by_key[item.component, item.key]
@@ -200,29 +198,6 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
             "quantization source selected geometry differs", code="quantization_source"
         )
     return selection
-
-
-def _mix(
-    selection: ArtifactQuantizationPlan, rows: Sequence[tuple[str, str, object]], encoding: str
-) -> None:
-    """Each selected weight no rule names takes the block type llama-quantize's mix `encoding` gives
-    the GGUF tensor it becomes (`ggml.mix`), over the plan's components' tensors."""
-    names = [f"{c}.{k}" for c, k, _ in rows if c in selection.components]
-    free = [t for t in selection.tensors if t.encoding is None]
-    try:
-        types = ggml.mix(
-            encoding,
-            ggml.gguf_names(names),
-            [f"{t.component}.{t.key}" for t in free],
-            {f"{t.component}.{t.key}": t.shape[1] for t in free},
-        )
-    except (KeyError, ValueError) as error:
-        raise UnsupportedInput(
-            f"{encoding}: {error}: the plan selects a weight llama-quantize does not quantize",
-            code="quantization_plan",
-        ) from error
-    for tensor in free:
-        tensor.encoding = types[f"{tensor.component}.{tensor.key}"]
 
 
 class QuantizeRequest(msgspec.Struct, kw_only=True):

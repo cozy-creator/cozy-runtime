@@ -26,6 +26,7 @@ from cozy_runtime.internal.decode_cores import (
     round_into,
     unpack,
 )
+from cozy_runtime.internal.encoding import ggml_types
 
 if TYPE_CHECKING:
     from torch import Generator, Tensor
@@ -665,22 +666,7 @@ MXFP4 = Adapter(
 # ------------------------------------------------------------------------------- ggml.*
 
 #: ggml type: (elements, bytes) per struct
-GGML = {
-    "q4_0": (32, 18),
-    "q4_1": (32, 20),
-    "q5_0": (32, 22),
-    "q5_1": (32, 24),
-    "q8_0": (32, 34),
-    "q2_k": (256, 84),
-    "q3_k": (256, 110),
-    "q4_k": (256, 144),
-    "q5_k": (256, 176),
-    "q6_k": (256, 210),
-    "mxfp4": (32, 17),
-    "nvfp4": (64, 36),
-    "q1_0": (128, 18),
-    "q2_0": (64, 18),
-}
+GGML = ggml_types.STRUCTS
 #: ggml's kvalues for FP4: E2M1 doubled (spec Appendix A.2)
 KVALUES = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
 

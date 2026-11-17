@@ -25,13 +25,14 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.weights_store import Checkpoint, Derivation
 
-from . import native_quantization, svdq
+from . import ggml, native_quantization, svdq
 from .quantization import (
     ArtifactQuantizationPlan,
     ArtifactQuantizationRequest,
     QuantizationTensor,
     bf16_source_dtypes,
     column_block,
+    encodes,
     known,
     prepare_bf16,
     prepare_source_quantization,
@@ -213,6 +214,8 @@ def _quantize(
         artifact = selection or prepare_source_quantization(
             opened, components=plan.components, block=column_block(plan.encoding)
         )
+        if plan.encoding in ggml.MIXES:
+            ggml.resolve(opened, artifact, plan.encoding)
     selected = {(t.component, t.key) for t in artifact.tensors} if artifact else set()
     converted = [t for t in bf16.tensors if (t.component, t.key) not in selected]
     encoded = len(selected)
@@ -235,6 +238,15 @@ def _quantize(
         )
         if calibrated is not None and not native_selection:
             raise UnsupportedInput("calibrated selection needs native Writer support")
+        if artifact is not None and plan.encoding is not None and not native_selection:
+            chosen = {t.encoding or plan.encoding for t in artifact.tensors}
+            native_only = sorted(e for e in chosen if not encodes(e))
+            if native_only:
+                raise UnsupportedInput(
+                    f"{', '.join(native_only)}: only TensorFS writes it, from plain or per-row "
+                    "float weights of two axes, and this selection holds another",
+                    code="quantization_plan",
+                )
         if native_selection:
             assert artifact is not None and plan.encoding is not None
             rows = native_quantization.resolved(opened, artifact, plan.encoding, logical)

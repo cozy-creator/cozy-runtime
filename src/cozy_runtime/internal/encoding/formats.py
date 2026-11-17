@@ -348,6 +348,11 @@ class LeafProvider(Provider, Protocol):
 
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int: ...
 
+    def wheel_refuses(self, sm: int) -> str:
+        """Why the installed wheel carries no kernel of this leaf for an `sm` card, or "": a leaf
+        whose kernels are built for some families only refuses the rest, which decode."""
+        ...
+
 
 def _rank2(shape: Sequence[int]) -> str:
     if len(shape) != 2:

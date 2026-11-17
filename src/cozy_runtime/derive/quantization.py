@@ -316,13 +316,19 @@ def prepare_bf16(
 
 
 def known(encoding: str) -> bool:
-    """A lane encoding a plan may name: a scheme the Runtime encodes, or a llama-quantize mix."""
-    return encoding in _ENCODINGS or encoding in ggml.BLOCKS or encoding in ggml.MIXES
+    """A lane encoding a plan may name: a scheme the Runtime or TensorFS encodes, or a
+    llama-quantize mix."""
+    return encodes(encoding) or encoding in ggml.TYPES or encoding in ggml.MIXES
+
+
+def encodes(encoding: str) -> bool:
+    """The Runtime's own encoder writes `encoding` (`quantize_component_into`)."""
+    return encoding in _ENCODINGS
 
 
 def column_block(encoding: str | None) -> int:
     """The column multiple a scheme's tensors need; 32 is fp8.rowwise's."""
-    if encoding in ggml.BLOCKS or encoding in ggml.MIXES:
+    if encoding in ggml.TYPES or encoding in ggml.MIXES:
         return ggml.block(encoding)
     found = _ENCODINGS.get(encoding or "")
     return found.block if found is not None else 32

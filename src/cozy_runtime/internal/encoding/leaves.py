@@ -44,6 +44,7 @@ from cozy_runtime.internal import (
     svdq_linear,
     w4a8_linear,
 )
+from cozy_runtime.internal.encoding import ggml_types
 from cozy_runtime.internal.encoding.formats import (
     CONVROT_GROUP,
     E4M3_MAX,
@@ -517,6 +518,9 @@ class RowwiseNativeLeaf:
     def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
         return 8.0 * self.resident_bytes(parts) / max(numel, 1)
 
+    def wheel_refuses(self, sm: int) -> str:
+        return ""
+
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
         return 0
 
@@ -617,6 +621,9 @@ class Int8ConvRotNativeLeaf:
 
     def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
         return 8.0 * self.resident_bytes(parts) / max(numel, 1)
+
+    def wheel_refuses(self, sm: int) -> str:
+        return ""
 
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
         return 0
@@ -770,6 +777,9 @@ class W4a8NativeLeaf:
     def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
         return 8.0 * self.resident_bytes(parts) / max(numel, 1)
 
+    def wheel_refuses(self, sm: int) -> str:
+        return ""
+
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
         return 0
 
@@ -894,6 +904,9 @@ class Nvfp4NativeLeaf:
 
     def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
         return 8.0 * self.resident_bytes(parts) / max(numel, 1)
+
+    def wheel_refuses(self, sm: int) -> str:
+        return ""
 
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
         # As the MX leaf's: to_blocked's padded grid, reshape copy and final blocked copy.
@@ -1087,6 +1100,9 @@ class SvdqNvfp4NativeLeaf:
     def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
         return 8.0 * self.resident_bytes(parts) / max(numel, 1)
 
+    def wheel_refuses(self, sm: int) -> str:
+        return ""
+
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
         return 0
 
@@ -1248,6 +1264,9 @@ class MicroScaledNativeLeaf:
     def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
         return 8.0 * self.resident_bytes(parts) / max(numel, 1)
 
+    def wheel_refuses(self, sm: int) -> str:
+        return ""
+
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
         rows, cols = _blocked_shape(*parts["scale"].shape)
         return 3 * rows * cols  # to_blocked's padded grid, its reshape copy and the result
@@ -1309,19 +1328,19 @@ def _ggml_leaf_class(torch: ModuleType) -> _LeafClass:
             # It launches by pointer: a leaf run outside its model's forward has its blocks read in.
             blocks, bias = read(self.blocks), read(self.bias)
             return ggml_linear.linear(
-                torch, x, blocks, self.encoding, self.out_features, bias, out_dtype,
-                functools.partial(GgmlNativeLeaf.decoded, torch, self.encoding, blocks, x.dtype),
-            )  # fmt: skip
+                torch, x, blocks, self.encoding, self.out_features, bias, out_dtype
+            )
 
     class GgmlEmbedding(_leaf_class(torch)):  # type: ignore[misc]
-        """A token table in ggml blocks, as llama.cpp's get_rows reads one: only the looked-up rows decode."""
+        """A token table in ggml blocks, as llama.cpp's get_rows reads one: only the looked-up
+        rows decode."""
 
         def forward(
             self, x: Tensor, *, prequantized: PreQuantized | None = None, out: Tensor | None = None
         ) -> Tensor:
             blocks = read(self.blocks)
             rows = blocks.index_select(0, x.reshape(-1))
-            table = GgmlNativeLeaf.decoded(torch, self.encoding, rows, self.out_dtype)
+            table = ggml_linear.decoded(torch, self.encoding, rows, self.out_dtype)
             looked: Tensor = table.view(*x.shape, -1)
             return looked
 
@@ -1354,7 +1373,7 @@ class GgmlNativeLeaf:
 
     @property
     def schemes(self) -> frozenset[str]:
-        return frozenset(ggml_linear.TYPES)
+        return frozenset(ggml_types.WRITTEN)
 
     @property
     def code_revision(self) -> str:
@@ -1384,15 +1403,14 @@ class GgmlNativeLeaf:
     def output_dtype_rule(self) -> str:
         return "contract"
 
-    @staticmethod
-    def wheel_refuses(sm: int) -> str:
+    def wheel_refuses(self, sm: int) -> str:
         """Why this card's wheel runs no ggml matmul, or ""."""
         return ggml_linear.carried(sm)
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
         """Rank 2 in whole blocks; rows of whole 512-column chunks, which ggml's kernels read."""
         why = _rank2(shape)
-        block = ggml_linear.BLOCK.get(self.encoding, 0)
+        block = ggml_types.block(self.encoding) if self.encoding in ggml_types.WRITTEN else 0
         if not why and dict(params) != {"block_size": block}:
             why = f"{self.encoding} has block_size {block}; this weight's params are {dict(params)}"
         if not why and int(shape[1]) % ggml_linear.ROW_PADDING:
@@ -1415,22 +1433,6 @@ class GgmlNativeLeaf:
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
         return 0
 
-    @staticmethod
-    def decoded(torch: ModuleType, scheme: str, blocks: Tensor, dtype: Dtype) -> Tensor:
-        """The weight as a float [N, K], by the decode cores: the fallback where no kernel serves."""
-        from cozy_runtime.internal.decode_schemes import BY_SCHEME
-        from cozy_runtime.internal.encoding.adapters import CoreDequant
-        from cozy_runtime.internal.encoding.formats import params_of
-
-        n = ggml_linear.BLOCK[scheme]
-        out: Tensor = torch.empty(
-            int(blocks.shape[0]), int(blocks.shape[1]) * n, dtype=dtype, device=blocks.device
-        )
-        CoreDequant(scheme, params_of(BY_SCHEME[scheme].probe_params)).decode(
-            torch, {"blocks": blocks}, out
-        )
-        return out
-
     def leaf(
         self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: object, out_dtype: Dtype
     ) -> Leaf:
@@ -1449,6 +1451,6 @@ class GgmlNativeLeaf:
             out_dtype,
             self.name,
             self.encoding,
-            units * ggml_linear.BLOCK[self.encoding],
+            units * ggml_types.block(self.encoding),
             rows,
         )

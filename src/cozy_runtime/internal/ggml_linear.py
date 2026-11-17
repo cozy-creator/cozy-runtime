@@ -1,11 +1,17 @@
-"""llama.cpp's quantized matmuls for the `ggml.*` lanes (xs-213): MMVQ for a few rows, few-row MMQ and MMQ
-above, as ggml's own MUL_MAT rule picks among them per card, type and row count (`_kernels._ggml`, vendored from
-llama.cpp b12466). The weight stays its stored blocks; ggml quantizes the f32 activation to q8_1 and multiplies on
-dp4a or the int8 tensor cores, writing f32.
+"""llama.cpp's quantized matmuls for the `ggml.*` lanes (xs-213): MMVQ for a few rows, few-row MMQ
+and MMQ above, as ggml's own MUL_MAT rule picks among them per card, type and row count
+(`_kernels._ggml`, vendored from llama.cpp b12466). The weight stays its stored blocks; ggml
+quantizes the f32 activation to q8_1 and multiplies on dp4a or the int8 tensor cores, writing f32.
 
 It serves a card the module carries a kernel for once its probe agrees with the exact decode there
-(`kernel_ready.verified`); elsewhere, and where a row is not whole 512-column chunks (ggml pads the last row of a
-weight to them and reads that far), the weight decodes to a float one and torch multiplies.
+(`kernel_ready.verified`), for a weight whose rows are whole 512-column chunks (ggml pads the last
+row of a weight to them and reads that far), contiguous and 16-byte aligned. Elsewhere the weight
+decodes a band of rows at a time and torch multiplies.
+
+A call's own memory beyond its input and output is at most `WORKING`: its rows go through in pieces
+(each piece's f32 copy, q8_1 activation and f32 product), or its weight's bands decode one at a
+time. That is below the floor a site plans a cut for (`execution.catch`), so a site plans a ggml
+linear as it plans any other.
 
 `torch` is the torch module: this module imports no torch.
 """
@@ -17,23 +23,19 @@ from types import ModuleType
 
 from cozy_runtime._kernels import ABSENT, ARCHS, NO_GGML
 from cozy_runtime.internal import int8_linear, kernel_ready, prebuilt, verify
+from cozy_runtime.internal.encoding import ggml_types
 from cozy_runtime.internal.encoding.formats import Dtype, Tensor, params_of
 
 OP = "llama.cpp-ggml"
 #: ggml's type ids (`ggml.h`) of the block encodings it runs.
-TYPES = {
-    "ggml.q8_0": 8,
-    "ggml.q5_0": 6,
-    "ggml.q5_1": 7,
-    "ggml.q4_k": 12,
-    "ggml.q5_k": 13,
-    "ggml.q6_k": 14,
-}
+TYPES = ggml_types.WRITTEN
 #: ggml pads a quantized weight's last row to this many columns and its kernels read that far
 #: (`MATRIX_ROW_PADDING`): a weight serves only with whole ones.
 ROW_PADDING = 512
 #: What a probe's output may differ from the exact decode's GEMM by: q8_1 activations, f32 sums.
 BUDGET = 2e-2
+#: A call's memory beyond its input and output, at most (module doc).
+WORKING = 32 << 20
 
 
 def capability(torch: ModuleType, index: int) -> int:
@@ -51,7 +53,8 @@ def carried(sm: int) -> str:
 
 
 def native(torch: ModuleType, index: int) -> ModuleType | None:
-    """The module on this card once its probe passes here, off any request thread; None until then, and for
+    """The module on this card once its probe passes here, off any request thread; None until
+    then, and for
     good where it fails or the wheel has no kernel for the card."""
     if carried(capability(torch, index)):
         return None
@@ -84,12 +87,28 @@ def why(index: int) -> str:
     return "" if failed is None else str(failed)
 
 
-def kernel(torch: ModuleType, index: int, scheme: str, k: int, n: int, m: int) -> str:
-    """The kernel ggml's rule takes for `m` rows of a [n, k] `scheme` weight here: mmvq, mmq_few or mmq."""
+def kernel(
+    torch: ModuleType, index: int, scheme: str, k: int, n: int, m: int, blocks: Tensor
+) -> str:
+    """The kernel ggml's rule takes for `m` rows of this [n, k] `scheme` weight here: mmvq,
+    mmq_few or mmq."""
     from cozy_runtime._kernels import _ggml
 
     with torch.cuda.device(index):
-        return str(_ggml.KERNELS[_ggml.kernel(index, TYPES[scheme], k, n, m)])
+        return str(_ggml.KERNELS[_ggml.kernel(index, TYPES[scheme], k, n, m, blocks.data_ptr())])
+
+
+def unserved(blocks: Tensor, k: int) -> str:
+    """Why ggml's kernels cannot read this weight as it is held, or ""."""
+    if k % ROW_PADDING:
+        return (
+            f"ggml's kernels read rows in {ROW_PADDING}-column chunks; this weight's are {k} long"
+        )
+    if not blocks.is_contiguous():
+        return "ggml's kernels read a weight's blocks contiguous, and this one is strided"
+    if blocks.data_ptr() % 16:
+        return "ggml's kernels read a weight 16-byte aligned, and this one is not"
+    return ""
 
 
 def matmul(
@@ -124,23 +143,51 @@ def linear(
     n: int,
     bias: Tensor | None,
     out_dtype: Dtype,
-    decode: object,
 ) -> Tensor:
-    """`x @ W.T + bias` for one ggml weight: its blocks on this card's kernels, else the weight decoded by
-    `decode()` (a float [n, k]) and multiplied by torch."""
+    """`x @ W.T + bias` for one ggml weight: its blocks on this card's kernels, a piece of rows at a
+    time, else decoded a band at a time and multiplied by torch (module doc)."""
+    k = int(x.shape[-1])
+    rows = x.reshape(-1, k)
+    m = int(rows.shape[0])
+    out: Tensor = torch.empty(m, n, dtype=out_dtype, device=x.device)
     index = x.get_device() if x.is_cuda else -1
-    ops = native(torch, index) if index >= 0 and int(x.shape[-1]) % ROW_PADDING == 0 else None
+    ops = native(torch, index) if index >= 0 else None
     if ops is not None:
         try:
-            y = matmul(ops, torch, x, blocks, scheme, n)
-            if bias is not None:
-                y = y + bias.to(torch.float32)
-            return y.to(out_dtype)
+            if why := unserved(blocks, k):
+                raise ValueError(why)
+            step = max(1, WORKING // (4 * k + 2 * k + 4 * n))
+            for at in range(0, m, step):
+                y = matmul(ops, torch, rows[at : at + step], blocks, scheme, n)
+                if bias is not None:
+                    y += bias.to(torch.float32)
+                out[at : at + step].copy_(y)
+                del y
+            return out.view(*x.shape[:-1], n)
         except Exception as exc:
             int8_linear.failed(OP, index, exc)
-    weight: Tensor = decode()  # type: ignore[operator]
-    out: Tensor = torch.nn.functional.linear(x.to(weight.dtype), weight, bias)
-    return out.to(out_dtype)
+    band = max(1, WORKING // (rows.element_size() * k + out.element_size() * m))
+    for at in range(0, n, band):
+        weight = decoded(torch, scheme, blocks[at : at + band], rows.dtype)
+        part = bias[at : at + band].to(rows.dtype) if bias is not None else None
+        out[:, at : at + band] = torch.nn.functional.linear(rows, weight, part)
+        del weight
+    return out.view(*x.shape[:-1], n)
+
+
+def decoded(torch: ModuleType, scheme: str, blocks: Tensor, dtype: Dtype) -> Tensor:
+    """Rows of a weight as floats [rows, K], by the decode cores."""
+    from cozy_runtime.internal.decode_schemes import BY_SCHEME
+    from cozy_runtime.internal.encoding.adapters import CoreDequant
+
+    out: Tensor = torch.empty(
+        int(blocks.shape[0]), int(blocks.shape[1]) * ggml_types.block(scheme), dtype=dtype,
+        device=blocks.device,
+    )  # fmt: skip
+    CoreDequant(scheme, params_of(BY_SCHEME[scheme].probe_params)).decode(
+        torch, {"blocks": blocks}, out
+    )
+    return out
 
 
 def _probe(torch: ModuleType, index: int, ops: ModuleType) -> verify.Verdict:
@@ -173,21 +220,10 @@ def encode(torch: ModuleType, scheme: str, weight: Tensor) -> Tensor:
     rows, cols = (int(s) for s in weight.shape)
     encoded = raw.quantize(
         scheme, weight.float().contiguous().numpy().tobytes(), dtype="F32", shape=[rows, cols],
-        strategy="ggml-ref/1", params={"block_size": BLOCK[scheme]},
+        strategy="ggml-ref/1", params={"block_size": ggml_types.block(scheme)},
     )  # fmt: skip
     data = bytearray(encoded.parts["blocks"].tobytes())
     blocks: Tensor = torch.frombuffer(data, dtype=torch.uint8).reshape(
-        rows, cols // BLOCK[scheme], -1
+        rows, cols // ggml_types.block(scheme), -1
     )
     return blocks
-
-
-#: Elements per block of each type.
-BLOCK = {
-    "ggml.q8_0": 32,
-    "ggml.q5_0": 32,
-    "ggml.q5_1": 32,
-    "ggml.q4_k": 256,
-    "ggml.q5_k": 256,
-    "ggml.q6_k": 256,
-}

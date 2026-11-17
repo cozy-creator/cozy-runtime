@@ -48,7 +48,7 @@ _STRATEGIES = {
     "svdq.nvfp4": SVDQ_STRATEGY,
     "fp8.rowwise": "fp8-rowwise-rne/1",
     "w4a8.convrot": "w4a8-convrot256-fixed/1",
-    **dict.fromkeys(ggml.BLOCKS, ggml.STRATEGY),
+    **dict.fromkeys(ggml.TYPES, ggml.STRATEGY),
 }
 _NVFP4: dict[str, MetadataInput] = {
     "block_size": NVFP4_BLOCK,
@@ -67,7 +67,7 @@ PARAMS: dict[str, dict[str, MetadataInput]] = {
         "rotation_size": CONVROT_GROUP,
     },
     "svdq.nvfp4": dict(_NVFP4),
-    **{scheme: {"block_size": n} for scheme, n in ggml.BLOCKS.items()},
+    **{scheme: {"block_size": ggml.block(scheme)} for scheme in sorted(ggml.TYPES)},
 }
 #: Encodings a derivation reads through the serving decoder (`model_values`): per-row scaled
 #: codes, whose exact values a lane is written from (Ideogram 4 ships only fp8.rowwise).

@@ -24,11 +24,19 @@ import torch
 
 import cozy_runtime
 from cozy_runtime import _build_provenance
-from cozy_runtime.author import Context
 from cozy_runtime.accel.kernels import Launch
-from cozy_runtime.derive import ggml as ggml_derive
-from cozy_runtime.internal import arch, attention, ggml_linear, int8_linear, nvfp4_linear, prebuilt, triton_kernels
+from cozy_runtime.author import Context
+from cozy_runtime.internal import (
+    arch,
+    attention,
+    ggml_linear,
+    int8_linear,
+    nvfp4_linear,
+    prebuilt,
+    triton_kernels,
+)
 from cozy_runtime.internal.bench.attention import _device, _quantiles, _timed, _warm
+from cozy_runtime.internal.encoding import ggml_types
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP
 
 BF16 = torch.bfloat16
@@ -354,12 +362,12 @@ def _ggml(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
     rules: dict[str, str] = {"gemm": "", "linear": ""}
     for scheme in GGML_TYPES:
         name = scheme.removeprefix("ggml.")
-        size = ggml_derive.BYTES[scheme]
-        blocks = torch.randint(0, 256, (s.n, s.k // ggml_linear.BLOCK[scheme], size), generator=g, device="cuda:0", dtype=torch.uint8)
+        n, size = ggml_types.STRUCTS[name]
+        blocks = torch.randint(0, 256, (s.n, s.k // n, size), generator=g, device="cuda:0", dtype=torch.uint8)
         matmul = partial(ggml_linear.matmul, ops, torch, rows, blocks, scheme, s.n)
         calls[f"ggml-matmul{GGML_GRAPHED}:{name}"] = _graphed(matmul)
         calls[f"ggml-linear{GGML_GRAPHED}:{name}"] = _graphed(partial(_ggml_linear, ops, x, blocks, scheme, s.n))
-        rules[f"kernel:{name}"] = ggml_linear.kernel(torch, 0, scheme, s.k, s.n, s.m)
+        rules[f"kernel:{name}"] = ggml_linear.kernel(torch, 0, scheme, s.k, s.n, s.m, blocks)
     if card.ops is not None and card.row.int8 and s.k % CONVROT_GROUP == 0:
         # Our own 8-bit linear at the same rows, graphed alike: int8.convrot's GEMV (its rotation fused) beside MMVQ.
         data = torch.randint(-127, 128, (s.n, s.k), generator=g, device="cuda:0", dtype=torch.int8)
