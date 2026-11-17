@@ -13,7 +13,9 @@ from cozy_runtime.internal.execution import catch, cuts
 from cozy_runtime.internal.execution.catch import checkpoint as piece
 from cozy_runtime.internal.execution.catch import refusals, serving
 from cozy_runtime.internal.execution.cuts import (
+    ahead,
     attend,
+    moved,
     narrowed,
     read,
     split,
@@ -26,8 +28,10 @@ from cozy_runtime.internal.residency import Request, blocks_of
 
 __all__ = [
     "Steps",
+    "ahead",
     "attend",
     "install",
+    "moved",
     "narrowed",
     "piece",
     "read",
