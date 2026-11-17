@@ -59,7 +59,7 @@ import time
 import weakref
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 
@@ -1136,20 +1136,33 @@ class _Keeper:
         self.held, self.since, self.began = held, 0, time.perf_counter()
         self.decoded = 0.0
         self.kept = self.read = 0
+        #: the held blocks' own lease, which a refusal beside them ends (`_shed`)
+        self.lease: ExitStack | None = None
+        #: bytes each keep leaves free past its reserve: the refused blocks' (`_shed`), measured
+        self.less = 0
+        self.sheds = 0
+        self.again = False
 
     def step(self, steps: int) -> None:
-        if self.placed is None or steps > 2:
+        if self.placed is None or (steps > 2 and not self.again):
             return
         if steps == 1:  # the prompt's token: the decode begins
             self.since, self.decoded = time.monotonic_ns(), time.perf_counter()
             return
+        self.again = False
         try:
-            found = self.placed[0].keep(self.placed[1], self.since, KEEP_RESERVE)
+            found = self.placed[0].keep(self.placed[1], self.since, KEEP_RESERVE + self.less)
             if found is None:
+                self.kept = 0
                 return
             binding, self.kept, self.read = found
-            self.held.callback(binding.close)
-            self.held.enter_context(binding.prepare())
+            lease = ExitStack()
+            lease.callback(binding.close)
+            lease.enter_context(binding.prepare())
+            self.lease = lease
+            sheds = binding.model.memory.sheds
+            sheds.append(self._shed)
+            self.held.callback(self._end, sheds)
             print(
                 f"[lm] streamed decode holds {_gib(self.kept)} of its weights, reads "
                 f"{_gib(self.read)} again a token",
@@ -1161,6 +1174,27 @@ class _Keeper:
             _unwind(exc)
             self.kept = 0
 
+    def _shed(self, need: int) -> bool:
+        """A block this decode streams was refused room beside the blocks it holds: they go now,
+        and from the next token it holds less by the refused block's `need`, each refusal again
+        (cr-319: Klein's upsampler at a 6 GiB cap held 4.0 GiB and a 0.2 GiB layer it streams found
+        no room; gate 44062127052)."""
+        lease, self.lease = self.lease, None
+        if lease is None:
+            return False
+        lease.close()
+        self.less += need
+        self.sheds += 1
+        self.again = True
+        return True
+
+    def _end(self, sheds: list[Callable[[int], bool]]) -> None:
+        with suppress(ValueError):
+            sheds.remove(self._shed)
+        lease, self.lease = self.lease, None
+        if lease is not None:
+            lease.close()
+
     def report(self, prompt: int, steps: int) -> None:
         """Its tokens a second, and the bytes kept and read again a token, in the run record."""
         if self.placed is None or steps < 2:
@@ -1170,6 +1204,7 @@ class _Keeper:
             f"{steps} tokens after {prompt} through Transformers' loop: "
             f"{(steps - 1) / max(seconds, 1e-9):.2f} tokens/s decoding, "
             f"{_gib(self.kept)} of its weights held, {_gib(self.read)} read again a token"
+            + (f", holding less after {self.sheds} refusals beside it" if self.sheds else "")
         )
         print(f"[lm] {text}", file=sys.stderr)
         self.placed[0].note(f"{self.placed[1]}.lm", text)
