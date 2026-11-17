@@ -1422,9 +1422,10 @@ class Memory:
             # A tied tensor used by distinct modules stays common, so either forward sees
             # one live parameter. The declared encoded bind routes must name their targets.
             group = model.sites.get(bound)
-            if group is not None:
-                if any(_block_of(name, blocks) != path for name in named[id(group)]):
-                    path = ""
+            if group is not None and any(
+                _block_of(name, blocks) != path for name in named[id(group)]
+            ):
+                path = ""
             parts = {}
             for role, part in stored_parts(w.ck, w.component, key).items():
                 parts[role or "value"] = _Part(part.dtype, tuple(part.shape), part.length, role)

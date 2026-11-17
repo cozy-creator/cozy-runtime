@@ -25,7 +25,6 @@ from dataclasses import dataclass, field
 from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
-
 from cozy_runtime import graphs
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._loader import (
