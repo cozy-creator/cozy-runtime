@@ -27,12 +27,12 @@ from cozy_runtime.weights_store import Checkpoint, Derivation
 
 from . import native_quantization, svdq
 from .quantization import (
-    _ENCODINGS,
     ArtifactQuantizationPlan,
     ArtifactQuantizationRequest,
     QuantizationTensor,
     bf16_source_dtypes,
     column_block,
+    known,
     prepare_bf16,
     prepare_source_quantization,
     quantize_component_into,
@@ -121,7 +121,7 @@ def plan(
                 "a tripwire threshold needs an encoding lane", code="quantization_plan"
             )
     else:
-        if encoding not in _ENCODINGS:
+        if not known(encoding):
             raise UnsupportedInput(
                 f"unsupported quantization encoding {encoding!r}", code="quantization_plan"
             )
