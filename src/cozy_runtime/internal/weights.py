@@ -130,6 +130,9 @@ class Backend:
         #: id(module) -> the loaded model (of any construction) and path holding it, and the module
         self.owned: dict[int, tuple[Model, str, object]] = {}
         self.indexed: tuple[int, ...] = ()
+        #: other loaded models whose tensors this one's bakes found (`_owner`): a release keeps
+        #: their construction while this one is loaded
+        self.reads: set[Model] = set()
         self.derived: dict[str, dict[tuple[Module, str], Tensor]] = {}
         #: Persistent buffers the checkpoint does not store (full keys): they keep their values.
         self.unstored: set[str] = set()
@@ -431,7 +434,11 @@ class Backend:
                 for path, sub in model.module.named_modules()
             }
         held = self.owned.get(id(module))
-        return None if held is None or held[2] is not module else (held[0], held[1])
+        if held is None or held[2] is not module:
+            return None
+        if held[0] not in self.models.values():
+            self.reads.add(held[0])
+        return held[0], held[1]
 
     @contextmanager
     def _reading(self, module: object) -> Iterator[None]:

@@ -3711,8 +3711,9 @@ class Executor:
 
     def release_constructions(self, keys: list[str]) -> None:
         """TensorD's `release`, on the seam's reading thread: each named construction no call
-        uses (one prepared on it, or running from its lookup on: `_using`) and no load is building
-        (`_loads`) leaves `constructions` now, before any later frame is queued, so a `load` of it
+        uses (one prepared on it, or running from its lookup on: `_using`), no load is building
+        (`_loads`) and no other loaded construction reads (`_readers`; a reader named beside it goes
+        with it) leaves `constructions` now, before any later frame is queued, so a `load` of it
         after builds it anew. What they hold goes on a thread of their own (`_unload`), ordered as
         a call is (`_Order`): beside the calls running, before any later load or map (which never
         meets the one torn down), with idle work waiting for it."""
@@ -3724,10 +3725,11 @@ class Executor:
                 flush=True,
             )
             return
-        gone: list[Executor] = []
         with self._lookup:
+            loaded = self.constructions
+            free: dict[str, Executor] = {}
             for key in dict.fromkeys(keys):
-                child = self.constructions.get(key)
+                child = loaded.get(key)
                 why = (
                     "a load of it is running"
                     if key in self.loading
@@ -3738,11 +3740,23 @@ class Executor:
                 if why or child is None:
                     print(f"[executor] construction {key} kept: {why}", file=sys.stderr, flush=True)
                     continue
-                # A new map: calls iterating the old one beside this are undisturbed.
-                self.constructions = {k: c for k, c in self.constructions.items() if k != key}
-                gone.append(child)
-        if not gone:
-            return
+                free[key] = child
+            # One another loaded construction reads stays while that one does: both go together.
+            readers = _readers(loaded)
+            while kept := {k: r for k in free for r in readers.get(k, ()) if r not in free}:
+                for key, reader in kept.items():
+                    print(
+                        f"[executor] construction {key} kept: construction {reader} reads its "
+                        "models",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    del free[key]
+            if not free:
+                return
+            # A new map: calls iterating the old one beside this are undisturbed.
+            self.constructions = {k: c for k, c in loaded.items() if k not in free}
+        gone = list(free.values())
         order = self.order
         turn: contextlib.AbstractContextManager[None] = (
             order.turn(order.ticket(False, "release"))
@@ -5353,6 +5367,29 @@ class Executor:
 #: Telemetry the worker reads as optional: what a reply loses when an author's key reads as
 #: a credential (`tel.log(..., token=1)`) and the seam refuses the frame.
 _TELEMETRY = ("observations", "execution", "attribution")
+
+
+def _readers(loaded: Mapping[str, Executor]) -> dict[str, set[str]]:
+    """By loaded construction, the other loaded ones whose bakes read its models
+    (`Backend.reads`: H3's turbo overlay, read by its base)."""
+    backends = {
+        key: [m.backend for m in child.model_executors or [child] if m.backend is not None]
+        for key, child in loaded.items()
+    }
+    owner = {
+        id(model): key
+        for key, held in backends.items()
+        for backend in held
+        for model in tuple(backend.models.values())
+    }
+    readers: dict[str, set[str]] = {}
+    for key, held in backends.items():
+        for backend in held:
+            for model in tuple(backend.reads):
+                read = owner.get(id(model))
+                if read is not None and read != key:
+                    readers.setdefault(read, set()).add(key)
+    return readers
 
 
 def _send_reply(channel: Channel, reply: Reply) -> None:
