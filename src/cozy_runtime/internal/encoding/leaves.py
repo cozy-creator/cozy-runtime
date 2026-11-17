@@ -739,14 +739,14 @@ def _conv_leaf_class(torch: ModuleType) -> _ConvLeafClass:
                     rows = x.contiguous(memory_format=torch.channels_last_3d).permute(0, 2, 3, 4, 1)
                     one = torch.ones((n, _conv8.CHANNELS), dtype=torch.float32, device=x.device)
                     q, qs = _conv8.quantize(module, rows, one, torch.zeros_like(one), silu=False)
-                    out = self.convolve(module, q, qs, None, x.dtype)
-                    if out is not None:
-                        return out.permute(0, 4, 1, 2, 3)
+                    fused = self.convolve(module, q, qs, None, x.dtype)
+                    if fused is not None:
+                        return fused.permute(0, 4, 1, 2, 3)
             bias = None if self.bias is None else self.bias.to(x.dtype)
-            out: Tensor = torch.nn.functional.conv3d(
+            eager: Tensor = torch.nn.functional.conv3d(
                 x, self.filter(x.dtype), bias, self.stride, self.padding, self.dilation, self.groups
             )
-            return out
+            return eager
 
         def convolve(
             self, module: ModuleType, q: Tensor, qs: Tensor, residual: Tensor | None, dtype: Dtype
