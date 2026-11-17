@@ -316,6 +316,8 @@ class Output:
             name,
             cls=UNKNOWN_CLASS if declared is None else declared.cls,
             config=config if config is not None else ({} if declared is None else declared.config),
+            # A tokenizer's config is its tokenizer_config.json: the name goes with it.
+            config_file=None if declared is None else declared.config_file,
         )
         self._components[name] = writer
         return writer
