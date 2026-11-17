@@ -422,11 +422,12 @@ def joined(
     module: nn.Module, paths: Sequence[str], sizes: Mapping[str, int], granularity: int, room: int
 ) -> list[str]:
     """`paths` with the units too small for the card's pages joined into their parent module
-    (each unit is one Region, rounded up to `granularity`), where the component then fits `room`
-    beside its working memory. Qwen3.6-35B-A3B's 10,496 int8 experts are 3.01 MiB each and took
-    4 MiB: 45.2 GiB of a 48 GB card for 35.0 GiB of weights, too little left to decode (cl-1119).
-    Joined, each layer's experts are one 771 MiB unit. On a card the component doesn't fit, each
-    pages alone: the padding is what streaming only a token's own experts costs."""
+    (each unit is one Region, rounded up to `granularity`) where that is what lets the component fit
+    `room` beside its working memory. Qwen3.6-35B-A3B's 10,496 int8 experts are 3.01 MiB each and
+    took 4 MiB: 45.2 GiB of a 48 GB card for 35.0 GiB of weights, too little left to decode
+    (cl-1119). Joined, each layer's experts are one 771 MiB unit. Where it fits unit by unit, or
+    doesn't fit either way, each unit pages alone: the padding is what streaming only a token's own
+    experts costs."""
 
     def padded(n: int) -> int:
         return -(-n // granularity) * granularity
@@ -450,9 +451,9 @@ def joined(
         within = sum(n for name, n in sizes.items() if name.startswith(parent + "."))
         if parent and inside == children and within <= _SPLIT_UNIT:
             blocks = (blocks - children) | {parent}
-    if blocks == set(paths):
-        return list(paths)
-    if sum(map(padded, units(blocks).values())) > room - min(room // 8, _WORKING):
+    fits = room - min(room // 8, _WORKING)
+    alone, together = sum(map(padded, held.values())), sum(map(padded, units(blocks).values()))
+    if blocks == set(paths) or alone <= fits or together > fits:
         return list(paths)
     order = {path: i for i, path in enumerate(dict(module.named_modules()))}
     return sorted(blocks, key=order.__getitem__)
