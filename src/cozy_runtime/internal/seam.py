@@ -433,7 +433,8 @@ class _Asked:
 class Mux:
     """One seam shared by every thread of the process. Whoever needs a frame reads the next
     one and routes it: an answer to the request waiting on its `seq`, a `cancel` to its call's
-    mark and to `cancelled`, a `preview` to its call's watch, a frame that may carry a capability (`SUPPLYING`) to `bearer` as it
+    mark and to `cancelled`, a `preview` to its call's watch, a `release` to `released` before
+    any later frame is queued, a frame that may carry a capability (`SUPPLYING`) to `bearer` as it
     is read, anything else to the commands, in order. No
     reader thread exists, so a process that has served no call stays single-threaded and
     forkable (`zygote`)."""
@@ -443,9 +444,10 @@ class Mux:
         channel: Channel,
         bearer: Callable[[Frame], None] = _nothing,
         cancelled: Callable[[str], None] = _nothing,
+        released: Callable[[list[str]], None] = _nothing,
     ) -> None:
         self.channel = channel
-        self._bearer, self._cancelled = bearer, cancelled
+        self._bearer, self._cancelled, self._released = bearer, cancelled, released
         self._seq = 0
         self._asked: dict[int, _Asked] = {}
         self._commands: deque[Frame] = deque()
@@ -590,6 +592,9 @@ class Mux:
             self.watch_previews(
                 str(frame.get("request_id", "")), for_ms if type(for_ms) is int else 0
             )
+        elif frame.get("cmd") == "release":
+            keys = frame.get("constructions")
+            self._released([str(key) for key in keys] if isinstance(keys, list) else [])
         else:
             if (carried := supplying(frame)) is not None:
                 self._bearer(carried)

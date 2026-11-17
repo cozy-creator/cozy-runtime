@@ -22,6 +22,7 @@ commands, defined once in Rust and read here as `tensorfs.executor`'s classes:
     cancel    discard a queued preparation, or mark a running call cancelled
     invoke    run ONE PREPARED attempt through the author invocation kernel and report its facts
     map       warm a loaded construction's models, on the GPU or in RAM
+    release   drop loaded constructions no call uses (out of band, like cancel; tfs-303)
 
 A group's other GPUs answer GPU 0's own commands as well (`parallel.commands`).
 
@@ -1142,9 +1143,23 @@ class Executor:
         self.mux: Mux = (
             host.mux
             if host is not None
-            else Mux(channel, functools.partial(_supplied, self.bearers), self._discard)
+            else Mux(
+                channel,
+                functools.partial(_supplied, self.bearers),
+                self._discard,
+                self.release_constructions,
+            )
         )
         self.in_flight: _InFlight = host.in_flight if host is not None else _InFlight()
+        #: HOST ONLY: a call's lookup of its construction, a load's registration and a release's
+        #: removal, each against the others (`_using`, `release_constructions`)
+        self._lookup: threading.Lock = host._lookup if host is not None else threading.Lock()
+        #: HOST ONLY: the construction keys a load is building or binding now (`_loads`)
+        self.loading: set[str] = set()
+        #: calls on this construction now, from their lookup to their end (`_using`)
+        self.calls = 0
+        #: the TensorFS checkpoints this generation opened, closed when it is released
+        self.opened: list[Checkpoint] = []
         #: the construction key this generation was loaded under; "" on the host
         self.construction = construction
         #: HOST ONLY: every loaded construction and the active one. One memory decides where
@@ -1303,7 +1318,8 @@ class Executor:
             case Start():
                 return self.start(command)
             case Load():
-                return self.load(command, forwarded)
+                with self._loads(command.construction):
+                    return self.load(command, forwarded)
             case PrepareRequest():
                 with call_scope.preparing(command.request_id):
                     return self.serve_request(command)
@@ -1348,6 +1364,8 @@ class Executor:
             "world": self.world,
             # TensorD may send `preview` (a client watches a call's previews): `author.preview`.
             "previews": 1,
+            # TensorD may send `release` (idle constructions go): `release_constructions`.
+            "releases": 1,
             # A device Start that asks for it hands TensorD its vigil's line (cl-977).
             "vigil": int(_VIGIL is not None),
         }
@@ -2631,7 +2649,8 @@ class Executor:
 
     def _register(self, key: str, child: Executor, reply: Reply) -> None:
         child.load_reply = reply
-        self.constructions[key] = child
+        with self._lookup:
+            self.constructions[key] = child
         self.discovered = child.discovered
         self.surface_names = dict(child.surface_names)
         self.torch = child.torch or self.torch
@@ -2925,6 +2944,7 @@ class Executor:
             opened[manifest] = host._checkpoint(
                 manifest, _connection(command.tensorfs, command.actor, host.bearers), binding.view
             )
+        self.opened = list(opened.values())
         checkpoints = {name: opened[vmap.get(name, reference.snapshot)] for name in names}
         # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
         # carries: a constructed component the checkpoint lacks is the fit's own
@@ -2966,6 +2986,8 @@ class Executor:
             _connection(command.tensorfs, command.actor, host.bearers),
             binding.view,
         )
+        if config_checkpoint not in self.opened:
+            self.opened.append(config_checkpoint)
         config_bytes = model_config.construction_config(config_checkpoint.configs())
         config_document = {} if config_bytes is None else canonical.parse_canonical(config_bytes)
         if not isinstance(config_document, dict):
@@ -3670,19 +3692,148 @@ class Executor:
                     return True
         return False
 
+    def release_constructions(self, keys: list[str]) -> None:
+        """TensorD's `release`, on the seam's reading thread: each named construction no call
+        uses (one prepared on it, or running from its lookup on: `_using`) and no load is building
+        (`_loads`) leaves `constructions` now, before any later frame is queued, so a `load` of it
+        after builds it anew. What they hold goes on a thread of their own (`_unload`), ordered as
+        a call is (`_Order`): beside the calls running, before any later load or map (which never
+        meets the one torn down), with idle work waiting for it. A call reads only its own
+        construction's models (`Backend._owner` refuses another's), so a release takes nothing a
+        loaded construction reads."""
+        if self.world > 1:
+            print(
+                f"[executor] release of {', '.join(keys)} ignored: a GPU group keeps its "
+                "constructions",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        with self._lookup:
+            loaded = self.constructions
+            free: dict[str, Executor] = {}
+            for key in dict.fromkeys(keys):
+                child = loaded.get(key)
+                why = (
+                    "a load of it is running"
+                    if key in self.loading
+                    else "not loaded"
+                    if child is None
+                    else child._in_use()
+                )
+                if why or child is None:
+                    print(f"[executor] construction {key} kept: {why}", file=sys.stderr, flush=True)
+                    continue
+                free[key] = child
+            if not free:
+                return
+            # A new map: calls iterating the old one beside this are undisturbed.
+            self.constructions = {k: c for k, c in loaded.items() if k not in free}
+        gone = list(free.values())
+        order = self.order
+        turn: contextlib.AbstractContextManager[None] = (
+            order.turn(order.ticket(False, "release"))
+            if order is not None
+            else contextlib.nullcontext()
+        )
+        threading.Thread(
+            target=contextvars.Context().run,
+            args=(self._unloading, gone, turn),
+            name="release",
+            daemon=True,
+        ).start()
+
+    def _in_use(self) -> str:
+        """Why a release keeps this construction: calls on it, running or prepared."""
+        with self._prepared_lock:
+            prepared = len(self.awaiting)
+        if self.calls or prepared:
+            return f"{self.calls} call(s) running on it, {prepared} prepared"
+        return ""
+
+    def _unloading(
+        self, gone: list[Executor], turn: contextlib.AbstractContextManager[None]
+    ) -> None:
+        """The released constructions' teardown, in its turn. On a GPU its stream drains first,
+        as a map to RAM does."""
+        with turn, self._execution_context():
+            if self.torch is not None:
+                accel.drain(self.torch, self.device_kind)
+            while gone:
+                gone.pop(0)._unload()
+            gc.collect()  # what package code kept of them, in cycles
+
+    def _unload(self) -> None:
+        """This released construction's models leave the memory (their regions, host pages and
+        graphs) and the checkpoints it opened close: nothing of it holds a model in the store or
+        a chunk file open any more."""
+        members = self.model_executors or [self]
+        held = sum(sum(m.backend.sizes().values()) for m in members if m.backend is not None)
+        closed, failed = 0, False
+        for member in members:
+            try:
+                if member.residency is not None:
+                    member.residency.release()
+                if member.backend is not None:
+                    member.backend.close()
+            except Exception:
+                traceback.print_exc()
+                failed = True  # a model still in use: its checkpoints stay open
+            else:
+                for checkpoint in member.opened:
+                    checkpoint.ck.close()
+                closed += len(member.opened)
+        print(
+            f"[executor] released construction {self.construction}: {held / 2**30:.2f} GiB of "
+            f"weights, {closed} checkpoint(s) closed"
+            + (" (its teardown failed, above)" if failed else ""),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    @contextlib.contextmanager
+    def _loads(self, key: str) -> Iterator[None]:
+        """A load of `key` runs: a release keeps it (`release_constructions`)."""
+        with self._lookup:
+            self.loading.add(key)
+        try:
+            yield
+        finally:
+            with self._lookup:
+                self.loading.discard(key)
+
+    @contextlib.contextmanager
+    def _using(
+        self, command: PrepareRequest | Invoke, *, attempt: bool
+    ) -> Iterator[Executor | Reply]:
+        """`_target`, which no release takes while this request or attempt runs on it."""
+        with self._lookup:
+            target = self._target(command, attempt=attempt)
+            if not isinstance(target, dict):
+                target.calls += 1
+        try:
+            yield target
+        finally:
+            if not isinstance(target, dict):
+                with self._lookup:
+                    target.calls -= 1
+
     def serve_request(self, command: PrepareRequest) -> Reply:
-        target = self._target(command, attempt=False)
-        if isinstance(target, dict):
-            return target
-        return target.prepare_request(command)
+        with self._using(command, attempt=False) as target:
+            if isinstance(target, dict):
+                return target
+            return target.prepare_request(command)
 
     def serve_invoke(self, command: Invoke) -> Reply:
-        for construction in (self, *self.constructions.values()):  # its invoke came
-            with construction._prepared_lock:
-                construction.awaiting.discard(command.request_id)
-        target = self._target(command, attempt=True)
-        if isinstance(target, dict):
-            return target
+        with self._using(command, attempt=True) as target:
+            for construction in (self, *self.constructions.values()):  # its invoke came
+                with construction._prepared_lock:
+                    construction.awaiting.discard(command.request_id)
+            if isinstance(target, dict):
+                return target
+            return self._attempt(target, command)
+
+    def _attempt(self, target: Executor, command: Invoke) -> Reply:
         requested = _attention_pin(command.attention_kernel, command.bits)
         alone = self.world > 1 or bool(requested and target._attention_reaches(requested))
         with self.in_flight.attempt(alone, command.request_id) as slot, request_path.serving():

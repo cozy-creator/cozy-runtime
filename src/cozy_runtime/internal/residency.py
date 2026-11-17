@@ -35,7 +35,7 @@ from torch.utils.hooks import RemovableHandle
 
 from cozy_runtime import graphs
 from cozy_runtime.author import _phases, _retained
-from cozy_runtime.author._errors import DoesNotFit, Fault, fault, is_capacity
+from cozy_runtime.author._errors import CapabilityError, DoesNotFit, Fault, fault, is_capacity
 from cozy_runtime.author._model import WARNINGS, WarningRow, recovered
 from cozy_runtime.internal import cache_owners, pacing, proctree
 from cozy_runtime.internal.accel import (
@@ -622,6 +622,8 @@ class Model:
         #: The component by its checkpoint's content, however its package was installed.
         self.content = f"{self.source.ck.id}/{self.component}"
         self.name = f"{self.source.release}/{self.content}"
+        #: the construction whose load built it (`weights.Backend`): what a bake may read
+        self.construction = ""
         self.fill, self.bind, self.finals = declared.fill, declared.bind, declared.finals
         self.declared_finals = declared.finals
         self.binding_identity = None if self.finals is None else self.finals.identity
@@ -675,8 +677,14 @@ class Model:
         # concurrent caller instead of swapping one module's slots beneath its forward.
         with self.memory.lock:
             me = threading.get_ident()
-            if self.closed or self.retiring:
-                raise ResidencyError("the model is closed or retiring its cached graphs")
+            if self.closed:
+                raise CapabilityError(
+                    f"{self.name} is no longer loaded (its construction was released): a call "
+                    "reads only the models its own construction loaded",
+                    code="model_not_loaded",
+                )
+            if self.retiring:
+                raise ResidencyError("the model is retiring its cached graphs")
             if self.users and self.thread != me:
                 raise ResidencyError("concurrent model use requires separate executor storage")
             self.users += 1
@@ -817,7 +825,13 @@ class Model:
             for block in self.groups():
                 self.memory._discard(block, forget=True)
             self.memory._forget_pages(self)
-            self.memory.models.pop(self.module, None)
+            if self.name in self.memory._coming:
+                # Its pages were read ahead for another request: their Sources hold its checkpoint.
+                self.memory._staging, self.memory._coming = [], set()
+            # A new map: a request beside it may be iterating the old one (a released construction).
+            models = dict(self.memory.models)
+            models.pop(self.module, None)
+            self.memory.models = models
 
 
 class Hold:
@@ -1425,7 +1439,8 @@ class Memory:
             warnings.warn(f"{w.component}: {why}", RuntimeWarning, stacklevel=2)
         _placeholders(model)
         _hooks(model)
-        self.models[module] = model
+        with self.lock:  # against a close replacing the map (`Model.close`)
+            self.models[module] = model
         return model
 
     def _configure_binding(
