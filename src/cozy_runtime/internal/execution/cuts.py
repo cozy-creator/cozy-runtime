@@ -26,9 +26,12 @@ import torch
 from torch import Tensor, nn
 
 import cozy_runtime.internal.execution.catch as catch
+import cozy_runtime.internal.execution.pinned as pinned
 import cozy_runtime.internal.execution.sizing as sizing
+from cozy_runtime.author._errors import is_capacity, unwind
 from cozy_runtime.internal.encoding.leaves import NVFP4
 from cozy_runtime.internal.execution.sizing import levelled, levels, pieces
+from cozy_runtime.internal.residency import Request
 
 type Band = Callable[[int, int], Tensor]
 
@@ -918,18 +921,24 @@ def split[T](
     out_bytes: int,
     item_bytes: float,
     holds: int,
-    run: Callable[[int], T],
+    run: Callable[[int, bool], T],
     pure: bool = False,
+    hostable: bool = False,
 ) -> T:
-    """A package's `split` (`cozy_runtime.author.split`): `run(most)` runs it in windows of at
-    most `most` of its `total` elements; `finest` is the least a window can hold. Its author
+    """A package's `split` (`cozy_runtime.author.split`): `run(most, host)` runs it in windows of
+    at most `most` of its `total` elements; `finest` is the least a window can hold. Its author
     must preserve global statistics/quantizers and declare any overlap approximation; merely
     having no side effects does not make differently sized windows numerically equivalent.
     Package code runs once; `pure` says `run` is a Runtime leaf's, which runs again finer only
     when varena answers a refusal in it so (`catch.retry`). `out_bytes` is the whole output held
     beside the windows, `item_bytes` a window's output per element, `holds` how many of that its
-    op's peak holds: its author's estimate, which a completed pass's measured sample replaces."""
+    op's peak holds: its author's estimate, which a completed pass's measured sample replaces.
+
+    Where `hostable` and no level fits with the whole on the device (refused before any window
+    ran, or its allocation refused in the run: `whole`), the whole goes to pinned host memory
+    for the rest of the request: the levels then need only their windows (cr-305)."""
     deepest = levels(-(-total // max(finest, 1)))
+    site = f"split:{key}"
 
     def window(level: int) -> int:
         return max(pieces(total, level), finest)
@@ -937,7 +946,71 @@ def split[T](
     def need(level: int) -> tuple[int, ...]:
         return (out_bytes, *[int(window(level) * item_bytes)] * holds)
 
-    return catch.cut(f"split:{key}", deepest, need, lambda level: run(window(level)), pure=pure)
+    def windows_only(level: int) -> tuple[int, ...]:
+        return (*[int(window(level) * item_bytes)] * holds,)
+
+    request = catch.CURRENT.get()
+    if request is None or not request.memory.cuda:
+        hostable = False
+    if not (hostable and request is not None and site in request.hosted):
+        try:
+            return catch.cut(
+                site, deepest, need, lambda level: run(window(level), False), pure=pure
+            )
+        except catch.Unplaced as exc:  # refused before a window ran (or the op is pure)
+            if not hostable or request is None or _capturing():
+                raise
+            unwind(exc)
+            _hosted(request, site, name)
+    return catch.cut(
+        f"{site}:host", deepest, windows_only, lambda level: run(window(level), True), pure=pure
+    )
+
+
+def whole(part: Tensor, shape: Sequence[int], key: str, host: bool) -> Tensor:
+    """The whole output a package's `split` assembles its windows in, `part` its first: pinned
+    host memory with `host`; else the device's, or pinned host memory when the device refuses it
+    beside the windows (a Runtime retry: no window runs again)."""
+    if host:
+        return pinned.empty(shape, part.dtype, part.device)
+    try:
+        return part.new_empty(shape)
+    except BaseException as exc:
+        request = catch.CURRENT.get()
+        if request is None or not part.is_cuda or not is_capacity(exc) or _capturing():
+            raise
+        try:
+            out = pinned.empty(shape, part.dtype, part.device)
+        except Exception as failed:
+            exc.add_note(f"its whole output in host memory failed too: {failed}")
+            raise exc from None
+        unwind(exc)
+        request.retries += 1
+        _hosted(request, f"split:{key}", key)
+        return out
+
+
+def write(dst: Tensor, src: Tensor) -> None:
+    """A split's window into its whole output (`pinned.write`)."""
+    pinned.write(dst, src)
+
+
+def read[X](window: X) -> X:
+    """A split's input window on the device, where it is a window of a host whole."""
+    return cast("X", pinned.read(window)) if isinstance(window, Tensor) else window
+
+
+def _hosted(request: Request, site: str, name: str) -> None:
+    request.hosted.add(site)
+    print(
+        f"cozy-runtime: {name}: no room for its whole output beside its windows; it is kept in "
+        "host memory",
+        file=sys.stderr,
+    )
+
+
+def _capturing() -> bool:
+    return torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
 
 
 def windows(

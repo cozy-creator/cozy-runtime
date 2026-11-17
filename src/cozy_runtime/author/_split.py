@@ -29,8 +29,10 @@ class Cut:
 
 
 class Pieces(Protocol):
-    """The memory's side of `split`: `split` runs `run(most)` in windows of at most `most` of
-    `total` elements, the least `finest`, once; `piece` marks each window's start."""
+    """The memory's side of `split`: `split` runs `run(most, host)` in windows of at most `most`
+    of `total` elements, the least `finest`, once, its whole output in host memory with `host`
+    (only where `hostable`); `piece` marks each window's start. `whole` is the output windows are
+    assembled in, `write` puts a window there and `read` brings an input's window to the device."""
 
     def split[T](
         self,
@@ -41,11 +43,18 @@ class Pieces(Protocol):
         out_bytes: int,
         item_bytes: float,
         holds: int,
-        run: Callable[[int], T],
+        run: Callable[[int, bool], T],
         pure: bool = False,
+        hostable: bool = False,
     ) -> T: ...
 
     def piece(self) -> None: ...
+
+    def whole(self, part: Tensor, shape: Sequence[int], key: str, host: bool) -> Tensor: ...
+
+    def write(self, dst: Tensor, src: Tensor) -> None: ...
+
+    def read[X](self, window: X) -> X: ...
 
     def windows(
         self, name: str, key: str, needs: Sequence[int]
@@ -126,7 +135,11 @@ def split[W](
     whole output is no device need.
 
     `holds` is `fn`'s device peak beside the whole output, in windows of its output: the estimate
-    the device's choice starts from before it has measured a pass."""
+    the device's choice starts from before it has measured a pass.
+
+    Where the device has no room for the whole output beside the windows, the memory keeps it in
+    host memory the device addresses (a CUDA tensor all the same), and a `split` reading it
+    brings each window back: slower, never out of memory. A blended cut's stays on the device."""
     runtime = _RUNTIME
     shape = tuple(int(n) for n in x.shape)
     # Writing windows in place (`out`) can consume its input, so that never runs twice.
@@ -134,24 +147,27 @@ def split[W](
     if out is not None and any(c.scale != 1 or c.overlap for c in cuts):
         raise ValueError("split(out=) writes windows in place: its cuts take no scale or overlap")
     whole = 0 if out is not None or host else _bytes(shape, cuts, x)
+    hostable = bool(whole) and not any(c.overlap for c in cuts)
+    key = _key(fn, shape, cuts, x.dtype)
     if most is not None and cuts:
         windows = _windows(shape, cuts, most)
         if runtime is None:
-            return _run(fn, x, cuts, windows, lambda: None, out)
+            return _run(fn, x, cuts, windows, None, key, out)
         # The largest window these cuts made, not `most`: a small input cuts smaller.
         largest = max(math.prod(b - a for a, b in w) for w in windows) * (
             math.prod(shape) // math.prod(shape[c.dim] for c in cuts)
         )
         return runtime.split(
             _name(fn),
-            _key(fn, shape, cuts, x.dtype),
+            key,
             largest,
             largest,
             whole,
             _item_bytes(cuts, x),
             holds,
-            lambda _: _run(fn, x, cuts, windows, runtime.piece, out),
+            lambda _, on_host: _run(fn, x, cuts, windows, runtime, key, out, on_host),
             pure,
+            hostable,
         )
     if runtime is None or not cuts:
         entire = cast("W", x)  # run whole, `fn` takes `x` as its own window (`Sliceable`)
@@ -161,14 +177,17 @@ def split[W](
         return out
     return runtime.split(
         _name(fn),
-        _key(fn, shape, cuts, x.dtype),
+        key,
         math.prod(shape),
         _finest(shape, cuts),
         whole,
         _item_bytes(cuts, x),
         holds,
-        lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece, out),
+        lambda most, on_host: _run(
+            fn, x, cuts, _windows(shape, cuts, most), runtime, key, out, on_host
+        ),
         pure,
+        hostable,
     )
 
 
@@ -358,23 +377,34 @@ def _run[W](
     x: Sliceable[W],
     cuts: tuple[Cut, ...],
     windows: list[Window],
-    piece: Callable[[], None],
+    runtime: Pieces | None,
+    key: str,
     into: Tensor | None = None,
+    host: bool = False,
 ) -> Tensor:
+    """`fn` over `windows` of `x`, assembled whole (`into` where given), in host memory with
+    `host`."""
     ndim = x.dim()
     dims = [c.dim % ndim for c in cuts]
+
+    def at(index: list[slice[int | None]]) -> W:
+        window = x[tuple(index)]
+        return window if runtime is None else runtime.read(window)
+
     if into is not None:  # each window writes its own rows of `into` (`split(out=)`)
         write = cast("Callable[[W, Tensor], object]", fn)  # `out`: the second overload
         for window in windows:
             index = [slice(None)] * ndim
             for d, (a, b) in zip(dims, window, strict=True):
                 index[d] = slice(a, b)
-            piece()
-            write(x[tuple(index)], into[tuple(index)])
+            if runtime is not None:
+                runtime.piece()
+            write(at(index), into[tuple(index)])
         return into
     fn = cast("Callable[[W], Tensor]", fn)  # no `out`: the first overload
     if len(windows) == 1:
-        return fn(cast("W", x))  # run whole, `fn` takes `x` as its own window (`Sliceable`)
+        # run whole, `fn` takes `x` as its own window (`Sliceable`)
+        return fn(cast("W", x if runtime is None else runtime.read(x)))
     blend = any(c.overlap for c in cuts)
     out: Tensor | None = None
     total: Tensor | None = None
@@ -383,8 +413,9 @@ def _run[W](
         index = [slice(None)] * ndim
         for d, (a, b) in zip(dims, window, strict=True):
             index[d] = slice(a, b)
-        piece()
-        part = fn(x[tuple(index)])
+        if runtime is not None:
+            runtime.piece()
+        part = fn(at(index))
         place = [slice(None)] * part.dim()
         for d, c, (a, _), size in zip(dims, cuts, window, sizes, strict=True):
             start = round(a * c.scale)
@@ -393,13 +424,22 @@ def _run[W](
             shape = list(part.shape)
             for d, size in zip(dims, sizes, strict=True):
                 shape[d] = size
-            wide = part if part.dtype.itemsize >= 4 else part.float()
-            out = wide.new_zeros(shape) if blend else part.new_empty(shape)
             if blend:
+                wide = part if part.dtype.itemsize >= 4 else part.float()
+                out = wide.new_zeros(shape)
                 total = out.new_zeros([size if d in dims else 1 for d, size in enumerate(shape)])
+            else:
+                out = (
+                    part.new_empty(shape)
+                    if runtime is None
+                    else runtime.whole(part, shape, key, host)
+                )
         trim = tuple(slice(0, s.stop - s.start) if s.start is not None else s for s in place)
         if not blend:
-            out[tuple(place)] = part[trim]
+            if runtime is None:
+                out[tuple(place)] = part[trim]
+            else:
+                runtime.write(out[tuple(place)], part[trim])
             continue
         weight = out.new_ones([1] * part.dim())
         for d, c, (a, b) in zip(dims, cuts, window, strict=True):

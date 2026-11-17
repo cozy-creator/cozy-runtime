@@ -2696,6 +2696,10 @@ class Memory:
                 request.sample()
                 request.ended = request.stats()
                 self.last = request.ended
+                if request.hosted:  # execution imports residency: loaded by now
+                    from cozy_runtime.internal.execution import pinned
+
+                    pinned.release()
             finally:
                 try:
                     with self.lock:
@@ -3035,6 +3039,8 @@ class Request:
         #: refusals the Runtime answered by running again another way (a pure op's finer split, an LM
         #: token decoded eagerly for a capture its pool couldn't hold): zero in a normal run
         self.retries = 0
+        #: split sites whose whole output the card had no room for: kept in host memory (cr-305)
+        self.hosted: set[str] = set()
         #: refusals a CUDA graph capture answered by recording again with room for them
         #: (`graphs.capture`): what runs is the same
         self.regrown = 0

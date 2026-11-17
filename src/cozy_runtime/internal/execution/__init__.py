@@ -12,7 +12,7 @@ from torch import nn
 from cozy_runtime.internal.execution import catch, cuts
 from cozy_runtime.internal.execution.catch import checkpoint as piece
 from cozy_runtime.internal.execution.catch import refusals, serving
-from cozy_runtime.internal.execution.cuts import attend, split, windows
+from cozy_runtime.internal.execution.cuts import attend, read, split, whole, windows, write
 from cozy_runtime.internal.executor_replies import Ceiling, GpuMemory
 from cozy_runtime.internal.residency import Request, blocks_of
 
@@ -21,11 +21,14 @@ __all__ = [
     "attend",
     "install",
     "piece",
+    "read",
     "record",
     "refusals",
     "serving",
     "split",
+    "whole",
     "windows",
+    "write",
 ]
 
 
