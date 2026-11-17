@@ -3239,7 +3239,7 @@ class _Engine:
         self.eager += 1
         why = vt.replay_differs([*state, *self._written(size, at)], replayed)
         if why:
-            why += "; " + self._explain(key[2], size, state, start, at, replayed, ops, launch)
+            why += "; " + self._explain(key[2], size, state, start, at, replayed, ops, launch, graph)
             self._discard(key, graph, stream)
             self._unrecorded(key, why, "replay_mismatch")
 
@@ -3253,11 +3253,13 @@ class _Engine:
         replayed: list[torch.Tensor],
         ops: list[tuple[object, ...]],
         launch: Launch | None,
+        graph: torch.cuda.CUDAGraph,
     ) -> str:
         """Why a step's replay differed from it as written (tracker design
         cuda-graph-correctness.md §5.3, cr-283): the step as written again from the same state,
-        then on its capture's stream and leases, its ops and kernels beside its capture's. The
-        last run is the check's eager step again, which serves."""
+        then on its capture's stream and leases, its ops and kernels beside its capture's, and its
+        graph replayed again (a replay that repeats froze something at capture; one that doesn't
+        reads memory that changed). The last run is the check's eager step again, which serves."""
 
         def run(on_capture: bool, mode: object = None) -> list[torch.Tensor]:
             for tensor, value in zip(state, start, strict=True):
@@ -3273,6 +3275,10 @@ class _Engine:
         mode, written = observe.trace(torch)
         served = False
         try:
+            for tensor, value in zip(state, start, strict=True):
+                tensor.copy_(value)
+            vt.replay(graph, stream=torch.cuda.current_stream())
+            twice = [*(value.clone() for value in state), *self._written(size, at)]
             again = run(False, mode)
             on_stream = run(True)
             run(False)
@@ -3290,7 +3296,8 @@ class _Engine:
                 self._advance(size)
         if noise := vt.replay_differs(here, again):
             return f"the step as written differs run to run ({noise}): a nondeterministic kernel"
-        said = []
+        replays = vt.replay_differs(replayed, twice)
+        said = [f"its replays differ ({replays})" if replays else "its replays repeat"]
         if _STEPS[0] is not launch:
             said.append("its kernels landed between its capture and its check")
         if op := observe.diverged(written, ops):
@@ -3299,10 +3306,10 @@ class _Engine:
             said.append(
                 "as written on its capture's stream it equals the replay: a library chose by stream"
             )
-        if not said:
+        if len(said) == 1:
             return (
                 f"the same {len(written)} ops, and on its capture's stream it differs too: a "
-                "kernel outside Torch's dispatcher"
+                f"kernel outside Torch's dispatcher; {said[0]}"
             )
         return "the capture ran another program: " + "; ".join(said)
 
