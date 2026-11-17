@@ -566,10 +566,15 @@ def _inputs(linears: Sequence[_Linear], normed: Tensor) -> list[Tensor]:
 
 def _mlp(launch: Launch, site: _Site, hidden: Sequence[Tensor]) -> Tensor:
     """`down(silu(gate) * up)`. An int8 `down` gets the product from its own quantization pass
-    when gate and up are two linears' rows: the same rows, never written in bf16."""
+    when gate and up are two linears' rows, or one's [up | gate] halves (`value_first`): the same
+    rows, never written in 16 bits."""
     mlp = site.layout.mlp
     if mlp.up is None:
         (both,) = hidden
+        if mlp.value_first:
+            rows = int8_rows(both, (site.down,), activation="swiglu")
+            if rows is not None:
+                return site.down(rows)
         half = int(both.shape[-1]) // 2
         hidden = (both[..., :half], both[..., half:])
         hidden = hidden[::-1] if mlp.value_first else hidden
