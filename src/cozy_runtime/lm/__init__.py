@@ -241,12 +241,25 @@ def _lm(model: PreTrainedModel) -> _Generating:
     return cast("_Generating", model)  # cast: `generate` serves causal LMs (GenerationMixin's)
 
 
-def _decoding(model: torch.nn.Module) -> tuple[str, ...]:
-    """The module paths a decode step reads: the language model's decoder, its head and a draft
-    head. A vision tower only a prefill reads stays out, evictable once the prefill is done: held
-    with the rest, Qwen3.6-27B's decode pinned 21.8 of a 4090's 22.9 GiB (cr-319)."""
+#: The room a decode step takes beside its held weights: its live tensors, graph pool and one
+#: eager step. Qwen3.6 measured: 27B int8 on a 5090 0.8 GiB live + 1.3 GiB pool, out of memory
+#: with 2.2 GiB left (44080295662); 27B w4a8 on a 4090 1.1 + 0.6, out at 1.9 (44077054825);
+#: 35B-A3B on an A6000 0.4 + 0.9, out at 1.3 (cl-1119).
+STEP_ROOM = 5 << 29
+
+
+class NoStepRoom(RuntimeError):
+    """The held weights leave a decode step too little of the card (`_Engine._short`)."""
+
+
+def _decoding(model: torch.nn.Module, drafting: bool) -> tuple[str, ...]:
+    """The module paths a decode step reads: the language model's decoder, its head and, while
+    it drafts, its draft head. A vision tower only a prefill reads stays out, evictable once the
+    prefill is done: held with the rest, Qwen3.6-27B's decode pinned 21.8 of a 4090's 22.9 GiB
+    (cr-319)."""
     lm = _lm(model)  # type: ignore[arg-type]  # a model `generate` was given
-    reads = (lm.get_decoder(), lm.get_output_embeddings(), getattr(model, "mtp", None))
+    head = getattr(model, "mtp", None) if drafting else None
+    reads = (lm.get_decoder(), lm.get_output_embeddings(), head)
     wanted = {id(m) for m in reads if m is not None}
     paths = tuple(name for name, module in model.named_modules() if name and id(module) in wanted)
     return paths or ("",)
@@ -1834,6 +1847,8 @@ class _Engine:
         #: torch pool of its own with no varena memory
         self.pool: Pool | None = None
         self.addresses: dict[int, Binding] = {}
+        #: the module paths each binding leases (`_decoding`)
+        self.reads: dict[int, tuple[str, ...]] = {}
         self.unprepared: BaseException | None = None
         self.completions: dict[torch.cuda.Stream, torch.cuda.Event] = {}
         self.unfenced: set[torch.cuda.Stream] = set()
@@ -1992,10 +2007,13 @@ class _Engine:
                         if held is False:
                             if self._occupied():
                                 raise self.unprepared or RuntimeError("decode residency was lost")
+                            why = "its decode set does not fit at home" + (
+                                f" ({str(self.unprepared)[:200]})" if self.unprepared else ""
+                            )
+                            if isinstance(self.unprepared, NoStepRoom):
+                                why = str(self.unprepared)
                             for request in self.incoming:
-                                request.fallback = "its decode set does not fit at home" + (
-                                    f" ({str(self.unprepared)[:200]})" if self.unprepared else ""
-                                )
+                                request.fallback = why
                             self.incoming = []
                         if self.incoming or self.retire:
                             self._settle(self.incoming)
@@ -2051,14 +2069,17 @@ class _Engine:
         identities: list[object] = []
         with ExitStack() as leases:
             for module, (residency, name) in self._targets():
+                drafting = self.draft is not None
+                reads = _decoding(module, drafting) if module is self.model else ("",)
                 binding = self.addresses.get(id(module))
-                if binding is not None and not binding.valid():
+                moved = self.reads.get(id(module)) != reads
+                if binding is not None and (not binding.valid() or moved):
                     self._forget()
                     binding.close()
                     binding = None
                 if binding is None:
-                    reads = _decoding(module) if module is self.model else ("",)
                     binding = self.addresses[id(module)] = residency.retain(name, reads)
+                    self.reads[id(module)] = reads
                 try:
                     leases.enter_context(binding.prepare())
                 except Exception as exc:
@@ -2067,9 +2088,30 @@ class _Engine:
                     self.unprepared = exc
                     return False
                 identities.append(binding.identity)
+            if (short := self._short()) is not None:
+                self.unprepared = short  # its leases go as this returns
+                return False
             self.where = (*identities, built)
             stack.enter_context(leases.pop_all())
         return True
+
+    def _short(self) -> NoStepRoom | None:
+        """Whether the weights just leased leave a step too little of the card: then the driver
+        drops the draft head, and short still, decodes through Transformers' streamed loop before
+        any step runs, never out of memory after it (cr-319). Rows decoding now decode on."""
+        if self._occupied() or PLACED.get(self.model) is None or not torch.cuda.is_initialized():
+            return None
+        device = torch.cuda.current_device()
+        room = vt.room(device)
+        left = room["capacity"] - room["pinned"] - room["working_live"]
+        if left >= STEP_ROOM:
+            return None
+        name = getattr(self.model.config, "_name_or_path", "") or type(self.model).__name__
+        return NoStepRoom(
+            f"{name} doesn't fit {_gib(room['capacity'])} with room to decode "
+            f"({_gib(room['pinned'])} of weights held, {_gib(left)} left; a step takes about "
+            f"{_gib(STEP_ROOM)}): running the slower streamed path"
+        )
 
     #: The retained bindings' fill generations and derived tensor addresses.
     where: tuple[object, ...] = ()
