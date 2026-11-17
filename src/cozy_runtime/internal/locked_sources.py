@@ -2,8 +2,9 @@
 
 A caller's signature may use a callee package's type, and the callee is read as source, never
 run. A local package is read from the directory the lock names. A published one is read from
-the exact wheel the lock pins: fetched through the egress boundary by its URL and sha256, and
-unpacked as files. Nothing is built, installed or imported (#713).
+the exact wheel the lock pins: the machine's own copy of it when it holds one (cl-1127: so with
+its Hub unreachable too), else fetched through the egress boundary by its URL, each held to its
+sha256, and unpacked as files. Nothing is built, installed or imported (#713).
 """
 
 from __future__ import annotations
@@ -112,8 +113,15 @@ class Wheels:
     """The pinned wheels, each fetched and unpacked once, on the first module that needs it,
     into a directory removed with this object."""
 
-    def __init__(self, wheels: Mapping[str, LockedWheel]) -> None:
+    def __init__(
+        self, wheels: Mapping[str, LockedWheel], held: Mapping[str, Path] | None = None
+    ) -> None:
         self.pending = dict(wheels)
+        #: The pinned wheels the machine holds, by sha256 hex: read in place of their URLs.
+        self.held = {
+            digest.removeprefix("sha256:").lower(): Path(path)
+            for digest, path in (held or {}).items()
+        }
         self.directory = Path(
             tempfile.mkdtemp(prefix="cozy-locked-wheels-", dir=call_scope.process_tempdir())
         )
@@ -126,11 +134,12 @@ class Wheels:
             return None
         target = self.directory / wheel.sha256.removeprefix("sha256:")
         archive = target.with_suffix(".whl")
+        local = wheel.local or self.held.get(wheel.sha256.removeprefix("sha256:").lower())
         try:
-            if wheel.local is None:
+            if local is None:
                 egress.fetch_public_wheel(archive, wheel.url, wheel.sha256, WHEEL_CEILING)
             else:
-                with wheel.local.open("rb") as source:
+                with local.open("rb") as source:
                     raw = source.read(WHEEL_CEILING + 1)
                 if (
                     len(raw) > WHEEL_CEILING
