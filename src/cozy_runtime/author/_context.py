@@ -168,6 +168,9 @@ class Context:
     #: `preview`'s, where a client may watch this run; and the last step `progress` told
     _preview: Previews | None = field(default=None, repr=False)
     _step: tuple[int, int] = field(default=(0, 0), repr=False)
+    #: where a text output's words go as they are made (`vlm`): `(output, index, delta)`, each
+    #: delta appended to what went before; held by no one but the run's followers
+    _text: Callable[[str, int, str], None] | None = field(default=None, repr=False)
 
     def tensorfs_source(self, weights: Weights[Model[object]]) -> Checkpoint:
         """An admitted `Weights` argument's checkpoint: its pipeline, components and stored
