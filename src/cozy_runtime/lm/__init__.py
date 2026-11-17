@@ -1091,7 +1091,9 @@ def _transformers(
     tell: _Tell,
     allowed: Constraint | None = None,
     ngram: int = 0,
+    why: str = "",
 ) -> torch.Tensor:
+    """`why`: what sent the call here, said with its tokens a second in the run record."""
     prompt = int(inputs["input_ids"].shape[1])
     processors: list[_Allowed | _TopK | _Presence | _Draw | NoRepeatNGramLogitsProcessor] = (
         [] if allowed is None else [_Allowed(prompt, allowed, stops)]
@@ -1106,7 +1108,7 @@ def _transformers(
         processors.append(_Draw(prompt, sampling))
     context = CURRENT.get()
     with _PLANE, torch.inference_mode(), ExitStack() as held:
-        cancel = _Cancel(context, tell, _Keeper(model, held), prompt)
+        cancel = _Cancel(context, tell, _Keeper(model, held, why), prompt)
         out = _lm(model).generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -1132,8 +1134,8 @@ class _Keeper:
     cap decoded about 1 s a token, every weight read again for each). The prompt's prefill runs
     before any is held: its working memory is the call's largest."""
 
-    def __init__(self, model: torch.nn.Module, held: ExitStack) -> None:
-        self.placed = PLACED.get(model)
+    def __init__(self, model: torch.nn.Module, held: ExitStack, why: str = "") -> None:
+        self.placed, self.why = PLACED.get(model), why
         self.held, self.since, self.began = held, 0, time.perf_counter()
         self.decoded = 0.0
         self.kept = self.read = 0
@@ -1167,7 +1169,7 @@ class _Keeper:
         if self.placed is None or steps < 2:
             return
         seconds = time.perf_counter() - self.decoded
-        text = (
+        text = (f"{self.why}: " if self.why else "") + (
             f"{steps} tokens after {prompt} through Transformers' loop: "
             f"{(steps - 1) / max(seconds, 1e-9):.2f} tokens/s decoding, "
             f"{_gib(self.kept)} of its weights held, {_gib(self.read)} read again a token"
@@ -1928,6 +1930,7 @@ class _Engine:
                 request.tell,
                 request.allowed,
                 request.ngram,
+                request.fallback,
             )
         self._report(request)
         return request.result()
