@@ -26,10 +26,11 @@ call's keys and state for its prompt and `max_new_tokens`, sized from the config
 pool are decided before its prefill (`_Engine._enter`): allocated or mapped then, else it waits for
 decoding rows to leave. Running short never ends a call while a lever remains: graphs whose pool
 has no room go (decode runs eagerly, captured again where room allows), a draft head's keys go,
-and slots or a prefill that still do not fit beside the leased weights (an allocation refused, or
-a split level that has no room) decode through Transformers' loop, its weights streamed and its
-cache only as long as its tokens. Only slots larger than the whole card are `DoesNotFit` up front,
-naming what would fit. Errors after execution starts are final; package code is never restarted.
+and slots or a prefill that still do not fit beside the leased weights decode through
+Transformers' loop, its weights streamed and its cache only as long as its tokens. Short is one
+rule for every such lever (`_short_of_room`): an allocation refused, or a native refusal
+(`DoesNotFit`). Only slots larger than the whole card are `DoesNotFit` up front, naming what would
+fit. Errors after execution starts are final; package code is never restarted.
 On a CPU, or after a safe capture refusal (a run warning), the same step runs eagerly. A model this
 does not serve (a layer type other than full or linear attention, an attention other than SDPA or
 eager, a generation config that adds logits processors) generates through Transformers, said once.
@@ -1130,7 +1131,7 @@ class _Keeper:
                 file=sys.stderr,
             )
         except Exception as exc:  # holding is only speed: the decode streams as it did
-            if not is_capacity(exc):
+            if not _short_of_room(exc):
                 raise
             _unwind(exc)
             self.kept = 0
@@ -2027,7 +2028,7 @@ class _Engine:
                 try:
                     leases.enter_context(binding.prepare())
                 except Exception as exc:
-                    if not is_capacity(exc) and getattr(exc, "code", None) != "STALE_BINDING":
+                    if not _short_of_room(exc) and getattr(exc, "code", None) != "STALE_BINDING":
                         raise
                     self.unprepared = exc
                     return False
@@ -2239,11 +2240,7 @@ class _Engine:
         try:
             fresh = self._prefill(request, kwargs, mask, position, first)
         except Exception as exc:
-            # A split level refused room (`DoesNotFit`) was judged beside this engine's own leased
-            # weights and slots, which no reclaim takes: the prefill is short, as when an
-            # allocation is (cr-331: an edit's vision tower, 21.4 GiB leased on a 4090).
-            short = is_capacity(exc) or isinstance(exc, DoesNotFit)
-            if not short or request.inputs["input_ids"].device.type != "cuda":
+            if not _short_of_room(exc) or request.inputs["input_ids"].device.type != "cuda":
                 raise
             # Nothing of the engine's changed: the prompt went into a cache of its own. Its slots
             # and leased weights go, and Transformers' loop streams the weights beside its prompt.
@@ -2312,7 +2309,7 @@ class _Engine:
         try:
             self._grow(size, capacity, stops, position, device)
         except Exception as exc:
-            if not (placed and is_capacity(exc)):
+            if not (placed and _short_of_room(exc)):
                 raise
             if occupied:
                 request.waits = True  # it is tried again once these rows leave
@@ -2998,14 +2995,10 @@ class _Engine:
                         if graph is not None and pool.prepared > reserve:
                             self.regrown.append((reserve, pool.prepared))
                     except Exception as exc:  # no room for its pool, or short outside it
-                        if not is_capacity(exc):
+                        if not _short_of_room(exc):
                             raise
                         why = no_room(domain.device, "its pool", pool.prepared, exc)
-                        if not isinstance(exc, Exhausted):  # an allocation varena counted refused
-                            from cozy_runtime.internal.execution.catch import CURRENT as REQUEST
-
-                            if (request := REQUEST.get()) is not None:
-                                request.retries += 1  # answered: this token decodes eagerly
+                        _answered(exc)  # this token decodes eagerly
             except Building:  # eager until a kernel lands
                 graph, why, self.building = None, "", LANDED[0]
             finally:
@@ -3457,6 +3450,15 @@ def _unwind(exc: BaseException) -> None:
     from cozy_runtime.internal.execution import catch
 
     catch._unwind(exc)
+
+
+def _short_of_room(exc: BaseException) -> bool:
+    """Whether `exc` says an admitted call is short of room: an allocation refused (`is_capacity`)
+    or a native refusal before anything ran (`DoesNotFit`: a split level, a pass's floor). Both are
+    judged beside what this engine holds (its leased weights, slots, graphs' pool), which its slower
+    path gives up, so each is that path's cue, never the call's end (cr-331: an edit's vision tower
+    refused beside 21.4 GiB leased on a 4090 failed the call)."""
+    return is_capacity(exc) or isinstance(exc, DoesNotFit)
 
 
 def _answered(exc: BaseException) -> None:
