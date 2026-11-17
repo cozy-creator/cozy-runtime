@@ -597,7 +597,7 @@ class VisionLM(Model[Pipeline]):
             thinking=thinking,
             on_delta=on_delta,
         )
-        answers = []
+        answers: list[str] = []
         for row, (answer, thought) in enumerate(zip(final.texts, final.thoughts, strict=True)):
             if thinking and not answer.strip():  # its thought never ended: it is all there is
                 WARNINGS.append(
@@ -730,7 +730,7 @@ class _Told:
                     thought = _held(thought, [THOUGHT_END])
         # A text decoded again that no longer starts as told (a token's bytes merged) is told no
         # more: what it ends as is what `Final` says.
-        deltas = []
+        deltas: list[Delta] = []
         if len(thought) > len(self.thought) and thought.startswith(self.thought):
             deltas.append(Delta(row, thought[len(self.thought) :], "reasoning"))
             self.thought = thought
