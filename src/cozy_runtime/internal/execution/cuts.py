@@ -6,8 +6,10 @@ The results stay on the device, at the level native selection takes from each ca
 (`catch`, `sizing`). Level L is 2^L pieces, down to the finest.
 
 Call cuts: Diffusers' FFNs by token, a Runtime-fused block's gated MLP by token (`gated`), its
-channel RMS norms by rows, attention by head groups then query rows, a Transformers vision tower
-by pictures, a package's `split` by windows.
+channel RMS norms by rows, what Diffusers' attention
+processors run before dispatch (their q/k RMS norms by rows, their RoPE by sequence rows: `rope`),
+attention by head groups then query rows, a Transformers vision tower by pictures, a package's
+`split` by windows.
 """
 
 from __future__ import annotations
@@ -54,8 +56,9 @@ def install(module: nn.Module) -> int:
     the module's path. A Transformers gated MLP cuts by tokens as Diffusers' FFNs do, and a
     Transformers vision tower that reads packed patches and each picture's
     grid (`forward(hidden_states, grid_thw)`: Qwen2.5-VL, Qwen3-VL, Qwen3.5) runs its pictures in
-    groups. Returns how many it cut."""
-    count = 0
+    groups. Diffusers' RMS norms (each attention processor's q/k norm) cut by rows, and the RoPE
+    functions Diffusers' processors call (`rope`). Returns how many it cut."""
+    count = _ropes()
     for path, sub in module.named_modules():
         if _gated_mlp(sub) and "_cozy_cut" not in vars(sub):
             sub.forward = catch.transparent(_ffn(f"{path}:tokens", sub, _forward(sub)))
@@ -79,7 +82,11 @@ def install(module: nn.Module) -> int:
             count += 1
         # torch's RMS norm reduces each row alone: token pieces are the whole (v7 H3 13826 ran
         # out in a DiT block's 546 MiB rms_norm, a site with no cut).
-        if type(sub) is nn.RMSNorm and "forward" not in vars(sub) and "_cozy_cut" not in vars(sub):
+        if (
+            (type(sub) is nn.RMSNorm or _diffusers_rms(sub))
+            and "forward" not in vars(sub)
+            and "_cozy_cut" not in vars(sub)
+        ):
             norm: nn.Module = sub
             norm.forward = catch.transparent(_norm(f"{path}:tokens", sub, _forward(sub)))
             vars(sub)["_cozy_cut"] = True
@@ -445,9 +452,20 @@ def _tokens(forward: Forward, x: Tensor, tokens: int, level: int) -> object:
     return out.view(*x.shape[:-1], *out.shape[1:])
 
 
+def _diffusers_rms(module: nn.Module) -> bool:
+    """Diffusers' `RMSNorm` as written: every row of its last axis alone (each attention
+    processor's q/k norm, over [batch, tokens, heads, head_dim])."""
+    kind = type(module)
+    return kind.__name__ == "RMSNorm" and kind.__module__ == "diffusers.models.normalization"
+
+
 def _norm(site: str, module: nn.Module, forward: Forward) -> Forward:
-    """A norm over its trailing `normalized_shape` in pieces of whole rows (tokens)."""
-    dims = len(cast("tuple[int, ...]", module.normalized_shape))
+    """A norm over its trailing `normalized_shape` (torch's), or its last axis (Diffusers' RMSNorm),
+    in pieces of whole rows (tokens). Diffusers' holds an fp32 upcast and its square, then an fp32
+    product: two fp32 temporaries a value."""
+    torch_norm = isinstance(module, nn.RMSNorm)
+    dims = len(cast("tuple[int, ...]", module.normalized_shape)) if torch_norm else 1
+    intermediate = 4 if torch_norm else 8
 
     def cut(x: object, *args: object, **kwargs: object) -> object:
         if (
@@ -465,7 +483,7 @@ def _norm(site: str, module: nn.Module, forward: Forward) -> Forward:
         flat = x.reshape(tokens, *x.shape[-dims:])
         run = functools.partial(_rows, forward, flat, tokens)
         # torch's rms_norm holds an fp32 upcast of its rows where it is not fused
-        need = levelled(tokens, sizing.norm(tokens, row, x.element_size(), 4))
+        need = levelled(tokens, sizing.norm(tokens, row, x.element_size(), intermediate))
         out = catch.cut(site, levels(tokens), need, run)
         return cast(Tensor, out).view(x.shape)
 
@@ -561,6 +579,135 @@ def _rms_bands(forward: Forward, x: Tensor, axis: int, level: int) -> object:
             raise _Whole
         out.narrow(axis, at, length).copy_(part)
         del part
+    return out
+
+
+class Rows(Protocol):
+    """Where a RoPE call's sequence rows are: the axis of its input, or None (it runs whole)."""
+
+    def __call__(
+        self, x: Tensor, freqs: object, /, *args: object, **kwargs: object
+    ) -> int | None: ...
+
+
+class Rotation(Protocol):
+    """A RoPE function: its input and tables first, then whatever else it takes."""
+
+    def __call__(self, x: Tensor, freqs: object, /, *args: object, **kwargs: object) -> Tensor: ...
+
+
+def _real_rows(x: Tensor, freqs: object, /, *args: object, **kwargs: object) -> int | None:
+    """`diffusers.models.embeddings.apply_rotary_emb`: (cos, sin) tables, [S, D], over the axis
+    it is told (`sequence_dim`, 2 by default). Its complex form (Lumina's) runs whole."""
+    real = args[0] if args else kwargs.get("use_real", True)
+    axis = args[2] if len(args) > 2 else kwargs.get("sequence_dim", 2)
+    return axis if real is True and isinstance(axis, int) and axis in (1, 2) else None
+
+
+def _complex_rows(x: Tensor, freqs: object, /, *args: object, **kwargs: object) -> int | None:
+    """Qwen-Image's `apply_rotary_emb_qwen`: a complex table, [S, D/2], over [B, S, H, D]. Its
+    real form lines its tables up with the heads, and runs whole."""
+    real = args[0] if args else kwargs.get("use_real", True)
+    return 1 if real is False else None
+
+
+#: The RoPE functions Diffusers' attention processors call before dispatch, by the module that
+#: defines each, its name there, and where a call's sequence rows are (`Rows`).
+_QWEN = "diffusers.models.transformers.transformer_qwenimage"
+_ROPES: tuple[tuple[str, str, Rows], ...] = (
+    ("diffusers.models.embeddings", "apply_rotary_emb", _real_rows),
+    (_QWEN, "apply_rotary_emb_qwen", _complex_rows),
+    (f"{_QWEN}21", "apply_rotary_emb_qwen", _complex_rows),
+)
+#: a RoPE function's original, on its cut (`rope`)
+_ORIGINAL = "_cozy_rope"
+#: a piece's temporaries a rotated value: its fp32 upcast and the upcast rotation, a product of
+#: each with its table, and the rotation itself
+_ROTATED = 14
+
+
+def _ropes() -> int:
+    """Cut every `_ROPES` function this process has loaded: each where it is defined, and every
+    loaded Diffusers module's name bound to it (a processor's module imported it by name), so a
+    processor finds the cut whichever way it reaches it. Returns how many it cut now."""
+    cut: dict[int, Rotation] = {}
+    for name, attribute, rows in _ROPES:
+        found = sys.modules.get(name)
+        original = vars(found).get(attribute) if found is not None else None
+        if not callable(original) or _ORIGINAL in vars(original):
+            continue
+        cut[id(original)] = rope(cast("Rotation", original), rows)
+    if cut:
+        for name, loaded in list(sys.modules.items()):
+            if name.startswith("diffusers.") and loaded is not None:
+                bound = vars(loaded)
+                for key, value in list(bound.items()):
+                    if id(value) in cut and callable(value):
+                        bound[key] = cut[id(value)]
+    return len(cut)
+
+
+def rope(original: Rotation, rows: Rows) -> Rotation:
+    """`original`, a RoPE function a Diffusers attention processor calls on its queries and keys
+    before dispatch, in pieces of their sequence rows (`rows` says where they are; None: whole), at
+    the level native selection takes under the current block. It rotates each value alone with
+    its row's table entry, so a piece is the whole call's rows, byte for byte: PAN2's fp32
+    temporaries were 0.8 GiB a call (cr-320). Whole outside a named block, under autograd, and for
+    an input that is not contiguous [B, ·, ·, D] or tables that are not one row a token."""
+
+    def cut(x: Tensor, freqs: object, /, *args: object, **kwargs: object) -> Tensor:
+        axis = (
+            rows(x, freqs, *args, **kwargs)
+            if isinstance(x, Tensor) and x.dim() == 4 and x.is_contiguous()
+            else None
+        )
+        site = None if axis is None or torch.is_grad_enabled() else catch.site("rope")
+        if site is None or axis is None:
+            return original(x, freqs, *args, **kwargs)
+        length = int(x.shape[axis])
+        tables = list(freqs) if isinstance(freqs, list | tuple) else [freqs]
+        if length < 2 or not all(
+            isinstance(t, Tensor) and t.dim() >= 1 and t.shape[0] == length for t in tables
+        ):
+            return original(x, freqs, *args, **kwargs)
+        need = levelled(
+            length, sizing.norm(length, x.numel() // length, x.element_size(), _ROTATED)
+        )
+        run = functools.partial(_rotated, original, x, freqs, axis, args, kwargs)
+        return catch.cut(site, levels(length), need, run)
+
+    functools.update_wrapper(cut, original)
+    vars(cut)[_ORIGINAL] = original
+    return cut
+
+
+def _rotated(
+    original: Rotation,
+    x: Tensor,
+    freqs: object,
+    axis: int,
+    args: Sequence[object],
+    kwargs: dict[str, object],
+    level: int,
+) -> Tensor:
+    if not level:
+        return original(x, freqs, *args, **kwargs)
+    length = int(x.shape[axis])
+    size, out = pieces(length, level), None
+    for at in range(0, length, size):
+        catch.checkpoint()
+        n = min(size, length - at)
+        tables = (
+            type(freqs)(cast(Tensor, t).narrow(0, at, n) for t in freqs)
+            if isinstance(freqs, list | tuple)
+            else cast(Tensor, freqs).narrow(0, at, n)
+        )
+        part = original(x.narrow(axis, at, n), tables, *args, **kwargs)
+        if out is None:
+            out = part.new_empty((*x.shape[:axis], length, *part.shape[axis + 1 :]))
+        out.narrow(axis, at, n).copy_(part)
+        del part
+    assert out is not None
     return out
 
 
