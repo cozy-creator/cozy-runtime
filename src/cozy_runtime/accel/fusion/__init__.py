@@ -1229,8 +1229,8 @@ class CausalConvEncoder:
         return f"fused.{self.conv.conv.__name__.lower()[:44]}.{self.accumulate}"
 
     def contract(self) -> dict[str, object]:
-        def named(item: Callable[..., object] | type) -> str:
-            return f"{item.__module__}:{item.__qualname__}"
+        def named(item: object) -> str:
+            return f"{getattr(item, '__module__', '')}:{getattr(item, '__qualname__', '')}"
 
         return {
             "conv": named(self.conv.conv),
@@ -1460,9 +1460,7 @@ def _block_site(
         pad = tuple(int(v) for v in declared.pad(block))
         if len(pad) != 4 or min(pad) < 0 or (any(pad) and any(layout.conv.padding(conv)[0])):
             raise _Mismatch(f"{path}: pads {pad} before a conv that pads in space too")
-        return "padded-conv", _ConvSite(
-            layout, index, ((None, conv),), pad=cast("tuple[int, int, int, int]", pad)
-        )
+        return "padded-conv", _ConvSite(layout, index, ((None, conv),), pad=pad)
     steps: list[tuple[nn.Module | None, nn.Module]] = []
     for norm_name, conv_name in declared.steps:
         norm, conv = child(norm_name), child(conv_name)
