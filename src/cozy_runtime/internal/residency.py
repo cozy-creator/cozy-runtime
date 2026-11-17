@@ -812,7 +812,13 @@ class Model:
             for block in self.groups():
                 self.memory._discard(block, forget=True)
             self.memory._forget_pages(self)
-            self.memory.models.pop(self.module, None)
+            if self.name in self.memory._coming:
+                # Its pages were read ahead for another request: their Sources hold its checkpoint.
+                self.memory._staging, self.memory._coming = [], set()
+            # A new map: a request beside it may be iterating the old one (a released construction).
+            models = dict(self.memory.models)
+            models.pop(self.module, None)
+            self.memory.models = models
 
 
 class Hold:
@@ -1430,7 +1436,8 @@ class Memory:
             warnings.warn(f"{w.component}: {why}", RuntimeWarning, stacklevel=2)
         _placeholders(model)
         _hooks(model)
-        self.models[module] = model
+        with self.lock:  # against a close replacing the map (`Model.close`)
+            self.models[module] = model
         return model
 
     def _configure_binding(
