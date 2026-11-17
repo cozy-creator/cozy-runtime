@@ -22,14 +22,21 @@ Answers stream as they are made (xs-209): the engine hands each row's decoded te
 
 from __future__ import annotations
 
+import base64
 import functools
+import http.client
+import io
 import json
 import secrets
 import sys
-from collections.abc import Callable, Mapping, Sequence
+import threading
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, TypedDict
+from urllib.parse import urlsplit
 
 import msgspec
 import torch
@@ -770,6 +777,144 @@ class TransformersEngine:
             finish_reasons=reasons,
             usage=Usage(read, sum(made)),
         )
+
+
+class ServedEngine:
+    """An engine behind an OpenAI-compatible server (vLLM, llama-server) at `url`: each question one
+    streamed chat completion, all rows at once, so the server batches them with whatever else it
+    serves. The server reads the pictures (sent as PNG) and the sampled frames (as JPEG) itself;
+    the chat template is the checkpoint's, applied there. A thought is the text before the
+    template's thought end, as `TransformersEngine` splits it. Cancelling the run closes its
+    streams, which ends them in the server."""
+
+    #: The server's stream is read in pieces of this many bytes.
+    READ = 4096
+
+    def __init__(self, url: str, model: str = "m", timeout: float = 600.0) -> None:
+        self.url, self.model, self.timeout = urlsplit(url), model, timeout
+
+    def generate(
+        self,
+        questions: list[Question],
+        params: Params,
+        *,
+        on_delta: Callable[[Delta], None],
+        progress: Callable[[int], None] | None = None,
+    ) -> Final:
+        if params.no_repeat_ngram:
+            WARNINGS.append(("no_repeat_ngram is not served by this engine; ignored", {}))
+        context = CURRENT.get()
+        told = [_Told(params.thinking) for _ in questions]
+        made = [0] * len(questions)
+        lock, last = threading.Lock(), [0.0]
+        began = time.monotonic()
+
+        def tick(row: int) -> None:
+            with lock:
+                made[row] += 1
+                now = time.monotonic()
+                if progress is not None and now - last[0] >= 0.25:
+                    last[0] = now
+                    progress(max(made))
+
+        def row(index: int) -> tuple[str, int, int, float]:
+            text, reason, usage, first = "", "length", (0, 0), 0.0
+            for event in self._stream(self._body(questions[index], params)):
+                if context is not None and context.cancelled:
+                    return "cancelled", *usage, first
+                if event.get("usage"):
+                    usage = (event["usage"]["prompt_tokens"], event["usage"]["completion_tokens"])
+                for choice in event.get("choices") or []:
+                    piece = (choice.get("delta") or {}).get("content") or ""
+                    if piece:
+                        first = first or time.monotonic() - began
+                        text += piece
+                        tick(index)
+                        for delta in told[index].more(index, text, ended=False):
+                            on_delta(delta)
+                    reason = choice.get("finish_reason") or reason
+            for delta in told[index].more(index, text, ended=True):
+                on_delta(delta)
+            return reason, *usage, first
+
+        with ThreadPoolExecutor(max_workers=len(questions)) as pool:
+            rows = list(pool.map(row, range(len(questions))))
+        return Final(
+            texts=[t.answer for t in told],
+            thoughts=[t.thought for t in told],
+            finish_reasons=[r[0] for r in rows],
+            usage=Usage(sum(r[1] for r in rows), sum(r[2] for r in rows)),
+            timings={"first_token": min((r[3] for r in rows if r[3]), default=0.0)},
+        )
+
+    def _body(self, question: Question, params: Params) -> dict[str, object]:
+        content: list[dict[str, object]] = []
+        for part in question.read():
+            if isinstance(part, str):
+                content.append({"type": "text", "text": part})
+            elif isinstance(part, Watched):
+                frames = ",".join(_encoded(frame, "JPEG") for frame in part.frames)
+                content.append(
+                    {"type": "video_url", "video_url": {"url": f"data:video/jpeg;base64,{frames}"}}
+                )
+            else:
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{_encoded(part, 'PNG')}"},
+                    }
+                )
+        messages = [{"role": "system", "content": params.system}] if params.system else []
+        kwargs: dict[str, object] = {"enable_thinking": params.thinking}
+        if params.thinking and params.reasoning_effort:
+            kwargs["reasoning_effort"] = params.reasoning_effort
+        return {
+            "model": self.model,
+            "messages": [*messages, {"role": "user", "content": content}],
+            "max_tokens": params.max_new_tokens,
+            "temperature": params.temperature,
+            "top_p": params.top_p,
+            "presence_penalty": params.presence_penalty,
+            "seed": params.seed,
+            # A thought may say a stop string: then stops cut only the answer, in VisionLM.ask.
+            "stop": [] if params.thinking else params.stop,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "chat_template_kwargs": kwargs,
+            "skip_special_tokens": True,
+        }
+
+    def _stream(self, body: dict[str, object]) -> Iterator[dict[str, Any]]:  # type: ignore[explicit-any]  # the server's JSON events
+        connection = http.client.HTTPConnection(
+            self.url.hostname or "127.0.0.1", self.url.port, timeout=self.timeout
+        )
+        try:
+            connection.request(
+                "POST",
+                f"{self.url.path.rstrip('/')}/v1/chat/completions",
+                json.dumps(body),
+                {"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            if response.status != 200:
+                said = response.read(500).decode(errors="replace")
+                raise RuntimeError(f"the engine refused the request: {response.status} {said}")
+            pending = b""
+            while chunk := response.read1(self.READ):
+                pending += chunk
+                *lines, pending = pending.split(b"\n")
+                for line in lines:
+                    data = line.strip().removeprefix(b"data:").strip()
+                    if data and data != b"[DONE]" and line.strip().startswith(b"data:"):
+                        yield json.loads(data)
+        finally:
+            connection.close()
+
+
+def _encoded(picture: Image, kind: str) -> str:
+    buffer = io.BytesIO()
+    picture.save(buffer, kind, **({"quality": 95} if kind == "JPEG" else {}))
+    return base64.b64encode(buffer.getvalue()).decode()
 
 
 class _Told:
