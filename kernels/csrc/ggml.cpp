@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: Apache-2.0
+// `_kernels._ggml`: llama.cpp's quantized matmuls (MMVQ, few-row MMQ, MMQ; `ggml/`, vendored at b12466) for the
+// `ggml.*` lanes, on the caller's buffers: raw device pointers, sizes, a stream and a stream-ordered allocator for
+// the temporaries, so neither torch nor the Python version is a build input. Every call returns its CUDA error code:
+// 0 ran, NOT_SUPPORTED has no kernel for this card, type or shape; `error()` names a failure ggml raised.
+#include <nanobind/nanobind.h>
+
+#include <cuda_runtime.h>
+
+#include <cstdint>
+
+#include "ggml/matmul.h"
+
+namespace nb = nanobind;
+using namespace nb::literals;
+
+namespace {
+
+class OnDevice {
+  public:
+    explicit OnDevice(int device) {
+        error_ = cudaGetDevice(&previous_);
+        if (error_ == cudaSuccess && previous_ != device) error_ = cudaSetDevice(device);
+    }
+    ~OnDevice() {
+        int now = -1;
+        if (error_ == cudaSuccess && cudaGetDevice(&now) == cudaSuccess && now != previous_)
+            cudaSetDevice(previous_);
+    }
+    cudaError_t error() const { return error_; }
+
+  private:
+    int previous_ = -1;
+    cudaError_t error_ = cudaSuccess;
+};
+
+// Each temporary from the caller's `allocate(bytes)`: an object with `data_ptr()`, held until the call returns.
+struct Held {
+    nb::handle allocate;
+    nb::list objects;
+};
+
+void* allocate(size_t bytes, void* context) {
+    auto& held = *static_cast<Held*>(context);
+    nb::object made = held.allocate(bytes);
+    held.objects.append(made);
+    return reinterpret_cast<void*>(nb::cast<uintptr_t>(made.attr("data_ptr")()));
+}
+
+int kernel(int device, int type, int64_t K, int64_t N, int64_t M) {
+    const OnDevice guard(device);
+    if (guard.error() != cudaSuccess) return cozy_ggml::kNone;
+    return cozy_ggml::kernel(device, type, K, N, M);
+}
+
+int matmul(int device, int type, uintptr_t w, uintptr_t x, uintptr_t out, int64_t K, int64_t N, int64_t M,
+           nb::handle allocator, uintptr_t stream) {
+    const OnDevice guard(device);
+    if (guard.error() != cudaSuccess) return guard.error();
+    Held held{allocator, {}};
+    return cozy_ggml::matmul(device, type, reinterpret_cast<const void*>(w), reinterpret_cast<const float*>(x),
+                             reinterpret_cast<float*>(out), K, N, M, &allocate, &held,
+                             reinterpret_cast<cudaStream_t>(stream));
+}
+
+}  // namespace
+
+NB_MODULE(_ggml, m) {
+    m.attr("NOT_SUPPORTED") = int(cudaErrorNotSupported);
+    m.attr("OUT_OF_MEMORY") = int(cudaErrorMemoryAllocation);
+    m.attr("UNKNOWN") = int(cudaErrorUnknown);
+    m.attr("KERNELS") = nb::make_tuple("", "mmvq", "mmq_few", "mmq");
+    m.attr("UPSTREAM") = "llama.cpp b12466 (ede6106780fef959e40ae309afb68da7b6442883)";
+    m.def("error_name", [](int code) { return cudaGetErrorName(cudaError_t(code)); });
+    m.def("error", [] { return cozy_ggml::error(); });
+    m.def("kernel", &kernel, "device"_a, "type"_a, "K"_a, "N"_a, "M"_a);
+    m.def("matmul", &matmul, "device"_a, "type"_a, "w"_a, "x"_a, "out"_a, "K"_a, "N"_a, "M"_a, "allocate"_a,
+          "stream"_a);
+}
