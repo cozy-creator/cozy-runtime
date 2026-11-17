@@ -365,6 +365,9 @@ def _ggml(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
         data = torch.randint(-127, 128, (s.n, s.k), generator=g, device="cuda:0", dtype=torch.int8)
         scale = _rand(g, s.n, scale=1e-3, add=5e-4)
         calls[f"ggml-int8{GGML_GRAPHED}:convrot"] = _graphed(partial(card.ops.int8_linear, x, data, scale, None, BF16))
+        if s.m <= int8_linear.GEMV_ROWS:
+            # The GEMV in MMVQ's shape over rows quantized once, beside the one that rotates in every block.
+            calls[f"ggml-int8{GGML_GRAPHED}:convrot-q"] = _graphed(partial(card.ops.int8_gemv_q, x, data, scale, None, BF16))
     return calls, rules
 
 

@@ -124,6 +124,16 @@ int gemv(int device, uintptr_t x, bool x_half, uintptr_t w, uintptr_t w_scale, u
                            sm_count(device), on(stream));
 }
 
+int gemv_q(int device, uintptr_t q, uintptr_t scales, uintptr_t w, uintptr_t w_scale,
+           uintptr_t bias, uintptr_t out, bool out_half, int M, int N, int K, uintptr_t stream) {
+    if (!fits(false, K) || N < 1) return cudaErrorInvalidValue;
+    const OnDevice guard(device);
+    if (guard.error() != cudaSuccess) return guard.error();
+    return cozy_int8::gemv_q(at<const int8_t>(q), at<const float>(scales), at<const int8_t>(w),
+                             at<const float>(w_scale), at<const void>(bias), at<void>(out), out_half,
+                             M, N, K, on(stream));
+}
+
 int gemm(int device, int family, bool fp8, uintptr_t q, uintptr_t scales, uintptr_t w,
          uintptr_t w_scale, uintptr_t bias, uintptr_t out, int64_t ldo, bool out_half, int M,
          int N, int K, int config, nb::handle allocator, uintptr_t stream) {
@@ -206,6 +216,8 @@ NB_MODULE(_gemm, m) {
           "K"_a, "scale"_a, "shift"_a, "scale_stride"_a, "shift_stride"_a, "rows_per_entry"_a,
           "norm"_a, "eps"_a, "activation"_a, "up"_a, "stream"_a);
     m.def("gemv", &gemv, "device"_a, "x"_a, "x_half"_a, "w"_a, "w_scale"_a, "bias"_a, "out"_a,
+          "out_half"_a, "M"_a, "N"_a, "K"_a, "stream"_a);
+    m.def("gemv_q", &gemv_q, "device"_a, "q"_a, "scales"_a, "w"_a, "w_scale"_a, "bias"_a, "out"_a,
           "out_half"_a, "M"_a, "N"_a, "K"_a, "stream"_a);
     m.def("w4a8_gemm", &w4a8_gemm, "device"_a, "q"_a, "scales"_a, "w"_a, "s"_a, "codebook"_a,
           "w_scale"_a, "bias"_a, "out"_a, "out_half"_a, "M"_a, "N"_a, "K"_a, "config"_a, "stream"_a);

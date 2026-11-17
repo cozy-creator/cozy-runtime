@@ -62,6 +62,14 @@ cudaError_t fp8_quantize(const void* x, bool x_half, void* q, float* scales, int
 cudaError_t gemv(const void* x, bool x_half, const int8_t* w, const float* w_scale, const void* bias,
           void* out, bool out_half, int M, int N, int K, int sms, cudaStream_t stream);
 
+// The same linear for M <= kGemvRows from `rotate_quantize`'s `q` [M, K] and `scales` [M], in
+// MMVQ's shape (xs-213): blocks of four warps over kGemvQRows weight rows, 16 bytes a lane, so
+// no block repeats the activation's rotation. K % 16 == 0.
+constexpr int kGemvQRows = 2;
+cudaError_t gemv_q(const int8_t* q, const float* scales, const int8_t* w, const float* w_scale,
+                   const void* bias, void* out, bool out_half, int M, int N, int K,
+                   cudaStream_t stream);
+
 // D[M, N] = (q @ w.T) * scales[m] * w_scale[n] + bias[n], D's rows `ldo` elements apart (N, or
 // wider: sibling linears writing their column ranges of one output); `config` < 0 picks the tile
 // by shape, else names one (a sweep); cudaErrorNotSupported when that tile cannot take the problem.
