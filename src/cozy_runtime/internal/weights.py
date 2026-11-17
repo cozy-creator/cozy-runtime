@@ -1281,6 +1281,7 @@ class Placement:
             bakes.choose("bake")  # Followers open here; the invoke may then select per_step.
         for model in self.models.values():
             graphs.mark(model.module)
+        self.memory.read_ahead_models(self.models.values())
 
     def plan(self, steps: Sequence[str | Collection[str]], request: Request | None = None) -> None:
         self.steps = [frozenset([step] if isinstance(step, str) else step) for step in steps]
