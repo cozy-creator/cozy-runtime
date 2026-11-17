@@ -1381,9 +1381,11 @@ def install_encoder(plan: Plan, layout: CausalConvEncoder, *roots: nn.Module) ->
                 sites.append((block, *_block_site(layout, declared, block, path, index)))
     except _Mismatch as exc:
         return report(str(exc))
-    norms = [norm for _, _, site in sites for norm, _ in site.steps if norm is not None]
-    if any(_hooked(m) for m in (*(m for m, _, _ in sites), *norms)):
-        return report("a hook on a module the fused forwards take over or skip")
+    # A block's own hooks run around its fused forward (the memory manager pages a resnet block in by
+    # them); the norms and convs a fused block reads instead of calling would skip theirs.
+    skipped = [m for _, _, site in sites for step in site.steps for m in step if m is not None]
+    if any(_hooked(m) for m in skipped):
+        return report("a hook on a norm or conv the fused blocks read instead of calling")
     before = [_census(root) for root in roots]
     eager = [(module, type(module)) for module, _, _ in sites]
     for module, kind, site in sites:
