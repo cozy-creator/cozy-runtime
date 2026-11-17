@@ -342,7 +342,8 @@ class Backend:
                 [key],
             )
         shape = tuple(destination.shape)
-        if shape != tuple(row.shape) or (spec.nbytes and spec.nbytes != row.nbytes):
+        conv = row.encoded.scheme == "int8.convrot" and is_conv_declared(row.shape, shape)
+        if (shape != tuple(row.shape) and not conv) or (spec.nbytes and spec.nbytes != row.nbytes):
             raise _refuse(
                 "length_mismatch",
                 f"{key}: the destination is {shape} and the checkpoint supplies {row.shape} "
