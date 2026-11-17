@@ -3421,6 +3421,8 @@ def _layout(
         return  # An arbitrary binder has not declared immutable final bytes.
     aliases: dict[str, dict[str, str]] = {}
     finals: dict[str, dict[str, _Part]] = {}
+    #: each alias's final geometry, should the block hold all its targets as finals
+    whole: dict[str, dict[str, _Part]] = {}
     codes = {kind: code for code, kind in _DTYPES.items() if code != "F4"}
     for key, parts in block.parts.items():
         if binding is not None:
@@ -3442,6 +3444,7 @@ def _layout(
             }
         row_aliases = aliases[key] = {}
         row_finals = finals[key] = {}
+        row_whole = whole[key] = {}
         for name, layout in declared.items():
             if name not in model.sites:
                 raise ResidencyError(f"{model.name}: final layout names no target {name}")
@@ -3477,8 +3480,17 @@ def _layout(
             ):
                 assert layout.source is not None
                 row_aliases[name] = layout.source
+                row_whole[name] = _Part(layout.dtype, shape, count * width, "", strides)
             else:
                 row_finals[name] = _Part(layout.dtype, shape, count * width, "", strides)
+    if any(finals.values()) and any(aliases.values()):
+        # A block with a final holds every target there and none of its stored bytes beside it:
+        # aliased, its stored region stayed resident whole, its swizzled or cast parts' stored
+        # bytes too (cr-319: Qwen3.6-27B nvfp4's row-major scales, 1.0 GiB, beside their blocked
+        # finals). Its finals are copied from the stored bytes once a fill, or kept on the host.
+        for key, row in whole.items():
+            finals[key].update(row)
+            aliases[key] = {}
     block.aliases = aliases
     block.finals = {key: row for key, row in finals.items() if row}
     if model.fill is None and not block.finals:
