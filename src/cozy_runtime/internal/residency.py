@@ -1190,9 +1190,6 @@ class Memory:
         self.models: dict[nn.Module, Model] = {}
         self._working_phase_owners: dict[str, set[Model | Request]] = {}
         self.regions: weakref.WeakSet[Region] = weakref.WeakSet()
-        #: what holds weights only for speed (a streamed decode's kept blocks, `lm._Keeper`): asked
-        #: to let them go when a block it doesn't hold is refused room, before the refusal stands
-        self.sheds: list[Callable[[int], bool]] = []
         self.requests: set[Request] = set()
         self.last: RequestStats | None = None
         self.native: varena.Device | None = None
@@ -2276,21 +2273,6 @@ class Memory:
                 request.read(block, read_ns, read_bytes, bake=bake)
         return data
 
-    def _placed_after_shed(self, block: _Block, overlay: Hashable) -> bool:
-        """`block` placed after what holds weights only for speed let them go (`sheds`): False
-        when nothing did, or it still has no room. A refused block beside them is the refusal
-        that gives way first (cr-319: Klein's upsampler at a 6 GiB cap held 4.0 GiB of its 10.1
-        to decode streamed, and a 0.2 GiB layer it streams had no room; gate 44062127052)."""
-        need = block.allocation_bytes
-        if not any([shed(need) for shed in list(self.sheds)]):
-            return False
-        try:
-            self._ensure(block, True, overlay)
-        except Exhausted:
-            return False
-        block.gathered = None
-        return True
-
     def _gather(self, block: _Block, overlay: Hashable) -> None:
         """An embedding table that does not fit the room stays on the host: its forward looks up
         there and moves only the rows it read (`_gathering`), so a room below the table never
@@ -2375,14 +2357,11 @@ class Memory:
                     self._ensure(block, reclaim, overlay)
                     block.gathered = None
                 except Exhausted:  # varena refused its region before its forward ran
-                    if not (reclaim and self.cuda and not capturing):
+                    if not (block.table and reclaim and self.cuda and not capturing):
                         raise
-                    if not self._placed_after_shed(block, overlay):
-                        if not block.table:
-                            raise
-                        gathered = block.gathered is not None and block.gathered[0] == overlay
-                        with nullcontext() if gathered else self._read_told(block):
-                            self._gather(block, overlay)
+                    gathered = block.gathered is not None and block.gathered[0] == overlay
+                    with nullcontext() if gathered else self._read_told(block):
+                        self._gather(block, overlay)
             # A cached Hold can keep count > 0 across sequential threads or streams.
             # Every consumer needs readiness in addition to storage ownership.
             # Capture's owner joined the prepared stream before capture began. Waiting on
