@@ -116,6 +116,26 @@ class Prebuilt:
         q, scales = self.int8_quantize(flat)
         return self.int8_gemm(q, scales, data, scale, bias, out_dtype).view(shape)
 
+    def int8_gemv_q(
+        self, x: Tensor, data: Tensor, scale: Tensor, bias: Tensor | None, out_dtype: Dtype
+    ) -> Tensor:
+        """The linear for at most `GEMV_ROWS` rows as MMVQ runs one (xs-213): the rows rotated and
+        quantized once (`int8_quantize`), then the GEMV over them (`_gemm.gemv_q`)."""
+        flat = self._rows(INT8, x)
+        rows, width = flat.shape
+        bias = self._weight(INT8, data, scale, bias, width, out_dtype)
+        q, scales = self.int8_quantize(flat)
+        out: Tensor = self.torch.empty(
+            (*x.shape[:-1], data.shape[0]), dtype=out_dtype, device=x.device
+        )
+        code = _kernels._gemm.gemv_q(
+            self.index, q.data_ptr(), scales.data_ptr(), data.data_ptr(), scale.data_ptr(),
+            _ptr(bias), out.data_ptr(), self._half(out_dtype), rows, data.shape[0], width,
+            self._stream(),
+        )  # fmt: skip
+        self._check(code, "the GEMV")
+        return out
+
     def fp8_linear(
         self, x: Tensor, data: Tensor, scale: Tensor, bias: Tensor | None, out_dtype: Dtype
     ) -> Tensor:

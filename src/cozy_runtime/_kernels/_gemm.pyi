@@ -26,6 +26,20 @@ def quantize(
     up: int,
     stream: int,
 ) -> int: ...
+def gemv_q(
+    device: int,
+    q: int,
+    scales: int,
+    w: int,
+    w_scale: int,
+    bias: int,
+    out: int,
+    out_half: bool,
+    M: int,
+    N: int,
+    K: int,
+    stream: int,
+) -> int: ...
 def gemv(
     device: int,
     x: int,

@@ -406,6 +406,73 @@ __global__ void __launch_bounds__(kGemvThreads) gemv_kernel(
     }
 }
 
+constexpr int kGemvQThreads = 128;
+
+// R weight rows a block against M int8 rows already rotated and quantized: each lane takes 16
+// bytes of every row a step, the warps' sums meet in shared memory, and the row scales and bias
+// apply once. The activation is read from L2 once per R rows, never rotated again.
+template <typename Out, int M, int R>
+__global__ void __launch_bounds__(kGemvQThreads) gemv_q_kernel(
+    const int8_t* __restrict__ q, const float* __restrict__ qs, const int8_t* __restrict__ w,
+    const float* __restrict__ w_scale, const Out* __restrict__ bias, Out* __restrict__ out, int N,
+    int K) {
+    constexpr int kWarps = kGemvQThreads / 32;
+    __shared__ int partial[R][M][kWarps];
+    const int first = blockIdx.x * R;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int acc[R][M];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int m = 0; m < M; ++m) acc[r][m] = 0;
+#pragma unroll 2
+    for (int k = threadIdx.x * 16; k < K; k += kGemvQThreads * 16) {
+        int4 wv[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            wv[r] = first + r < N ? __ldg(reinterpret_cast<const int4*>(w + int64_t(first + r) * K + k))
+                                  : make_int4(0, 0, 0, 0);
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            const int4 xv = __ldg(reinterpret_cast<const int4*>(q + int64_t(m) * K + k));
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[r][m] = dot16(wv[r], xv, acc[r][m]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            int v = acc[r][m];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(kFull, v, o);
+            if (lane == 0) partial[r][m][warp] = v;
+        }
+    __syncthreads();
+    if (threadIdx.x >= R * M) return;
+    const int r = threadIdx.x / M, m = threadIdx.x % M, n = first + r;
+    if (n >= N) return;
+    int sum = 0;
+#pragma unroll
+    for (int i = 0; i < kWarps; ++i) sum += partial[r][m][i];
+    const float b = bias != nullptr ? as_float(bias[n]) : 0.f;
+    out[int64_t(m) * N + n] = from_float<Out>(float(sum) * qs[m] * w_scale[n] + b);
+}
+
+template <typename Out>
+cudaError_t gemv_q_as(const int8_t* q, const float* qs, const int8_t* w, const float* ws,
+                      const Out* bias, Out* out, int M, int N, int K, cudaStream_t s) {
+    constexpr int R = kGemvQRows;
+    const int blocks = (N + R - 1) / R;
+    switch (M) {
+        case 1: gemv_q_kernel<Out, 1, R><<<blocks, kGemvQThreads, 0, s>>>(q, qs, w, ws, bias, out, N, K); break;
+        case 2: gemv_q_kernel<Out, 2, R><<<blocks, kGemvQThreads, 0, s>>>(q, qs, w, ws, bias, out, N, K); break;
+        case 3: gemv_q_kernel<Out, 3, R><<<blocks, kGemvQThreads, 0, s>>>(q, qs, w, ws, bias, out, N, K); break;
+        default: gemv_q_kernel<Out, 4, R><<<blocks, kGemvQThreads, 0, s>>>(q, qs, w, ws, bias, out, N, K); break;
+    }
+    return cudaGetLastError();
+}
+
 template <typename T, bool kFp8>
 cudaError_t quantize_as(const void* x, void* q, float* scales, int M, int K,
                         const Prologue& prologue, cudaStream_t s) {
@@ -437,6 +504,17 @@ cudaError_t gemv_as(const T* x, const int8_t* w, const float* ws, const Out* bia
 }
 
 }  // namespace
+
+cudaError_t gemv_q(const int8_t* q, const float* scales, const int8_t* w, const float* w_scale,
+                   const void* bias, void* out, bool out_half, int M, int N, int K,
+                   cudaStream_t stream) {
+    if (M < 1 || M > kGemvRows || N < 1 || K < 16 || K % 16) return cudaErrorNotSupported;
+    if (out_half)
+        return gemv_q_as(q, scales, w, w_scale, static_cast<const __half*>(bias),
+                         static_cast<__half*>(out), M, N, K, stream);
+    return gemv_q_as(q, scales, w, w_scale, static_cast<const __nv_bfloat16*>(bias),
+                     static_cast<__nv_bfloat16*>(out), M, N, K, stream);
+}
 
 cudaError_t rotate_quantize(const void* x, bool x_half, int8_t* q, float* scales, int M, int K,
                             const Prologue& prologue, cudaStream_t stream) {
