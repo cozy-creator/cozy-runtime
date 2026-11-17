@@ -73,6 +73,7 @@ from cozy_runtime.internal.residency import (
     Request,
     TensorLayout,
     Weights,
+    joined,
     paging,
     split,
     uncached,
@@ -470,6 +471,9 @@ class Backend:
         }
         blocks = split(root, found, sizes)
         rule = rule if blocks == found else f"{rule}+split"
+        if self.memory.native is not None:
+            whole = joined(root, blocks, sizes, self.memory.granularity, self.memory.most_room()[0])
+            rule, blocks = (rule, blocks) if whole == blocks else (f"{rule}+joined", whole)
         bakes = self.bakes[name] = _Bakes(self, root, rows, set(blocks))
         routes = _Routes(self, rows)
         leg = self._leg(f"{name}.routes", leg)
