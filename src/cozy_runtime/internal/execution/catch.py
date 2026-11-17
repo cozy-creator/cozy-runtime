@@ -286,13 +286,15 @@ def nested[T](
     pure: bool,
 ) -> T:
     """A cut inside another site's leaf (an FFN or attention in a split's window), where native
-    selection can't open a second leaf: the coarsest level whose need the card's free room holds
-    now, no coarser than one refused before. A pure op refused there runs again a level finer,
-    the windows of the leaf around it kept (cr-305: H3's upscale ran its MLP whole inside a
-    window and ran out). The last level's refusal stands."""
+    selection can't open a second leaf: the coarsest level whose need the card's room holds now,
+    no coarser than one refused before. The room is the card less what is live and the weights in
+    use: what is unmapped, cached or held by idle weights, which varena reclaims for it. A pure op
+    refused there runs again a level finer, the windows of the leaf around it kept (cr-305: H3's
+    upscale ran its MLP whole inside a window and ran out). The last level's refusal stands."""
     device = request.memory.device.index or 0
-    free = int(vt.room(device)["free"])
-    fitting = next((at for at, (_, row) in enumerate(menu) if sum(row) <= free), len(menu) - 1)
+    room = vt.room(device)
+    usable = int(room["capacity"]) - int(room["working_live"]) - int(room["pinned"])
+    fitting = next((at for at, (_, row) in enumerate(menu) if sum(row) <= usable), len(menu) - 1)
     level = max(fitting, _NESTED.get(key, 0))
     while True:
         LEVELS[key] = level
