@@ -3239,7 +3239,9 @@ class _Engine:
         self.eager += 1
         why = vt.replay_differs([*state, *self._written(size, at)], replayed)
         if why:
-            why += "; " + self._explain(key[2], size, state, start, at, replayed, ops, launch, graph)
+            why += "; " + self._explain(
+                key[2], size, state, start, at, replayed, ops, launch, graph
+            )
             self._discard(key, graph, stream)
             self._unrecorded(key, why, "replay_mismatch")
 
