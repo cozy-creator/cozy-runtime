@@ -1070,6 +1070,10 @@ class _Pending:
     leaves: list[object]
     #: the package's plain context variables its call ran under (`_context`)
     context: tuple[tuple[contextvars.ContextVar[object], object], ...]
+    #: by leaf, the call's own integer or bool tensor on the host, its storage span (`_kept`)
+    values: list[Tensor | None]
+    #: one per device, recorded after those copies
+    copied: list[Event]
 
     def __call__(self) -> bool:
         tokens = [(var, var.set(value)) for var, value in self.context]
@@ -2522,18 +2526,43 @@ def _queue(
             or recorder.churned
         ):
             return
+        values, copied = _kept(torch, leaves)
         pending = recorder.queued[key] = _Pending(
-            torch, weakref.ref(module), call, key, spec, layout, context
+            torch, weakref.ref(module), call, key, spec, layout, context, values, copied
         )
     IDLE.add(pending)
 
 
+def _kept(torch: ModuleType, leaves: list[object]) -> tuple[list[Tensor | None], list[Event]]:
+    """The call's integer and bool tensors for its idle recording, each its storage span copied
+    to the host behind its stream, and an event per device after the copies. Seeded integers
+    (zeros) made every index the same: P-H3-Image's `index_copy_` writes raced, so its warm-up
+    and replay differed in every value and the check discarded a sound graph (cr-287)."""
+    values: list[Tensor | None] = []
+    devices: dict[TorchDevice, None] = {}
+    for leaf in leaves:
+        if not isinstance(leaf, torch.Tensor) or leaf.is_floating_point() or leaf.is_complex():
+            values.append(None)
+            continue
+        flat = leaf.detach().as_strided((_span(tuple(leaf.shape), leaf.stride()),), (1,))
+        values.append(flat.to("cpu", non_blocking=True, copy=True))  # pinned when on a GPU
+        if flat.is_cuda:
+            devices[flat.device] = None
+    copied: list[Event] = []
+    for device in devices:
+        with torch.cuda.device(device):
+            event = torch.cuda.Event()
+            event.record()
+        copied.append(event)
+    return values, copied
+
+
 def _content_inputs(torch: ModuleType, leaves: list[object]) -> str:
     """Why an idle recording can't check this signature ("" when it can): an idle recording
-    replays on seeded inputs (integers zero), so a call whose path depends on its token ids would
-    pass that check and replay unchecked on real ones. Anima's text encoder did: its graph,
-    recorded at idle, served outputs 2.85% (relative L2) from the call as written on real ids
-    (cr-300, pod-session 43795665114)."""
+    checks its graph on one call's ids, so a call whose path depends on its token ids would pass
+    that check and replay unchecked on others. Anima's text encoder did, checked on zeros before
+    cr-287: its graph, recorded at idle, served outputs 2.85% (relative L2) from the call as
+    written on real ids (cr-300, pod-session 43795665114)."""
     for leaf in leaves:
         if (
             isinstance(leaf, torch.Tensor)
@@ -2825,9 +2854,9 @@ def _record(
     placed: _Placed | None,
     submit: float,
 ) -> bool:
-    """Records `pending`'s signature at idle on seeded inputs of its layout, in its region's
-    capture pool: a warm-up run, measured, then the capture, kept when its replay is bit for bit
-    equal to the warm-up. Its pool gets one
+    """Records `pending`'s signature at idle on inputs of its layout (its call's own integers and
+    bools, seeded floats), in its region's capture pool: a warm-up run, measured, then the capture,
+    kept when its replay is bit for bit equal to the warm-up. Its pool gets one
     free run of `vt.pool_bytes` of the warm-up's peak beside what the pool holds, more if the
     capture takes more (`capture`). No room for its weights, warm-up, pool or capture: it runs as
     written until a call records it, the run says what it needed, and its next call queues it
@@ -2870,13 +2899,15 @@ def _record(
             with torch.cuda.stream(stream):
                 # Warm-up runs with ordinary Torch allocations, before graph-private storage.
                 seeded = torch.Generator(device=current.device).manual_seed(_SEED)
+                for event in pending.copied:
+                    event.synchronize()  # its call's values are on the host
                 warming = _WARMING.set(True)
                 try:
                     with attention_ulysses.observing() as served:
                         with _measured(owner.device) as peak:  # what its capture allocates
                             inputs: list[Tensor | None] = [
-                                _input(torch, v, seeded) if isinstance(v, _Leaf) else None
-                                for v in pending.leaves
+                                _input(torch, v, seeded, value) if isinstance(v, _Leaf) else None
+                                for v, value in zip(pending.leaves, pending.values, strict=True)
                             ]
                             cargs, ckwargs = _arguments(torch, pending.spec, pending.leaves, inputs)
                             took, metered = time.perf_counter(), IDLE.metered_ms
@@ -3639,24 +3670,27 @@ def _arguments(
     return args, kwargs
 
 
+def _span(shape: tuple[int, ...], stride: tuple[int, ...]) -> int:
+    """The elements a layout's storage spans, from its first to its last."""
+    return 1 + sum((n - 1) * s for n, s in zip(shape, stride, strict=True)) if all(shape) else 0
+
+
 def _static(torch: ModuleType, leaf: _Leaf) -> Tensor:
     """A static input of `leaf`'s layout, uninitialized: made inside a capture, from its pool."""
-    span = 1 + sum((n - 1) * s for n, s in zip(leaf.shape, leaf.stride, strict=True))
-    flat: Tensor = torch.empty(span if all(leaf.shape) else 0, dtype=leaf.dtype, device=leaf.device)
+    flat: Tensor = torch.empty(_span(leaf.shape, leaf.stride), dtype=leaf.dtype, device=leaf.device)
     return flat.as_strided(leaf.shape, leaf.stride)
 
 
-def _input(torch: ModuleType, leaf: _Leaf, generator: Generator) -> Tensor:
-    """A static input of `leaf`'s layout, seeded: floats standard normal (zeros would hide a
-    replay that drops work), bools fair coins, integers zero (a valid index into any table)."""
-    span = 1 + sum((n - 1) * s for n, s in zip(leaf.shape, leaf.stride, strict=True))
-    span = span if all(leaf.shape) else 0
+def _input(torch: ModuleType, leaf: _Leaf, generator: Generator, value: Tensor | None) -> Tensor:
+    """A static input of `leaf`'s layout: an integer or bool tensor its call's own `value`
+    (`_kept`), floats seeded standard normal (zeros would hide a replay that drops work)."""
+    span = _span(leaf.shape, leaf.stride)
     flat: Tensor = torch.zeros(span, dtype=leaf.dtype, device=leaf.device)
-    if flat.is_floating_point() or flat.is_complex():  # drawn wide, cast (fp8 draws nothing)
+    if value is not None:
+        flat.copy_(value, non_blocking=True)  # `value` lives with its `_Pending`
+    elif flat.is_floating_point() or flat.is_complex():  # drawn wide, cast (fp8 draws nothing)
         wide = torch.complex64 if flat.is_complex() else torch.float32
         flat.copy_(torch.randn(span, generator=generator, device=leaf.device, dtype=wide))
-    elif flat.dtype == torch.bool:
-        flat.copy_(torch.randint(0, 2, (span,), generator=generator, device=leaf.device))
     return flat.as_strided(leaf.shape, leaf.stride)
 
 
