@@ -315,7 +315,9 @@ def paging(module: nn.Module) -> tuple[str, list[str]]:
         for path, sub in module.named_modules()
         if path and any(kind.__name__ in names for kind in type(sub).__mro__)
     ]
-    found = [a for a in found if not any(b.startswith(a + ".") for b in found)]
+    # The innermost units: an outer one (a layer holding its experts) gives way to them.
+    outer = {prefix for path in found for prefix in _prefixes(path)}
+    found = [path for path in found if path not in outer]
     if found:
         return rule, found
     best, most = [], 0
@@ -338,13 +340,17 @@ _SPLIT_UNIT = 1 << 30
 _TABLE_UNIT = 64 << 20
 
 
-def _unit(name: str, blocks: Collection[str]) -> str:
-    """The block holding tensor `name` (its longest dotted prefix that is a block), "" for common."""
-    while name:
+def _prefixes(name: str) -> Iterator[str]:
+    """`name`'s proper dotted prefixes, longest first: `a.b.c` gives `a.b`, then `a`."""
+    while "." in name:
         name = name.rpartition(".")[0]
-        if name in blocks:
-            return name
-    return ""
+        yield name
+
+
+def _unit(name: str, blocks: Collection[str]) -> str:
+    """The block holding tensor `name` (its longest dotted prefix that is a block), "" for common.
+    `blocks` is a set or a mapping: a lookup per prefix, never a scan of the blocks."""
+    return next((prefix for prefix in _prefixes(name) if prefix in blocks), "")
 
 
 def split(module: nn.Module, paths: Sequence[str], sizes: Mapping[str, int]) -> list[str]:
@@ -353,16 +359,20 @@ def split(module: nn.Module, paths: Sequence[str], sizes: Mapping[str, int]) -> 
     largest children that hold no block, one at a time, until under. A new block over the bound splits
     the same way, down to single layers; one tensor over it stays whole. `sizes` are the stored bytes
     by module-relative tensor name. Hunyuan-Image-3 kept 10 GB of attention and dense layers in common
-    beside its expert blocks."""
+    beside its expert blocks. Linear in tensors and modules: each module's weighted bytes are summed
+    once, and a unit's bytes move with the blocks (Qwen3.6's 10,240 expert blocks took ~25 s a scan)."""
     modules = dict(module.named_modules())
     blocks = set(paths)
-
-    def held() -> dict[str, int]:
-        units: dict[str, int] = {}
-        for name, n in sizes.items():
-            unit = _unit(name, blocks)
-            units[unit] = units.get(unit, 0) + n
-        return units
+    #: every module path's stored bytes below it, and the paths that hold a block (a block and its parents)
+    below: dict[str, int] = {}
+    for name, n in sizes.items():
+        for prefix in _prefixes(name):
+            below[prefix] = below.get(prefix, 0) + n
+    holding = {prefix for block in blocks for prefix in (block, *_prefixes(block))}
+    units: dict[str, int] = {}
+    for name, n in sizes.items():
+        unit = _unit(name, blocks)
+        units[unit] = units.get(unit, 0) + n
 
     def free(path: str) -> list[tuple[int, str]]:
         """`path`'s weighted child modules that hold no block, through children that hold one."""
@@ -371,31 +381,41 @@ def split(module: nn.Module, paths: Sequence[str], sizes: Mapping[str, int]) -> 
             parent = stack.pop()
             for name, _ in modules[parent].named_children():
                 child = f"{parent}.{name}" if parent else name
-                if any(b == child or b.startswith(child + ".") for b in blocks):
+                if child in holding:
                     if child not in blocks:
                         stack.append(child)
-                elif size := sum(n for t, n in sizes.items() if t.startswith(child + ".")):
+                elif size := below.get(child, 0):
                     found.append((size, child))
         return sorted(found, reverse=True)
 
-    units = held()
+    def block(child: str, size: int, owner: str) -> None:
+        """`child`, which holds no block and lies in unit `owner`, becomes a block of its own."""
+        blocks.add(child)
+        holding.update((child, *_prefixes(child)))
+        units[owner] -= size
+        units[child] = size
+
     queue = [unit for unit, n in units.items() if n > _SPLIT_UNIT]
     while queue:
         unit = queue.pop()
-        if held().get(unit, 0) <= _SPLIT_UNIT:
+        if units.get(unit, 0) <= _SPLIT_UNIT:
             continue
         if unit:
             children = free(unit)
             if not children:
                 continue
+            # Its own tensors join the unit around it; its children's become theirs.
             blocks.discard(unit)
-            blocks.update(child for _, child in children)
+            around = _unit(unit + ".", blocks)
+            units[around] = units.get(around, 0) + units.pop(unit)
+            for size, child in children:
+                block(child, size, around)
             queue += ["", *(child for size, child in children if size > _SPLIT_UNIT)]
             continue
         for size, child in free(""):
-            if held().get("", 0) <= _SPLIT_UNIT:
+            if units.get("", 0) <= _SPLIT_UNIT:
                 break
-            blocks.add(child)
+            block(child, size, "")
             if size > _SPLIT_UNIT:
                 queue.append(child)
     # A table pages as its own unit, so one that does not fit the room gathers its rows on the
@@ -649,7 +669,7 @@ class Model:
         """The weight sites `groups` hold, mapped once: a LoRA bake binds one source block per
         linear, and walking every site for each took 6 s of Qwen's first step (cr-245)."""
         if self._block_sites is None:
-            paths = list(self.blocks)
+            paths = self.blocks
             held: dict[int, tuple[str, list[_Site]]] = {}
             for name, sites in self.sites.items():
                 path = _block_of(name, paths)
@@ -1381,17 +1401,21 @@ class Memory:
         tables = [p for p, sub in module.named_modules() if p and isinstance(sub, nn.Embedding)]
         sizes: dict[str, int] = {}
         by_path: dict[str, dict[str, dict[str, _Part]]] = {}
+        blocks = frozenset(paths)
+        #: each site group's names, once (a tied tensor's are several)
+        named: dict[int, list[str]] = {}
+        for name, sites in model.sites.items():
+            named.setdefault(id(sites), []).append(name)
         for key in tensors:
             if w.keys is not None and key not in w.keys:
                 continue
             bound = w.bound.get(key, key) if w.bound else key
-            path = _block_of(bound, paths)
+            path = _block_of(bound, blocks)
             # A tied tensor used by distinct modules stays common, so either forward sees
             # one live parameter. The declared encoded bind routes must name their targets.
             group = model.sites.get(bound)
             if group is not None:
-                aliases = [name for name, sites in model.sites.items() if sites is group]
-                if any(_block_of(name, paths) != path for name in aliases):
+                if any(_block_of(name, blocks) != path for name in named[id(group)]):
                     path = ""
             parts = {}
             for role, part in stored_parts(w.ck, w.component, key).items():
@@ -3181,8 +3205,10 @@ def _ahead(memory: Memory) -> dict[str, int]:
     }
 
 
-def _block_of(name: str, paths: Sequence[str]) -> str:
-    return max((p for p in paths if name == p or name.startswith(p + ".")), key=len, default="")
+def _block_of(name: str, paths: Collection[str]) -> str:
+    """The block holding `name` (itself, or its longest dotted prefix in `paths`), "" for common.
+    `paths` is a set or a mapping: a lookup per prefix, never a scan of the blocks."""
+    return name if name in paths else _unit(name, paths)
 
 
 def _sites(module: nn.Module) -> dict[str, list[_Site]]:
@@ -3405,15 +3431,18 @@ def _placeholder(
 
 def _placeholders(model: Model) -> None:
     done: set[int] = set()
+    #: each stored key's group, once: a lookup per site, where a scan of every group was 10,240
+    #: of them per site on Qwen3.6 (cr-307)
+    stored = {key: block for block in reversed(model.groups()) for key in block.parts}
     for name, sites in model.sites.items():
         meta = sites[0].table[sites[0].name]
         assert meta is not None  # a site is a slot that held a tensor
         if id(meta) in done or meta.device.type != "meta":
             continue
         done.add(id(meta))
-        block = next((b for b in model.groups() if name in b.parts), None)
+        block = stored.get(name)
         if block is None:
-            path = _block_of(name, list(model.blocks))
+            path = _block_of(name, model.blocks)
             block = model.blocks.get(path) or model.common
         if block is None:
             raise ResidencyError(f"{model.name}: no stored group for {name}")

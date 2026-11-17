@@ -25,7 +25,6 @@ from dataclasses import dataclass, field
 from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
-from tensorfs.raw import parts as stored_parts
 
 from cozy_runtime import graphs
 from cozy_runtime.author._errors import CapabilityError
@@ -465,10 +464,7 @@ class Backend:
         # The paging blocks, found once and split where a unit is too large: residency, the bakes
         # and the execution catch all read these (`Declared.blocks`).
         rule, found = paging(root)
-        sizes = {
-            bound[stored]: sum(part.length for part in stored_parts(checkpoint.ck, name, stored).values())
-            for stored in rows
-        }
+        sizes = {bound[stored]: row.stored_nbytes for stored, row in rows.items()}
         blocks = split(root, found, sizes)
         rule = rule if blocks == found else f"{rule}+split"
         if self.memory.native is not None:
