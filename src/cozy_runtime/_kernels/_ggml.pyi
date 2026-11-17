@@ -8,6 +8,7 @@ NOT_SUPPORTED: int
 OUT_OF_MEMORY: int
 UNKNOWN: int
 KERNELS: tuple[str, str, str, str]
+ACTIVATIONS: tuple[str, str, str]
 UPSTREAM: str
 
 def error_name(code: int) -> str: ...
@@ -18,6 +19,7 @@ def matmul(
     type: int,
     w: int,
     x: int,
+    x_type: int,
     out: int,
     K: int,
     N: int,

@@ -1,17 +1,18 @@
-"""llama.cpp's quantized matmuls for the `ggml.*` lanes (xs-213): MMVQ for a few rows, few-row MMQ
-and MMQ above, as ggml's own MUL_MAT rule picks among them per card, type and row count
-(`_kernels._ggml`, vendored from llama.cpp b12466). The weight stays its stored blocks; ggml
-quantizes the f32 activation to q8_1 and multiplies on dp4a or the int8 tensor cores, writing f32.
+"""llama.cpp's quantized matmuls for the `ggml.*` lanes (xs-213): MMVQ for a few rows, few-row
+MMQ and MMQ above, as ggml's own MUL_MAT rule picks among them per card, type and row count
+(`_kernels._ggml`, vendored from llama.cpp b12466). The weight stays its stored blocks; the
+activation (bf16, f16 or f32) is quantized to q8_1, and the kernels multiply on dp4a or the int8
+tensor cores, writing f32.
 
 It serves a card the module carries a kernel for once its probe agrees with the exact decode there
 (`kernel_ready.verified`), for a weight whose rows are whole 512-column chunks (ggml pads the last
 row of a weight to them and reads that far), contiguous and 16-byte aligned. Elsewhere the weight
 decodes a band of rows at a time and torch multiplies.
 
-A call's own memory beyond its input and output is at most `WORKING`: its rows go through in pieces
-(each piece's f32 copy, q8_1 activation and f32 product), or its weight's bands decode one at a
-time. That is below the floor a site plans a cut for (`execution.catch`), so a site plans a ggml
-linear as it plans any other.
+A call's own memory beyond its input and output is at most `WORKING`: its rows go through in
+pieces (each piece's q8_1 activation, an f32 copy of other dtypes, and its f32 product), or its
+weight's bands decode one at a time. That is below the floor a site plans a cut for
+(`execution.catch`), so a site plans a ggml linear as it plans any other.
 
 `torch` is the torch module: this module imports no torch.
 """
@@ -114,9 +115,13 @@ def unserved(blocks: Tensor, k: int) -> str:
 def matmul(
     ops: ModuleType, torch: ModuleType, x: Tensor, blocks: Tensor, scheme: str, n: int
 ) -> Tensor:
-    """f32 `x[..., K] @ W.T` for `n` rows of `scheme` blocks; raises what the module said."""
+    """f32 `x[..., K] @ W.T` for `n` rows of `scheme` blocks; raises what the module said. A bf16
+    or f16 `x` is quantized to q8_1 as it is; another dtype goes through f32."""
     k = int(x.shape[-1])
-    rows = x.reshape(-1, k).to(torch.float32).contiguous()
+    name = str(x.dtype).removeprefix("torch.")
+    if name not in ops.ACTIVATIONS:
+        x, name = x.to(torch.float32), "float32"
+    rows = x.reshape(-1, k).contiguous()
     out = torch.empty(rows.shape[0], n, dtype=torch.float32, device=x.device)
     index = x.get_device()
 
@@ -125,8 +130,9 @@ def matmul(
         return held
 
     code = ops.matmul(
-        index, TYPES[scheme], blocks.data_ptr(), rows.data_ptr(), out.data_ptr(), k, n,
-        int(rows.shape[0]), allocate, torch.cuda.current_stream(x.device).cuda_stream,
+        index, TYPES[scheme], blocks.data_ptr(), rows.data_ptr(), ops.ACTIVATIONS.index(name),
+        out.data_ptr(), k, n, int(rows.shape[0]), allocate,
+        torch.cuda.current_stream(x.device).cuda_stream,
     )  # fmt: skip
     if code != 0:
         said = ops.error() if code == ops.UNKNOWN else ops.error_name(code)
@@ -207,9 +213,13 @@ def _probe(torch: ModuleType, index: int, ops: ModuleType) -> verify.Verdict:
         core.decode(torch, {"blocks": blocks}, exact)
         for m in (1, 6, 48):
             x = (torch.randn(m, k, generator=generator) * 0.5).to(device)
-            got = matmul(ops, torch, x, blocks, scheme, n)
-            want = x.double() @ exact.double().t()
-            errors[f"{scheme} m={m}"] = verify.error(torch, got, want)
+            for dtype in (torch.float32, torch.bfloat16):
+                rows = x.to(dtype)
+                got = matmul(ops, torch, rows, blocks, scheme, n)
+                want = rows.double() @ exact.double().t()
+                errors[f"{scheme} m={m} {str(dtype).removeprefix('torch.')}"] = verify.error(
+                    torch, got, want
+                )
     return verify.within(errors, BUDGET)
 
 

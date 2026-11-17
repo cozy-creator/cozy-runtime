@@ -53,12 +53,12 @@ int kernel(int device, int type, int64_t K, int64_t N, int64_t M, uintptr_t w) {
     return cozy_ggml::kernel(device, type, reinterpret_cast<const void*>(w), K, N, M);
 }
 
-int matmul(int device, int type, uintptr_t w, uintptr_t x, uintptr_t out, int64_t K, int64_t N, int64_t M,
+int matmul(int device, int type, uintptr_t w, uintptr_t x, int x_type, uintptr_t out, int64_t K, int64_t N, int64_t M,
            nb::handle allocator, uintptr_t stream) {
     const OnDevice guard(device);
     if (guard.error() != cudaSuccess) return guard.error();
     Held held{allocator, {}};
-    return cozy_ggml::matmul(device, type, reinterpret_cast<const void*>(w), reinterpret_cast<const float*>(x),
+    return cozy_ggml::matmul(device, type, reinterpret_cast<const void*>(w), reinterpret_cast<const void*>(x), x_type,
                              reinterpret_cast<float*>(out), K, N, M, &allocate, &held,
                              reinterpret_cast<cudaStream_t>(stream));
 }
@@ -74,6 +74,7 @@ NB_MODULE(_ggml, m) {
     m.def("error_name", [](int code) { return cudaGetErrorName(cudaError_t(code)); });
     m.def("error", [] { return cozy_ggml::error(); });
     m.def("kernel", &kernel, "device"_a, "type"_a, "K"_a, "N"_a, "M"_a, "w"_a);
-    m.def("matmul", &matmul, "device"_a, "type"_a, "w"_a, "x"_a, "out"_a, "K"_a, "N"_a, "M"_a, "allocate"_a.none(),
-          "stream"_a);
+    m.attr("ACTIVATIONS") = nb::make_tuple("float32", "bfloat16", "float16");
+    m.def("matmul", &matmul, "device"_a, "type"_a, "w"_a, "x"_a, "x_type"_a, "out"_a, "K"_a, "N"_a, "M"_a,
+          "allocate"_a.none(), "stream"_a);
 }

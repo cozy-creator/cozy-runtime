@@ -16,11 +16,14 @@ enum Kernel { kNone = 0, kMmvq = 1, kMmqFew = 2, kMmq = 3 };
 // The kernel for the `type` weights [N, K] at `w` times M rows of a 256-byte aligned activation on `device`.
 int kernel(int device, int type, const void* w, int64_t K, int64_t N, int64_t M);
 
-// out[M, N] (f32) = x[M, K] (f32) times the [N, K] ggml blocks at `w`, on `stream`; temporaries from
-// `allocate(bytes, context)`, held by the caller until this returns. A CUDA error code; a failure ggml itself
+// The activation's element types.
+enum Activation { kF32 = 0, kBF16 = 1, kF16 = 2 };
+
+// out[M, N] (f32) = x[M, K] (dense rows of `x_type`) times the [N, K] ggml blocks at `w`, on `stream`; temporaries
+// from `allocate(bytes, context)`, held by the caller until this returns. A CUDA error code; a failure ggml itself
 // raises is cudaErrorUnknown, its message in `error()`.
-int matmul(int device, int type, const void* w, const float* x, float* out, int64_t K, int64_t N, int64_t M,
-           void* (*allocate)(size_t, void*), void* context, cudaStream_t stream);
+int matmul(int device, int type, const void* w, const void* x, int x_type, float* out, int64_t K, int64_t N,
+           int64_t M, void* (*allocate)(size_t, void*), void* context, cudaStream_t stream);
 
 const char* error();
 
