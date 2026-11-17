@@ -727,7 +727,7 @@ class _Told:
             if not closed:
                 thought, answer = text, ""
                 if not ended:
-                    thought = _held(thought, [THOUGHT_END])
+                    thought = _firm(thought, [THOUGHT_END])
         # A text decoded again that no longer starts as told (a token's bytes merged) is told no
         # more: what it ends as is what `Final` says.
         deltas: list[Delta] = []
@@ -755,7 +755,7 @@ class _Words:
         self.made += text
         words = self.made.lstrip()
         cut = _cut(words, self.stop)
-        words = (cut if len(cut) < len(words) else _held(words, self.stop)).rstrip()
+        words = (cut if len(cut) < len(words) else _firm(words, self.stop)).rstrip()
         return self._more(words)
 
     def end(self, answer: str) -> str:
@@ -786,7 +786,7 @@ def _cut(text: str, stop: list[str]) -> str:
     return text[: min((at for s in stop if (at := text.find(s)) >= 0), default=len(text))]
 
 
-def _held(text: str, ends: list[str]) -> str:
+def _firm(text: str, ends: list[str]) -> str:
     """`text` less its longest tail that may be the start of one of `ends`."""
     tail = max((n for end in ends for n in range(1, len(end)) if text.endswith(end[:n])), default=0)
     return text[: len(text) - tail]
