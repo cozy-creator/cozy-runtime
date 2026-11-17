@@ -2002,9 +2002,9 @@ class Memory:
 
     def _use(self, block: _Block, *, final: bool = False) -> varena.Use:
         """`block`'s bytes pinned for this stream. An idle request takes only what is resident."""
-        if not final and block.prefilled is not None:
-            use, block.prefilled = block.prefilled, None
-            return use
+        if not final and (prefilled := block.prefilled) is not None:
+            block.prefilled = None
+            return prefilled
         request = _REQUEST.get()
         if request is not None and request.idle:
             region = block.final_region if final else block.region
