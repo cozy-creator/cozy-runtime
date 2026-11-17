@@ -5070,9 +5070,8 @@ class Executor:
             if group is not None:
                 group.broadcast(commands.encode(command))
             for parameter in getattr(command, "build", ()):
-                model = child.models.get(parameter)
-                if isinstance(model, _OnDemand):
-                    model._cozy_build()
+                if isinstance(proxy := child.models.get(parameter), _OnDemand):
+                    proxy._cozy_build()
             if self.memory is not None:
                 members = [m for m in child.model_executors or [child] if m.backend is not None]
                 if command.level == "ram":
