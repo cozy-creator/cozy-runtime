@@ -5,7 +5,8 @@ gate's package copy calls `arm` once at import. The Runtime then digests every c
 call's outputs, records each split decision and, by arm, turns on varena's checks, presses the card
 before the second request, or runs every component root as written. The rows go in the execution
 record as `loops`. A package can't import the Runtime's internals (cr-329: Runtime 0.48's contract
-refused the hook that did), so the arms live here.
+refused the hook that did), so the arms live here. Not the author API: inert unless the machine is a
+dev machine (`dev = true` in its config.toml, its executors' Start).
 """
 
 from __future__ import annotations
@@ -48,14 +49,16 @@ _held: list[Tensor] = []
 
 
 def arm(checks: Mapping[str, bool] | None = None, press: Press = "") -> None:
-    """This process's arm, once. `checks` names varena's (`unmap_idle`, `perturb`, `guards`);
-    `press` is what the second request meets: "refill", the card filled and let go before it, so
-    a kept graph's weights left and come back; "hold", kept filled through it; "eager", every
-    component root runs as written, no graph."""
+    """This process's arm, once, on a dev machine only (elsewhere nothing). `checks` names
+    varena's (`unmap_idle`, `perturb`, `guards`); `press` is what the second request meets:
+    "refill", the card filled and let go before it, so a kept graph's weights left and come back;
+    "hold", kept filled through it; "eager", every component root runs as written, no graph."""
+    from cozy_runtime import graphs
+
+    if not graphs.AUDIT:  # set from the executor's Start: the machine's `dev = true`
+        return
     import tensorfs.varena.torch as vt
     import torch
-
-    from cozy_runtime import graphs
     from cozy_runtime.author._errors import DoesNotFit
     from cozy_runtime.internal import executor
     from cozy_runtime.internal.execution import catch
