@@ -734,7 +734,8 @@ class Outputs(_Bound):
         parameters, starting on a keyframe, on a zero-based fixed frame clock; otherwise it
         refuses `video_copy_incompatible` before `soundtrack` is called. `soundtrack` receives
         each video's frame count and returns an audio-only header and its chunks on the
-        zero-based sample clock, encoded as `save_video_stream` encodes audio.
+        zero-based sample clock, encoded as `save_video_stream` encodes audio. A video this attempt
+        saved lives on in the join, so it need not be returned, as with `join_video`.
         """
         self._attempt.check_open("Outputs.save_video_concat")
         _codec.require_encoder()
@@ -748,7 +749,9 @@ class Outputs(_Bound):
             samples = sum(e.sample_count for e in source if isinstance(e, DecodedAudioChunk))
             frames = sum(shape.frame_count for shape in shapes)
             handle = self._attempt.next_handle(VideoFile.kind)
-            return self._unwritten(handle, _Picture.of(shapes[0]), audio_format, frames, samples)
+            saved = self._unwritten(handle, _Picture.of(shapes[0]), audio_format, frames, samples)
+            self._attempt.shown.update(video.ref for video in videos)
+            return saved
         paths = []
         for video in videos:
             if (
@@ -795,7 +798,7 @@ class Outputs(_Bound):
                 video._check_file()
             return audio_samples
 
-        return self._save_mp4(
+        joined = self._save_mp4(
             _VideoFormat(
                 width=copy.width,
                 height=copy.height,
@@ -811,6 +814,8 @@ class Outputs(_Bound):
             feed,
             copy,
         )
+        self._attempt.shown.update(video.ref for video in videos)
+        return joined
 
     def join_video(self, audio: DecodedAudioFormat | None) -> VideoJoin:
         """A packet-copy join that grows one video at a time, for publishing as it grows.
