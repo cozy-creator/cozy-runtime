@@ -1,0 +1,1 @@
+`Outputs.save_video_concat` takes its videos into the join, as `join_video` does. A video the attempt saved and joined no longer needs to be returned. A call that returned only the join was refused `unreturned_handle`; MiniMax H3's pickup from a take without latents failed this way (packages#953).
