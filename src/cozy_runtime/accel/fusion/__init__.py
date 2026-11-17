@@ -36,7 +36,8 @@ and with the SiLU after it where the package names that pair (`ChannelNorm`, `in
 A video VAE decoding a lone image frame skips its causal convolutions' zero taps and padded
 copies, and upsamples in its own dtype (`LoneFrame`, `install_lone_frame`). A causal-conv video
 encoder runs NDHWC in fp16, each norm, SiLU and pad one pass and each conv accumulating in fp16
-with its residual in its epilogue (`CausalConvEncoder`, `install_encoder`).
+with its residual in its epilogue, and a lone frame on each conv's last temporal tap alone
+(`CausalConvEncoder`, `install_encoder`).
 """
 
 from __future__ import annotations
@@ -361,6 +362,7 @@ if TYPE_CHECKING:
     class _FusedConv(nn.Module):
         weight: Tensor
         bias: Tensor | None
+        kernel_size: tuple[int, ...]
         stride: tuple[int, ...]
         dilation: tuple[int, ...]
         groups: int
@@ -1210,6 +1212,11 @@ class PaddedConv:
     pad: Callable[[nn.Module], tuple[int, int, int, int]]
 
 
+#: What a causal-conv encoder runs for a lone frame (a picture): each conv's last temporal tap (cr-323). In its plan
+#: report, which the release gate's `h3-vae-picture` cell reads, and in its plan identity.
+_LONE_FRAME = "last_tap"
+
+
 @dataclass(frozen=True)
 class CausalConvEncoder:
     """A causal-conv video encoder as Runtime runs it (cr-306): fp16 activations `channels_last_3d` from one conv to the
@@ -1217,7 +1224,8 @@ class CausalConvEncoder:
     alone: its statistics never mix frames), and every conv accumulating in fp16 (`accumulate`; its deepest reductions
     in fp32) with its bias and its block's residual in its epilogue. comfy-kitchen's kernels (#167), as ComfyUI's
     MiniMax H3 encoder runs under `--fast fp16_accumulation`. `blocks` are the forwards Runtime takes over; any other
-    module calling a declared conv gets the fused conv alone. Anything the kernels decline runs on torch."""
+    module calling a declared conv gets the fused conv alone. Anything the kernels decline runs on torch. A lone
+    frame (a picture) runs each conv on its last temporal tap alone, the only one it meets (cr-323)."""
 
     conv: CausalConv
     norm: type[nn.Module]
@@ -1290,20 +1298,28 @@ def _causal(
     extra: tuple[int, int, int, int] = (0, 0, 0, 0),
     residual: Tensor | None = None,
 ) -> Tensor:
-    """`conv(pad(silu(norm(x))))` [+ residual]: the pass that normalizes and pads, then the conv."""
+    """`conv(pad(silu(norm(x))))` [+ residual]: the pass that normalizes and pads, then the conv. A lone frame (a
+    picture) meets only the filter's last temporal tap, its causal zero frames the others: the pass writes no zero
+    frames and the conv runs on that tap alone (cr-323)."""
     (left, right, top, bottom), front, fill = site.layout.conv.padding(conv)
+    fused = cast("_FusedConv", conv)
+    lone = _lone_frame(x, fused, front)
     padding: Padding = (
         (left + extra[0], right + extra[1], top + extra[2], bottom + extra[3]),
-        front,
+        0 if lone else front,
         fill,
     )
     module = kernels if kernels is not None else _conv.kernels(site.index)
-    if norm is not None or any(padding[0]) or front:
+    if norm is not None or any(padding[0]) or padding[1]:
         assert module is not None  # `_conv_kernels` served this call
         x = _conv.norm_pad(module, x, _norm_of(norm), padding, silu=norm is not None)
-    fused = cast("_FusedConv", conv)
     stride = cast("tuple[int, int, int]", tuple(fused.stride))
-    return _conv.conv3d(kernels, x, fused.weight, fused.bias, residual, stride)
+    return _conv.conv3d(kernels, x, fused.weight, fused.bias, residual, stride, last_tap=lone)
+
+
+def _lone_frame(x: Tensor, conv: _FusedConv, front: int) -> bool:
+    """`x` is one frame and `conv` pads exactly its other temporal taps with zero frames before it."""
+    return int(x.shape[2]) == 1 and front > 0 and front == int(conv.kernel_size[0]) - 1
 
 
 def _causal_forward(self: nn.Module, x: Tensor, *args: object, **kwargs: object) -> Tensor:
@@ -1345,6 +1361,7 @@ def install_encoder(plan: Plan, layout: CausalConvEncoder, *roots: nn.Module) ->
     document: dict[str, object] = {
         "conv": layout.conv.conv.__qualname__,
         "accumulate": layout.accumulate,
+        "lone_frame": _LONE_FRAME,
     }
 
     def report(reason: str = "", **counts: int) -> str:
@@ -1409,7 +1426,11 @@ def install_encoder(plan: Plan, layout: CausalConvEncoder, *roots: nn.Module) ->
 
 
 def _encoder_identity(layout: CausalConvEncoder) -> str:
-    document = {"kernels": prebuilt.artifact("_conv"), "layout": layout.contract()}
+    document = {
+        "kernels": prebuilt.artifact("_conv"),
+        "layout": layout.contract(),
+        "lone_frame": _LONE_FRAME,
+    }
     encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
     return "sha256:" + hashlib.sha256(b"cozy.fusion.causal-conv-encoder\0" + encoded).hexdigest()
 

@@ -1,0 +1,1 @@
+`fusion.CausalConvEncoder` (cr-323): a lone frame (a picture: P-H3-Image, MiniMax-H3-Image references, H3's reference pictures) runs each causal conv on its last temporal tap alone, the only one it meets, with no zero frames padded in front: a third of the conv work, through the same fp16-accumulate kernel. Its plan report says `"lone_frame": "last_tap"`.

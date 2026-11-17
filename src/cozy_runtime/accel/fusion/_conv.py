@@ -110,11 +110,16 @@ def conv3d(
     bias: Tensor | None,
     residual: Tensor | None,
     stride: tuple[int, int, int],
+    *,
+    last_tap: bool = False,
 ) -> Tensor:
     """`conv3d(x, weight) + bias + residual`, unpadded, `channels_last_3d` in and out: the
     kernel accumulating in fp16 (its deepest reductions in fp32) where `module` serves the shape,
-    else torch's convolution."""
+    else torch's convolution. `last_tap`: `x` is one frame, convolved with the filter's last
+    temporal tap alone (a 2-D convolution)."""
     with readable(weight, bias) as (weight, bias):
+        if last_tap:
+            weight = weight[:, :, -1:]
         weight = weight.contiguous(memory_format=torch.channels_last_3d)
         n, c, d, h, w = (int(v) for v in x.shape)
         k, _, kt, kr, ks = (int(v) for v in weight.shape)
@@ -158,7 +163,11 @@ def conv3d(
             if code != -1:
                 raise RuntimeError(f"cozy conv: conv3d: {module.error_name(code)}")
         x = x.contiguous(memory_format=torch.channels_last_3d)
-        out = torch.nn.functional.conv3d(x, weight, bias, stride)
+        if last_tap:
+            out = torch.nn.functional.conv2d(x[:, :, 0], weight[:, :, 0], bias, stride[1:])
+            out = out.unsqueeze(2)
+        else:
+            out = torch.nn.functional.conv3d(x, weight, bias, stride)
         out = out.contiguous(memory_format=torch.channels_last_3d)
     return out if residual is None else out.add_(residual)
 
