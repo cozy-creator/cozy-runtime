@@ -1042,6 +1042,14 @@ class Binding:
                             assert self.regions is not None
                             uses.update((region, region.pin()) for region in self.regions)
                         else:
+                            if memory.native is not None and any(
+                                b.data is None and not b.cached() for b in self.groups
+                            ):
+                                # Its phase planned before its first fill, as a forward plans it,
+                                # so the core's worker fills each next block while this thread
+                                # binds the one before: a decode's hold comes before any forward,
+                                # and filled Qwen3.6's 10,541 blocks one at a time (cr-307).
+                                memory._activate_phase(self.model)
                             for block in self.groups:
                                 memory._enter(block)
                                 entered.append(block)
