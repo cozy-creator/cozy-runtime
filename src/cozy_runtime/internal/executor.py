@@ -1039,6 +1039,13 @@ class _OnDemand:
             with contextlib.suppress(SeamError):
                 self._need(request_id)
 
+    def _cozy_build(self) -> None:
+        """Built now, as its first read would build it: a predicted request that reads it, loaded
+        ahead (`Executor.map`, cl-1123). Nothing once it is built."""
+        with self._lock:
+            if self._model is None:
+                self._model = self._build()
+
     @property
     def _cozy_residency(self) -> Residency | None:
         residency: Residency | None = getattr(self._model, "_cozy_residency", None)
@@ -5048,7 +5055,9 @@ class Executor:
 
     def map(self, command: Map) -> Reply:
         """TensorD's warming: one loaded construction's models at `command.level`, on every GPU
-        of a group."""
+        of a group; the on-demand ones `command.build` names built first, as a call's first read
+        of each would build them (cl-1123: a predicted request's, so its first step builds
+        nothing). A TensorFS whose `Map` names none builds none."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         child = self.constructions.get(command.construction)
@@ -5060,6 +5069,10 @@ class Executor:
         try:
             if group is not None:
                 group.broadcast(commands.encode(command))
+            for parameter in getattr(command, "build", ()):
+                model = child.models.get(parameter)
+                if isinstance(model, _OnDemand):
+                    model._cozy_build()
             if self.memory is not None:
                 members = [m for m in child.model_executors or [child] if m.backend is not None]
                 if command.level == "ram":

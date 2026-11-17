@@ -1,0 +1,1 @@
+A machine loading a predicted request ahead builds the on-demand models that request reads (Qwen Image's prompt enhancer, its Turbo LoRA) along with the rest, so a call of it builds nothing in its first step. TensorD names them in `Map`'s `build`; a TensorFS whose `Map` has no `build` builds none, as before.
