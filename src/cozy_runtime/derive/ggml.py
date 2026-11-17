@@ -28,6 +28,16 @@ BLOCKS = {
     "ggml.q6_k": 256,
 }
 
+#: Each block type's bytes per block (`ggml-common.h`).
+BYTES = {
+    "ggml.q8_0": 34,
+    "ggml.q5_0": 22,
+    "ggml.q5_1": 24,
+    "ggml.q4_k": 144,
+    "ggml.q5_k": 176,
+    "ggml.q6_k": 210,
+}
+
 #: llama-quantize's file types (`LLAMA_FTYPE_MOSTLY_*`) a plan may name: each mix's default type.
 MIXES = {"ggml.q4_k_m": "ggml.q4_k"}
 
