@@ -1222,6 +1222,8 @@ class Memory:
         )
         self._phase_plan_keys: dict[frozenset[str], str] = {}
         self._phase_plan_models: set[Model] = set()
+        #: what the active plan was built from (`_phase_stamp`): the same stamp is the same plan
+        self._phase_plan_stamp: tuple[object, ...] | None = None
         self._phase_plan_status: tuple[object, ...] | None = None
         self._phase_names: frozenset[str] | None = None
         self._phase_request: str | None = None
@@ -2030,6 +2032,7 @@ class Memory:
                 self._phase_plan.deactivate()
                 self._phase_plan = None
                 self._phase_plan_signature = None
+                self._phase_plan_stamp = None
                 self._phase_plan_keys = {}
                 self._phase_plan_models.clear()
                 self._note_phase_plan("unplanned", reason)
@@ -2078,6 +2081,15 @@ class Memory:
         request = _REQUEST.get()
         steps = [] if request is None else [frozenset(step) for step in request.steps]
         order = list(dict.fromkeys(names if names & step else step for step in steps))
+        stamp = self._phase_stamp(names, order)
+        if self._phase_plan is not None and stamp == self._phase_plan_stamp:
+            # Its Regions can't have changed: every change of one retires the plan. Each forward
+            # re-plans in O(models), not O(blocks) (cr-307: 10,541 of them for Qwen3.6).
+            try:
+                self._phase_plan.activate(self._phase_plan_keys[names])
+            except NotImplementedError:
+                self._retire_phase_plan("multiple_arenas")
+            return
         phases = [] if names in order else [(names, *self._phase_regions(names))]
         phases += [(step, *self._phase_regions(step)) for step in order]
         reason = next((why for step, _, _, why in phases if step == names), "")
@@ -2109,10 +2121,26 @@ class Memory:
                 if any(model.name in step for step, _ in planned)
             }
             self._note_phase_plan("active", native=self._phase_plan.facts())
+        self._phase_plan_stamp = stamp
         try:
             self._phase_plan.activate(self._phase_plan_keys[names])
         except NotImplementedError:
             self._retire_phase_plan("multiple_arenas")
+
+    def _phase_stamp(self, names: frozenset[str], order: list[frozenset[str]]) -> tuple[object, ...]:
+        """What a plan of `names` among `order` is built from, short of its Regions: the phases,
+        and each model in them with its representation (`_phase_regions` reads the same)."""
+        named = names.union(*order)
+        return (
+            names,
+            tuple(order),
+            tuple(
+                (id(model), model.identity, model.wanted_identity(), model.layout_identity,
+                 model.generation, model.closed, model.retiring)
+                for model in self.models.values()
+                if model.name in named
+            ),
+        )
 
     def _activate_phase(self, model: Model) -> None:
         """Declare a component-phase boundary; native policy retains/evicts actual pages."""
