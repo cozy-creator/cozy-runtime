@@ -2676,6 +2676,8 @@ class RequestStats(TypedDict):
     working_splits: list[SplitRecord]
     escaped: list[EscapeRecord]
     retries: int
+    #: `Request.hosted`
+    hosted: dict[str, str]
     regrown: int
     swallowed_ooms: int
     retained_bytes: int
@@ -2912,8 +2914,9 @@ class Request:
         #: refusals the Runtime answered by running again another way (a pure op's finer split, an LM
         #: token decoded eagerly for a capture its pool couldn't hold): zero in a normal run
         self.retries = 0
-        #: split sites whose whole output the card had no room for: kept in host memory (cr-305)
-        self.hosted: set[str] = set()
+        #: split sites whose whole output the card had no room for, kept in host memory (cr-305): the
+        #: card's room when its allocation was refused there, or "" when selection chose host
+        self.hosted: dict[str, str] = {}
         #: refusals a CUDA graph capture answered by recording again with room for them
         #: (`graphs.capture`): what runs is the same
         self.regrown = 0
@@ -3064,6 +3067,7 @@ class Request:
             "working_splits": list(self.working_splits.values()),
             "escaped": list(self.escaped),
             "retries": self.retries,
+            "hosted": dict(self.hosted),
             "regrown": self.regrown,
             "swallowed_ooms": self.swallowed_ooms,
             "retained_bytes": self.retained_bytes,
