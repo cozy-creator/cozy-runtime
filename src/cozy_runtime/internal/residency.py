@@ -2458,7 +2458,7 @@ class Memory:
 
     def _start_probe(self, block: _Block, capturing: bool) -> None:
         """Measure `block` if it is its model's first at this pass shape in this process: the
-        working peak resets here, and `_end_probe` reads it with the driver's free bytes (cr-305)."""
+        working peak resets here, and `_end_probe` reads it beside varena's room (cr-305)."""
         request = _REQUEST.get()
         key = (block.model.name, PASS_SHAPE.get())
         if (
@@ -2472,13 +2472,11 @@ class Memory:
             return
         device = self.device.index or 0
         request.sample()  # the request keeps its peak so far
-        free = int(torch.cuda.mem_get_info(device)[0])
         stats, room = vt.stats(device), vt.room(device)
         vt.reset_peak(device)
         self._probe = _Probe(
             block,
             key,
-            free,
             int(stats["mapped_bytes"]),
             int(stats["allocated_bytes"]),
             int(room["weights_resident"]),
@@ -2492,15 +2490,15 @@ class Memory:
         request = _REQUEST.get()
         if request is None:
             return
-        free = int(torch.cuda.mem_get_info(device)[0])
         stats, room = vt.stats(device), vt.room(device)
-        mapped, weights = int(stats["mapped_bytes"]), int(room["weights_resident"])
         peak, allocated = int(stats["allocated_peak"]), int(stats["allocated_bytes"])
         request.first_blocks.append(
             {
                 "block": f"{probe.block.model.component}/{probe.block.path}",
                 "shape": probe.key[1],
-                "non_torch": (probe.free - free) - (mapped - probe.mapped) - (weights - probe.weights),
+                # varena's room samples the driver: what it lost outside varena's pages
+                "non_torch": probe.capacity - int(room["capacity"]),
+                "mapped_growth": int(stats["mapped_bytes"]) - probe.mapped,
                 "peak_above_entry": peak - probe.allocated,
                 "transient": peak - allocated,
                 "fragmentation": int(stats["mapped_peak"]) - peak,
@@ -2889,13 +2887,15 @@ class RequestStats(TypedDict):
 
 class FirstBlock(TypedDict):
     """A model's first block at a pass shape, measured as vLLM's profile run splits a forward, in
-    bytes: what the driver lost beyond varena's own pages (`non_torch`: context, library
-    workspaces, kernel modules), the working peak above entry, its `transient` part (the peak less
-    what the block left allocated), and mapped less allocated at the peaks (`fragmentation`)."""
+    bytes: the room it lost outside varena's pages (`non_torch`: context, library workspaces,
+    kernel modules), the working pages it mapped, the working peak above entry, its `transient`
+    part (the peak less what the block left allocated), and mapped less allocated at the peaks
+    (`fragmentation`)."""
 
     block: str
     shape: int
     non_torch: int
+    mapped_growth: int
     peak_above_entry: int
     transient: int
     fragmentation: int
@@ -2911,7 +2911,6 @@ class _Probe:
 
     block: _Block
     key: tuple[str, int]
-    free: int
     mapped: int
     allocated: int
     weights: int
