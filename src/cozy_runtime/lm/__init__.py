@@ -80,6 +80,7 @@ from cozy_runtime.graphs import (
     capture_domain,
     close_pool,
     no_room,
+    observe,
     safeguard,
     say,
 )
@@ -88,6 +89,7 @@ from cozy_runtime.internal import cache_owners, contract
 from cozy_runtime.lm import _kernels
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
     from types import ModuleType
 
     from torch.utils.hooks import RemovableHandle
@@ -3101,6 +3103,14 @@ class _Engine:
                 return
             capturing = time.perf_counter()
             reserve, why = vt.pool_bytes(self.peaks[key]), ""
+            # Its ops and kernels, set beside the step as written's when its check differs.
+            traced, ops = observe.trace(torch)
+            launch = _STEPS[0]
+
+            def step() -> None:
+                with cast("AbstractContextManager[object]", traced):
+                    self._advance(size)
+
             try:
                 with (
                     self._graph_memory(drafted),
@@ -3116,7 +3126,7 @@ class _Engine:
                     try:
                         graph, why = capture(
                             torch,
-                            lambda: self._advance(size),
+                            step,
                             pool,
                             domain,
                             reserve,
@@ -3153,7 +3163,7 @@ class _Engine:
                     vt.pool_scratch(_set(self.pool).handle, (), domain.device)
                 except (RuntimeError, ValueError) as exc:  # A live allocation: it stays mapped.
                     safeguard("scratch_declined", str(exc))
-                self._verify(key, graph, size)
+                self._verify(key, graph, size, ops, launch)
                 return
             elif why:
                 self._unrecorded(key, why)
@@ -3186,9 +3196,17 @@ class _Engine:
         layers = [layer for layer in _layers(_set(self.cache)) if isinstance(layer, _Keys)]
         return [buffer[rows, :, at] for layer in layers for buffer in (layer.keys, layer.values)]
 
-    def _verify(self, key: _Key, graph: torch.cuda.CUDAGraph, size: int) -> None:
+    def _verify(
+        self,
+        key: _Key,
+        graph: torch.cuda.CUDAGraph,
+        size: int,
+        ops: list[tuple[object, ...]],
+        launch: Launch | None,
+    ) -> None:
         """A new graph's one check: its replay, then this token's eager step from the same
-        state, last so that what serves the call is eager's. A difference discards the graph."""
+        state, last so that what serves the call is eager's. A difference discards the graph and
+        explains itself (`_explain`)."""
         domain = _set(self.domain)
         state, stream = self._token_state(key[2]), torch.cuda.current_stream(domain.device)
         start: list[torch.Tensor] | None = None
@@ -3221,8 +3239,72 @@ class _Engine:
         self.eager += 1
         why = vt.replay_differs([*state, *self._written(size, at)], replayed)
         if why:
+            why += "; " + self._explain(key[2], size, state, start, at, replayed, ops, launch)
             self._discard(key, graph, stream)
             self._unrecorded(key, why, "replay_mismatch")
+
+    def _explain(
+        self,
+        drafted: bool,
+        size: int,
+        state: list[torch.Tensor],
+        start: list[torch.Tensor],
+        at: torch.Tensor,
+        replayed: list[torch.Tensor],
+        ops: list[tuple[object, ...]],
+        launch: Launch | None,
+    ) -> str:
+        """Why a step's replay differed from it as written (tracker design
+        cuda-graph-correctness.md §5.3, cr-283): the step as written again from the same state,
+        then on its capture's stream and leases, its ops and kernels beside its capture's. The
+        last run is the check's eager step again, which serves."""
+
+        def run(on_capture: bool, mode: object = None) -> list[torch.Tensor]:
+            for tensor, value in zip(state, start, strict=True):
+                tensor.copy_(value)
+            with (
+                self._graph_memory(drafted) if on_capture else nullcontext(),
+                cast("AbstractContextManager[object]", mode or nullcontext()),
+            ):
+                self._advance(size)
+            return [*(value.clone() for value in state), *self._written(size, at)]
+
+        here = [*(value.clone() for value in state), *self._written(size, at)]
+        mode, written = observe.trace(torch)
+        served = False
+        try:
+            again = run(False, mode)
+            on_stream = run(True)
+            run(False)
+            served = True
+        except Exception as exc:
+            if not is_capacity(exc):
+                raise
+            _unwind(exc)
+            _answered(exc)
+            return "no room to run the step again"
+        finally:
+            if not served:
+                for tensor, value in zip(state, start, strict=True):
+                    tensor.copy_(value)
+                self._advance(size)
+        if noise := vt.replay_differs(here, again):
+            return f"the step as written differs run to run ({noise}): a nondeterministic kernel"
+        said = []
+        if _STEPS[0] is not launch:
+            said.append("its kernels landed between its capture and its check")
+        if op := observe.diverged(written, ops):
+            said.append(op)
+        if not vt.replay_differs(on_stream, replayed):
+            said.append(
+                "as written on its capture's stream it equals the replay: a library chose by stream"
+            )
+        if not said:
+            return (
+                f"the same {len(written)} ops, and on its capture's stream it differs too: a "
+                "kernel outside Torch's dispatcher"
+            )
+        return "the capture ran another program: " + "; ".join(said)
 
     def _discard(self, key: _Key, graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> None:
         """A recorded graph goes, and its pool with the last of them."""

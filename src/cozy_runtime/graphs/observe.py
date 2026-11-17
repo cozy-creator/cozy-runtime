@@ -68,6 +68,8 @@ class Observed:
         self.retained: dict[int, object] = {}
         #: the ops that read a host tensor: a graph replays the value it had at capture
         self.host: set[str] = set()
+        #: each op it ran (`step`), set beside its call's as written when a replay differs
+        self.ops: list[tuple[object, ...]] = []
 
     def answer(self, tensor: Tensor) -> object:
         """The value the call as written read at this read, or `HostRead`."""
@@ -125,6 +127,57 @@ def merge(spans: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
         else:
             merged.append((start, end))
     return merged
+
+
+def step(torch: ModuleType, func: object, args: object) -> tuple[object, ...]:
+    """One op as a trace keeps it: the op and each argument, a tensor by its shape and dtype."""
+    plain = (bool, int, float, str, type(None), torch.dtype, torch.device)
+    return (
+        func,
+        *(
+            (tuple(v.shape), v.dtype)
+            if isinstance(v, torch.Tensor)
+            else v
+            if isinstance(v, plain)
+            else type(v).__name__
+            for v in torch.utils._pytree.tree_leaves(args)
+        ),
+    )
+
+
+def trace(torch: ModuleType) -> tuple[object, list[tuple[object, ...]]]:
+    """A dispatch mode over a call as written and each op it ran (`step`): what a capture's ops
+    are set beside (`diverged`)."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    ops: list[tuple[object, ...]] = []
+
+    class Trace(TorchDispatchMode):
+        def __torch_dispatch__(
+            self,
+            func: object,
+            types: tuple[type, ...],
+            args: tuple[object, ...] = (),
+            kwargs: dict[str, object] | None = None,
+        ) -> object:
+            ops.append(step(torch, func, (args, kwargs or {})))
+            return func(*args, **(kwargs or {}))  # type: ignore[operator]  # an OpOverload
+
+    return Trace(), ops  # type: ignore[no-untyped-call]  # TorchDispatchMode's __init__
+
+
+def diverged(written: Sequence[tuple[object, ...]], captured: Sequence[tuple[object, ...]]) -> str:
+    """Where a call as written and its capture ran other ops: the first that differs ("" alike)."""
+
+    def said(op: tuple[object, ...]) -> str:
+        return f"{op[0]}{op[1:]}"[:160]
+
+    for at, (a, b) in enumerate(zip(written, captured, strict=False)):
+        if a != b:
+            return f"op {at + 1} of {len(written)}: as written {said(a)}, captured {said(b)}"
+    if len(written) != len(captured):
+        return f"as written {len(written)} ops, captured {len(captured)}"
+    return ""
 
 
 def reads(torch: ModuleType) -> tuple[object, list[object]]:
@@ -215,6 +268,7 @@ def observer(
             kwargs: dict[str, object] | None = None,
         ) -> object:
             kwargs = kwargs or {}
+            seen.ops.append(step(torch, func, (args, kwargs)))
             if func is scalar and isinstance(args[0], tensor_type) and args[0].is_cuda:
                 return seen.answer(args[0])  # reading it would end the capture
             if any(

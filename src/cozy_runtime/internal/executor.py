@@ -2099,6 +2099,8 @@ class Executor:
         self.host.gpu_memory_limit = command.gpu_memory_limit
         # An older machine's Start names none.
         self.host.display_limit = tuple(getattr(command, "display_limit", ()) or ())
+        # A dev machine (`dev = true` in its config.toml) audits its CUDA graphs' replays.
+        graphs.AUDIT = bool(getattr(command, "dev", False))
         if pacing.configure(pace := command.display_pace) and pace is not None:
             print(
                 f"[pacing] the GPU drives a display: a call pauses {pace.pause_ms} ms "
