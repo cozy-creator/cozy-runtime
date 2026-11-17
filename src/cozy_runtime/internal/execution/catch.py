@@ -85,6 +85,22 @@ def site(kind: str) -> str | None:
     return f"{_local.named}/{kind}#{n}"
 
 
+@contextmanager
+def library(device: torch.device) -> Iterator[None]:
+    """A library call that answers a refused allocation itself by taking another algorithm:
+    cuDNN's conv plans fall back to ones needing less workspace (h3-notext-1080p's latent
+    upscaler at a 6 GiB cap: 28 such refusals, counted as swallowed OOMs). What varena refused
+    while one completes, less what a Runtime Retry answered, is the request's `fallbacks`."""
+    request = CURRENT.get()
+    if request is None or not request.memory.cuda or device.type != "cuda":
+        yield
+        return
+    index = device.index or 0
+    ooms, retries = vt.ooms(index), request.retries
+    yield
+    request.fallbacks += max(vt.ooms(index) - ooms - (request.retries - retries), 0)
+
+
 def checkpoint() -> None:
     """Stop at an owned eager boundary. In a group, the GPU that stops ends the others' calls
     (`spmd`). A CUDA capture keeps its prepared interval intact; its caller checks cancellation

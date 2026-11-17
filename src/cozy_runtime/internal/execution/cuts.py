@@ -123,9 +123,14 @@ def _conv_of(module: Convolution) -> Conv:
 def _conv_bands(site: str, module: Convolution, conv: Conv) -> Conv:
     """A conv at the level the process keeps for `site`: whole at 0, else in bands of images, else
     (one image, ungrouped) of output channels, each band copied into its slice of the result.
-    Measured on a GPU (tests/test_band_live_bytes.py): the band's workspace is what shrinks."""
+    Measured on a GPU (tests/test_band_live_bytes.py): the band's workspace is what shrinks.
+    cuDNN answers a refused workspace by taking a plan that needs less (`catch.library`)."""
 
     def cut(x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
+        with catch.library(x.device):
+            return banded(x, weight, bias)
+
+    def banded(x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
         batched = x.dim() == weight.dim()
         by_images = batched and x.shape[0] > 1
         # the conv's own groups apply to every call: a channel band of a grouped one is not

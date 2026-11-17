@@ -2826,6 +2826,7 @@ class RequestStats(TypedDict):
     escaped: list[EscapeRecord]
     retries: int
     regrown: int
+    fallbacks: int
     swallowed_ooms: int
     retained_bytes: int
     gathered: int
@@ -3064,6 +3065,9 @@ class Request:
         #: refusals a CUDA graph capture answered by recording again with room for them
         #: (`graphs.capture`): what runs is the same
         self.regrown = 0
+        #: refusals a library answered itself inside a Runtime cut by taking another algorithm
+        #: (`catch.library`: cuDNN's conv plans): what runs is still the same op
+        self.fallbacks = 0
         #: refusals a package scope returned past (`contract._Scopes`): zero in a conforming run
         self.swallowed_ooms = 0
         #: cross-step state its loops declared (`author.retained`)
@@ -3212,6 +3216,7 @@ class Request:
             "escaped": list(self.escaped),
             "retries": self.retries,
             "regrown": self.regrown,
+            "fallbacks": self.fallbacks,
             "swallowed_ooms": self.swallowed_ooms,
             "retained_bytes": self.retained_bytes,
             "gathered": self.gathered,
