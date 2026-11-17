@@ -37,6 +37,8 @@ jobs:
           else
             echo run=true >> "$GITHUB_OUTPUT"
           fi
+          # The decode engine's own change (or no known diff): its families check below.
+          if [ -z "$files" ] || grep -q '^src/cozy_runtime/lm/' <<< "$files"; then echo lm=true >> "$GITHUB_OUTPUT"; fi
       - if: steps.scope.outputs.run == 'true'
         uses: actions/checkout@v5
         with:
@@ -88,3 +90,14 @@ jobs:
           restore-keys: typecheck-${{ runner.os }}-${{ hashFiles('scripts/typecheck-requirements.txt') }}-
       - if: steps.scope.outputs.run == 'true'
         run: scripts/typecheck.sh
+      # A change to the decode engine (src/cozy_runtime/lm/) runs it against Transformers' greedy generate on a tiny
+      # random model of each LM family it serves, on the CPU (cozy-creator e2e/cpu/lm_families.py, cl-1103): a family
+      # whose masks or caches break fails here, before the merge, not on the RC after it. Other changes skip it.
+      - if: steps.scope.outputs.run == 'true' && steps.scope.outputs.lm == 'true'
+        name: Decode engine, one tiny model per LM family
+        env:
+          CREATOR: 7a4a95f81de2df7babaa2f84c5231ff1c174282e
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/cozy-creator/cozy-creator/$CREATOR/e2e/cpu/lm_families.py" -o "$RUNNER_TEMP/lm_families.py"
+          uv run --locked --group diffusers python -I "$RUNNER_TEMP/lm_families.py" | tee "$RUNNER_TEMP/lm.txt"
+          grep -q '^PASS' "$RUNNER_TEMP/lm.txt" && ! grep -q '^FAIL' "$RUNNER_TEMP/lm.txt"
