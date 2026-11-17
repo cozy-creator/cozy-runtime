@@ -25,8 +25,6 @@ from dataclasses import dataclass, field
 from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
-from tensorfs.raw import parts as stored_parts
-
 from cozy_runtime import graphs
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._loader import (
@@ -73,6 +71,7 @@ from cozy_runtime.internal.residency import (
     Request,
     TensorLayout,
     Weights,
+    _unit,
     joined,
     paging,
     split,
@@ -465,10 +464,7 @@ class Backend:
         # The paging blocks, found once and split where a unit is too large: residency, the bakes
         # and the execution catch all read these (`Declared.blocks`).
         rule, found = paging(root)
-        sizes = {
-            bound[stored]: sum(part.length for part in stored_parts(checkpoint.ck, name, stored).values())
-            for stored in rows
-        }
+        sizes = {bound[stored]: row.stored_nbytes for stored, row in rows.items()}
         blocks = split(root, found, sizes)
         rule = rule if blocks == found else f"{rule}+split"
         if self.memory.native is not None:
@@ -905,7 +901,7 @@ class _Bakes:
                 continue
             bake = _Bake(stored, repr((encoded.scheme, encoded.params)), leaf=leaf)
             hooks: list[object] = list(module._forward_hooks.values()) if module is not None else []
-            if any(site.startswith(block + ".") for block in blocks):
+            if _unit(site, blocks):  # a block holds it: a lookup per prefix, not a scan of them
                 bake.hooks = [hook for hook in hooks if isinstance(hook, LoRASource)]
             target = site.removesuffix(".base_layer")
             kron = cast("KronLayer | None", root.get_submodule(target) if target != site else None)
