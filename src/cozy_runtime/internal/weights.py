@@ -71,6 +71,7 @@ from cozy_runtime.internal.residency import (
     Request,
     TensorLayout,
     Weights,
+    _unit,
     joined,
     paging,
     split,
@@ -900,7 +901,7 @@ class _Bakes:
                 continue
             bake = _Bake(stored, repr((encoded.scheme, encoded.params)), leaf=leaf)
             hooks: list[object] = list(module._forward_hooks.values()) if module is not None else []
-            if any(site.startswith(block + ".") for block in blocks):
+            if _unit(site, blocks):  # a block holds it: a lookup per prefix, not a scan of them
                 bake.hooks = [hook for hook in hooks if isinstance(hook, LoRASource)]
             target = site.removesuffix(".base_layer")
             kron = cast("KronLayer | None", root.get_submodule(target) if target != site else None)
