@@ -148,6 +148,8 @@ class Invocation:
     """Whether a client watches this attempt's previews now (`preview`), and `preview` where
     each encoded one goes."""
     preview: Callable[[PreviewFrame], None] | None = None
+    text: Callable[[str, int, str], None] | None = None
+    """Where a text output's words go as they are made (`Context._text`)."""
     #: No worker settles this attempt's frames (the fakes), so each encodes at its save.
     settle_at_save: bool = False
     #: False on a group's other GPUs: a save records its asset and writes nothing (`Attempt`).
@@ -332,6 +334,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
         ctx._preview = Previews(
             inv.previewing, inv.preview, lambda why: record.emit("log", why, "warning")
         )
+    ctx._text = inv.text
     handles = ExitStack()
     _bind_tensorfs(ctx, record, inv, surface, handles)
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)

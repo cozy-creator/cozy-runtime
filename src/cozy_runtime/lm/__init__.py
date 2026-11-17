@@ -263,6 +263,7 @@ def generate(
     allowed: Constraint | None = None,
     progress: Callable[[int], None] | None = None,
     no_repeat_ngram: int | None = None,
+    streamed: Callable[[list[list[int]]], None] | None = None,
 ) -> torch.Tensor:
     """Tokens after the prompt, `[batch, n]` (`model.generate(...)`'s tail): `inputs` as the
     processor returned them, generation ends at a `stop` token or after `max_new_tokens`, and a
@@ -289,7 +290,9 @@ def generate(
     `PROGRESS_S`, for display only; one that raises is dropped, with a run warning (a cancel is
     the decode's own check's to act on). Without one, the running telemetry stage is told them
     as a count of tokens, `max_new_tokens` only their cap. `ctx.progress` called from it counts
-    tokens too, never steps."""
+    tokens too, never steps.
+    `streamed(rows)` is told each row's tokens so far, at most every `STREAM_S`, for display only
+    (`vlm` streams their words); one that raises is dropped, with a run warning."""
     for named in (draft, _DRAFT.get(), HEADS.get(model)):
         if named is not None:
             draft = named
@@ -304,7 +307,7 @@ def generate(
     if progress is None and (stage := stage_tokens()) is not None:
         progress = partial(_share, stage, max_new_tokens)
     sampling = _Sampling(float(temperature), float(top_p), int(seed), int(top_k))
-    tell = _Tell(progress)
+    tell = _Tell(progress, streamed)
     stops = [int(token) for token in stop]
     filler = stops[0] if pad is None else int(pad)
     why = ABSENT or _unsupported(model)
@@ -1079,7 +1082,7 @@ def _transformers(
         processors.append(_Draw(prompt, sampling))
     context = CURRENT.get()
     with _PLANE, torch.inference_mode(), ExitStack() as held:
-        cancel = _Cancel(context, tell, _Keeper(model, held))
+        cancel = _Cancel(context, tell, _Keeper(model, held), prompt)
         out = _lm(model).generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -1153,8 +1156,9 @@ class _Cancel(StoppingCriteria):
     """Transformers' loop raises the attempt's cancellation between tokens, tells its progress
     and, after the first decode step, keeps what of the model fits (`_Keeper`)."""
 
-    def __init__(self, context: Context | None, tell: _Tell, keeper: _Keeper) -> None:
+    def __init__(self, context: Context | None, tell: _Tell, keeper: _Keeper, prompt: int) -> None:
         self.context, self.tell, self.keeper, self.steps = context, tell, keeper, 0
+        self.prompt = prompt
 
     def __call__(
         self, input_ids: torch.Tensor, scores: tuple[torch.Tensor] | None, **kwargs: object
@@ -1163,26 +1167,45 @@ class _Cancel(StoppingCriteria):
             self.context.raise_if_cancelled()
         self.steps += 1  # one token a step: this loop drafts none
         self.keeper.step(self.steps)
-        self.tell(lambda: self.steps)
+        self.tell(lambda: self.steps, lambda: input_ids[:, self.prompt :].tolist())
         flags = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         return cast("torch.BoolTensor", flags)  # cast: Transformers types its flags as BoolTensor
 
 
 #: The least time between two progress reports of one call.
 PROGRESS_S = 0.25
+#: The least time between two reports of a call's tokens (`streamed`): words grow about ten times a
+#: second.
+STREAM_S = 0.1
 
 
 class _Tell:
-    """A call's `progress`, told its tokens so far at most every `PROGRESS_S`: `count` is read only
-    then."""
+    """A call's `progress`, told its tokens so far at most every `PROGRESS_S`, and `streamed`, told
+    each row's tokens at most every `STREAM_S`: `count` and `rows` are read only then."""
 
-    def __init__(self, progress: Callable[[int], None] | None) -> None:
+    def __init__(
+        self,
+        progress: Callable[[int], None] | None,
+        streamed: Callable[[list[list[int]]], None] | None = None,
+    ) -> None:
         self.progress, self.told = progress, 0.0
+        self.streamed, self.shown = streamed, 0.0
 
-    def __call__(self, count: Callable[[], int]) -> None:
+    def __call__(
+        self, count: Callable[[], int], rows: Callable[[], list[list[int]]] | None = None
+    ) -> None:
+        now = time.perf_counter()
+        if self.streamed is not None and rows is not None and now - self.shown >= STREAM_S:
+            self.shown = now
+            try:
+                self.streamed(rows())
+            except Cancelled:  # the decode's own check ends the call
+                pass
+            except Exception as exc:  # the decode outlives its words' display
+                self.streamed = None
+                WARNINGS.append(recovered("decode's words stopped streaming", error=str(exc)[:200]))
         if self.progress is None:
             return
-        now = time.perf_counter()
         if now - self.told < PROGRESS_S:
             return
         self.told = now
@@ -2869,8 +2892,9 @@ class _Engine:
                 row.generated += [took[(1 + j) * size + slot] for j in range(took[slot])]
 
     def _tell(self) -> None:
-        """Each held call's progress, its longest row's tokens: drafting decodes several a step. The
-        flag check has just caught the host up with the device, so reading `n` waits on nothing."""
+        """Each held call's progress, its longest row's tokens (drafting decodes several a step),
+        and each row's tokens so far where its words stream. The flag check has just caught the
+        host up with the device, so reading `n` and `out` waits on nothing."""
         counts: list[int] = []
 
         def tokens(request: _Request) -> int:
@@ -2883,8 +2907,23 @@ class _Engine:
             )
             return max(held, default=0)
 
+        def rows(request: _Request) -> list[list[int]]:
+            if not counts:
+                counts.extend(self.n.tolist())
+            held = {
+                row.row: slot
+                for slot, row in enumerate(self.slots)
+                if row is not None and row.request is request
+            }
+            return [
+                self.out[held[i], : counts[held[i]]].tolist()
+                if i in held
+                else ([] if done is None else done.tolist())
+                for i, done in enumerate(request.tokens)
+            ]
+
         for request in {id(row.request): row.request for row in self.slots if row}.values():
-            request.tell(partial(tokens, request))
+            request.tell(partial(tokens, request), partial(rows, request))
 
     def _read(self, drafted: bool) -> tuple[torch.nn.Module, ...]:
         """The modules a step reads: the model, and its head when the step drafts."""
