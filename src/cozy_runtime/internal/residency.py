@@ -293,6 +293,100 @@ def _readable(value: object) -> object:
     return value._varena_read() if isinstance(value, Placeholder) else value
 
 
+#: Stored float dtypes a Linear's weight can stay on the host in (`_HostRows`).
+_FLOATS = ("F16", "BF16", "F32")
+#: A host-kept weight's rows copied to the card at once: one window of its linear.
+_HOST_WINDOW = 64 << 20
+
+
+class _HostRows(Tensor):
+    """A Linear's weight with no room on the card beside the live set, kept on the host
+    (`Memory._gather`). A linear over it runs on the card a window of its output rows at a time,
+    each window's rows copied over and dropped after it, so the card holds one window of the
+    weight. `narrow` on its rows copies only those rows (a linear cut's window). Anything else
+    reads it whole. cr-320: LTX-2.5's `video_text_proj_in`, 1.44 GB in one bf16 tensor, had no
+    room beside its live set at a 6 GiB cap and the run failed `memory_exhausted`."""
+
+    host: Tensor
+
+    @staticmethod
+    def __new__(cls: type[_HostRows], host: Tensor, device: torch.device) -> _HostRows:
+        made = Tensor._make_wrapper_subclass(
+            cls, tuple(host.shape), dtype=host.dtype, device=device, storage_size=0
+        )
+        made.host = host
+        return made
+
+    @classmethod
+    def of(cls, value: Tensor, device: torch.device) -> Tensor:
+        """A gathered block's bound value on `device`: its 2-D weight kept on the host, the rest
+        (a bias) copied over."""
+        if value.dim() == 2:
+            return cls(value.detach(), device)
+        return value.detach().to(device)
+
+    def rows(self, start: int, length: int) -> Tensor:
+        return self.host.narrow(0, start, length).to(self.device, non_blocking=True)
+
+    @classmethod
+    def __torch_function__(  # type: ignore[explicit-any, override]  # any torch function
+        cls,
+        func: Callable[..., Any],
+        types: Sequence[type],
+        args: Sequence[Any] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        kwargs = kwargs or {}
+        if getattr(func, "__name__", "") == "__get__":  # shape, dtype, device: the wrapper's own
+            with torch._C.DisableTorchFunctionSubclass():
+                return func(*args, **kwargs)
+        if func is torch.nn.functional.linear:
+            bound = [*args, *(kwargs.get(k) for k in ("input", "weight", "bias") if k in kwargs)]
+            x, weight, bias = (bound + [None, None, None])[:3]
+            if isinstance(weight, _HostRows) and not isinstance(x, _HostRows):
+                return _windowed(x, weight, bias)
+        if func in (Tensor.narrow, torch.narrow) and len(args) >= 4 and isinstance(args[0], _HostRows):
+            dim = args[1] % args[0].dim()
+            if dim == 0:
+                return args[0].rows(int(args[2]), int(args[3]))
+        with torch._C.DisableTorchFunctionSubclass():
+            return func(*tree_map(_onto, args), **tree_map(_onto, kwargs))
+
+    @classmethod
+    def __torch_dispatch__(  # type: ignore[explicit-any, override]  # any op, any operands
+        cls,
+        func: OpOverload[..., Any],
+        types: Sequence[type],
+        args: Sequence[Any] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        return func(*tree_map(_onto, args), **tree_map(_onto, kwargs or {}))
+
+
+def _onto(value: object) -> object:
+    return value.host.to(value.device) if isinstance(value, _HostRows) else value
+
+
+def _windowed(x: Tensor, weight: _HostRows, bias: Tensor | None) -> Tensor:
+    """`F.linear(x, weight, bias)` a window of `weight`'s rows at a time (`_HostRows`)."""
+    n, k = weight.shape
+    step = max(1, _HOST_WINDOW // max(k * weight.element_size(), 1))
+    if bias is not None:
+        bias = bias.to(x.device)
+    out: Tensor | None = None
+    for start in range(0, n, step):
+        size = min(step, n - start)
+        part = torch.nn.functional.linear(
+            x, weight.rows(start, size), None if bias is None else bias.narrow(0, start, size)
+        )
+        if out is None:
+            out = part.new_empty((*part.shape[:-1], n))
+        out.narrow(-1, start, size).copy_(part)
+        del part
+    assert out is not None  # a weight has rows
+    return out
+
+
 def blocks_of(module: nn.Module) -> list[str]:
     return paging(module)[1]
 
@@ -543,6 +637,9 @@ class _Block:
     )
     #: an `nn.Embedding`'s table: one that does not fit the room gathers its rows on the host
     table: bool = False
+    #: an `nn.Linear` of plain stored tensors: one that does not fit the room stays on the host and
+    #: its linear runs on the card by windows of its output rows (`_HostRows`)
+    rows: bool = False
     #: its host copy while it gathers, by overlay: (overlay, raw views, final views)
     gathered: tuple[Hashable, dict[str, dict[str, Tensor]], dict[str, dict[str, Tensor]]] | None = (
         None
@@ -1435,7 +1532,12 @@ class Memory:
         for index, path in enumerate(p for p in ("", *paths) if p in by_path):
             block = _Block(model, path, index, by_path[path])
             if path:
-                block.table = isinstance(module.get_submodule(path), nn.Embedding)
+                sub = module.get_submodule(path)
+                block.table = isinstance(sub, nn.Embedding)
+                block.rows = isinstance(sub, nn.Linear) and all(
+                    set(parts) == {"value"} and parts["value"].dtype in _FLOATS
+                    for parts in by_path[path].values()
+                )
                 model.blocks[path] = block
             else:
                 model.common = block
@@ -2445,7 +2547,8 @@ class Memory:
                     self._ensure(block, reclaim, overlay)
                     block.gathered = None
                 except Exhausted:  # varena refused its region before its forward ran
-                    if not (block.table and reclaim and self.cuda and not capturing):
+                    rows = block.rows and not block.finals
+                    if not ((block.table or rows) and reclaim and self.cuda and not capturing):
                         raise
                     gathered = block.gathered is not None and block.gathered[0] == overlay
                     with nullcontext() if gathered else self._read_told(block):
@@ -2459,6 +2562,8 @@ class Memory:
             if not nested:
                 if block.assigned is None:
                     assigned = _assign(block)
+                    if block.rows and block.gathered is not None and self.cuda:
+                        assigned = [(site, _HostRows.of(value, self.device)) for site, value in assigned]
                     ready = block.ready
                     if self.cuda:
                         ready = torch.cuda.Event()
