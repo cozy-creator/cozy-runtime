@@ -65,6 +65,13 @@ if "_sage3" not in sys.argv[2:]:
     )
 _attn4 = load("_attn4")
 assert _attn4.attention(0, *(0,) * 11, 1, 2, 2, 128, 128, 128, True, 1.0, *((0, 0, 0),) * 4, 0) != 0
+_conv = load("_conv")
+assert _conv.conv(0, 0, 0, 0, False, 0, 1, 3, 8, 8, 8, 8, 3, 3, 3, 1, 6, 6, 1, 1, 1, -1, (0,) * 4, (0,) * 4, 0) != 0
+try:
+    _conv.norm_pad(*(0,) * 5, 1, 12, 1, 4, 4, 4, 1e-6, 1, 1, 1, 1, 2, True, False, 48, False, 0)
+    raise AssertionError("norm_pad took 12 channels")
+except ValueError:
+    pass
 print(f"{sys.version.split()[0]}: gemv without a GPU -> {code} {_gemm.error_name(code)}")
 """
 

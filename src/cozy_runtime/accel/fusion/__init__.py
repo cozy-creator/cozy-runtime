@@ -34,7 +34,9 @@ declaration serves eager (reported).
 A VAE's channel-first RMS norm (Wan's `RMS_norm` and the Qwen-Image copies of it) is one kernel,
 and with the SiLU after it where the package names that pair (`ChannelNorm`, `install_norms`).
 A video VAE decoding a lone image frame skips its causal convolutions' zero taps and padded
-copies, and upsamples in its own dtype (`LoneFrame`, `install_lone_frame`).
+copies, and upsamples in its own dtype (`LoneFrame`, `install_lone_frame`). A causal-conv video
+encoder runs NDHWC in fp16, each norm, SiLU and pad one pass and each conv accumulating in fp16
+with its residual in its epilogue (`CausalConvEncoder`, `install_encoder`).
 """
 
 from __future__ import annotations
@@ -47,10 +49,12 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from types import FrameType
+from functools import partial
+from types import FrameType, ModuleType
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
-from cozy_runtime.accel.fusion import _kernels
+from cozy_runtime.accel.fusion import _conv, _kernels
+from cozy_runtime.accel.fusion._conv import Padding as Padding
 from cozy_runtime.accel.kernels import (
     KernelsUnavailable,
     Launch,
@@ -61,6 +65,7 @@ from cozy_runtime.accel.kernels import (
     int8_rows,
     quantize_once,
 )
+from cozy_runtime.internal import kernel_ready, prebuilt
 
 if TYPE_CHECKING:
     import torch
@@ -361,6 +366,12 @@ if TYPE_CHECKING:
         groups: int
         _cozy_lone: tuple[int, int]
         _cozy_eager: Callable[[Tensor, Tensor | None], Tensor]
+
+    class _FusedConvBlock(nn.Module):
+        """A conv or block `install_encoder` took over."""
+
+        _cozy_conv: _ConvSite
+        _cozy_eager: _Eager
 
 
 @dataclass(frozen=True, slots=True)
@@ -787,6 +798,12 @@ def _fused[M: nn.Module](cls: type[M], kind: str) -> type[M]:
             body["forward"] = _lone_conv_forward
         elif kind == "nearest":
             body["forward"] = torch.nn.Upsample.forward
+        elif kind == "causal-conv":
+            body["forward"] = _causal_forward
+        elif kind == "conv-residual":
+            body["forward"] = _residual_forward
+        elif kind == "padded-conv":
+            body["forward"] = _padded_forward
         else:
             body |= {"forward": _head_norm_forward, "_cozy_rope": None}
         _FUSED[(cls, kind)] = type(f"Fused{cls.__name__}", (cls,), body)
@@ -1041,10 +1058,15 @@ def install_norms(plan: Plan, layout: ChannelNorm, *roots: nn.Module) -> str:
             module.__class__ = cls
         return report(f"{exc.code}: {exc}")
     encoded = json.dumps(
-        {"kernels": layout.kernels.identity, "norm": layout.norm.__qualname__,
-         "silu": [[cls.__qualname__, list(names)] for cls, names in layout.silu],
-         "dtype": layout.dtype, "bias": layout.bias},
-        sort_keys=True, separators=(",", ":"),
+        {
+            "kernels": layout.kernels.identity,
+            "norm": layout.norm.__qualname__,
+            "silu": [[cls.__qualname__, list(names)] for cls, names in layout.silu],
+            "dtype": layout.dtype,
+            "bias": layout.bias,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
     ).encode()
     return "sha256:" + hashlib.sha256(b"cozy.fusion.channel-norm\0" + encoded).hexdigest()
 
@@ -1153,14 +1175,318 @@ def install_lone_frame(plan: Plan, layout: LoneFrame, *roots: nn.Module) -> str:
     return "sha256:" + hashlib.sha256(b"cozy.fusion.lone-frame\0" + encoded).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class CausalConv:
+    """A causal video convolution, `conv3d(pad(x))`: a Conv3d (no padding, dilation or groups of its own) whose
+    `padding(module)` is its `Padding`: (left, right, top, bottom) pixels, the zero frames before, and whether the
+    border reflects or is zero."""
+
+    conv: type[nn.Module]
+    padding: Callable[[nn.Module], Padding]
+
+
+@dataclass(frozen=True, slots=True)
+class ConvResidual:
+    """A block whose forward is `shortcut(x) + convN(silu(normN(... conv1(silu(norm1(x))))))`: `steps`, its (norm, conv)
+    pairs by name; `shortcut`, the module the residual passes through (absent, or None on a block, for none)."""
+
+    block: type[nn.Module]
+    steps: tuple[tuple[str, str], ...]
+    shortcut: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PaddedConv:
+    """A block whose forward is `conv(pad(x))`: `pad(block)` the (left, right, top, bottom) pixels it reflects before
+    its causal conv `conv`, whose own spatial padding is zero."""
+
+    block: type[nn.Module]
+    conv: str
+    pad: Callable[[nn.Module], tuple[int, int, int, int]]
+
+
+@dataclass(frozen=True)
+class CausalConvEncoder:
+    """A causal-conv video encoder as Runtime runs it (cr-306): fp16 activations `channels_last_3d` from one conv to the
+    next, each `silu(norm(x))` in front of a conv and the conv's padding one pass (`norm`, a GroupNorm of each frame
+    alone: its statistics never mix frames), and every conv accumulating in fp16 (`accumulate`; its deepest reductions
+    in fp32) with its bias and its block's residual in its epilogue. comfy-kitchen's kernels (#167), as ComfyUI's
+    MiniMax H3 encoder runs under `--fast fp16_accumulation`. `blocks` are the forwards Runtime takes over; any other
+    module calling a declared conv gets the fused conv alone. Anything the kernels decline runs on torch."""
+
+    conv: CausalConv
+    norm: type[nn.Module]
+    blocks: tuple[ConvResidual | PaddedConv, ...] = ()
+    accumulate: Literal["fp16", "fp32"] = "fp16"
+
+    @property
+    def name(self) -> str:
+        return f"fused.{self.conv.conv.__name__.lower()[:44]}.{self.accumulate}"
+
+    def contract(self) -> dict[str, object]:
+        def named(item: Callable[..., object] | type) -> str:
+            return f"{item.__module__}:{item.__qualname__}"
+
+        return {
+            "conv": named(self.conv.conv),
+            "padding": named(self.conv.padding),
+            "norm": named(self.norm),
+            "blocks": [
+                {
+                    "block": named(b.block),
+                    "steps": [list(s) for s in b.steps],
+                    "shortcut": b.shortcut,
+                }
+                if isinstance(b, ConvResidual)
+                else {"block": named(b.block), "conv": b.conv, "pad": named(b.pad)}
+                for b in self.blocks
+            ],
+            "accumulate": self.accumulate,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _ConvSite:
+    """An installed encoder's declaration, on each of its convs and blocks."""
+
+    layout: CausalConvEncoder
+    index: int
+    #: a ConvResidual's (norm, conv) modules and shortcut; a PaddedConv's conv and pad
+    steps: tuple[tuple[nn.Module | None, nn.Module], ...] = ()
+    shortcut: nn.Module | None = None
+    pad: tuple[int, int, int, int] = (0, 0, 0, 0)
+
+
+def _conv_kernels(site: _ConvSite, x: Tensor) -> ModuleType | None | Literal[False]:
+    """The encoder kernels for `x`, None where only the norm and pad pass serves (fp32 accumulation), and False where
+    the eager forward serves: not fp16 on CUDA, or the kernels not serving here."""
+    if not (x.is_cuda and x.dtype is torch.float16):
+        return False
+    kernels = _conv.kernels(site.index)
+    if kernels is None:
+        return False
+    return kernels if site.layout.accumulate == "fp16" else None
+
+
+def _norm_of(module: nn.Module | None) -> _conv.Norm | None:
+    if module is None:
+        return None
+    weight, bias = getattr(module, "weight"), getattr(module, "bias")  # an affine GroupNorm's
+    return weight, bias, int(getattr(module, "num_groups")), float(getattr(module, "eps"))
+
+
+def _causal(
+    site: _ConvSite,
+    kernels: ModuleType | None,
+    conv: nn.Module,
+    x: Tensor,
+    *,
+    norm: nn.Module | None = None,
+    extra: tuple[int, int, int, int] = (0, 0, 0, 0),
+    residual: Tensor | None = None,
+) -> Tensor:
+    """`conv(pad(silu(norm(x))))` [+ residual]: the pass that normalizes and pads, then the conv."""
+    (left, right, top, bottom), front, fill = site.layout.conv.padding(conv)
+    padding: Padding = (
+        (left + extra[0], right + extra[1], top + extra[2], bottom + extra[3]),
+        front,
+        fill,
+    )
+    module = kernels if kernels is not None else _conv.kernels(site.index)
+    if norm is not None or any(padding[0]) or front:
+        assert module is not None  # `_conv_kernels` served this call
+        x = _conv.norm_pad(module, x, _norm_of(norm), padding, silu=norm is not None)
+    fused = cast("_FusedConv", conv)
+    stride = cast("tuple[int, int, int]", tuple(fused.stride))
+    return _conv.conv3d(kernels, x, fused.weight, fused.bias, residual, stride)
+
+
+def _causal_forward(self: nn.Module, x: Tensor, *args: object, **kwargs: object) -> Tensor:
+    site: _ConvSite = vars(self)["_cozy_conv"]
+    kernels = _conv_kernels(site, x)
+    if kernels is False or args or kwargs:
+        return cast("Tensor", cast("_FusedConvBlock", self)._cozy_eager(x, *args, **kwargs))
+    return _causal(site, kernels, self, x)
+
+
+def _residual_forward(self: nn.Module, x: Tensor, *args: object, **kwargs: object) -> Tensor:
+    site: _ConvSite = vars(self)["_cozy_conv"]
+    kernels = _conv_kernels(site, x)
+    if kernels is False or args or kwargs:
+        return cast("Tensor", cast("_FusedConvBlock", self)._cozy_eager(x, *args, **kwargs))
+    h = x
+    for at, (norm, conv) in enumerate(site.steps):
+        residual = None
+        if at == len(site.steps) - 1:
+            residual = x if site.shortcut is None else cast("Tensor", site.shortcut(x))
+        h = _causal(site, kernels, conv, h, norm=norm, residual=residual)
+    return h
+
+
+def _padded_forward(self: nn.Module, x: Tensor, *args: object, **kwargs: object) -> Tensor:
+    site: _ConvSite = vars(self)["_cozy_conv"]
+    kernels = _conv_kernels(site, x)
+    if kernels is False or args or kwargs:
+        return cast("Tensor", cast("_FusedConvBlock", self)._cozy_eager(x, *args, **kwargs))
+    ((_, conv),) = site.steps
+    return _causal(site, kernels, conv, x, extra=site.pad)
+
+
+def install_encoder(plan: Plan, layout: CausalConvEncoder, *roots: nn.Module) -> str:
+    """`layout` on every declared conv and block under `roots`: the plan's identity, or "" when the eager modules serve
+    (no CUDA sm80+, no kernels in this wheel, or a module that is not the declaration; reported). The kernels pass
+    their probe on this card before any call serves fused (`accel.fusion._conv`)."""
+    device = torch.device(plan.device)
+    document: dict[str, object] = {
+        "conv": layout.conv.conv.__qualname__,
+        "accumulate": layout.accumulate,
+    }
+
+    def report(reason: str = "", **counts: int) -> str:
+        outcome = {**document, "applied": not reason, **({"reason": reason} if reason else counts)}
+        plan.report(layout.name, outcome)
+        print(f"[cozy] {layout.name}: {json.dumps(outcome, sort_keys=True)}", file=sys.stderr)
+        return ""
+
+    if device.type != "cuda" or torch.cuda.get_device_capability(device)[0] < 8:
+        return report(f"fused convs serve CUDA sm80+, not {device}")
+    missing = _kernels_absent()
+    if missing:
+        return report(f"kernels_absent: {missing}")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    found = [
+        (f"{i}.{path}", module)
+        for i, root in enumerate(roots)
+        for path, module in root.named_modules()
+    ]
+    convs = [(path, m) for path, m in found if type(m) is layout.conv.conv]
+    if not convs:
+        if any(getattr(type(m), "_cozy_fused", None) == "causal-conv" for _, m in found):
+            return _encoder_identity(layout)  # installed already
+        return report(f"no {layout.conv.conv.__qualname__}")
+    sites: list[tuple[nn.Module, str, _ConvSite]] = []
+    try:
+        for path, conv in convs:
+            _check_conv(layout, conv, path)
+            sites.append((conv, "causal-conv", _ConvSite(layout, index)))
+        for declared in layout.blocks:
+            for path, block in found:
+                if type(block) is not declared.block or "forward" in vars(block):
+                    continue
+                sites.append((block, *_block_site(layout, declared, block, path, index)))
+    except _Mismatch as exc:
+        return report(str(exc))
+    norms = [norm for _, _, site in sites for norm, _ in site.steps if norm is not None]
+    if any(_hooked(m) for m in (*(m for m, _, _ in sites), *norms)):
+        return report("a hook on a module the fused forwards take over or skip")
+    before = [_census(root) for root in roots]
+    eager = [(module, type(module)) for module, _, _ in sites]
+    for module, kind, site in sites:
+        module.__class__ = _fused(type(module), kind)
+        cast("_FusedConvBlock", module)._cozy_conv = site  # its class is the fused one now
+    if [_census(root) for root in roots] != before:
+        raise RuntimeError("the fused substitution moved a parameter or buffer")
+    # Opened here, off any request: its probe runs now, and a refusal leaves every call eager.
+    name = f"cozy conv cuda:{index}"
+    kernel_ready.ready(name, partial(_conv._open, index))
+    refused = kernel_ready.failed(name)
+    if refused is not None:
+        for module, cls in eager:
+            module.__class__ = cls
+        return report(f"kernels_failed: {refused}")
+    counts = Counter(kind for _, kind, _ in sites)
+    report(
+        convs=counts["causal-conv"], residuals=counts["conv-residual"], padded=counts["padded-conv"]
+    )
+    return _encoder_identity(layout)
+
+
+def _encoder_identity(layout: CausalConvEncoder) -> str:
+    document = {"kernels": prebuilt.artifact("_conv"), "layout": layout.contract()}
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(b"cozy.fusion.causal-conv-encoder\0" + encoded).hexdigest()
+
+
+def _kernels_absent() -> str:
+    from cozy_runtime import _kernels as wheel
+
+    return wheel.ABSENT or getattr(wheel, "NO_CONV", "")
+
+
+def _check_conv(layout: CausalConvEncoder, conv: nn.Module, path: str) -> None:
+    if not isinstance(conv, torch.nn.Conv3d):
+        raise _Mismatch(f"{path}: not a Conv3d")
+    if (
+        tuple(conv.padding) != (0, 0, 0)
+        or tuple(conv.dilation) != (1, 1, 1)
+        or conv.groups != 1
+        or "forward" in vars(conv)
+    ):
+        raise _Mismatch(f"{path}: a Conv3d with its own padding, dilation or groups")
+    try:
+        (pad, front, fill) = layout.conv.padding(conv)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise _Mismatch(f"{path}: its padding: {exc}") from exc
+    if fill not in ("reflect", "zeros") or len(pad) != 4 or min(*pad, front) < 0:
+        raise _Mismatch(f"{path}: padding {pad}, {front} frames, {fill!r}")
+
+
+def _block_site(
+    layout: CausalConvEncoder,
+    declared: ConvResidual | PaddedConv,
+    block: nn.Module,
+    path: str,
+    index: int,
+) -> tuple[str, _ConvSite]:
+    def child(name: str) -> nn.Module | None:
+        try:
+            return block.get_submodule(name)
+        except AttributeError:
+            if name in vars(block) or getattr(block, name, 0) is None:
+                return None
+            raise _Mismatch(f"{path}: no {name}") from None
+
+    if isinstance(declared, PaddedConv):
+        conv = child(declared.conv)
+        if conv is None or type(conv) is not layout.conv.conv:
+            raise _Mismatch(f"{path}.{declared.conv}: not a {layout.conv.conv.__qualname__}")
+        pad = tuple(int(v) for v in declared.pad(block))
+        if len(pad) != 4 or min(pad) < 0 or (any(pad) and any(layout.conv.padding(conv)[0])):
+            raise _Mismatch(f"{path}: pads {pad} before a conv that pads in space too")
+        return "padded-conv", _ConvSite(
+            layout, index, ((None, conv),), pad=cast("tuple[int, int, int, int]", pad)
+        )
+    steps: list[tuple[nn.Module | None, nn.Module]] = []
+    for norm_name, conv_name in declared.steps:
+        norm, conv = child(norm_name), child(conv_name)
+        if conv is None or type(norm) is not layout.norm or type(conv) is not layout.conv.conv:
+            raise _Mismatch(
+                f"{path}: {norm_name}, {conv_name} are not a {layout.norm.__qualname__} and a conv"
+            )
+        group = cast("torch.nn.GroupNorm", norm)
+        if not isinstance(norm, torch.nn.GroupNorm) or not group.affine:
+            raise _Mismatch(f"{path}.{norm_name}: not an affine GroupNorm")
+        steps.append((norm, conv))
+    shortcut = None if declared.shortcut is None else child(declared.shortcut)
+    if not steps:
+        raise _Mismatch(f"{path}: no steps")
+    return "conv-residual", _ConvSite(layout, index, tuple(steps), shortcut)
+
+
 __all__ = [
+    "CausalConv",
+    "CausalConvEncoder",
     "ChannelNorm",
+    "ConvResidual",
     "DiTBlock",
     "GatedMLP",
     "LoneFrame",
     "Modulation",
+    "PaddedConv",
+    "Padding",
     "Rope",
     "install",
+    "install_encoder",
     "install_lone_frame",
     "install_norms",
 ]
