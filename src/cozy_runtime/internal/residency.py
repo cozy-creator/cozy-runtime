@@ -19,7 +19,7 @@ import weakref
 from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict, Unpack, cast
 
@@ -2500,8 +2500,9 @@ class Memory:
                 with torch.inference_mode(False):
                     use = pin()
                     if use is not None:
-                        raw = use.tensor[offset : offset + part.nbytes]
-                        value = _view(site.name, part.role, part, raw)
+                        value = (
+                            use.tensor[offset : offset + part.nbytes].view(stored).view(part.shape)
+                        )
                         if widen is not None:
                             value = value.to(widen)
                         block.last = time.monotonic_ns()
@@ -3436,8 +3437,6 @@ def _layout(
         return  # An arbitrary binder has not declared immutable final bytes.
     aliases: dict[str, dict[str, str]] = {}
     finals: dict[str, dict[str, _Part]] = {}
-    #: each alias's final geometry, should the block hold all its targets as finals
-    whole: dict[str, dict[str, _Part]] = {}
     codes = {kind: code for code, kind in _DTYPES.items() if code != "F4"}
     for key, parts in block.parts.items():
         if binding is not None:
@@ -3459,7 +3458,6 @@ def _layout(
             }
         row_aliases = aliases[key] = {}
         row_finals = finals[key] = {}
-        row_whole = whole[key] = {}
         for name, layout in declared.items():
             if name not in model.sites:
                 raise ResidencyError(f"{model.name}: final layout names no target {name}")
@@ -3481,11 +3479,6 @@ def _layout(
             dtype = getattr(torch, _DTYPES[layout.dtype])
             width = int(torch.empty((), dtype=dtype, device="meta").element_size())
             source = parts.get(layout.source) if layout.source is not None else None
-            if source is not None and source.dtype == "F4":
-                # Packed two a byte: a stored F4 [..., C] is the U8 [..., C/2] its leaves read
-                # (`_view`), not a second copy of it (cr-319).
-                carrier = (*source.shape[:-1], source.shape[-1] // 2)
-                source = replace(source, dtype="U8", shape=carrier)
             if (
                 source is not None
                 and source.dtype == layout.dtype
@@ -3495,17 +3488,8 @@ def _layout(
             ):
                 assert layout.source is not None
                 row_aliases[name] = layout.source
-                row_whole[name] = _Part(layout.dtype, shape, count * width, "", strides)
             else:
                 row_finals[name] = _Part(layout.dtype, shape, count * width, "", strides)
-    if any(finals.values()) and any(aliases.values()):
-        # A block with a final holds every target there and none of its stored bytes beside it:
-        # aliased, its stored region stayed resident whole, its swizzled or cast parts' stored
-        # bytes too (cr-319: Qwen3.6-27B nvfp4's row-major scales, 1.0 GiB, beside their blocked
-        # finals). Its finals are copied from the stored bytes once a fill, or kept on the host.
-        for key, row in whole.items():
-            finals[key].update(row)
-            aliases[key] = {}
     block.aliases = aliases
     block.finals = {key: row for key, row in finals.items() if row}
     if model.fill is None and not block.finals:
