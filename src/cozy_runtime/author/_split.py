@@ -50,11 +50,7 @@ class Pieces(Protocol):
 
     def piece(self) -> None: ...
 
-    def whole(
-        self, part: Tensor, shape: Sequence[int], key: str, host: bool, zeros: bool = False
-    ) -> Tensor: ...
-
-    def narrowed(self, whole: Tensor, dtype: torch.dtype) -> Tensor: ...
+    def whole(self, part: Tensor, shape: Sequence[int], key: str, host: bool) -> Tensor: ...
 
     def write(self, dst: Tensor, src: Tensor) -> None: ...
 
@@ -143,18 +139,15 @@ def split[W](
 
     Where the device has no room for the whole output beside the windows, the memory keeps it in
     host memory the device addresses (a CUDA tensor all the same), and a `split` reading it
-    brings each window back: slower, never out of memory. A blended cut's float32 whole goes
-    there too, each window's weighted part added in place."""
+    brings each window back: slower, never out of memory. A blended cut's stays on the device."""
     runtime = _RUNTIME
     shape = tuple(int(n) for n in x.shape)
     # Writing windows in place (`out`) can consume its input, so that never runs twice.
     pure = out is None and getattr(fn, "PURE_WINDOWS", False)
     if out is not None and any(c.scale != 1 or c.overlap for c in cuts):
         raise ValueError("split(out=) writes windows in place: its cuts take no scale or overlap")
-    # A blended whole accumulates in float32 (`_run`).
-    widen = max(4 // x.element_size(), 1) if any(c.overlap for c in cuts) else 1
-    whole = 0 if out is not None or host else _bytes(shape, cuts, x) * widen
-    hostable = bool(whole)
+    whole = 0 if out is not None or host else _bytes(shape, cuts, x)
+    hostable = bool(whole) and not any(c.overlap for c in cuts)
     key = _key(fn, shape, cuts, x.dtype)
     if most is not None and cuts:
         windows = _windows(shape, cuts, most)
@@ -433,11 +426,7 @@ def _run[W](
                 shape[d] = size
             if blend:
                 wide = part if part.dtype.itemsize >= 4 else part.float()
-                out = (
-                    wide.new_zeros(shape)
-                    if runtime is None
-                    else runtime.whole(wide, shape, key, host, zeros=True)
-                )
+                out = wide.new_zeros(shape)
                 total = out.new_zeros([size if d in dims else 1 for d, size in enumerate(shape)])
             else:
                 out = (
@@ -464,9 +453,7 @@ def _run[W](
         held[tuple(s if i in dims else slice(None) for i, s in enumerate(place))] += weight
     whole = cast("Tensor", out)  # made at the first of at least two windows
     if blend:
-        whole.div_(cast("Tensor", total))
-        dtype = part.dtype  # type: ignore[possibly-undefined]  # >= 2 windows ran
-        return whole.to(dtype) if runtime is None else runtime.narrowed(whole, dtype)
+        return whole.div_(cast("Tensor", total)).to(part.dtype)  # type: ignore[possibly-undefined]  # >= 2 windows ran
     return whole
 
 

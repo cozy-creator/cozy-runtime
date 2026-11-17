@@ -699,23 +699,22 @@ def split[T](
     )
 
 
-def whole(part: Tensor, shape: Sequence[int], key: str, host: bool, zeros: bool = False) -> Tensor:
-    """The whole output a package's `split` assembles its windows in, `part` its first (zeroed
-    with `zeros`: a blended whole's accumulator): pinned host memory with `host`; else the
-    device's, or pinned host memory when the device refuses it beside the windows (a Runtime
-    retry: no window runs again)."""
+def whole(part: Tensor, shape: Sequence[int], key: str, host: bool) -> Tensor:
+    """The whole output a package's `split` assembles its windows in, `part` its first: pinned
+    host memory with `host`; else the device's, or pinned host memory when the device refuses it
+    beside the windows (a Runtime retry: no window runs again)."""
     _WHOLES[key] = math.prod(shape) * part.dtype.itemsize
     if host:
-        return _pinned(shape, part, zeros)
+        return pinned.empty(shape, part.dtype, part.device)
     try:
-        return part.new_zeros(shape) if zeros else part.new_empty(shape)
+        return part.new_empty(shape)
     except BaseException as exc:
         request = catch.CURRENT.get()
         if request is None or not part.is_cuda or not is_capacity(exc) or _capturing():
             raise
         room = catch.room(part.device.index or 0)  # beside the refused bytes, for the record
         try:
-            out = _pinned(shape, part, zeros)
+            out = pinned.empty(shape, part.dtype, part.device)
         except Exception as failed:
             exc.add_note(f"its whole output in host memory failed too: {failed}")
             raise exc from None
@@ -723,20 +722,6 @@ def whole(part: Tensor, shape: Sequence[int], key: str, host: bool, zeros: bool 
         request.retries += 1
         _hosted(request, f"split:{key}", key, room)
         return out
-
-
-def _pinned(shape: Sequence[int], part: Tensor, zeros: bool) -> Tensor:
-    out = pinned.empty(shape, part.dtype, part.device)
-    return out.zero_() if zeros else out  # a kernel fills it, in the stream's order
-
-
-def narrowed(whole: Tensor, dtype: torch.dtype) -> Tensor:
-    """A blended whole cast to its windows' `dtype`, where it is: a host whole stays on host."""
-    if not pinned.held(whole):
-        return whole.to(dtype)
-    out = pinned.empty(whole.shape, dtype, whole.device)
-    out.copy_(whole)  # a kernel over both: no host round trip
-    return out
 
 
 def write(dst: Tensor, src: Tensor) -> None:

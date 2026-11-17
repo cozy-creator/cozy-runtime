@@ -83,11 +83,6 @@ def read(src: Tensor) -> Tensor:
     return out
 
 
-def held(tensor: Tensor) -> bool:
-    """Whether `tensor` is a view of a pinned buffer."""
-    return _host(tensor) is not None
-
-
 def settle() -> None:
     """Free the buffers whose tensors went, once the stream has passed their last use."""
     while _GOING:
