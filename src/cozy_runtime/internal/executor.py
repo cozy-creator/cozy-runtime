@@ -3711,12 +3711,13 @@ class Executor:
 
     def release_constructions(self, keys: list[str]) -> None:
         """TensorD's `release`, on the seam's reading thread: each named construction no call
-        uses (one prepared on it, or running from its lookup on: `_using`), no load is building
-        (`_loads`) and no other loaded construction reads (`_readers`; a reader named beside it goes
-        with it) leaves `constructions` now, before any later frame is queued, so a `load` of it
+        uses (one prepared on it, or running from its lookup on: `_using`) and no load is building
+        (`_loads`) leaves `constructions` now, before any later frame is queued, so a `load` of it
         after builds it anew. What they hold goes on a thread of their own (`_unload`), ordered as
         a call is (`_Order`): beside the calls running, before any later load or map (which never
-        meets the one torn down), with idle work waiting for it."""
+        meets the one torn down), with idle work waiting for it. A call reads only its own
+        construction's models (`Backend._owner` refuses another's), so a release takes nothing a
+        loaded construction reads."""
         if self.world > 1:
             print(
                 f"[executor] release of {', '.join(keys)} ignored: a GPU group keeps its "
@@ -3741,17 +3742,6 @@ class Executor:
                     print(f"[executor] construction {key} kept: {why}", file=sys.stderr, flush=True)
                     continue
                 free[key] = child
-            # One another loaded construction reads stays while that one does: both go together.
-            readers = _readers(loaded)
-            while kept := {k: r for k in free for r in readers.get(k, ()) if r not in free}:
-                for key, reader in kept.items():
-                    print(
-                        f"[executor] construction {key} kept: construction {reader} reads its "
-                        "models",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    del free[key]
             if not free:
                 return
             # A new map: calls iterating the old one beside this are undisturbed.
@@ -5367,29 +5357,6 @@ class Executor:
 #: Telemetry the worker reads as optional: what a reply loses when an author's key reads as
 #: a credential (`tel.log(..., token=1)`) and the seam refuses the frame.
 _TELEMETRY = ("observations", "execution", "attribution")
-
-
-def _readers(loaded: Mapping[str, Executor]) -> dict[str, set[str]]:
-    """By loaded construction, the other loaded ones whose bakes read its models
-    (`Backend.reads`: H3's turbo overlay, read by its base)."""
-    backends = {
-        key: [m.backend for m in child.model_executors or [child] if m.backend is not None]
-        for key, child in loaded.items()
-    }
-    owner = {
-        id(model): key
-        for key, held in backends.items()
-        for backend in held
-        for model in tuple(backend.models.values())
-    }
-    readers: dict[str, set[str]] = {}
-    for key, held in backends.items():
-        for backend in held:
-            for model in tuple(backend.reads):
-                read = owner.get(id(model))
-                if read is not None and read != key:
-                    readers.setdefault(read, set()).add(key)
-    return readers
 
 
 def _send_reply(channel: Channel, reply: Reply) -> None:
