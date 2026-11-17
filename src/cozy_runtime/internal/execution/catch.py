@@ -120,23 +120,34 @@ def _gib(n: int) -> str:
     return f"{n / (1 << 30):.1f} GiB"
 
 
-def _holders(device: int) -> str:
-    """What holds `device`'s memory now: live tensors, the working pages mapped beside them (free
-    but in pages a live tensor shares, or freed and awaiting their stream), weights in use, graph
-    pools and caches."""
-    room, stats = vt.room(device), vt.stats(device)
-    pools, caches = stats["pools_bytes"], stats["cache_mapped_bytes"]
+def _holders(device: int, refused: Mapping[str, int] | None = None) -> str:
+    """What holds `device`'s memory: live tensors, weights in use, graph pools and caches, as the
+    refused allocation found them (`refused`, `vt.refusal`), else now, with the working pages
+    mapped beside the live tensors (free but in pages a live tensor shares, or freed and awaiting
+    their stream)."""
+    beside = ""
+    if refused is None:
+        room, stats = vt.room(device), vt.stats(device)
+        refused = {
+            "working_live": room["working_live"],
+            "pinned": room["pinned"],
+            "weights_resident": room["weights_resident"],
+            "capacity": room["capacity"],
+            "pools": stats["pools_bytes"],
+            "caches": stats["cache_mapped_bytes"],
+        }
+        mapped = max(stats["mapped_bytes"] - room["working_live"], 0)
+        beside = f" and {_gib(mapped)} mapped beside them ({_gib(stats['pending_bytes'])} awaiting their stream)"
+    pools, caches = refused["pools"], refused["caches"]
     held = (
         f"{_gib(pools)} of graph pools, {_gib(caches)} of caches"
         if pools or caches
         else "no graph pools or caches"
     )
-    beside = max(stats["mapped_bytes"] - room["working_live"], 0)
     return (
-        f"{_gib(room['working_live'])} of live tensors and {_gib(beside)} mapped beside them "
-        f"({_gib(stats['pending_bytes'])} awaiting their stream), {_gib(room['pinned'])} of "
-        f"weights in use ({_gib(room['weights_resident'])} resident), {held}, of "
-        f"{_gib(room['capacity'])} on GPU {device}"
+        f"{_gib(refused['working_live'])} of live tensors{beside}, {_gib(refused['pinned'])} of "
+        f"weights in use ({_gib(refused['weights_resident'])} resident), {held}, of "
+        f"{_gib(refused['capacity'])} on GPU {device}"
     )
 
 
@@ -146,15 +157,24 @@ def room(device: int) -> str:
 
 
 def _room_line() -> str:
-    """The card's room now, for a device OOM's line (`_errors.ROOM`): read where the failure is
-    classified, its frames still held."""
+    """The card's room for a device OOM's line (`_errors.ROOM`): as varena found it when it refused
+    the allocation, its pins still held (cr-319: read here, after the frames unwound, Qwen3.6's
+    45.2 GiB of pinned weights read "0.0 GiB in use"); "every evictable byte offered" only when
+    every lever of the reclaim order was tried first."""
     try:
         if not torch.cuda.is_initialized():
             return "a card this process has not started"
-        holders = _holders(torch.cuda.current_device())
+        device = torch.cuda.current_device()
+        read = getattr(vt, "refusal", None)  # a TensorFS that keeps its refusals' room
+        refused = cast("Mapping[str, int] | None", read(device) if read is not None else None)
+        holders = _holders(device, refused)
     except Exception as exc:  # the line only describes the failure; it never replaces it
         return f"a room that could not be read ({type(exc).__name__})"
-    return f"{holders}, every evictable byte offered"
+    if refused is None:
+        return f"{holders} now"
+    if refused["offered"]:
+        return f"{holders}, every evictable byte offered"
+    return f"{holders}, its graph pool short"
 
 
 if not ROOM:
