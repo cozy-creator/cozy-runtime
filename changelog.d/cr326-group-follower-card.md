@@ -1,0 +1,1 @@
+Multi-GPU group runs prepare again (cr-326). cl-1119 asked torch for the card's size while registering a model, inside the construction's one-card view, where `torch.cuda.device_count()` answers 1: every follower GPU (rank 1 and up, torch device 1) failed its prepare with `AssertionError: Invalid device id`. Runtime now reads the card past that view, as its other probes do.

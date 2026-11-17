@@ -1339,9 +1339,13 @@ class Memory:
     def most_room(self) -> tuple[int, str]:
         """The most weight bytes this process could ever hold on its card at once, with every
         other byte of the card or its cap given back, less its own live working memory; and
-        that in words."""
+        that in words. The card is read past a construction's one-card view (`placing`): there,
+        torch's `get_device_properties(1)` refused every group follower's registration (cr-326)."""
+        from cozy_runtime.internal.derive import placing
+
         index = self.device.index or 0
-        total = int(torch.cuda.get_device_properties(index).total_memory)
+        with placing():
+            total = int(torch.cuda.get_device_properties(index).total_memory)
         card = total if self.budget_bytes is None else min(self.budget_bytes, total)
         live = int(vt.room(index)["working_live"])
         said = f"GPU {index}'s {_gib(card)}{' cap' if card < total else ''} less {_gib(live)} live"
