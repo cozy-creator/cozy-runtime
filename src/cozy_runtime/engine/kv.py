@@ -173,6 +173,9 @@ class KvManager:
         self.card_blocks = min(max_rows * max_blocks, card // block)
         self._kv = gpu.cache(self.card_blocks * block)
         self._kv_pages = _Pages(self._kv, self.device)
+        # Block 0's page stays mapped for the manager's life: the card tier's base is every K/V
+        # kernel's pointer, and a launcher asks the driver of it (an unmapped one is refused).
+        self._kv_pages.take([(0, block)])
         page = self._kv.granularity
         span = layout.span
         tables = (
@@ -229,11 +232,12 @@ class KvManager:
         self._known: dict[int, int] = {}
         self._slots: dict[int, int] = {}
         self._drafting: set[int] = set()
-        self._free: set[int] = set(range(self.card_blocks))
+        self._free: set[int] = set(range(1, self.card_blocks))
         #: free blocks on pages a held block keeps mapped: taken before any page is mapped
         self._spare: set[int] = set()
         #: the other free blocks, lowest first; an entry may be stale (`_take` checks it)
-        self._fresh: list[int] = list(range(self.card_blocks))
+        self._fresh: list[int] = list(range(1, self.card_blocks))
+        self._respare([0])
 
     # ------------------------------------------------------------------ what a call needs
 
@@ -430,5 +434,6 @@ class KvManager:
         del self.block_table, self.lengths, self.slot_mapping, self.state_slot, self.blocks
         self._states.clear()
         self.state_scratch.clear()
+        self._kv_pages.drop([(0, self.layout.block_bytes)])
         self._kv.close()
         self._state.close()
