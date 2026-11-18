@@ -428,24 +428,25 @@ def _fallback(chosen: str, cols: int) -> str:
 
 
 def resolve(source: Checkpoint, selection: ArtifactQuantizationPlan, encoding: str) -> None:
-    """Each selected weight no rule names takes its type in mix `encoding`, over each of the
-    selection's components; one llama-quantize keeps leaves the selection, at source precision."""
+    """Each selected weight no rule names takes its type in mix `encoding`; one llama-quantize
+    keeps leaves the selection, at source precision. The checkpoint's components are one GGUF, as
+    llama.cpp's converter writes a model (its language layers and MTP layer, stored apart or not):
+    the mix's counters run over all of them, and the vision tower is mmproj's."""
     free = [t for t in selection.tensors if t.encoding is None]
+    if not free:
+        return
+    held = source.components
+    config = next((h.config for h in held.values() if h.config.get("architectures")), None)
+    config = held[free[0].component].config if config is None else config
+    shapes = {key: tuple(info.shape) for h in held.values() for key, info in h.tensors.items()}
+    try:
+        types = mix(encoding, model(config, shapes), [t.key for t in free])
+    except (KeyError, ValueError) as error:
+        raise UnsupportedInput(f"{encoding}: {error}", code="quantization_plan") from error
     kept: set[tuple[str, str]] = set()
-    for component in dict.fromkeys(t.component for t in free):
-        held = source.components[component]
-        shapes = {key: tuple(info.shape) for key, info in held.tensors.items()}
-        names = [t.key for t in free if t.component == component]
-        try:
-            types = mix(encoding, model(held.config, shapes), names)
-        except (KeyError, ValueError) as error:
-            raise UnsupportedInput(
-                f"{encoding}: {component}: {error}", code="quantization_plan"
-            ) from error
-        for tensor in free:
-            if tensor.component == component:
-                chosen = types[tensor.key]
-                if chosen is None:
-                    kept.add((tensor.component, tensor.key))
-                tensor.encoding = chosen
+    for tensor in free:
+        chosen = types[tensor.key]
+        if chosen is None:
+            kept.add((tensor.component, tensor.key))
+        tensor.encoding = chosen
     selection.tensors[:] = [t for t in selection.tensors if (t.component, t.key) not in kept]
