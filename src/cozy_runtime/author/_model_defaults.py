@@ -116,7 +116,9 @@ def model_on_demand(value: object) -> tuple[str, ...]:
 #: The longest rule: one small boolean expression, never a program.
 MAX_NEEDS_RULE = 1024
 #: A component of a Model argument, as a `needs=` key names it: `model.vision`.
-_COMPONENT_KEY = re.compile(r"(?P<argument>[A-Za-z_][A-Za-z0-9_]*)\.(?P<component>[A-Za-z0-9_][A-Za-z0-9_-]*)")
+_COMPONENT_KEY = re.compile(
+    r"(?P<argument>[A-Za-z_][A-Za-z0-9_]*)\.(?P<component>[A-Za-z0-9_][A-Za-z0-9_-]*)"
+)
 
 
 def needs_component(key: str) -> tuple[str, str] | None:
