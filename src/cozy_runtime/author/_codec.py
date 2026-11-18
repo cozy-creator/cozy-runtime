@@ -31,7 +31,6 @@ import io
 import math
 import os
 import queue
-import shutil
 import struct
 import threading
 from array import array
@@ -55,7 +54,6 @@ if TYPE_CHECKING:
     from av.audio.codeccontext import AudioCodecContext
     from av.audio.frame import AudioFrame
     from av.packet import Packet
-    from av.rational import AVRational
     from av.stream import Stream
     from av.video.frame import VideoFrame
     from torch import Tensor
