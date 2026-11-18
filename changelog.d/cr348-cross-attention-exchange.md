@@ -1,0 +1,1 @@
+Ulysses crosses a cross-attention between two split sequences (queries' rows unlike keys' and values'), on the group's exchange like a self-attention: its tensors each take their own split, planned as one byte payload a pair of GPUs (cr-348). A package's cross-modal attention no longer needs its own NCCL all-to-alls, each with a host sync to learn the sizes.
