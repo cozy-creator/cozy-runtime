@@ -429,7 +429,13 @@ class _Broker:
         try:
 
             def asset_value(value: object) -> object:
-                if isinstance(value, (Model, Weights)):
+                if isinstance(value, Weights):
+                    raise CapabilityError(
+                        "a call takes a Weights slot by its ref: "
+                        "ModelChoice(lora=(Lora(weights.ref),)) or ModelChoice(ref=weights.ref)",
+                        code="child.model_artifact_required",
+                    )
+                if isinstance(value, Model):
                     raise CapabilityError(
                         "a call's model is a ModelChoice; an injected Model belongs to this "
                         "attempt. Retain it with a zero-byte TensorFS derivation and pass "

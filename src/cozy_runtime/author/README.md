@@ -118,8 +118,20 @@ def generate(ctx: Context, payload: Request, model: Flow, upsampler: Upsampler, 
   request when the package is read: a field that isn't there refuses the package.
 - A model argument with a rule is built when the function first reads it. One with no rule is
   always needed.
-- A function that loads no model and calls others names a function it calls:
+- A function that calls others names a function it calls:
   `needs={"edit_segment": "request.plate != null"}`.
+- A LoRA a function applies through a call is a `Weights` argument with a default, so a
+  request can replace it. Its rule says which requests fetch it, and the call takes it by its
+  `ref`:
+
+  ```python
+  @app.entrypoint(defaults={"depth": "patil/depth-control@0.1.0"},
+                  needs={"depth": 'request.control.exists(c, c.kind == "depth")'})
+  async def generate(ctx: Context, payload: Request, depth: Weights) -> Result:
+      return await call(control, payload, models={"model": ModelChoice(lora=(Lora(depth.ref),))})
+  ```
+
+  A string field of another package's request takes `depth.ref` too.
 - Err toward true: a rule that is true for a request that doesn't read the model only fetches
   too much. One that is false for a request that does read it makes that request wait for the
   download when it reads it, and the run warns.

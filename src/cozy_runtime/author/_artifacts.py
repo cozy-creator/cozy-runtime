@@ -63,7 +63,8 @@ class ModelArtifact(msgspec.Struct, frozen=True):
 
 class Lora(msgspec.Struct, frozen=True, omit_defaults=True):
     """A LoRA, named as `cozy run --lora` names one: `[org/]name[@release]`,
-    `name@sha256:<commit>`, `local/<alias>`, `hf://…` or `civitai://…`."""
+    `name@sha256:<commit>`, `local/<alias>`, `hf://…` or `civitai://…`; or a `Weights`
+    argument's `ref`, the LoRA its slot was bound to."""
 
     ref: str
     strength: float = 1.0

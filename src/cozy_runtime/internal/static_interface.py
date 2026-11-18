@@ -1946,9 +1946,10 @@ def _call_rules(
     rows: Mapping[tuple[str, str], dict[str, Json]],
 ) -> None:
     """Each `needs=` rule that names a function this one calls goes on that call's row. A key
-    is a constructed Model argument or one called function, never both and never neither."""
+    is a model argument (a Model or raw Weights) or one called function, never both and never
+    neither."""
     models = typing.cast(list[dict[str, Json]], doc.get("models", []))
-    slots = {str(m["path"]).rpartition(".")[2] for m in models if not m.get("weights")}
+    slots = {str(m["path"]).rpartition(".")[2] for m in models}
     for name, rule in registration.model_needs.items():
         called = [row for (_, function), row in rows.items() if function == name]
         if name in slots and not called:
@@ -1957,7 +1958,7 @@ def _call_rules(
             reader.refuse(
                 registration.module,
                 registration.fn,
-                f"needs names {name!r}: a rule is for one Model argument of "
+                f"needs names {name!r}: a rule is for one model argument of "
                 f"{registration.name}, or one function it calls",
                 "model_needs",
             )
