@@ -1,0 +1,1 @@
+A dev machine's extra decode check (what the check before cr-283 would have found, `decode.partial_restore`) records any failure and serves. It re-raised anything but a capacity error, so on a dev machine a failure there failed the user's call (44202545137).

@@ -3283,9 +3283,9 @@ class _Engine:
                 try:
                     self.partial.append(self._partial(size, state, start, at, graph, stream))
                 except Exception as exc:  # a dev machine's diagnosis never fails its call
-                    if not is_capacity(exc):
-                        raise
-                    self.partial.append(f"no room to check without them: {exc}"[:200])
+                    said = "no room to check without them" if is_capacity(exc) else "failed"
+                    self.partial.append(f"{said}: {type(exc).__name__}: {exc}"[:200])
+                    _unwind(exc)
                     start.restore()
                     self._advance(size)
         finally:
