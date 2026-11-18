@@ -205,7 +205,9 @@ def varena_core(payload: VarenaCoreRequest, ctx: Context) -> Measured:
     rows = [json.loads(line) for line in lines if line.startswith("{")]
     found = {"case": case, "exit": code, "rows": rows, "tail": lines[-40:] if code else []}
     if code:
-        raise RuntimeError(f"varena case {case} failed: {json.dumps(found)[-4000:]}")
+        # The exception first: a run's record keeps a message's start, and warnings fill a tail's.
+        error = " | ".join(line.strip() for line in lines[-8:] if line.strip())
+        raise RuntimeError(f"varena case {case} failed: {error[-1500:]} :: {json.dumps(found)[-2500:]}")
     return Measured(json.dumps(found, sort_keys=True))
 
 
