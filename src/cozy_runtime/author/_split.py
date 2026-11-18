@@ -453,6 +453,9 @@ def _run[W](
             # Nothing computes in place on host memory: a window of a whole kept there is brought
             # to the card, written, and copied back.
             staged = runtime.staged(target)
+            from cozy_runtime.internal import var030  # PROOF ONLY (var-030), never merge
+
+            var030.inplace(staged)
             write(at(index), staged)
             if staged is not target:
                 runtime.write(target, staged)

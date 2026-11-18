@@ -38,6 +38,7 @@ from cozy_runtime.author import _phases, _retained
 from cozy_runtime.author._errors import CapabilityError, DoesNotFit, Fault, fault, is_capacity
 from cozy_runtime.author._model import WARNINGS, WarningRow, recovered
 from cozy_runtime.internal import cache_owners, pacing, proctree
+from cozy_runtime.internal import var030  # PROOF ONLY (var-030), never merge
 from cozy_runtime.internal.accel import (
     ResidencyError,
     StaleBinding,
@@ -2008,7 +2009,8 @@ class Memory:
             if use is None:
                 raise StaleBinding("idle graph preparation cannot fill native weight backing")
             return use
-        return self._native_region(block, final=final).use(self._cuda_stream().cuda_stream)
+        with var030.span("weights use"):
+            return self._native_region(block, final=final).use(self._cuda_stream().cuda_stream)
 
     def _fill(self, groups: list[_Block]) -> None:
         """`groups`' absent raw Regions filled together before their blocks bind (cr-318): one
@@ -2805,6 +2807,8 @@ class Memory:
                     _escaped_warnings(request.escaped)
                 request.sample()
                 request.ended = request.stats()
+                if not idle:
+                    request.ended["var030"] = var030.take(request.id)  # type: ignore[typeddict-unknown-key]
                 self.last = request.ended
                 if request.hosted:  # execution imports residency: loaded by now
                     from cozy_runtime.internal.execution import pinned
@@ -3222,6 +3226,8 @@ class Request:
         self.gathered = 0
         self.prefetch_completed = 0
         self.ahead = _ahead(memory)
+        if not idle:
+            var030.begin()
         self.allocator = _allocator(memory)
         self._trace: list[FillEntry] = []
         self.ended: RequestStats | None = None

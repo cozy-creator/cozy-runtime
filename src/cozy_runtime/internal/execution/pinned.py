@@ -15,8 +15,12 @@ import math
 import weakref
 from collections.abc import Callable, Sequence
 
+import time
+
 import torch
 from torch import Tensor
+
+from cozy_runtime.internal import var030  # PROOF ONLY (var-030), never merge
 
 
 class _Buffer:
@@ -24,7 +28,9 @@ class _Buffer:
     tensor made over it holds this until its storage goes."""
 
     def __init__(self, nbytes: int) -> None:
+        began = time.perf_counter()
         self.host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        var030.count("pinned_alloc", nbytes, time.perf_counter() - began)
         self.address = self.host.data_ptr()
         self.__cuda_array_interface__ = {
             "shape": (nbytes,),
@@ -94,24 +100,34 @@ def write(dst: Tensor, src: Tensor) -> None:
     a window of rows at a pitch one pitched copy; a kernel writes it in place only where its
     strides are neither, or `src` is not the same tensor on the card."""
     host = _host(dst)
+    nbytes = dst.numel() * dst.element_size()
+    var030.at("write")
     if host is None:
         dst.copy_(src)
+        var030.moved("wrote_card", nbytes)
+        var030.at("w")
         return
-    nbytes = dst.numel() * dst.element_size()
     if dst.is_contiguous():
         host.copy_(src, non_blocking=True)
         count("to_host", nbytes)
+        var030.moved("wrote_host", nbytes)
+        var030.at("w")
         return
     rows = _rows(dst)
     same = src.is_cuda and src.dtype == dst.dtype and src.shape == dst.shape and not held(src)
     if rows is None or not same or not nbytes:
         dst.copy_(src)
         count("kernel", nbytes)
+        var030.moved("wrote_host_strided", nbytes)
+        var030.at("w")
         return
     width, height, pitch = rows
     src = src.contiguous()
     _pitched(dst.data_ptr(), pitch, src.data_ptr(), width, width, height, dst.device)
     count("to_host", nbytes)
+    var030.moved("wrote_host_pitched", nbytes)
+    var030.count(f"pitched_write_width_{width}", nbytes)
+    var030.at("w")
 
 
 def read(src: Tensor) -> Tensor:
@@ -120,19 +136,26 @@ def read(src: Tensor) -> Tensor:
     host = _host(src)
     if host is None:
         return src
+    var030.at("read")
     out = torch.empty(src.shape, dtype=src.dtype, device=src.device)
     nbytes = src.numel() * src.element_size()
     rows = None if src.is_contiguous() else _rows(src)
     if src.is_contiguous():
         out.copy_(host, non_blocking=True)
+        var030.moved("read_host", nbytes)
     elif rows is not None and nbytes:
         width, height, pitch = rows
         _pitched(out.data_ptr(), width, src.data_ptr(), pitch, width, height, src.device)
+        var030.moved("read_host_pitched", nbytes)
+        var030.count(f"pitched_read_width_{width}", nbytes)
     else:
         out.copy_(src)
         count("kernel", nbytes)
+        var030.moved("read_host_strided", nbytes)
+        var030.at("w")
         return out
     count("to_card", nbytes)
+    var030.at("w")
     return out
 
 
@@ -232,10 +255,12 @@ def settle() -> None:
     """Free the buffers whose tensors went, once the stream has passed their last use."""
     while _GOING:
         event, _ = _GOING[0]
+        began = time.perf_counter()
         if event is None:
             torch.cuda.synchronize()
         else:
             event.synchronize()
+        var030.count("pinned_settle_wait", 0, time.perf_counter() - began)
         _GOING.pop(0)
 
 
