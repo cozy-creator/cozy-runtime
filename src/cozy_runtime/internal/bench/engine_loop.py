@@ -438,8 +438,7 @@ def measure() -> dict[str, JSON]:
             row[name] = section(wrong)
         except Exception as failed:
             row[name] = {"error": f"{type(failed).__name__}: {failed}"}
-            if name != "copies":  # a question for the driver: it reports; a wrong captured copy still fails
-                wrong.append(f"{name}: {type(failed).__name__}: {failed}")
+            wrong.append(f"{name}: {type(failed).__name__}: {failed}")
     torch.cuda.synchronize()
     row["wrong"] = wrong
     if wrong:
