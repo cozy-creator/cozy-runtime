@@ -36,10 +36,13 @@ _PREPARING: contextvars.ContextVar[str] = contextvars.ContextVar("cozy_preparing
 
 
 class _Placed:
-    """The call that holds the process now: its names and the process's temporary directory."""
+    """The call that holds the process now: its names, and the process's own temporary directory,
+    values of those names (None: unset) and working directory."""
 
     names: dict[str, str] = {}
     tempdir = ""
+    saved: dict[str, str | None] = {}
+    cwd = ""
 
 
 def names() -> dict[str, str]:
@@ -50,6 +53,24 @@ def names() -> dict[str, str]:
 def process_tempdir() -> str:
     """The process's temporary directory, during a placed call too: for the Runtime's own files."""
     return _Placed.tempdir or tempfile.gettempdir()
+
+
+def process_environment() -> dict[str, str]:
+    """The process's own environment, during a placed call too: for a child that may outlive the
+    call (a kernel builder), so it never lives in the call's place."""
+    environ, saved = dict(os.environ), _Placed.saved
+    for name, value in saved.items():
+        if value is None:
+            environ.pop(name, None)
+        else:
+            environ[name] = value
+    return environ
+
+
+def process_cwd() -> str | None:
+    """The process's own working directory during a placed call; None outside one (it is the
+    current one)."""
+    return _Placed.cwd or None
 
 
 def _own(scratch: Path) -> dict[str, str]:
@@ -94,6 +115,7 @@ def _placed(scratch: Path, request: str) -> Iterator[None]:
     try:
         for fd, log in zip((1, 2), logs, strict=True):
             os.dup2(log, fd)
+        _Placed.saved, _Placed.cwd = saved, cwd  # before the call's stand in for them
         environ.update(own)
         _Placed.names, _Placed.tempdir = own, process_tmp
         tempfile.tempdir = str(tmp)
@@ -115,6 +137,7 @@ def _placed(scratch: Path, request: str) -> Iterator[None]:
                 environ.pop(name, None)
             else:
                 environ[name] = value
+        _Placed.saved, _Placed.cwd = {}, ""  # after the process's are back
         for directory in (work, tmp, home):
             shutil.rmtree(directory, ignore_errors=True)
 

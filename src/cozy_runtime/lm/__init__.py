@@ -1876,8 +1876,8 @@ class _Engine:
         self.partial: list[str] = []
         self.replayed = 0
         self.retired_graphs = 0
-        #: `LANDED` when a capture met a kernel still building (none records until one lands),
-        #: and when the graphs were last started over
+        #: `LANDED` when a capture, or its graph domain's opening, met a kernel still building
+        #: (none records until one lands), and when the graphs were last started over
         self.building, self.landed = -1, LANDED[0]
         self.driver: int | None = None
         self.draft: torch.nn.Module | None = None
@@ -3060,6 +3060,19 @@ class _Engine:
             if side is not None:
                 current.wait_stream(side)
 
+    def _opens(self) -> bool:
+        """Whether a step may warm up or record now. Its graph domain opens first, which a kernel
+        still building refuses (`Building`) as it refuses a capture: the step decodes eagerly until
+        a kernel lands, and its call never fails for it (cr-342)."""
+        if self.building == LANDED[0]:
+            return False
+        try:
+            _set(self.domain).initialize()
+        except Building:
+            self.building = LANDED[0]
+            return False
+        return True
+
     def _replay(self, size: int, cuda: bool) -> None:
         drafted = self._drafting(size)
         constrained = self._constrained()
@@ -3096,7 +3109,7 @@ class _Engine:
             self.eager += 1
             return
         graph = self.graphs.get(key)
-        if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
+        if graph is None and cuda and key not in self.unrecorded and self._opens():
             domain = _set(self.domain)  # a CUDA step's (`_one`)
             if key not in self.warmed:
                 # This is the caller's actual next token, never an extra speculative warmup; its
