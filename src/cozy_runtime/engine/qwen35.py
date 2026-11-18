@@ -13,7 +13,7 @@ own working memory, and nothing imports `cozy_runtime.lm`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 import torch.nn.functional as F
@@ -23,11 +23,79 @@ from cozy_runtime.engine.attention import HostTier, paged_step
 from cozy_runtime.engine.kv import KvLayout, StateSpec
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Sequence
 
     from torch import Tensor
 
     from cozy_runtime.engine.kv import KvManager
+
+
+class _Linear(Protocol):
+    """A linear as loaded: whatever lane serves it, called as the module it is."""
+
+    def __call__(self, x: Tensor, /) -> Tensor: ...
+
+
+class _Norm(Protocol):
+    weight: Tensor
+
+
+class _GatedNorm(Protocol):
+    weight: Tensor
+    variance_epsilon: float
+
+
+class _Conv(Protocol):
+    weight: Tensor
+
+
+class _Attention(Protocol):
+    q_proj: _Linear
+    k_proj: _Linear
+    v_proj: _Linear
+    o_proj: _Linear
+    q_norm: _Norm
+    k_norm: _Norm
+
+
+class _Delta(Protocol):
+    in_proj_qkv: _Linear
+    in_proj_z: _Linear
+    in_proj_b: _Linear
+    in_proj_a: _Linear
+    out_proj: _Linear
+    conv1d: _Conv
+    A_log: Tensor
+    dt_bias: Tensor
+    norm: _GatedNorm
+
+
+class _Mlp(Protocol):
+    gate_proj: _Linear
+    up_proj: _Linear
+    down_proj: _Linear
+    act_fn: _Linear
+
+
+class _Layer(Protocol):
+    """`Qwen3_5DecoderLayer`, as the step reads it: an attention layer has `self_attn`, a
+    gated-delta one `linear_attn`."""
+
+    input_layernorm: _Norm
+    post_attention_layernorm: _Norm
+    mlp: _Mlp
+    self_attn: _Attention
+    linear_attn: _Delta
+
+
+class _Mtp(Protocol):
+    """The checkpoint's multi-token-prediction head (`model.mtp`, `lm.Draft`'s modules)."""
+
+    fc: _Linear
+    pre_fc_norm_embedding: _Norm
+    pre_fc_norm_hidden: _Norm
+    layers: Sequence[_Layer]
+    norm: _Norm
 
 #: A row's split-KV parts at once: fixed, so a step's graph serves every length.
 PARTS = 32
@@ -68,8 +136,29 @@ class Text:
         return 2 * self.k_heads * self.dk + self.v_heads * self.dv
 
 
+class _TextConfig(Protocol):
+    hidden_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    layer_types: Sequence[str]
+    rms_norm_eps: float
+    linear_num_key_heads: int
+    linear_num_value_heads: int
+    linear_key_head_dim: int
+    linear_value_head_dim: int
+    linear_conv_kernel_dim: int
+
+
+class _Config(Protocol):
+    def get_text_config(self, decoder: bool = ...) -> _TextConfig: ...
+
+
+class _Configured(Protocol):
+    config: _Config
+
+
 def text_of(model: torch.nn.Module) -> Text:
-    config = cast("torch.nn.Module", model).config.get_text_config(decoder=True)  # type: ignore[operator]
+    config = cast("_Configured", model).config.get_text_config(decoder=True)
     rope = dict(getattr(config, "rope_parameters", None) or {})
     head_dim = int(getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads)
     return Text(
@@ -147,12 +236,12 @@ class Qwen35:
     def __init__(self, model: torch.nn.Module, kv: KvManager, host: HostTier) -> None:
         self.model, self.kv, self.host = model, kv, host
         self.text = text_of(model)
-        root = cast("torch.nn.Module", model.get_decoder())  # type: ignore[operator]
-        self.layers = list(cast("torch.nn.ModuleList", root.layers))
-        self.final = cast("torch.nn.Module", root.norm)
-        self.embed = cast("Callable[[Tensor], Tensor]", model.get_input_embeddings())  # type: ignore[operator]
-        self.head = cast("Callable[[Tensor], Tensor]", model.get_output_embeddings())  # type: ignore[operator]
-        self.mtp = cast("torch.nn.Module | None", getattr(model, "mtp", None))
+        root = model.get_decoder()  # type: ignore[operator]  # a Transformers model's
+        self.layers = [cast("_Layer", layer) for layer in root.layers]
+        self.final = cast("_Norm", root.norm)
+        self.embed = cast("_Linear", model.get_input_embeddings())  # type: ignore[operator]  # as above
+        self.head = cast("_Linear", model.get_output_embeddings())  # type: ignore[operator]  # as above
+        self.mtp = cast("_Mtp | None", getattr(model, "mtp", None))
         text = self.text
         inv = 1.0 / (text.theta ** (torch.arange(0, text.rotary, 2, dtype=torch.float) / text.rotary))
         self.inv_freq = inv.to(kv.device)
@@ -171,7 +260,7 @@ class Qwen35:
 
     def _attention(
         self,
-        block: torch.nn.Module,
+        block: _Attention,
         x: Tensor,
         rope: tuple[Tensor, Tensor],
         kv_layer: int,
@@ -195,10 +284,9 @@ class Qwen35:
             kv.layout, kv_layer, PARTS, dim**-0.5, tables.first_seen,
         )  # fmt: skip
         out = out.reshape(rows, span, -1) * torch.sigmoid(gate)
-        o: Tensor = block.o_proj(out)
-        return o
+        return block.o_proj(out)
 
-    def _delta(self, block: torch.nn.Module, x: Tensor, index: int) -> Tensor:
+    def _delta(self, block: _Delta, x: Tensor, index: int) -> Tensor:
         rows, span, _ = x.shape
         text, kv = self.text, self.kv
         mixed = block.in_proj_qkv(x).contiguous()
@@ -230,8 +318,7 @@ class Qwen35:
         normed = _gated(
             out.reshape(-1, text.dv), z.reshape(-1, text.dv), block.norm.weight, block.norm.variance_epsilon
         )
-        o: Tensor = block.out_proj(normed.reshape(rows, span, -1))
-        return o
+        return block.out_proj(normed.reshape(rows, span, -1))
 
     def _layer(self, i: int, x: Tensor, rope: tuple[Tensor, Tensor], tables: Tables) -> Tensor:
         layer = self.layers[i]
@@ -257,7 +344,7 @@ class Qwen35:
         rope = self._rope(positions, x.dtype)
         for i in range(len(self.layers)):
             x = self._layer(i, x, rope, tables)
-        return cast("Tensor", _norm(x, self.final.weight, self.text.eps))
+        return _norm(x, self.final.weight, self.text.eps)
 
     def draft(self, ids: Tensor, hidden: Tensor, positions: Tensor, tables: Tables) -> Tensor:
         """The head's state `[rows, S, hidden]` for tokens `ids` at `positions`, each from the
@@ -276,7 +363,7 @@ class Qwen35:
         m = layer.mlp
         a = _norm(x, layer.post_attention_layernorm.weight, eps)
         x = x + m.down_proj(m.act_fn(m.gate_proj(a)) * m.up_proj(a))
-        return cast("Tensor", _norm(x, mtp.norm.weight, eps))
+        return _norm(x, mtp.norm.weight, eps)
 
     def logits(self, hidden: Tensor) -> Tensor:
         return self.head(hidden).float()
