@@ -1,0 +1,4 @@
+# llama.cpp's vendored sources (xs-213) are held to their upstream digests (kernels/csrc/ggml/UPSTREAM.md): git never
+# converts their line endings, on any checkout (a Windows runner's autocrlf made every digest differ).
+kernels/csrc/ggml/ggml/** -text
+kernels/csrc/ggml/LICENSE -text
