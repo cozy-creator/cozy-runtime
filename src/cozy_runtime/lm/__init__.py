@@ -3218,6 +3218,7 @@ class _Engine:
         held = [*state, *_beyond(writes, state)]
         start: list[torch.Tensor] | None = None
         try:
+            _cr337_stage("the capture, before the check", held, [], domain.device)
             start, at = [value.clone() for value in held], self.length[:size].clone()
             _cr337_stage("clones of the held state", held, start, domain.device)
             vt.replay(graph, stream=stream)  # its pool is held since its capture
@@ -3890,6 +3891,11 @@ def _cr337_stage(
     except Exception as exc:
         _cr337_report(f"after {stage}", exc, [], [], held, start, device)
         raise
+    try:  # a device-to-host copy, as `.item()` makes one: the first stage after which it fails broke it
+        int(torch.ones(1, dtype=torch.int64, device=device).sum())
+    except Exception as exc:
+        _cr337_report(f"a device-to-host probe after {stage}", exc, [], [], held, start, device)
+        raise
 
 
 def _cr337_report(
@@ -3910,7 +3916,7 @@ def _cr337_report(
             f"  held {len(held)} tensors, cloned {cloned} bytes",
         ]
         try:
-            stats = cast("Mapping[str, object]", vt.stats(device.index or 0))
+            stats = cast("Mapping[str, object]", vt.stats(device if isinstance(device, int) else (device.index or 0)))
             keys = (
                 "mapped_bytes", "pending_bytes", "free_bytes", "allocated_bytes", "reclaim_ns",
                 "reclaim_pending_working_ns", "reclaim_completed_working_ns", "reclaim_idle_pools_ns",
