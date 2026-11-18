@@ -54,6 +54,14 @@ except ModuleNotFoundError:  # the pure wheel
 except ImportError as broken:
     NO_CONV = f"this cozy-runtime wheel's causal-conv encoder kernels do not load ({broken})"
 try:
+    import cozy_runtime._kernels._ggml as _ggml
+
+    NO_GGML = ""
+except ModuleNotFoundError:  # the pure wheel
+    NO_GGML = "this cozy-runtime wheel carries no ggml matmuls (llama.cpp's MMVQ and MMQ)"
+except ImportError as broken:
+    NO_GGML = f"this cozy-runtime wheel's ggml matmuls do not load ({broken})"
+try:
     import cozy_runtime._kernels._attn4 as _attn4
 
     NO_ATTN4 = ""
@@ -105,6 +113,8 @@ ARCHS: dict[str, dict[str, tuple[str, ...]]] = {
         "cubin": ("sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_103", "sm_120", "sm_121"),
         "ptx": ("compute_80",),
     },
+    # llama.cpp's MMVQ and MMQ (xs-213, `kernels/csrc/ggml`), on the families its release builds: Ampere, Ada and RTX 50.
+    "_ggml": {"cubin": ("sm_80", "sm_86", "sm_89", "sm_120a"), "ptx": ()},
     # The executor's record of a fatal signal (cr-275, `internal.crash`): no GPU code, Linux only.
     "_crash": {"cubin": (), "ptx": ()},
 }
@@ -160,5 +170,6 @@ def rms_rope_split_half(
     return q_out, k_out
 
 
-# The modules are `internal.prebuilt`'s to call, `_conv` `accel.fusion`'s; `rms_rope_split_half` is `accel.kernels`'.
-__all__ = ["_attn4", "_conv", "_fa3", "_gemm", "_norm", "_sage3", "rms_rope_split_half"]
+# The modules are `internal.prebuilt`'s to call, `_conv` `accel.fusion`'s, `_ggml` `internal.ggml_linear`'s;
+# `rms_rope_split_half` is `accel.kernels`'.
+__all__ = ["_attn4", "_conv", "_fa3", "_gemm", "_ggml", "_norm", "_sage3", "rms_rope_split_half"]

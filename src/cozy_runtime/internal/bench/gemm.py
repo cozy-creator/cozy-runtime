@@ -24,10 +24,19 @@ import torch
 
 import cozy_runtime
 from cozy_runtime import _build_provenance
-from cozy_runtime.author import Context
 from cozy_runtime.accel.kernels import Launch
-from cozy_runtime.internal import arch, attention, int8_linear, nvfp4_linear, prebuilt, triton_kernels
+from cozy_runtime.author import Context
+from cozy_runtime.internal import (
+    arch,
+    attention,
+    ggml_linear,
+    int8_linear,
+    nvfp4_linear,
+    prebuilt,
+    triton_kernels,
+)
 from cozy_runtime.internal.bench.attention import _device, _quantiles, _timed, _warm
+from cozy_runtime.internal.encoding import ggml_types
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP
 
 BF16 = torch.bfloat16
@@ -40,7 +49,9 @@ _MAX_REPS = 64
 _FLUSH_BYTES = 256 << 20
 #: Rows held bit for bit at each end of an output: a tile's sums are its own, whatever the row.
 _EDGE = 2048
-LANES = ("bf16", "int8", "fp8", "nvfp4", "w4a8")
+LANES = ("bf16", "int8", "fp8", "nvfp4", "w4a8", "ggml")
+#: The ggml block types the `ggml` lane times: Q8_0 and Q4_K_M's.
+GGML_TYPES = ("ggml.q8_0", "ggml.q4_k", "ggml.q5_k", "ggml.q6_k")
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +98,17 @@ SHAPES: tuple[Shape, ...] = (
         Shape(f"lm-m{m}", site, m, n, k, 64)
         for m in (1, 16, 256)
         for site, n, k in (("qkv", 10240, 5120), ("o", 5120, 8192), ("up", 51200, 5120), ("down", 5120, 25600))
+    ),
+    # xs-213's kernel parity with llama.cpp: Qwen3.5-9B's and Qwen3.8-27B's linears (a gated-delta layer's QKV and
+    # out projections, the MLP's up and down, the LM head) at a decoded token, a few-row step, a batch and a prefill.
+    *(
+        Shape(f"{model}-m{m}", site, m, n, k, 1)
+        for m in (1, 8, 32, 512)
+        for model, sites in (
+            ("q35-9b", (("qkv", 8192, 4096), ("out", 4096, 4096), ("up", 12288, 4096), ("down", 4096, 12288), ("head", 248320, 4096))),
+            ("q38-27b", (("qkv", 10240, 5120), ("out", 5120, 6144), ("up", 17408, 5120), ("down", 5120, 17408), ("head", 248320, 5120))),
+        )
+        for site, n, k in sites
     ),
 )  # fmt: skip
 
@@ -329,8 +351,57 @@ def _w4a8(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
     return calls, {"gemm": "w4a8-gemm:prebuilt", "linear": "w4a8-linear:prebuilt"}
 
 
+def _ggml(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[dict[str, Call], dict[str, str]]:
+    """llama.cpp's matmul of each block type from f32 rows, as llama.cpp's MUL_MAT takes them (q8_1 quantize and
+    kernel), and the leaf's whole path from bf16 rows; the rule's kernel (mmvq, mmq_few, mmq) per type. Random blocks:
+    the kernels' time does not depend on the values."""
+    from cozy_runtime._kernels import _ggml as ops
+
+    rows = x.float()
+    calls: dict[str, Call] = {}
+    rules: dict[str, str] = {"gemm": "", "linear": ""}
+    for scheme in GGML_TYPES:
+        name = scheme.removeprefix("ggml.")
+        n, size = ggml_types.STRUCTS[name]
+        blocks = torch.randint(0, 256, (s.n, s.k // n, size), generator=g, device="cuda:0", dtype=torch.uint8)
+        matmul = partial(ggml_linear.matmul, ops, torch, rows, blocks, scheme, s.n)
+        calls[f"ggml-matmul{GGML_GRAPHED}:{name}"] = _graphed(matmul)
+        calls[f"ggml-linear{GGML_GRAPHED}:{name}"] = _graphed(partial(_ggml_linear, ops, x, blocks, scheme, s.n))
+        rules[f"kernel:{name}"] = ggml_linear.kernel(torch, 0, scheme, s.k, s.n, s.m, blocks)
+    if card.ops is not None and card.row.int8 and s.k % CONVROT_GROUP == 0:
+        # Our own 8-bit linear at the same rows, graphed alike: int8.convrot's GEMV (its rotation fused) beside MMVQ.
+        data = torch.randint(-127, 128, (s.n, s.k), generator=g, device="cuda:0", dtype=torch.int8)
+        scale = _rand(g, s.n, scale=1e-3, add=5e-4)
+        calls[f"ggml-int8{GGML_GRAPHED}:convrot"] = _graphed(partial(card.ops.int8_linear, x, data, scale, None, BF16))
+    return calls, rules
+
+
+#: A ggml call is this many back-to-back matmuls replayed from one CUDA graph, as test-backend-ops times one op back
+#: to back in one graph: what is timed is the GPU's, not Python's launch.
+GGML_GRAPHED = 16
+
+
+def _graphed(call: Call) -> Call:
+    call()  # its kernels verified and their shared memory raised, before the recording
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        call()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(GGML_GRAPHED):
+            call()
+    return graph.replay
+
+
+def _ggml_linear(ops: ModuleType, x: torch.Tensor, blocks: torch.Tensor, scheme: str, n: int) -> torch.Tensor:
+    return ggml_linear.matmul(ops, torch, x, blocks, scheme, n).to(BF16)
+
+
 BUILDERS: dict[str, Callable[[torch.Tensor, Shape, torch.Generator, Card], tuple[dict[str, Call], dict[str, str]]]] = {
-    "bf16": _bf16, "int8": _int8, "fp8": _fp8, "nvfp4": _nvfp4, "w4a8": _w4a8,
+    "bf16": _bf16, "int8": _int8, "fp8": _fp8, "nvfp4": _nvfp4, "w4a8": _w4a8, "ggml": _ggml,
 }  # fmt: skip
 
 
@@ -342,6 +413,10 @@ def _admits(lane: str, s: Shape, card: Card) -> str:
         return "no fp8 tensor cores"
     if lane == "nvfp4" and s.k % 16:
         return f"K {s.k} is not whole 16-blocks"
+    if lane == "ggml":
+        return ggml_linear.carried(card.inventory["sm"]) or (
+            f"K {s.k} is not whole {ggml_linear.ROW_PADDING}-column chunks" if s.k % ggml_linear.ROW_PADDING else ""
+        )
     return ""
 
 
@@ -436,6 +511,8 @@ def speed(lanes: list[str], wanted: list[str], seed: int, ctx: Context) -> Speed
             del out
         weight_bytes = s.n * s.k * 2
         fits = weight_bytes <= int(torch.cuda.get_device_properties(0).L2_cache_size)
+        # ggml's alone run back to back with no flush, as test-backend-ops runs llama.cpp's: the same measure.
+        fits = fits and not all(name.startswith("ggml-") for name in live)
         times = _interleaved(live, flush if fits else None)
         results.append({
             "id": s.id, "model": s.model, "site": s.site, "m": s.m, "n": s.n, "k": s.k, "calls": s.calls,
