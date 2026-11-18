@@ -7,6 +7,8 @@ attention layer, a multi-token-prediction head), against Transformers' own forwa
 - Drafted: the decoder's drafted greedy tokens against its plain ones (a draft only changes how
   many tokens a step keeps, never which).
 - Rows: four prompts of different lengths in one bucket, each row against itself alone.
+- Sampled (temperature 0.7, top-k 20, top-p 0.95, a seed): drafted against plain, which must give the
+  same tokens (each draw is hashed from the seed and the token's index), and plain against itself.
 - The step's graph: recorded once and replayed (or why not).
 
 The head is scaled so greedy choices are decisive with random weights. It reports and fails on a
@@ -73,6 +75,7 @@ def measure() -> dict[str, JSON]:
     row: dict[str, JSON] = {}
     runs: dict[str, list[list[int]]] = {}
     head = model.mtp
+    sampled = Request(prompts=prompts[:2], max_new=NEW, stops=[], temperature=0.7, top_k=20, top_p=0.95, seed=213)
     for name, drafting in (("plain", False), ("drafted", True)):
         if drafting:
             model.mtp = head
@@ -89,6 +92,14 @@ def measure() -> dict[str, JSON]:
         runs[name] = call.tokens
         alone = decoder(Request(prompts=prompts[:1], max_new=NEW, stops=[]))
         runs[f"{name}-alone"] = alone.tokens
+        drawn = decoder(sampled)
+        runs[f"{name}-sampled"] = drawn.tokens
+        kept = [k for row in drawn.kept for k in row]
+        row[f"{name}-sampled"] = {"kept_a_step": sum(kept) / max(len(kept), 1), "steps": drawn.steps}
+        kept = [k for r in call.kept for k in r]
+        row[name]["kept_a_step"] = sum(kept) / max(len(kept), 1)  # type: ignore[index]  # the dict just made
+        if not drafting:
+            runs["plain-sampled-again"] = decoder(sampled).tokens
     checks: dict[str, JSON] = {}
     wrong: list[str] = []
     for i, prompt in enumerate(prompts):
@@ -112,6 +123,9 @@ def measure() -> dict[str, JSON]:
         }  # fmt: skip
         if first_wrong is not None:
             wrong.append(f"row {i}: plain token {first_wrong} is not Transformers' clear choice")
+    checks["sampled_drafted_equal"] = runs["drafted-sampled"] == runs["plain-sampled"]
+    checks["sampled_repeat_equal"] = runs["plain-sampled-again"] == runs["plain-sampled"]
+    checks["sampled_differs_from_greedy"] = runs["plain-sampled"][0] != runs["plain"][0]
     checks["alone_plain_equal"] = runs["plain-alone"][0] == runs["plain"][0]
     checks["alone_drafted_equal"] = runs["drafted-alone"][0] == runs["drafted"][0]
     row["checks"] = checks
