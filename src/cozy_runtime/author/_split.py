@@ -437,6 +437,9 @@ def _run[W](
                 index[d] = slice(a, b)
             if runtime is not None:
                 runtime.piece()
+                from cozy_runtime.internal import var030  # PROOF ONLY (var-030), never merge
+
+                var030.inplace(into[tuple(index)])
             write(at(index), into[tuple(index)])
         return into
     fn = cast("Callable[[W], Tensor]", fn)  # no `out`: the first overload

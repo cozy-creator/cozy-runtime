@@ -27,6 +27,7 @@ from torch import Tensor, nn
 from cozy_runtime.author._context import CURRENT as ATTEMPT
 from cozy_runtime.author._errors import ROOM, DoesNotFit, is_capacity
 from cozy_runtime.author._model import TRANSPARENT
+from cozy_runtime.internal import var030  # PROOF ONLY (var-030), never merge
 from cozy_runtime.internal.execution import phase, sizing
 from cozy_runtime.internal.residency import PASS_SHAPE, Model, Request
 
@@ -94,6 +95,12 @@ def checkpoint() -> None:
     if context is None or _capturing():
         return
     context.raise_if_cancelled()
+
+
+def piece() -> None:
+    """A cut's window begins: a checkpoint, and (var-030) its mark."""
+    checkpoint()
+    var030.piece()
 
 
 def _capturing() -> bool:
@@ -190,6 +197,7 @@ class Unplaced(DoesNotFit):
 def refuse(device: int, name: str, level: str, need: int, exc: BaseException) -> Unplaced:
     """Native selection cannot make room for `name` at `level` (`need` bytes) with everything
     evictable gone, before any piece ran."""
+    var030.event("unplaced", name, -1, f"{level} needs {need}")
     return Unplaced(
         f"{name}: {level} needs {_gib(need)} beside {_holders(device)} ({exc}): run it smaller, "
         "or rent a larger card: `cozy run … --on new`"
@@ -272,16 +280,21 @@ def cut[T](
             return run(LEVELS.get(key, 0))
         request.memory.remember_working_phase(key, owners(request))
         stream = int(torch.cuda.current_stream(device).cuda_stream)
-        selection = select(device, key, name, menu, stream)
+        with var030.span(f"select {var030.generic(name)}"):
+            selection = select(device, key, name, menu, stream)
         while True:
             level = int(selection["choice_id"])
-            token = begin(device, key, name, menu, level, selection, stream)
+            with var030.span(f"select {var030.generic(name)}"):
+                token = begin(device, key, name, menu, level, selection, stream)
             LEVELS[key] = level
             note(request, key, name, level, selection)
+            var030.selection(name, level, selection)
             try:
-                result = run(level)
+                with var030.call(name, level):
+                    result = run(level)
             except BaseException as exc:
-                again = retry(device, key, name, menu, level, token, stream, exc, pure)
+                with var030.span(f"select {var030.generic(name)}"):
+                    again = retry(device, key, name, menu, level, token, stream, exc, pure)
                 if again is None:
                     if is_capacity(exc):  # the run record names it: a package's `holds` was short
                         request.working_splits[key]["refused"] = {"level": level, "pure": pure}
@@ -320,13 +333,16 @@ def nested[T](
     while True:
         LEVELS[key] = level
         note(request, key, name, level)
+        var030.selection(name, level, None, usable)
         try:
-            return run(level)
+            with var030.call(name, level, nested=True):
+                return run(level)
         except BaseException as exc:
             if not (pure and is_capacity(exc)) or level + 1 >= len(menu):
                 raise
             _unwind(exc)
         request.retries += 1
+        var030.event("nested_finer", name, level)
         print(
             f"cozy-runtime: {name} refused at level {level} inside another cut: level {level + 1}",
             file=sys.stderr,
@@ -357,6 +373,7 @@ def retry(
     except varena.Exhausted as refused:
         raise refuse(device, name, "every finer split", sum(menu[-1][1]), refused) from exc
     if again is not None:
+        var030.event("short_estimate", name, level, f"to {again['choice_id']}")
         print(f"cozy-runtime: {name} refused at level {level}: a short estimate", file=sys.stderr)
         if (request := CURRENT.get()) is not None:
             request.retries += 1
@@ -506,7 +523,10 @@ def wrap(
         _local.named, _local.ordinals = name, {}
         try:
             checkpoint()
-            with nullcontext() if around is None else around(module, args, kwargs):
+            with (
+                var030.span(f"block {var030.generic(name)}"),
+                nullcontext() if around is None else around(module, args, kwargs),
+            ):
                 return forward(*args, **kwargs)
         finally:
             _local.named, _local.ordinals = outer

@@ -10,8 +10,7 @@ import torch
 from torch import nn
 
 from cozy_runtime.internal.execution import catch, cuts
-from cozy_runtime.internal.execution.catch import checkpoint as piece
-from cozy_runtime.internal.execution.catch import refusals, serving
+from cozy_runtime.internal.execution.catch import piece, refusals, serving
 from cozy_runtime.internal.execution.cuts import (
     ahead,
     attend,

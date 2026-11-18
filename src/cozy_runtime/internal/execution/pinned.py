@@ -13,8 +13,12 @@ import math
 import weakref
 from collections.abc import Sequence
 
+import time
+
 import torch
 from torch import Tensor
+
+from cozy_runtime.internal import var030  # PROOF ONLY (var-030), never merge
 
 
 class _Buffer:
@@ -22,7 +26,9 @@ class _Buffer:
     tensor made over it holds this until its storage goes."""
 
     def __init__(self, nbytes: int) -> None:
+        began = time.perf_counter()
         self.host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        var030.count("pinned_alloc", nbytes, time.perf_counter() - began)
         self.address = self.host.data_ptr()
         self.__cuda_array_interface__ = {
             "shape": (nbytes,),
@@ -76,10 +82,15 @@ def empty(shape: Sequence[int], dtype: torch.dtype, device: torch.device) -> Ten
 def write(dst: Tensor, src: Tensor) -> None:
     """`dst.copy_(src)`: into pinned memory a contiguous window is a host copy the stream orders."""
     host = _host(dst)
+    nbytes = int(src.numel()) * int(src.element_size())
+    var030.at("write")
     if host is not None and dst.is_contiguous():
         host.copy_(src, non_blocking=True)
+        var030.moved("wrote_host", nbytes)
     else:
         dst.copy_(src)  # a strided window of pinned memory: a kernel writes it in place
+        var030.moved("wrote_host_strided" if host is not None else "wrote_card", nbytes)
+    var030.at("w")
 
 
 def read(src: Tensor) -> Tensor:
@@ -88,8 +99,12 @@ def read(src: Tensor) -> Tensor:
     host = _host(src)
     if host is None:
         return src
+    var030.at("read")
     out = torch.empty(src.shape, dtype=src.dtype, device=src.device)
     out.copy_(host if src.is_contiguous() else src, non_blocking=True)
+    nbytes = int(src.numel()) * int(src.element_size())
+    var030.moved("read_host" if src.is_contiguous() else "read_host_strided", nbytes)
+    var030.at("w")
     return out
 
 
@@ -102,10 +117,12 @@ def settle() -> None:
     """Free the buffers whose tensors went, once the stream has passed their last use."""
     while _GOING:
         event, _ = _GOING[0]
+        began = time.perf_counter()
         if event is None:
             torch.cuda.synchronize()
         else:
             event.synchronize()
+        var030.count("pinned_settle_wait", 0, time.perf_counter() - began)
         _GOING.pop(0)
 
 

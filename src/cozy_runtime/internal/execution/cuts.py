@@ -28,6 +28,7 @@ from torch import Tensor, nn
 import cozy_runtime.internal.execution.catch as catch
 import cozy_runtime.internal.execution.pinned as pinned
 import cozy_runtime.internal.execution.sizing as sizing
+from cozy_runtime.internal import var030  # PROOF ONLY (var-030), never merge
 from cozy_runtime.author._errors import is_capacity, unwind
 from cozy_runtime.internal.encoding.leaves import NVFP4
 from cozy_runtime.internal.execution.sizing import levelled, levels, pieces
@@ -199,7 +200,7 @@ def _bands(
         return conv(x, weight, bias)
     size, out, axis = pieces(units, level), None, 0 if by_images else 1
     for at in range(0, units, size):
-        catch.checkpoint()
+        catch.piece()
         if by_images:
             part = conv(x[at : at + size], weight, bias)
         else:
@@ -525,7 +526,7 @@ def _pictures(site: str, module: nn.Module, forward: Forward) -> Forward:
                 return forward(patches, grid, **kwargs)
             size, parts, at = pieces(len(rows), level), [], 0
             for first in range(0, len(rows), size):
-                catch.checkpoint()
+                catch.piece()
                 count = sum(rows[first : first + size])
                 parts.append(
                     forward(patches[at : at + count], grid[first : first + size], **kwargs)
@@ -568,7 +569,7 @@ def _tokens(forward: Forward, x: Tensor, tokens: int, level: int, rank: bool = F
     size, flat, out = pieces(tokens, level), x.reshape(tokens, x.shape[-1]), None
     lead = (1,) * (x.dim() - 2) if rank else ()
     for at in range(0, tokens, size):
-        catch.checkpoint()
+        catch.piece()
         rows = flat[at : at + size]
         part = forward(rows.view(*lead, *rows.shape))
         if not isinstance(part, Tensor) or part.shape[: len(lead)] != lead:
@@ -626,7 +627,7 @@ def _rows(forward: Forward, flat: Tensor, tokens: int, level: int) -> object:
         return forward(flat)
     size, out = pieces(tokens, level), None
     for at in range(0, tokens, size):
-        catch.checkpoint()
+        catch.piece()
         part = cast(Tensor, forward(flat[at : at + size]))
         out = part.new_empty((tokens, *part.shape[1:])) if out is None else out
         out[at : at + part.shape[0]].copy_(part)
@@ -700,7 +701,7 @@ def _rms_bands(forward: Forward, x: Tensor, axis: int, level: int) -> object:
     rows, out = pieces(height, level), None
     for at in range(0, height, rows):
         length = min(rows, height - at)
-        catch.checkpoint()
+        catch.piece()
         part = forward(x.narrow(axis, at, length))
         expected = (*x.shape[:axis], length, *x.shape[axis + 1 :])
         if not isinstance(part, Tensor) or part.shape != expected:
@@ -826,7 +827,7 @@ def _rotated(
     length = int(x.shape[axis])
     size, out = pieces(length, level), None
     for at in range(0, length, size):
-        catch.checkpoint()
+        catch.piece()
         n = min(size, length - at)
         tables = (
             type(freqs)(cast(Tensor, t).narrow(0, at, n) for t in freqs)
@@ -905,7 +906,7 @@ def _attend(
     for h in range(0, count, hp):
         n, lo, hi = min(hp, count - h), h // group, (min(h + hp, count) - 1) // group + 1
         for s in range(0, length, rp):
-            catch.checkpoint()
+            catch.piece()
             part = whole[:, h : h + n, s : s + rp] if whole is not None else None
             piece = call(q[:, s : s + rp, h : h + n], k[:, :, lo:hi], v[:, :, lo:hi], part)
             out[:, s : s + rp, h : h + n].copy_(piece)
@@ -1008,6 +1009,7 @@ def whole(part: Tensor, shape: Sequence[int], key: str, host: bool, zeros: bool 
             raise exc from None
         unwind(exc)
         request.retries += 1
+        var030.event("whole_refused", key, -1, room)
         _hosted(request, f"split:{key}", key, room)
         return out
 
@@ -1043,6 +1045,7 @@ def ahead(key: str, host: bool, zeros: bool) -> Tensor | None:
         room = catch.room(device.index or 0)
         unwind(exc)
         request.retries += 1
+        var030.event("whole_short", key, -1, room)
         raise _Short(
             f"{key}: no room for its whole ({_nbytes(shape, dtype)} bytes) beside {room}"
         ) from None
@@ -1100,6 +1103,7 @@ def _on_card(key: str) -> bool:
 
 def _hosted(request: Request, site: str, name: str, why: str) -> None:
     request.hosted[site] = why
+    var030.event("hosted", site, -1, why)
     named = (_ESTIMATED, _MEASURED)
     print(
         f"cozy-runtime: {name}: no room for its whole output beside its windows; it is kept in "
