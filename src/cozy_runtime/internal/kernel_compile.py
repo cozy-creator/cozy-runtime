@@ -9,7 +9,8 @@ another kernel in its place; the machine compiles the ones every card needs ahea
 request (`machine_kernels`).
 
 The builder is `python -m cozy_runtime.internal.kernel_compile` under the caller's own
-interpreter and import path, so an extension builds against the torch that will import it. It
+interpreter and import path, so an extension builds against the torch that will import it, in
+the process's own environment and directories, never a call's (`call_scope`). It
 inherits the key's lock, runs at nice 19, and ends only by its own exit: nothing kills a build
 for going quiet. A wait shows the builder's word (phase, share done, CPU) and wakes at its
 exit (the key's lock frees) or the waiter's cancel, never on a clock. Each of its compiler jobs
@@ -297,9 +298,12 @@ def _spawn(store: kernel_cache.Store, job: Job, lock: int) -> None:
             }
         ),
     ]
+    # The executor's own place, never a call's: a build outlives the call that asked for it, whose
+    # place is removed at its end, and records its failure where `_failures` reads (cr-342).
     process = subprocess.Popen(
         argv,
-        env={**config.inherited_environment(), **job.env},
+        env={**config.inherited_environment(call_scope.process_environment()), **job.env},
+        cwd=call_scope.process_cwd(),
         pass_fds=(lock,),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
