@@ -27,7 +27,7 @@ from torch import Tensor, nn
 from cozy_runtime.author._context import CURRENT as ATTEMPT
 from cozy_runtime.author._errors import ROOM, DoesNotFit, is_capacity
 from cozy_runtime.author._model import TRANSPARENT
-from cozy_runtime.internal.execution import phase, sizing
+from cozy_runtime.internal.execution import diag, phase, sizing
 from cozy_runtime.internal.residency import PASS_SHAPE, Model, Request
 
 if TYPE_CHECKING:
@@ -166,8 +166,7 @@ def _room_line() -> str:
         if not torch.cuda.is_initialized():
             return "a card this process has not started"
         device = torch.cuda.current_device()
-        read = getattr(vt, "refusal", None)  # a TensorFS that keeps its refusals' room
-        refused = cast("Mapping[str, int] | None", read(device) if read is not None else None)
+        refused = cast("Mapping[str, int] | None", diag.refused_room(device, take=True))
         holders = _holders(device, refused)
     except Exception as exc:  # the line only describes the failure; it never replaces it
         return f"a room that could not be read ({type(exc).__name__})"
@@ -190,6 +189,7 @@ class Unplaced(DoesNotFit):
 def refuse(device: int, name: str, level: str, need: int, exc: BaseException) -> Unplaced:
     """Native selection cannot make room for `name` at `level` (`need` bytes) with everything
     evictable gone, before any piece ran."""
+    diag.event("unplaced", name, level=level, need=need, why=str(exc)[:160])
     return Unplaced(
         f"{name}: {level} needs {_gib(need)} beside {_holders(device)} ({exc}): run it smaller, "
         "or rent a larger card: `cozy run … --on new`"
@@ -278,14 +278,28 @@ def cut[T](
             token = begin(device, key, name, menu, level, selection, stream)
             LEVELS[key] = level
             note(request, key, name, level, selection)
+            diag.event(
+                "select", name, level=level, levels=len(menu), need=list(menu[level][1]),
+                required=selection["required_bytes"], available=selection["available_bytes"],
+                live=selection["live_bytes"], weights=selection["phase_weight_bytes"],
+                budget=selection["budget_bytes"], capacity=selection["capacity_bytes"],
+            )  # fmt: skip
+            diag.mark(device, name)
             try:
                 result = run(level)
             except BaseException as exc:
+                if is_capacity(exc):
+                    diag.capture(
+                        exc, f"cut:{name}", device, level=level, levels=len(menu), pure=pure,
+                        need=[list(row) for _, row in menu],
+                    )  # fmt: skip
                 again = retry(device, key, name, menu, level, token, stream, exc, pure)
                 if again is None:
                     if is_capacity(exc):  # the run record names it: a package's `holds` was short
                         request.working_splits[key]["refused"] = {"level": level, "pure": pure}
+                    diag.event("stands", name, level=level, pure=pure)
                     raise
+                diag.event("retry", name, level=level, to=int(again["choice_id"]))
                 selection = again
                 continue
             vt.split_end(device, token, submitted=True)
@@ -320,9 +334,17 @@ def nested[T](
     while True:
         LEVELS[key] = level
         note(request, key, name, level)
+        diag.event(
+            "nested", name, level=level, levels=len(menu), need=list(menu[level][1]), usable=usable
+        )
         try:
             return run(level)
         except BaseException as exc:
+            if is_capacity(exc):
+                diag.capture(
+                    exc, f"nested:{name}", device, level=level, levels=len(menu), pure=pure,
+                    need=[list(row) for _, row in menu], usable=usable,
+                )  # fmt: skip
             if not (pure and is_capacity(exc)) or level + 1 >= len(menu):
                 raise
             _unwind(exc)
@@ -399,6 +421,8 @@ class Fixed:
             yield
         except BaseException as exc:
             short = isinstance(exc, DoesNotFit) or is_capacity(exc)
+            if short:
+                diag.capture(exc, f"piece:{self.name}", level=self.level, levels=self.levels)
             if self.key is not None and short and self.level + 1 < self.levels:
                 _REFUSED[self.key] = self.level + 1
                 if (request := CURRENT.get()) is not None and self.key in request.working_splits:
@@ -440,6 +464,11 @@ def fixed(name: str, finest: int, need: sizing.Need) -> Fixed:
         selection = select(device, key, name, menu, stream)
         level = LEVELS[key] = max(int(selection["choice_id"]), _REFUSED.get(key, 0))
         note(request, key, name, level, selection)
+        diag.event(
+            "fixed", name, level=level, levels=len(menu), need=[list(row) for _, row in menu],
+            required=selection["required_bytes"], available=selection["available_bytes"],
+            live=selection["live_bytes"], weights=selection["phase_weight_bytes"],
+        )  # fmt: skip
         return Fixed(level, key, name, len(menu))
     finally:
         LEAF.release()
@@ -506,6 +535,7 @@ def wrap(
         _local.named, _local.ordinals = name, {}
         try:
             checkpoint()
+            diag.block(name)
             with nullcontext() if around is None else around(module, args, kwargs):
                 return forward(*args, **kwargs)
         finally:

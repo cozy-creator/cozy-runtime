@@ -26,6 +26,7 @@ import torch
 from torch import Tensor, nn
 
 import cozy_runtime.internal.execution.catch as catch
+import cozy_runtime.internal.execution.diag as diag
 import cozy_runtime.internal.execution.pinned as pinned
 import cozy_runtime.internal.execution.sizing as sizing
 from cozy_runtime.author._errors import is_capacity, unwind
@@ -976,6 +977,7 @@ def split[T](
         except catch.Unplaced as exc:  # refused before a window ran (or the op is pure)
             if not hostable or request is None:
                 raise
+            diag.event("host_tier", site, why=str(exc)[:200], measured=measured is not None)
             unwind(exc)
             _hosted(request, hsite, name, _ESTIMATED if measured is None else _MEASURED)
     return catch.cut(
@@ -1001,6 +1003,9 @@ def whole(part: Tensor, shape: Sequence[int], key: str, host: bool, zeros: bool 
         if request is None or not part.is_cuda or not is_capacity(exc) or _capturing():
             raise
         room = catch.room(part.device.index or 0)  # beside the refused bytes, for the record
+        diag.capture(
+            exc, f"whole:{key}", part.device.index or 0, shape=list(shape), dtype=str(part.dtype)
+        )
         try:
             out = _pinned(shape, part.dtype, part.device, zeros)
         except Exception as failed:
@@ -1041,6 +1046,7 @@ def ahead(key: str, host: bool, zeros: bool) -> Tensor | None:
         if not is_capacity(exc):
             raise
         room = catch.room(device.index or 0)
+        diag.capture(exc, f"ahead:{key}", device.index or 0, shape=list(shape), dtype=str(dtype))
         unwind(exc)
         request.retries += 1
         raise _Short(
@@ -1100,6 +1106,7 @@ def _on_card(key: str) -> bool:
 
 def _hosted(request: Request, site: str, name: str, why: str) -> None:
     request.hosted[site] = why
+    diag.event("hosted", site, why=why[:200])
     named = (_ESTIMATED, _MEASURED)
     print(
         f"cozy-runtime: {name}: no room for its whole output beside its windows; it is kept in "

@@ -416,6 +416,7 @@ def run_prepared(
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
+        _var030(exc)
         outcome = classify(exc)
         unwind(exc)
         return None, outcome, record
@@ -425,6 +426,28 @@ def run_prepared(
         if record._stall_watch is not None:
             record._stall_watch.stop()
         record.closed = True
+
+
+def _var030(exc: BaseException) -> None:
+    """PROOF ONLY (var-030; never merge): what a capacity failure found, before its frames go."""
+    try:
+        import sys
+
+        if "cozy_runtime.internal.execution.catch" not in sys.modules:
+            return
+        from cozy_runtime.author._errors import DoesNotFit, is_capacity
+
+        if not (is_capacity(exc) or isinstance(exc, DoesNotFit)):
+            return
+        import torch
+
+        if not torch.cuda.is_initialized():
+            return
+        from cozy_runtime.internal.execution import diag
+
+        diag.final(exc, torch.cuda.current_device())
+    except Exception:
+        return
 
 
 # ------------------------------------------------------------------------- preflight

@@ -2803,6 +2803,12 @@ class Memory:
                     failed = request.failed or (raised is not None and is_capacity(raised))
                     request.escaped = vt.escapes_take(self.device.index or 0, failed=failed)
                     _escaped_warnings(request.escaped)
+                if self.cuda and not idle and torch.cuda.is_initialized():
+                    # PROOF ONLY (var-030; never merge): what a capacity refusal found
+                    from cozy_runtime.internal.execution import diag
+
+                    request.refusals = diag.take()
+                    diag.say(request.refusals)
                 request.sample()
                 request.ended = request.stats()
                 self.last = request.ended
@@ -3196,6 +3202,8 @@ class Request:
         self.first_blocks: list[FirstBlock] = []
         #: refusals a package scope returned past (`contract._Scopes`): zero in a conforming run
         self.swallowed_ooms = 0
+        #: PROOF ONLY (var-030): what each capacity refusal found (`execution.diag`)
+        self.refusals: list[dict[str, object]] = []
         #: cross-step state its loops declared (`author.retained`)
         self.retained_bytes = 0
         #: Working allocation peak over the whole request, kept across cut-site resets. Weights
@@ -3345,6 +3353,7 @@ class Request:
             "first_blocks": list(self.first_blocks),
             "regrown": self.regrown,
             "swallowed_ooms": self.swallowed_ooms,
+            "refusals": self.refusals,  # type: ignore[typeddict-unknown-key]
             "retained_bytes": self.retained_bytes,
             "gathered": self.gathered,
             "host": None,
