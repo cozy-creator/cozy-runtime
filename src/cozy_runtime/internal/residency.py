@@ -2795,7 +2795,7 @@ class Memory:
                     request.forwards.add(model)
                     self._pass(model, request, hash(key) & _U64 or 1)
             if outer_forward:
-                if self.native is not None:
+                if self.native is not None and not self.capturing():
                     # What reads bound for the last forward's sake stays bound no longer: the
                     # VAE statistics a refine read held 832 MiB through its whole loop.
                     self._let_go_reads()
