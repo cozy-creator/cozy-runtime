@@ -68,6 +68,10 @@ ERASED_PREFIXES: tuple[str, ...] = (
     "TENSORFS_",
 )
 
+#: The seal's device order (cr-326): CUDA then numbers a `CUDA_VISIBLE_DEVICES` index as NVML,
+#: nvidia-smi and the machine do. Its default, FASTEST_FIRST, can number unlike cards otherwise.
+CUDA_ORDER = ("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
 #: The fill plane's capture directory, named here because the allowlist row and the config
 #: authority's reader must spell it identically and this is the table both read.
 FILL_FORENSICS_DIR = "COZY_FILL_FORENSICS_DIR"
@@ -122,6 +126,12 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "entries, so ordinal 0 inside the executor IS the selected device. A job's lane is "
         "the whole envelope. The row used to claim `plan.device_selection`; no plan ever "
         "selected a device, and every executor saw the whole envelope and used card 0",
+    ),
+    ProjectedVar(
+        CUDA_ORDER[0],
+        "worker.device_lane",
+        "`CUDA_ORDER` (cr-326): CUDA numbers a lane's index entries as the machine, NVML and "
+        "nvidia-smi do, so the executor drives the card the machine counts",
     ),
     ProjectedVar(
         "NCCL_NVLS_ENABLE",

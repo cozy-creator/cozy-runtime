@@ -64,7 +64,7 @@ class DeviceFacts:
     """The REAL NVIDIA driver version, from NVML. Never `torch.version.cuda`."""
     configuration: str
     index: int = 0
-    """The selected card. NVML is queried with `-i <index>`."""
+    """The selected card, torch's ordinal. NVML is asked by the card's UUID, never this."""
     cuda_runtime: str = ""
     """The CUDA runtime torch was built against — a BUILD fact, carried beside the driver
     rather than in place of it. This is the field that used to be called `driver`."""
@@ -121,10 +121,10 @@ def measure_device(torch: ModuleType, index: int = 0, kind: str = "") -> DeviceF
     """Read the SELECTED device once, as the facts a plan names it by.
 
     `index` is honoured all the way down (#549.9): torch is asked about that device and NVML
-    is queried with `-i index`. Passing 0 and reading card 0 while filling card 3 is the
-    defect this signature always looked like it did not have. `kind` is the device the plan
-    serves on (the host's accelerator by default): a CPU backend on a GPU host plans for the
-    CPU, never the card.
+    about the card torch names by its UUID (cr-326): under a seal of `2,3`, ordinal 0 is
+    NVML's 2. A card NVML cannot find by it is `unmapped`, never another card's settings.
+    `kind` is the device the plan serves on (the host's accelerator by default): a CPU backend
+    on a GPU host plans for the CPU, never the card.
 
     An unreadable knob is SPELLED rather than defaulted.
     """
@@ -144,11 +144,8 @@ def measure_device(torch: ModuleType, index: int = 0, kind: str = "") -> DeviceF
             configuration=accel.memory_class(kind),
             os_arch=os_arch,
         )
-    driver, power, mig = accel.device_settings(index)
-    try:  # NVML by UUID: `index` is torch's ordinal under the seal, not NVML's
-        uuid = f"GPU-{torch.cuda.get_device_properties(index).uuid}"
-    except Exception:
-        uuid = ""
+    uuid = accel.device_uuid(torch, index)
+    driver, power, mig = accel.device_settings(uuid)
     return DeviceFacts(
         kind=kind,
         name=str(identity["name"]),
@@ -162,7 +159,7 @@ def measure_device(torch: ModuleType, index: int = 0, kind: str = "") -> DeviceF
         index=int(index),
         cuda_runtime=str(identity["cuda_runtime"]),
         os_arch=os_arch,
-        half_accumulate=bool(uuid) and accel.half_accumulate(uuid),
+        half_accumulate=accel.half_accumulate(uuid),
     )
 
 
