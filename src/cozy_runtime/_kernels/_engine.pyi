@@ -4,7 +4,8 @@ HEADER: int
 class Segment:
     """A captured step graph (`raw_cuda_graph()`) run as the body of a CUDA WHILE node: one launch runs
     steps until a step writes 0 to the int32 at device pointer `go`. The step is cloned in, so the
-    caller's graph may be replayed alone; its memory must outlive the Segment."""
+    caller's graph may be replayed alone; its memory must outlive the Segment's last launch (the
+    launch reads it on the device after `launch` returns), not only the Segment."""
 
     def __init__(self, step: int, go: int, device: int) -> None: ...
     def launch(self, stream: int) -> None:
