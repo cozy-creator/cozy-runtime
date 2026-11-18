@@ -1,2 +1,0 @@
-# Advisories known in locked pins (xs-196): `build` runs pip-audit over the lock and fails on any advisory not listed
-# here, each as `<ID>` under a `# <package> <version>: <why it stays>` line. Empty: every pin is past its advisories (xs-200).
