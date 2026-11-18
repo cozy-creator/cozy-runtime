@@ -293,6 +293,8 @@ class ModelSpec:
     """What its constructor requires."""
     undeclared: tuple[str, ...] = ()
     """Its public methods with no `@uses_components` hint."""
+    loras: tuple[str, ...] = ()
+    """The components that take LoRAs (`Serving(loras=...)`)."""
 
     @property
     def selects(self) -> tuple[str, ...]:
@@ -320,6 +322,14 @@ class ModelSpec:
                 if p.default is p.empty and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
             ),
             undeclared_methods(model),
+            loras=tuple(
+                dict.fromkeys(
+                    name
+                    for compatible in model.__adapter_compatibility__
+                    if compatible.kind == "lora"
+                    for name in compatible.components
+                )
+            ),
         )
 
 

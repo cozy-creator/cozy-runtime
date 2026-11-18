@@ -1172,6 +1172,7 @@ class Reader:
                 spec = self.model(found.module, found.node)
                 components.update(spec.components)
         encoded_leaves, min_bits, phase = spec.encoded_leaves, spec.min_bits, spec.phase
+        loras = spec.loras
         undeclared = set(spec.undeclared)
         degrees, placeable = spec.sequence_parallel, spec.placeable
         for keyword in node.keywords:
@@ -1183,7 +1184,7 @@ class Reader:
         serving = self._serving(module, node)
         if serving is not None:
             encoded_leaves = "accept" if serving.encoded_leaves else "refuse"
-            min_bits, phase = serving.min_bits, serving.phase
+            min_bits, phase, loras = serving.min_bits, serving.phase, serving.loras
         for decorator in node.decorator_list:
             call = decorator if isinstance(decorator, ast.Call) else None
             found = self.resolve(module, call.func if call else decorator)
@@ -1235,7 +1236,7 @@ class Reader:
             arguments = _required(constructors.get("__new__") or constructors["__init__"])
         spec = ModelSpec(
             node.name, encoded_leaves, min_bits, phase, degrees, components, placeable, loads,
-            arguments, tuple(sorted(undeclared)),
+            arguments, tuple(sorted(undeclared)), loras,
         )  # fmt: skip
         self.models[key] = spec
         return spec

@@ -85,6 +85,9 @@ class ModelSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     on_demand: bool = False
     #: the CEL rule over `request` that says whether a request needs it (`needs=`); unset: always
     needs: str | msgspec.UnsetType = msgspec.UNSET
+    #: the components that take LoRAs (`Serving(loras=...)`) of those it fetches: where a LoRA
+    #: naming no slot binds
+    loras: tuple[str, ...] = ()
 
     @property
     def parameter(self) -> str:
@@ -340,6 +343,14 @@ def model_slot(declared: Declaration, slot: Slot) -> dict[str, Json]:
         doc["components"] = sorted(set(uses))
     elif not slot.weights and spec.selects:
         doc["components"] = list(spec.selects)
+    # Where a LoRA naming no slot binds (cl-1241): its class's LoRA components that this slot
+    # fetches, on every constructed slot (empty: it takes none), so a reader tells "none" from an
+    # interface written before the field. A raw `Weights[M]` slot is never constructed.
+    if not slot.weights:
+        fetched = doc.get("components")
+        doc["loras"] = sorted(
+            {c for c in spec.loras if not isinstance(fetched, list) or c in fetched}
+        )
     if spec.sequence_parallel:
         # The author's opt-in to a group lane (cr-068): the degrees the class's attention
         # shards at. Closed and optional; a slot without it is never sharded.
