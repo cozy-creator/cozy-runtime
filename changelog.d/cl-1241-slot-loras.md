@@ -1,0 +1,1 @@
+Every constructed model slot in the package interface names the components that take LoRAs, `loras`: its class's `Serving(loras=...)` components that the slot fetches, empty when none. Nothing new to write: it is read from `Serving`. Cozy binds a LoRA that names no slot by it, so FLUX.3 Klein's, Fibo's and Krea 2's text encoder slots never take one (cl-1241).

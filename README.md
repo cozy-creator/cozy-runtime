@@ -244,8 +244,9 @@ machine path or mutable selection reached it. The document has one `entrypoints`
 writes `description` (its docstring's first paragraph, on one line), `internal` (a private
 function) and `weights_outputs` when set and `accelerator` only as `false`, and its memo flag
 rides `invocable.memoize`, with `invocable.memo_requires` naming its optional `Seed` fields. A slot is `{path, class, component_use,
-encoded_leaves}`, plus `default`, `min_bits` and `phase` when declared and `weights: true` for a
-`Weights[M]` argument. `descriptor_id` (sha256 of
+encoded_leaves}`, plus `default`, `min_bits` and `phase` when declared, `weights: true` for a
+`Weights[M]` argument, and on every constructed slot `loras` (its class's `Serving(loras=...)`
+components the slot fetches, empty when none: where a LoRA naming no slot binds). `descriptor_id` (sha256 of
 one entry) is derived by `cozy-runtime describe <function>`, never stored. Deleted members are simply unknown fields; there is no legacy decoder or
 empty-value compatibility shim.
 Packages declare no GPU count, VRAM floor or lane: the machine picks a slot's lane from its
