@@ -276,7 +276,7 @@ def _fewest(length: int, cut: Cut, equal: bool, longest: int) -> list[tuple[int,
         if not more:
             break
         found = _equal(length, cut, more) if equal else _spans(length, cut, more)
-        if found is None:
+        if found is None or (equal and found == spans):  # equal: no finer distinct windows
             break
         count, spans = more, found
     return spans
@@ -288,21 +288,26 @@ def _span(spans: Sequence[tuple[int, int]]) -> int:
 
 
 def _equal(length: int, cut: Cut, count: int) -> list[tuple[int, int]] | None:
-    """The fewest windows, at least `count`, all of one length, covering `length` with starts
-    spread evenly on `align` and neighbours sharing at least `overlap`; None when there are none.
-    One length `L` keeps `L ≡ length (mod align)`, so the last window ends at `length`."""
+    """The fewest windows, at least `count`, all of one length, covering `length` with distinct
+    starts spread evenly on `align` and neighbours sharing at least `overlap`; where no count that
+    large has distinct starts, the finest that do; None when there are none. One length `L` keeps
+    `L ≡ length (mod align)`, so the last window ends at `length`."""
     if count <= 1 or length <= cut.overlap:
         return [(0, length)]
-    for k in range(count, length + 1):
+    finest: list[tuple[int, int]] | None = None
+    for k in range(2, length + 1):
         need = -(-(length + (k - 1) * cut.overlap) // k)
         size = need + (length - need) % cut.align
         if size >= length:
             continue
         steps = (length - size) // cut.align
         starts = [cut.align * round(i * steps / (k - 1)) for i in range(k)]
-        if all(b - a <= size - cut.overlap for a, b in itertools.pairwise(starts)):
-            return [(a, a + size) for a in starts]
-    return None
+        # A start twice would refine its rows twice and blend the copies as neighbours (cr-343).
+        if all(0 < b - a <= size - cut.overlap for a, b in itertools.pairwise(starts)):
+            finest = [(a, a + size) for a in starts]
+            if k >= count:
+                return finest
+    return finest
 
 
 type Window = tuple[tuple[int, int], ...]
