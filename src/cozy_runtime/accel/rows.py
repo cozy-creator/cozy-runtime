@@ -13,13 +13,16 @@ output rows reads whole, so they are the same in every window; only its scales' 
 bound where a window starts. An overlay's LoRA (`lora.Hook`) adds its rows of `up`, and a user
 LoRA's layer (`lora_composition`) its base's rows and each adapter's rows of `lora_B`; baked, the
 base's rows alone. Anything else (a scale over the output's rows, an unknown hook, another PEFT
-layer) does not cut: `rows` is None and the caller computes the whole."""
+layer) does not cut: `rows` is None and the caller computes the whole.
+
+`streamed(linear, take, whole)` is the Runtime's: a block that is one such layer and finds no room
+on the card keeps its weights on the host, and each window's rows are copied in (`take`)."""
 
 from __future__ import annotations
 
 import copy
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Protocol, TypeGuard, cast
 
 from torch import Tensor, nn
@@ -82,6 +85,21 @@ _ROWWISE: dict[str, tuple[frozenset[str], int]] = {
 }
 
 
+#: a stored tensor's rows [start, stop) as a window reads them; `whole` is one a window reads whole
+type Take = Callable[[Tensor, int, int], Tensor]
+type Whole = Callable[[Tensor], Tensor]
+#: what marks a hook as the Runtime's own (residency's block entry), never a layer's arithmetic
+OWN = "_cozy_runtime_hook"
+
+
+def _slice(tensor: Tensor, start: int, stop: int) -> Tensor:
+    return tensor[start:stop]
+
+
+def _same(tensor: Tensor) -> Tensor:
+    return tensor
+
+
 def rows(linear: nn.Module) -> Rows | None:
     """`linear`'s output windows, or None where its rows do not compute alone."""
     hooks = linear._forward_hooks.values()
@@ -112,13 +130,51 @@ def rows(linear: nn.Module) -> Rows | None:
     return None
 
 
+def streamed(linear: nn.Module, take: Take, whole: Whole) -> Rows | None:
+    """`rows` over weights the card does not hold: each window computes from `take`'s copy of its
+    rows (and `whole`'s of what every window reads), the arithmetic of `rows`. A plain
+    `nn.Linear` and the row-scaled encoded leaves, with an overlay's LoRA; a user LoRA's layer
+    and LoKr (whose factors are the block's too) and any unknown hook: None. The Runtime's own
+    hooks (`OWN`) are its block entry, not the layer's."""
+    hooks = [h for h in linear._forward_hooks.values() if not getattr(h, OWN, False)]
+    pre = [h for h in linear._forward_pre_hooks.values() if not getattr(h, OWN, False)]
+    if pre or any(not isinstance(h, lora.Hook) for h in hooks):
+        return None
+    if type(linear) is nn.Linear:
+        return lambda x, a, b, out=None: _hooked(
+            linear, x, _plain(linear, x, a, b, out, take), a, b
+        )
+    provider: str | None = getattr(linear, "provider", None)
+    cuts = None if provider is None else _ROWWISE.get(provider)
+    leaf = cast("_Leaf", linear)
+    if cuts is None or set(leaf.roles()) != cuts[0]:
+        return None
+    return lambda x, a, b, out=None: _hooked(
+        linear, x, _leaf(leaf, x, a, b, out, take, whole), a, b
+    )
+
+
+def tile(linear: nn.Module) -> int:
+    """The output rows a window of `linear` starts on a multiple of (its scales' tiles)."""
+    provider: str | None = getattr(linear, "provider", None)
+    cuts = None if provider is None else _ROWWISE.get(provider)
+    return 1 if cuts is None else cuts[1]
+
+
 def _plain(
-    linear: nn.Linear, x: Tensor | PreQuantized, start: int, stop: int, out: Tensor | None
+    linear: nn.Linear,
+    x: Tensor | PreQuantized,
+    start: int,
+    stop: int,
+    out: Tensor | None,
+    take: Take = _slice,
 ) -> Tensor:
     if isinstance(x, PreQuantized):
         raise ValueError("an nn.Linear takes its float input, not a quantized operand")
     with readable(linear.weight, linear.bias) as (weight, bias):
-        found = F.linear(x, weight[start:stop], None if bias is None else bias[start:stop])
+        found = F.linear(
+            x, take(weight, start, stop), None if bias is None else take(bias, start, stop)
+        )
     if out is None:
         return found
     out.copy_(found)
@@ -126,7 +182,13 @@ def _plain(
 
 
 def _leaf(
-    leaf: _Leaf, x: Tensor | PreQuantized, start: int, stop: int, out: Tensor | None
+    leaf: _Leaf,
+    x: Tensor | PreQuantized,
+    start: int,
+    stop: int,
+    out: Tensor | None,
+    take: Take = _slice,
+    whole: Whole = _same,
 ) -> Tensor:
     """The leaf's own forward over a copy holding its rows, in whole tiles of its scales (a slice
     stops at the weight's end where its last tile is padded): one code path for its GEMM, its
@@ -137,11 +199,12 @@ def _leaf(
     stored = getattr(leaf, weights), getattr(leaf, scales), leaf.bias
     with readable(*stored) as (weight, scale, bias):
         window = copy.copy(leaf)
+        own = {weights, scales, "bias"}
         vars(window)["_buffers"] = {
-            **leaf._buffers,
-            weights: weight[low:high],
-            scales: scale[low:high],
-            "bias": None if bias is None else bias[low:high],
+            **{k: v if v is None or k in own else whole(v) for k, v in leaf._buffers.items()},
+            weights: take(weight, low, high),
+            scales: take(scale, low, high),
+            "bias": None if bias is None else take(bias, low, high),
         }
         vars(window)["_forward_hooks"] = {}
         vars(window)["out_features"] = min(high, leaf.out_features) - low
@@ -195,6 +258,8 @@ def _hooked(
 ) -> Tensor:
     """An armed overlay's update, its rows of `up` (`lora.Hook`); none once baked."""
     for found in linear._forward_hooks.values():
+        if getattr(found, OWN, False):
+            continue
         hook = cast("lora.Hook", found)  # `rows` cuts only a linear whose hooks are all these
         if hook._cozy_baked:
             continue
