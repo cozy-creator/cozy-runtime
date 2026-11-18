@@ -32,7 +32,7 @@ from cozy_runtime.author._files import (
     field_preparation,
 )
 from cozy_runtime.author._markers import FileBound
-from cozy_runtime.author._model_defaults import check_model_arguments
+from cozy_runtime.author._model_defaults import check_model_arguments, needs_component
 from cozy_runtime.author._services import UNGRANTABLE
 from cozy_runtime.author._signature import Declaration, Surface, media_kinds
 from cozy_runtime.author._tool import AspectRatio, Audio, Image, Pickup, Prompt, Seed, Video
@@ -256,6 +256,32 @@ def _writes(declared: Declaration) -> None:
         )
 
 
+def _component_rules(declared: Declaration, constructed: Sequence[str]) -> None:
+    """A rule for a component (`<argument>.<component>`) is for one a constructed Model argument
+    fetches: of those its `components=` or its class's hints name, where they name any."""
+    specs = {slot.parameter: slot.spec for slot in declared.slots}
+    for key in declared.model_needs:
+        named = needs_component(key)
+        if named is None:
+            continue
+        argument, component = named
+        if argument not in constructed:
+            raise ConformanceError(
+                f"{declared.name}: needs names {key}, and {argument} is no constructed Model "
+                "argument of it",
+                code="model_needs",
+                fields=[key],
+            )
+        fetched = declared.model_components.get(argument) or specs[argument].selects
+        if fetched and component not in fetched:
+            raise ConformanceError(
+                f"{declared.name}: needs names {key}, a component {argument} doesn't fetch "
+                f"(it fetches {', '.join(fetched)})",
+                code="model_needs",
+                fields=[key],
+            )
+
+
 def _models(declared: Declaration) -> None:
     """The SOURCE clock over the model slots: arguments, classes and shard degrees. It cannot
     prove a component exists in an artifact not yet selected; exact binding does (§1.1)."""
@@ -266,6 +292,7 @@ def _models(declared: Declaration) -> None:
     check_model_arguments(dict.fromkeys(declared.model_on_demand), constructed, what="on_demand")
     # A rule's key that names no Model argument names a function this one calls, which only
     # the source reader knows (`static_interface._calls`).
+    _component_rules(declared, constructed)
     raw = sorted(set(declared.model_needs) & (set(slots) - set(constructed)))
     if raw:
         raise ConformanceError(
