@@ -2703,8 +2703,9 @@ class Memory:
                 self._declare(model)
             elif block is model.common and self._scoped(model) and not self.capturing():
                 # Read outside its forwards in a call that declared it (an overlay's factors,
-                # a VAE's latent statistics): bound once until the scope ends or a refused block
-                # sheds it (`_let_go_reads`), never one bind per op (cr-207).
+                # a VAE's latent statistics): bound until the next outermost forward begins, the
+                # scope ends or a refused block takes it back (`_let_go_reads`), so an overlay
+                # read in every layer binds once a forward, never once an op (cr-207).
                 self._enter(block)
                 model.local.held = True
                 return _bound(model, site)
@@ -2794,6 +2795,10 @@ class Memory:
                     request.forwards.add(model)
                     self._pass(model, request, hash(key) & _U64 or 1)
             if outer_forward:
+                if self.native is not None:
+                    # What reads bound for the last forward's sake stays bound no longer: the
+                    # VAE statistics a refine read held 832 MiB through its whole loop.
+                    self._let_go_reads()
                 self._activate_phase(model)
             if not depth:
                 model.local.request = request
