@@ -53,15 +53,25 @@ def arm(checks: Mapping[str, bool] | None = None, press: Press = "") -> None:
     varena's (`unmap_idle`, `perturb`, `guards`); `press` is what the second request meets:
     "refill", the card filled and let go before it, so a kept graph's weights left and come back;
     "hold", kept filled through it; "eager", every component root runs as written, no graph."""
+    import sys
+
     from cozy_runtime import graphs
 
     if not graphs.AUDIT:  # set from the executor's Start: the machine's `dev = true`
         return
     import tensorfs.varena.torch as vt
     import torch
+
     from cozy_runtime.author._errors import DoesNotFit
-    from cozy_runtime.internal import executor
     from cozy_runtime.internal.execution import catch
+
+    # The executor runs as `-m cozy_runtime.internal.executor`: its live class is `__main__`'s, and
+    # importing the module by name would make a second, unused copy (0.48's records had no rows).
+    executor = next(
+        held
+        for held in (sys.modules.get("__main__"), sys.modules.get("cozy_runtime.internal.executor"))
+        if held is not None and hasattr(getattr(held, "Executor", None), "_execution")
+    )
 
     if _armed:
         raise RuntimeError(f"differential.arm was already called: {_armed[0]}")
@@ -96,7 +106,7 @@ def arm(checks: Mapping[str, bool] | None = None, press: Press = "") -> None:
     def recorded(*args: object, **kwargs: object) -> object:
         """The execution record with this request's rows as `loops`; a held press lets go."""
         _held.clear()
-        document = record(*args, **kwargs)  # type: ignore[arg-type]
+        document = record(*args, **kwargs)
         rows = [row for held in _rows.values() for row in held]
         _rows.clear()
         return {**document, "loops": rows} if rows else document
@@ -113,7 +123,7 @@ def arm(checks: Mapping[str, bool] | None = None, press: Press = "") -> None:
 
     graphs._dispatch = digested  # type: ignore[assignment]
     catch.select = selected
-    executor.Executor._execution = recorded  # type: ignore[assignment, method-assign]
+    executor.Executor._execution = recorded
     if press == "eager":
         graphs._region_call = written
 
