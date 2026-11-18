@@ -675,6 +675,15 @@ def kv_tiers() -> Row:
     return bench.measure()
 
 
+@case
+def batch_shapes() -> Row:
+    """Whether a ggml linear's row depends on how many rows share its launch: the same rows in
+    batches of 1 to 16 and in prefills of three sizes (`bench/batch_shapes.py`)."""
+    from cozy_runtime.internal.bench import batch_shapes as bench
+
+    return bench.measure()
+
+
 def main(name: str) -> None:
     function = CASES.get(name)
     if function is None:
