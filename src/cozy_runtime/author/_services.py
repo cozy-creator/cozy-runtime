@@ -25,6 +25,7 @@ from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
+from itertools import accumulate
 from pathlib import Path
 from typing import (
     Literal,
@@ -749,7 +750,6 @@ class Outputs(_Bound):
             frames = sum(shape.frame_count for shape in shapes)
             handle = self._attempt.next_handle(VideoFile.kind)
             return self._unwritten(handle, _Picture.of(shapes[0]), audio_format, frames, samples)
-        paths = []
         for video in videos:
             if (
                 not isinstance(video, VideoFile)
@@ -760,9 +760,8 @@ class Outputs(_Bound):
                     "joined videos must be hydrated inputs of this attempt", code="foreign_asset"
                 )
             video._check_file()
-            paths.append(video._local)
-        copy = _codec.plan_video_copy(tuple(paths))
-        source = _AuthorEvents(soundtrack(copy.frames))
+        rate, frames = _codec.copy_frames(video._local for video in videos if video._local is not None)
+        source = _AuthorEvents(soundtrack(frames))
         header = next(source, None)
         if (
             not isinstance(header, DecodedMediaHeader)
@@ -772,45 +771,35 @@ class Outputs(_Bound):
             raise OutputError(
                 "a joined soundtrack must begin with an audio header", code="media_header"
             )
-        audio_format = header.audio
+        # The one join writer (cl-1210): each video's stretch of the soundtrack goes in with it.
+        join = VideoJoin(self, header.audio)
+        pending: DecodedMediaEvent | None = next(source, None)
+        ends = list(accumulate(Fraction(count) / rate for count in frames))
 
-        def feed(encoder: _codec.StreamingMP4Encoder) -> int:
-            audio_samples = 0
-            pending: DecodedMediaEvent | None = next(source, None)
+        def stretch(end: Fraction | None) -> Iterator[DecodedMediaEvent]:
+            nonlocal pending
+            while pending is not None and (
+                end is None
+                or not isinstance(pending, DecodedAudioChunk)  # refused when written
+                or pending.start_time < end
+            ):
+                yield pending
+                pending = next(source, None)
 
-            def before(time: Fraction | None) -> None:
-                """Write the soundtrack up to `time`; None writes the rest."""
-                nonlocal audio_samples, pending
-                while pending is not None and (
-                    time is None
-                    or not isinstance(pending, DecodedAudioChunk)  # refused when written
-                    or pending.start_time < time
-                ):
-                    audio_samples = self._write_audio(encoder, audio_format, pending, audio_samples)
-                    pending = next(source, None)
+        def until(end: Fraction | None) -> Callable[[int], Iterator[DecodedMediaEvent]]:
+            return lambda _: stretch(end)
 
-            encoder.copy_video(before)
-            before(None)
-            for video in videos:
-                video._check_file()
-            return audio_samples
-
-        return self._save_mp4(
-            _VideoFormat(
-                width=copy.width,
-                height=copy.height,
-                frame_rate=copy.frame_rate,
-                pixel_aspect_ratio=copy.pixel_aspect_ratio,
-                color_primaries=copy.color_primaries,
-                color_transfer=copy.color_transfer,
-                color_matrix=copy.color_matrix,
-                color_range=copy.color_range,
-            ),
-            audio_format,
-            source,
-            feed,
-            copy,
-        )
+        try:
+            for index, video in enumerate(videos):
+                last = index + 1 == len(videos)
+                join.add(video, until(None if last else ends[index]), last=last)
+            return join.finish()
+        except Exception as exc:
+            if isinstance(exc, AuthorError) or exc is source.raised:
+                raise
+            raise OutputError(
+                f"joined video failed: {type(exc).__name__}: {exc}", code="output_encode"
+            ) from exc
 
     def join_video(self, audio: DecodedAudioFormat | None) -> VideoJoin:
         """A packet-copy join that grows one video at a time, for publishing as it grows.
@@ -929,7 +918,6 @@ class Outputs(_Bound):
         audio_format: DecodedAudioFormat | None,
         source: _AuthorEvents,
         feed: Callable[[_codec.StreamingMP4Encoder], int],
-        copy: _codec.VideoCopy | None = None,
         *,
         keyframe_interval: int | None = None,
     ) -> SavedVideo:
@@ -940,8 +928,7 @@ class Outputs(_Bound):
             counted = _Unwritten()
             # the author's events still run: only the encode is gone
             samples = feed(cast(_codec.StreamingMP4Encoder, counted))
-            frames = sum(copy.frames) if copy is not None else counted.video_frames
-            return self._unwritten(handle, _Picture(**video), audio_format, frames, samples)
+            return self._unwritten(handle, _Picture(**video), audio_format, counted.video_frames, samples)
         tail = handle.rsplit("/", 1)[-1]
         temporary = self._attempt.spool / f".video-{tail}.partial"
         final = self._attempt.spool / f"video-{tail}"
@@ -955,7 +942,6 @@ class Outputs(_Bound):
                 max_bytes=self._attempt.max_output_bytes,
                 audio_channels=audio_format.channels if audio_format is not None else 0,
                 audio_sample_rate=audio_format.sample_rate if audio_format is not None else 0,
-                copy=copy,
                 keyframe_interval=keyframe_interval,
             )
             audio_samples = feed(encoder)
@@ -1320,7 +1306,9 @@ class Outputs(_Bound):
 
 
 class VideoJoin:
-    """`Outputs.join_video`: an indexed copy join published as it grows."""
+    """`Outputs.join_video`: a packet-copy join published as it grows (`_codec.GrowingMP4`).
+    Each revision is published as its parts, every `mdat` then its index, so the next revision
+    keeps all of this one's but the index and a reader holding it reads only what's new."""
 
     def __init__(self, outputs: Outputs, audio: DecodedAudioFormat | None) -> None:
         self._outputs, self._attempt, self._audio = outputs, outputs._attempt, audio
@@ -1329,7 +1317,7 @@ class VideoJoin:
             self._attempt.spool / f"join-{self._attempt.next_handle('join').rsplit('/', 1)[-1]}"
         )
         directory.mkdir()
-        self._join = _codec.FragmentedJoin(
+        self._join = _codec.GrowingMP4(
             directory,
             audio_channels=audio.channels if audio is not None else 0,
             audio_sample_rate=audio.sample_rate if audio is not None else 0,
@@ -1348,6 +1336,17 @@ class VideoJoin:
         clock. Each returned revision has a duration and seek index. `last` also closes
         the soundtrack; neither publishing nor closing re-encodes the joined media."""
         self._attempt.check_open("VideoJoin.append")
+        self.add(video, soundtrack, last=last)
+        return self._revision()
+
+    def add(
+        self,
+        video: VideoFile,
+        soundtrack: Callable[[int], Iterable[DecodedMediaEvent]],
+        *,
+        last: bool = False,
+    ) -> None:
+        """`append` without a revision to publish."""
         if (
             not isinstance(video, VideoFile)
             or video._local is None
@@ -1368,19 +1367,16 @@ class VideoJoin:
         video._check_file()
         # Its bytes live on in the joined video: a saved segment need not be returned.
         self._attempt.shown.add(video.ref)
-        return self._revision()
 
     def finish(self) -> SavedVideo:
-        """The joined video, registered as this attempt's output; its parts are the last
-        revision's, so publishing it again costs nothing."""
+        """The joined video, registered as this attempt's output: the last revision byte for
+        byte, its parts the same, so publishing it again costs nothing."""
         self._attempt.check_open("VideoJoin.finish")
-        if not self._join.parts:
-            raise OutputError("a joined video needs at least one video", code="media_header")
-        self._join.finish()
+        parts = self._join.finish()
         handle = self._attempt.next_handle(VideoFile.kind)
         final = self._attempt.spool / f"video-{handle.rsplit('/', 1)[-1]}"
         with final.open("xb") as writer:
-            for part, _ in self._join.parts:
+            for part, _ in parts:
                 with part.open("rb") as reader:
                     shutil.copyfileobj(reader, writer, 1 << 20)
             writer.flush()
@@ -1405,7 +1401,7 @@ class VideoJoin:
             attempt=self._attempt.request_id,
         )
         self._attempt.pending[handle] = asset
-        self._attempt.parts[handle] = self._parts()
+        self._attempt.parts[handle] = _published(parts)
         return SavedVideo(
             video=asset,
             width=facts.width,
@@ -1434,29 +1430,26 @@ class VideoJoin:
             submitted_audio_samples=self._written,
         )
 
-    def _parts(self) -> tuple[PublishPart, ...]:
-        return tuple(
-            PublishPart(local=f"{part.parent.name}/{part.name}", duration_us=micros)
-            for part, micros in self._join.parts
-        )
-
     def _revision(self) -> VideoFile:
-        """Publish one indexed byte identity for desktop and browser playback."""
-        path = self._join.indexed_revision()
+        """The join so far, to publish: its parts, whose bytes are one indexed MP4."""
+        parts = self._join.revision()
         handle = self._attempt.next_handle("revision")
         revision = VideoFile(
             handle,
             media_type="video/mp4",
-            size_bytes=path.stat().st_size,
+            size_bytes=sum(part.stat().st_size for part, _ in parts),
             attempt=self._attempt.request_id,
         )
-        self._attempt.parts[handle] = (
-            PublishPart(
-                local=f"{path.parent.name}/{path.name}",
-                duration_us=sum(duration for _, duration in self._join.parts),
-            ),
-        )
+        self._attempt.parts[handle] = _published(parts)
         return revision
+
+
+def _published(parts: Sequence[tuple[Path, int]]) -> tuple[PublishPart, ...]:
+    """A join's parts as a publish names them: by their place in the spool, each with its media time."""
+    return tuple(
+        PublishPart(local=f"{part.parent.name}/{part.name}", duration_us=micros)
+        for part, micros in parts
+    )
 
 
 class _Unwritten:
@@ -1469,9 +1462,6 @@ class _Unwritten:
         self.video_frames += 1
 
     def write_audio(self, planar: object) -> None:
-        return None
-
-    def copy_video(self, before: Callable[[Fraction | None], None]) -> None:
         return None
 
 
@@ -1519,14 +1509,23 @@ class _UnwrittenJoin(VideoJoin):
         last: bool = False,
     ) -> VideoFile:
         self._attempt.check_open("VideoJoin.append")
+        self.add(video, soundtrack, last=last)
+        handle = self._attempt.next_handle("revision")
+        return VideoFile(handle, media_type="video/mp4", attempt=self._attempt.request_id)
+
+    def add(
+        self,
+        video: VideoFile,
+        soundtrack: Callable[[int], Iterable[DecodedMediaEvent]],
+        *,
+        last: bool = False,
+    ) -> None:
         shape = self._outputs._shape(video)
         self._shapes.append(shape)
         for event in soundtrack(shape.frame_count):
             if isinstance(event, DecodedAudioChunk):
                 self._samples += event.sample_count
         self._attempt.shown.add(video.ref)
-        handle = self._attempt.next_handle("revision")
-        return VideoFile(handle, media_type="video/mp4", attempt=self._attempt.request_id)
 
     def finish(self) -> SavedVideo:
         self._attempt.check_open("VideoJoin.finish")
