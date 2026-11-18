@@ -30,6 +30,7 @@ from cozy_runtime.accel.kernels import (
     INT8_CONVROT,
     ROWWISE_FP8,
     PreQuantized,
+    made,
     read,
     readable,
     shared_operand,
@@ -389,25 +390,34 @@ def _native_leaf_class(torch: ModuleType) -> _LeafClass:
                 if torch.is_autocast_enabled(x.payload.device.type):
                     out_dtype = torch.get_autocast_dtype(x.payload.device.type)
                 return ops.gemm(torch, x, data, scale, bias, out_dtype, out)
-            cast = x
-            if torch.is_autocast_enabled(x.device.type):
-                # As the replaced `nn.Linear` does: from and to the autocast dtype.
+            autocast = torch.is_autocast_enabled(x.device.type)
+            if autocast:
+                # As the replaced `nn.Linear` does: from and to the autocast dtype, cast where the rows are
+                # read (a band's in a cut), never as a whole copy held through the GEMM.
                 out_dtype = torch.get_autocast_dtype(x.device.type)
-                cast = x.to(out_dtype)
+
+            def cast(t: Tensor) -> Tensor:
+                return t.to(out_dtype) if autocast else t
+
             few = ops is int8_linear and x.numel() <= int8_linear.GEMV_ROWS * x.shape[-1]
             if prequantized is None and few:
                 # A decode step's row or few: the op's one GEMV launch, which no shared operand
                 # serves (`int8_linear.quantize` declines so few rows).
-                return int8_linear.landed(ops.linear(torch, cast, data, scale, bias, out_dtype), out)
-            if prequantized is None or prequantized.provider != self.provider:
-                capturing = x.is_cuda and torch.cuda.is_current_stream_capturing()
-                sibling = None if capturing else self
-                prequantized = shared_operand(
-                    x, self.provider, lambda: ops.quantize(torch, cast), sibling
-                )
-            if prequantized is not None:
+                return int8_linear.landed(ops.linear(torch, cast(x), data, scale, bias, out_dtype), out)
+            if prequantized is not None and prequantized.provider == self.provider:
                 return ops.gemm(torch, prequantized, data, scale, bias, out_dtype, out)
-            return int8_linear.landed(ops.linear(torch, cast, data, scale, bias, out_dtype), out)
+            capturing = x.is_cuda and torch.cuda.is_current_stream_capturing()
+            sibling = None if capturing else self
+
+            def whole() -> Tensor:
+                operand = shared_operand(x, self.provider, lambda: ops.quantize(torch, cast(x)), sibling)
+                if operand is not None:
+                    return ops.gemm(torch, operand, data, scale, bias, out_dtype, out)
+                return int8_linear.landed(ops.linear(torch, cast(x), data, scale, bias, out_dtype), out)
+
+            if capturing:
+                return whole()
+            return _by_rows(torch, ops, x, cast, data, scale, bias, out_dtype, out, whole, self.provider)
 
         def int8_prologue(
             self,
@@ -435,6 +445,61 @@ def _native_leaf_class(torch: ModuleType) -> _LeafClass:
 
     _native_leaf_class._cached = NativeLinear  # type: ignore[attr-defined]
     return NativeLinear
+
+
+def _by_rows(
+    torch: ModuleType,
+    ops: _NativeOps,
+    x: Tensor,
+    cast: Callable[[Tensor], Tensor],
+    data: Tensor,
+    scale: Tensor,
+    bias: Tensor | None,
+    out_dtype: Dtype,
+    out: Tensor | None,
+    whole: Callable[[], Tensor],
+    provider: str,
+) -> Tensor:
+    """An 8-bit leaf's quantize and GEMM at the level native selection takes, as its token cuts are (`execution.cuts`):
+    whole (`whole`: the operand shared with its siblings, as before), or in bands of rows, each band's operand made and
+    read alone, its GEMM writing its rows of the output. A row's operand is its own (one scale a row), so a band is the
+    whole's arithmetic in a shorter GEMM. `cast` gives rows the GEMM's dtype (autocast's), a band's at a time. A call
+    whose whole is small runs whole before anything is asked (as `catch.cut` would, sooner: a decode step's calls)."""
+    from cozy_runtime.internal.execution import catch, sizing
+
+    width, n = int(x.shape[-1]), int(data.shape[0])
+    rows = x.numel() // max(width, 1)
+    product = 0 if out is not None else rows * n * out_dtype.itemsize
+    copied = width * out_dtype.itemsize if x.dtype != out_dtype else 0
+    if rows < 2 or not x.is_contiguous() or product + rows * (copied + width + 4) < catch._SMALL:
+        return whole()  # a strided input's bands would copy it whole first
+
+    held = made(x, provider)  # a sibling made the whole's operand already
+
+    def per(m: int) -> tuple[int, ...]:
+        # a row's cast, its int8 codes and f32 scale; none for the whole whose operand a sibling made
+        return product, 0 if held and m == rows else m * (copied + width + 4)
+
+    def run(level: int) -> Tensor:
+        if not level:
+            return whole()
+        flat = x.reshape(rows, width)
+        target = int8_linear.into(out, n)
+        result = target if target is not None else torch.empty(rows, n, dtype=out_dtype, device=x.device)
+        size = sizing.pieces(rows, level)
+        for at in range(0, rows, size):
+            catch.checkpoint()
+            band, into = cast(flat[at : at + size]), result[at : at + size]
+            operand = ops.quantize(torch, band)
+            if operand is None:
+                int8_linear.landed(ops.linear(torch, band, data, scale, bias, out_dtype), into)
+            else:
+                ops.gemm(torch, operand, data, scale, bias, out_dtype, into)
+        return int8_linear.landed(result.view(*x.shape[:-1], n), out)
+
+    # One site a weight shape: its leaves' needs differ only by their rows, which the menu's key holds.
+    found: Tensor = catch.cut(f"8bit:rows:{width}x{n}", sizing.levels(rows), sizing.levelled(rows, per), run)
+    return found
 
 
 def _leaf_geometry(replaced: object, data: Tensor) -> tuple[int, int, Tensor | None]:
