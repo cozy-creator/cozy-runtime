@@ -1127,7 +1127,7 @@ def _weightless_census(obj: object) -> tuple[int, int, int]:
     """Parameters on `meta`, parameters on a real device, and the real ones' bytes."""
     meta = real = real_bytes = 0
     members = getattr(obj, "components", None)
-    values = members.values() if isinstance(members, Mapping) else ()
+    values = [held for _, held in _members(obj)] if isinstance(members, Mapping) else ()
     for member in values:
         parameters = getattr(member, "parameters", None)
         if not callable(parameters):
@@ -1195,11 +1195,22 @@ def tensor_schema_of(obj: object) -> dict[str, TensorSpec]:
     return {d.key: d.spec for d in census(obj).destinations}
 
 
+#: A component root's parts, by name: modules of its construction a checkpoint stores as
+#: components of their own (`vlm.construct`'s vision tower and MTP head), each walked, filled and
+#: placed as one; its holder names the root alone.
+PARTS = "_cozy_parts"
+
+
 def _members(obj: object) -> Iterator[tuple[str, object]]:
     table = getattr(obj, "components", None)
     if isinstance(table, Mapping):
         for name in table:
             yield str(name), table[name]
+        for name in table:
+            parts: Mapping[str, object] = getattr(table[name], "__dict__", {}).get(PARTS, {})
+            for part, member in parts.items():
+                if part not in table:
+                    yield part, member
         return
     for name in dir(obj):
         if not name.startswith("_"):

@@ -138,7 +138,9 @@ class App:
           it leaves out at its default). Where it is true the weights come before the function
           starts; where false they aren't fetched. The argument is built when the function
           first reads it. In a function that loads no model and calls others, a key names a
-          function it calls. No rule: always needed.
+          function it calls. A key `<argument>.<component>` (`"model.vision"`) rules one
+          component of a model argument: where false, that component isn't fetched. No rule:
+          always needed.
         - `accelerator`: defaults to GPU for a constructed `Model` parameter, else CPU.
           `True` selects the machine's GPU for custom compute without a `Model`; `False`
           stays CPU only. Raw `Weights` inputs do not select a GPU.

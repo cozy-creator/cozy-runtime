@@ -28,7 +28,7 @@ from cozy_runtime.author._markers import (
     VideoPreparation,
 )
 from cozy_runtime.author._model import ENCODED_LEAVES
-from cozy_runtime.author._model_defaults import model_default
+from cozy_runtime.author._model_defaults import model_default, needs_component
 from cozy_runtime.author._recipes import DeclaredRecipe
 from cozy_runtime.author._signature import AssetInputValue, Declaration, Slot
 from cozy_runtime.internal import canonical, invocable_interface, schema
@@ -85,6 +85,9 @@ class ModelSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     on_demand: bool = False
     #: the CEL rule over `request` that says whether a request needs it (`needs=`); unset: always
     needs: str | msgspec.UnsetType = msgspec.UNSET
+    #: each component -> the rule that says whether a request needs it (`needs=` keyed
+    #: `<argument>.<component>`); a component with none is fetched whenever the slot is
+    component_needs: dict[str, str] = {}
     #: the components that take LoRAs (`Serving(loras=...)`) of those it fetches: where a LoRA
     #: naming no slot binds
     loras: tuple[str, ...] = ()
@@ -321,7 +324,8 @@ def model_slot(declared: Declaration, slot: Slot) -> dict[str, Json]:
     ComponentUseContracts. `default` is an unresolved release; the machine resolves it and
     picks its lane. `components` names the components the slot fetches: the function's own
     `components=`, else its class's hints (`ModelSpec.selects`); absent means all. `needs` is
-    its rule: a reader that evaluates none takes the slot as on demand."""
+    its rule: a reader that evaluates none takes the slot as on demand. `component_needs` are
+    its components' rules: a reader that evaluates none fetches them with the slot."""
     spec, parameter = slot.spec, slot.parameter
     doc: dict[str, Json] = {
         "path": f"{declared.name}.models.{parameter}",
@@ -364,6 +368,13 @@ def model_slot(declared: Declaration, slot: Slot) -> dict[str, Json]:
         doc["on_demand"] = True
     if rule := declared.model_needs.get(parameter):
         doc["needs"] = rule
+    ruled = {
+        named[1]: rule
+        for key, rule in declared.model_needs.items()
+        if (named := needs_component(key)) is not None and named[0] == parameter
+    }
+    if ruled:
+        doc["component_needs"] = dict(sorted(ruled.items()))
     return doc
 
 
@@ -412,6 +423,11 @@ def _fixed_point(value: Json, path: str = "") -> None:
                 continue
             if key == "default" and re.fullmatch(r"\.entrypoints\[\d+\]\.models\[\d+\]", path):
                 model_default(item)
+                continue
+            if key == "component_needs" and isinstance(item, Mapping):
+                # Its keys are the author's component names (`model` among them), not facts.
+                for component, rule in item.items():
+                    _fixed_point(rule, f"{path}.{key}.{component}")
                 continue
             if key in _FORBIDDEN_KEYS:
                 raise ConformanceError(
@@ -573,6 +589,8 @@ def _model_slot(slot: ModelSlot, name: str, source: str, path: str) -> None:
         _invalid(source, f"{path}.path", f"must start with {prefix!r}")
     if not slot.class_name:
         _invalid(source, f"{path}.class", "must be a non-empty string")
+    if not all(component and rule for component, rule in slot.component_needs.items()):
+        _invalid(source, f"{path}.component_needs", "must map component names to rules")
 
 
 def _assets_slot(slot: AssetsSlot, request: Json, source: str, path: str) -> None:

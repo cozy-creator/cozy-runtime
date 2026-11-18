@@ -55,6 +55,7 @@ from cozy_runtime.author._model_defaults import (
     model_defaults,
     model_needs,
     model_on_demand,
+    needs_component,
 )
 from cozy_runtime.author._recipes import CALIBRATED_ENTRYPOINT, canonical, fingerprint, outputs
 from cozy_runtime.author._recipes import ENTRYPOINT as RECIPES_ENTRYPOINT
@@ -1941,12 +1942,14 @@ def _call_rules(
     rows: Mapping[tuple[str, str], dict[str, Json]],
 ) -> None:
     """Each `needs=` rule that names a function this one calls goes on that call's row. A key
-    is a constructed Model argument or one called function, never both and never neither."""
+    is a constructed Model argument (or one's component, on its slot: `model_slot`) or one
+    called function, never both and never neither."""
     models = typing.cast(list[dict[str, Json]], doc.get("models", []))
     slots = {str(m["path"]).rpartition(".")[2] for m in models if not m.get("weights")}
     for name, rule in registration.model_needs.items():
         called = [row for (_, function), row in rows.items() if function == name]
-        if name in slots and not called:
+        component = needs_component(name)
+        if (name in slots or (component is not None and component[0] in slots)) and not called:
             continue
         if name in slots or len(called) != 1:
             reader.refuse(

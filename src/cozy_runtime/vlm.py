@@ -13,7 +13,10 @@ dense and mixture-of-experts, load through it.
 
 The construction config is the repository's `config.json`; the tokenizer, processor and chat
 template are the checkpoint's assets; parameters load in their stored dtype. Fused experts are
-split into per-expert blocks (`moe.split`): the checkpoint stores them per expert.
+split into per-expert blocks (`moe.split`): the checkpoint stores them per expert. A Qwen3.5
+checkpoint is three components, as ingest stores it (`Pipeline`): the language model (`model`),
+its vision tower (`vision`) and its multi-token-prediction head (`mtp`), so a call that shows
+no picture fetches no vision tower (a package's `needs={"model.vision": ...}`).
 
 Answers stream as they are made (xs-209): the engine hands each row's decoded text over as it comes
 (`Delta`, `on_delta`) and returns what it made (`Final`); above it, what may be shown of each answer
@@ -29,7 +32,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, TypedDict, cast
 
 import msgspec
 import torch
@@ -60,10 +63,10 @@ from cozy_runtime.author import (
     Serving,
     Telemetry,
     UnsupportedInput,
-    uses_components,
 )
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.author._loader import PARTS
 from cozy_runtime.author._model import WARNINGS
 from cozy_runtime.author._tool import spoken
 from cozy_runtime.fields import MENTION, Advanced, FileBound, Prompt, Video
@@ -76,6 +79,14 @@ if TYPE_CHECKING:
     from cozy_runtime.accel.kernels import Plan
 
 COMPONENT = "model"
+#: The vision tower (Transformers' `model.visual`, its own state dict) and the multi-token-
+#: prediction head (`lm.Draft`, its keys `mtp.*`): their own components in a checkpoint ingest
+#: stored so, as it stores every one of `SPLIT`'s model types.
+VISION = "vision"
+MTP = "mtp"
+SPLIT = frozenset({"qwen3_5", "qwen3_5_moe"})
+#: A tensor every Qwen-VL vision tower has, as the model stores it.
+VISUAL = "model.visual.patch_embed.proj.weight"
 DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
 #: Where a thought ends: `ask` returns what follows it.
 THOUGHT_END = "</think>"
@@ -381,8 +392,45 @@ def watch(
 def construct(model_config: Mapping[str, object], config: Config) -> PreTrainedModel:
     """The model, experts split per expert; every parameter in its stored dtype (Qwen3.5 keeps
     `A_log` and its gated norms in f32, and Runtime fills stored bytes as they are). Where the
-    checkpoint keeps its multi-token-prediction head (`mtp.*`), that too, as the model's `mtp`:
-    its decode drafts with the `lm.Draft` around it (`lm.HEADS`)."""
+    checkpoint keeps its multi-token-prediction head (`mtp.*`), that too: its decode drafts with
+    it (`lm.HEADS`). A checkpoint that stores the vision tower and the head as their own
+    components (`VISION`, `MTP`, as ingest stores Qwen3.5) gets them as the model's parts
+    (`PARTS`), each its own component under the model's holder; one that stores them in the
+    model, inside it (`model.visual`, `model.mtp`)."""
+    split = _split(config)
+    model, head = _built(model_config, config, f"{MTP if split else COMPONENT}.mtp.fc.weight")
+    if not split:
+        if head is not None:
+            model.mtp = head.mtp
+        _stored(config, {COMPONENT: model})
+        return _evaluated(model, head)
+    language = cast("torch.nn.Module", model.model)  # cast: Transformers' VL model's own `model`
+    vision = cast("torch.nn.Module", language.visual)  # cast: as above, its vision tower
+    # Out of the model's module tree, so it is a component of its own, and still its `visual`.
+    del language.visual
+    object.__setattr__(language, "visual", vision)
+    parts = {VISION: vision, **({MTP: head} if head is not None else {})}
+    _stored(config, {COMPONENT: model, **parts})
+    vision.eval()
+    vars(model)[PARTS] = parts
+    return _evaluated(model, head)
+
+
+def _split(config: Config) -> bool:
+    """Whether the checkpoint stores the vision tower apart from the model: its bound model
+    component holds no `model.visual` (a checkpoint that stores none of it refuses the key)."""
+    try:
+        config.tensor_dtype(f"{COMPONENT}.{VISUAL}", default="")
+    except ConformanceError:
+        return True
+    return False
+
+
+def _built(
+    model_config: Mapping[str, object], config: Config, head_key: str
+) -> tuple[PreTrainedModel, lm.Draft | None]:
+    """The model and, where the checkpoint stores `head_key`, its multi-token-prediction head;
+    the experts of both split per expert, numbered over the model's layers then the head's."""
     with no_init_weights():
         model: PreTrainedModel = AutoModelForImageTextToText.from_config(  # type: ignore[no-untyped-call]  # unannotated in Transformers
             AutoConfig.for_model(**model_config),  # type: ignore[arg-type]  # config.json's keys
@@ -391,15 +439,25 @@ def construct(model_config: Mapping[str, object], config: Config) -> PreTrainedM
         model.tie_weights()
         text = model.config.get_text_config(decoder=True)
         head = None
-        drafts = getattr(text, "mtp_num_hidden_layers", 0)
-        if drafts and _held(config, f"{COMPONENT}.mtp.fc.weight"):
-            head = lm.Draft(model.config, sys.modules[type(model).__module__])
-            model.mtp = head.mtp.to(torch.bfloat16)
+        if getattr(text, "mtp_num_hidden_layers", 0) and _held(config, head_key):
+            head = lm.Draft(model.config, sys.modules[type(model).__module__]).to(torch.bfloat16)
+            model.mtp = head.mtp
         moe.split(model)
-    for name, parameter in model.named_parameters():
-        stored = DTYPES.get(config.tensor_dtype(f"{COMPONENT}.{name}", default="bf16"))
-        if stored is not None and parameter.dtype != stored:
-            parameter.data = parameter.data.to(stored)
+        if head is not None:
+            del model.mtp
+    return model, head
+
+
+def _stored(config: Config, roots: Mapping[str, torch.nn.Module]) -> None:
+    """Each component's parameters in their stored dtype."""
+    for component, root in roots.items():
+        for name, parameter in root.named_parameters():
+            stored = DTYPES.get(config.tensor_dtype(f"{component}.{name}", default="bf16"))
+            if stored is not None and parameter.dtype != stored:
+                parameter.data = parameter.data.to(stored)
+
+
+def _evaluated(model: PreTrainedModel, head: lm.Draft | None) -> PreTrainedModel:
     if head is not None:
         lm.HEADS[model] = head.eval()
     evaluated: PreTrainedModel = model.eval()  # type: ignore[no-untyped-call]  # unannotated in Transformers
@@ -498,9 +556,26 @@ def processor(
 
 
 class Pipeline:
+    """The checkpoint's model as `VisionLM` runs it (`construct`). A Qwen3.5 checkpoint (`SPLIT`)
+    is three components, as ingest stores it: the language layers, head and token table
+    (`model`), the vision tower (`vision`) and, where it keeps one, the multi-token-prediction
+    head (`mtp`). One the binding leaves out stays on meta, never filled: a call that reads no
+    picture never reads the vision tower. One stored before the split is refused."""
+
     def __init__(self, config: Config) -> None:
-        model = construct(config.mapping(), config)
-        self.components: dict[str, PreTrainedModel] = {COMPONENT: model}
+        model_config = config.mapping()
+        if model_config.get("model_type") in SPLIT and _held(config, f"{COMPONENT}.{VISUAL}"):
+            raise ConformanceError(
+                "this checkpoint keeps its vision tower in its model component, as ingest stored "
+                "Qwen3.5 before it split it out: upload its source again (`cozy model upload`)",
+                code="checkpoint_layout",
+            )
+        self.components: dict[str, torch.nn.Module] = {COMPONENT: construct(model_config, config)}
+
+    @property
+    def model(self) -> PreTrainedModel:
+        """The language model (`COMPONENT`), which `TransformersEngine` decodes."""
+        return cast("PreTrainedModel", self.components[COMPONENT])
 
 
 @dataclass(frozen=True, slots=True)
@@ -551,20 +626,21 @@ class VisionLM(Model[Pipeline]):
         self.pipe = loader.construct(Pipeline)
         self.processor = processor(loader.assets)
         if "generation_config.json" in loader.assets.names():
-            model = self.pipe.components[COMPONENT]
+            model = self.pipe.model
             model.generation_config = GenerationConfig(  # type: ignore[no-untyped-call]  # unannotated in Transformers
                 **json.loads(loader.assets.read("generation_config.json"))
             )
         self.engine = TransformersEngine(self.pipe, self.processor)
 
     def execution_plan(self, plan: Plan) -> str:
-        model = self.pipe.components[COMPONENT]
+        model = self.pipe.model
         return "+".join(filter(None, (lm.install(plan, model), moe.install(plan, model))))
 
     def unload(self, loader: Loader) -> None:
         del self.pipe, self.engine
 
-    @uses_components(COMPONENT)
+    # No `@uses_components`: a slot fetches every component its checkpoint holds, as the
+    # package's rules say (`needs={"model.vision": ...}`), and the engine holds what it reads.
     def ask(
         self,
         questions: list[Question],
@@ -707,7 +783,7 @@ class TransformersEngine:
         return text
 
     def _inputs(self, **kwargs: object) -> BatchFeature:
-        model = self.pipe.components[COMPONENT]
+        model = self.pipe.model
         self.processor.tokenizer.padding_side = "left"
         inputs: BatchFeature = self.processor(padding=True, return_tensors="pt", **kwargs)
         inputs = inputs.to(model.device)
@@ -727,7 +803,7 @@ class TransformersEngine:
         """Each row decoded, its text handed to `on_delta` as it comes; a stop string that is one
         token also ends its row's decode. With `thinking`, what comes before the thought's end is
         its thought (`reasoning`)."""
-        model, tokenizer = self.pipe.components[COMPONENT], self.processor.tokenizer
+        model, tokenizer = self.pipe.model, self.processor.tokenizer
         configured = model.generation_config.eos_token_id
         single = [
             ids[0]

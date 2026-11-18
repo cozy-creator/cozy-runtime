@@ -115,11 +115,22 @@ def model_on_demand(value: object) -> tuple[str, ...]:
 
 #: The longest rule: one small boolean expression, never a program.
 MAX_NEEDS_RULE = 1024
+#: A component of a Model argument, as a `needs=` key names it: `model.vision`.
+_COMPONENT_KEY = re.compile(
+    r"(?P<argument>[A-Za-z_][A-Za-z0-9_]*)\.(?P<component>[A-Za-z0-9_][A-Za-z0-9_-]*)"
+)
+
+
+def needs_component(key: str) -> tuple[str, str] | None:
+    """A `needs=` key's Model argument and component, where it names one (`model.vision`)."""
+    match = _COMPONENT_KEY.fullmatch(key)
+    return None if match is None else (match["argument"], match["component"])
 
 
 def model_needs(value: object) -> dict[str, str]:
-    """Copy a `needs=` declaration: a Model argument, or a function this one calls, -> the
-    CEL expression over `request` that says whether a request needs it."""
+    """Copy a `needs=` declaration: a Model argument, a component of one
+    (`<argument>.<component>`), or a function this one calls, -> the CEL expression over
+    `request` that says whether a request needs it."""
     if value is None:
         return {}
     if not isinstance(value, Mapping) or len(value) > 16:
@@ -129,9 +140,11 @@ def model_needs(value: object) -> dict[str, str]:
         )
     out = {}
     for name, rule in value.items():
-        if not isinstance(name, str) or not name.isidentifier():
+        if not isinstance(name, str) or not (name.isidentifier() or needs_component(name)):
             raise ConformanceError(
-                "needs keys must be Model argument or function names", code="model_needs"
+                "needs keys must be Model argument or function names, or "
+                "<argument>.<component>",
+                code="model_needs",
             )
         if not isinstance(rule, str) or not rule.strip() or len(rule) > MAX_NEEDS_RULE:
             raise ConformanceError(
