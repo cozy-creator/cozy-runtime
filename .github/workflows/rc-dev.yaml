@@ -124,7 +124,8 @@ jobs:
           sleep 2
           gone=$(asset SHA256SUMS.old); [ -z "$gone" ] || gh api -X DELETE "repos/$REPO/releases/assets/$gone"
           last=$(asset SHA256SUMS); [ -z "$last" ] || rename_asset "$last" SHA256SUMS.old
-          rename_asset "$(asset SHA256SUMS.new)" SHA256SUMS
+          # A new one that won't take the name puts the last back: a reader is never left with only SHA256SUMS.old.
+          rename_asset "$(asset SHA256SUMS.new)" SHA256SUMS || { [ -z "$last" ] || rename_asset "$last" SHA256SUMS; touch swapped; exit 1; }
           sleep 2
           touch swapped && wait "$watcher"
           read -r sums old neither < watched
