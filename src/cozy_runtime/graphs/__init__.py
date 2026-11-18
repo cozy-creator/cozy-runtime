@@ -571,10 +571,20 @@ class _Recording:
         self.stream, self.fenced = stream, False
         copied = 0
         held: list[object] = []
+        prepared = False
         try:
             held = self._pinned(stream) if self.retained else []
             # cast: a recording is called only until it closes
-            vt.prepare_pool(cast("domain.Pool", self.pool).handle, 0, self.owner.device)
+            pool = cast("domain.Pool", self.pool).handle
+            try:
+                vt.prepare_pool(pool, 0, self.owner.device)
+            except Exception as exc:
+                if not is_capacity(exc):
+                    raise
+                vt.cancel_preparation(pool, self.owner.device)
+                # Nothing replayed yet: an idle pool's pages had no room to come back (cr-329)
+                raise _PoolShort(no_room(self.owner.device, "its pool", 0, exc)) from None
+            prepared = True
             for static, value in zip(self.inputs, leaves, strict=True):
                 # Always: a pool's contents need not survive between replays.
                 if static is not None:
@@ -610,7 +620,8 @@ class _Recording:
             del held  # each Use releases on the stream it consumed
             self.copied = copied
             cast("Event", self.done).record(stream)  # cast: made above
-            vt.record_pool_stream(cast("domain.Pool", self.pool).handle, stream)
+            if prepared:
+                vt.record_pool_stream(cast("domain.Pool", self.pool).handle, stream)
             self.fenced = True
 
     def close(self) -> None:
@@ -1898,6 +1909,10 @@ def _paged(before: WorkingStats, after: WorkingStats) -> str:
     return f"{filled / 2**20:.0f} MiB refilled" if filled > 0 else ""
 
 
+class _PoolShort(Exception):
+    """A replay's pool found no room to map its pages again: the call runs as written."""
+
+
 class _OverCard(Exception):
     """A capture's pool can't sit beside its graph's weights (`_over_card`): it runs as written."""
 
@@ -2947,6 +2962,12 @@ def _replay(
     except StaleBinding as exc:  # a retained state it reads ended or moved
         _note(recorder, "building", str(exc))
         return _STALE
+    except _PoolShort as exc:  # before the replay, as its weights' refusal is
+        why = str(exc)
+        _refused(recorder, placed, why)
+        safeguard("no_room", why)
+        _note(recorder, "no_room", why)
+        return _EAGER
     finally:
         lease.__exit__(None, None, None)
     recorder.gap = ""
