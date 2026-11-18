@@ -10,10 +10,9 @@ device-to-device copy ever names a host address and no kernel writes a window ov
 
 from __future__ import annotations
 
-import ctypes
 import math
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
 import torch
 from torch import Tensor
@@ -138,10 +137,7 @@ def read(src: Tensor) -> Tensor:
 
 def _rows(tensor: Tensor) -> tuple[int, int, int] | None:
     """`tensor`'s bytes as `(width, height, pitch)`: `height` rows of `width` contiguous bytes,
-    `pitch` bytes apart, in its own element order; None where its strides are not that, or no
-    pitched copy is at hand."""
-    if _copy2d() is None:
-        return None
+    `pitch` bytes apart, in its own element order; None where its strides are not that."""
     dims = [(n, s) for n, s in zip(tensor.shape, tensor.stride(), strict=True) if n != 1]
     run = 1  # elements in the innermost contiguous run
     while dims and dims[-1][1] == run:
@@ -160,67 +156,15 @@ def _rows(tensor: Tensor) -> tuple[int, int, int] | None:
     return run * item, height, step * item
 
 
-class _Copy2D(ctypes.Structure):
-    """The driver's `CUDA_MEMCPY2D`."""
-
-    _fields_ = [
-        ("srcXInBytes", ctypes.c_size_t),
-        ("srcY", ctypes.c_size_t),
-        ("srcMemoryType", ctypes.c_int),
-        ("srcHost", ctypes.c_void_p),
-        ("srcDevice", ctypes.c_uint64),
-        ("srcArray", ctypes.c_void_p),
-        ("srcPitch", ctypes.c_size_t),
-        ("dstXInBytes", ctypes.c_size_t),
-        ("dstY", ctypes.c_size_t),
-        ("dstMemoryType", ctypes.c_int),
-        ("dstHost", ctypes.c_void_p),
-        ("dstDevice", ctypes.c_uint64),
-        ("dstArray", ctypes.c_void_p),
-        ("dstPitch", ctypes.c_size_t),
-        ("WidthInBytes", ctypes.c_size_t),
-        ("Height", ctypes.c_size_t),
-    ]
-
-
-_UNIFIED = 4  # CU_MEMORYTYPE_UNIFIED: an address in the unified space, host or device
-#: `cuMemcpy2DAsync` once loaded: None where the driver library has none
-_COPY2D: list[Callable[[object, ctypes.c_void_p], int] | None] = []
-
-
-def _copy2d() -> Callable[[object, ctypes.c_void_p], int] | None:
-    if not _COPY2D:
-        try:
-            fn = ctypes.CDLL("libcuda.so.1").cuMemcpy2DAsync_v2
-        except (OSError, AttributeError):
-            _COPY2D.append(None)
-        else:
-            fn.argtypes = [ctypes.POINTER(_Copy2D), ctypes.c_void_p]
-            fn.restype = ctypes.c_int
-            _COPY2D.append(fn)
-    return _COPY2D[0]
-
-
 def _pitched(
     dst: int, dpitch: int, src: int, spitch: int, width: int, height: int, device: torch.device
 ) -> None:
-    """One copy of `height` rows of `width` bytes, ordered on `device`'s current stream."""
-    copy = _Copy2D(
-        srcMemoryType=_UNIFIED,
-        srcDevice=src,
-        srcPitch=spitch,
-        dstMemoryType=_UNIFIED,
-        dstDevice=dst,
-        dstPitch=dpitch,
-        WidthInBytes=width,
-        Height=height,
-    )
-    fn = _copy2d()
-    assert fn is not None  # `_rows` found it
+    """One copy of `height` rows of `width` bytes, ordered on `device`'s current stream, by varena
+    (`cuMemcpy2DAsync` on its own driver)."""
+    import tensorfs.varena.torch as vt
+
     stream = torch.cuda.current_stream(device).cuda_stream
-    code = fn(ctypes.byref(copy), ctypes.c_void_p(stream))
-    if code:
-        raise RuntimeError(f"cuMemcpy2DAsync: {height} rows of {width} bytes, CUresult {code}")
+    vt.copy_pitched(dst, dpitch, src, spitch, width, height, stream=stream, device=device)
 
 
 def held(tensor: Tensor) -> bool:
