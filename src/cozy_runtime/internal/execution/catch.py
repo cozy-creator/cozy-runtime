@@ -197,6 +197,17 @@ def refuse(device: int, name: str, level: str, need: int, exc: BaseException) ->
 
 
 def select(
+    device: int, key: str, name: str, menu: Sequence[tuple[str, Sequence[int]]], stream: int
+) -> Selection:
+    """The level native selection takes, its room made; `DoesNotFit` where none can have it."""
+    try:
+        selection: Selection = vt.split_select(device, key, menu, stream=stream)
+        return selection
+    except varena.Exhausted as exc:  # a decision, not a failure: nothing has run
+        raise refuse(device, name, "its finest split", sum(menu[-1][1]), exc) from exc
+
+
+def chosen(
     device: int,
     key: str,
     name: str,
@@ -204,24 +215,23 @@ def select(
     stream: int,
     last: bool = True,
 ) -> Selection | None:
-    """The level native selection takes, its room made; `DoesNotFit` where none can have it.
-    With `last` (the caller has no other way to run it), None where only a peak varena measured
-    refuses the finest: the menu's own need for it has room, and no allocation at this site was
-    refused in this request. That peak was taken under other levels of the sites inside it (an
-    8-bit leaf that ran whole and kept its operand), so the finest runs and its allocations
-    decide (var-030)."""
+    """`select`, or, with `last` (the caller has no other way to run it), None where only a peak
+    varena measured refuses the finest: the menu's own need for it has room, and no allocation
+    at this site was refused in this request. That peak was taken under other levels of the
+    sites inside it (an 8-bit leaf that ran whole and kept its operand), so the finest runs and
+    its allocations decide (var-030)."""
     try:
-        selection: Selection = vt.split_select(device, key, menu, stream=stream)
-        return selection
-    except varena.Exhausted as exc:  # a decision, not a failure: nothing has run
-        request, own = CURRENT.get(), sum(menu[-1][1])
-        measured = int(getattr(exc, "requested_bytes", 0)) > own
-        fits = own <= int(getattr(exc, "available_bytes", 0))
-        record = request.working_splits.get(key) if request is not None else None
-        refused = record is not None and "refused" in record
-        if last and measured and fits and request is not None and not refused:
-            return None
-        raise refuse(device, name, "its finest split", own, exc) from exc
+        return select(device, key, name, menu, stream)
+    except Unplaced as exc:
+        cause, request, own = exc.__cause__, CURRENT.get(), sum(menu[-1][1])
+        if not last or request is None or not isinstance(cause, varena.Exhausted):
+            raise
+        measured = int(getattr(cause, "requested_bytes", 0)) > own
+        fits = own <= int(getattr(cause, "available_bytes", 0))
+        record = request.working_splits.get(key)
+        if not (measured and fits) or (record is not None and "refused" in record):
+            raise
+        return None
 
 
 def unselected[T](
@@ -319,9 +329,10 @@ def cut[T](
             return run(LEVELS.get(key, 0))
         request.memory.remember_working_phase(key, owners(request))
         stream = int(torch.cuda.current_stream(device).cuda_stream)
-        selection = select(device, key, name, menu, stream, last)
-        if selection is None:
+        choice = chosen(device, key, name, menu, stream, last)
+        if choice is None:
             return unselected(request, key, name, len(menu) - 1, run, pure)
+        selection = choice
         while True:
             level = int(selection["choice_id"])
             token = begin(device, key, name, menu, level, selection, stream)
@@ -491,9 +502,9 @@ def fixed(name: str, finest: int, need: sizing.Need) -> Fixed:
             return Fixed(LEVELS.get(key, 0))
         request.memory.remember_working_phase(key, owners(request))
         stream = int(torch.cuda.current_stream(device).cuda_stream)
-        selection = select(device, key, name, menu, stream)
-        chosen = len(menu) - 1 if selection is None else int(selection["choice_id"])
-        level = LEVELS[key] = max(chosen, _REFUSED.get(key, 0))
+        selection = chosen(device, key, name, menu, stream)
+        picked = len(menu) - 1 if selection is None else int(selection["choice_id"])
+        level = LEVELS[key] = max(picked, _REFUSED.get(key, 0))
         note(request, key, name, level, selection)
         return Fixed(level, key, name, len(menu))
     finally:
