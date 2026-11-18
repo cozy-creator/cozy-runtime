@@ -94,14 +94,8 @@ jobs:
         with:
           repo-token: ${{ github.token }}
       - run: uv python install 3.12
-      # An arm runner builds the locked TensorFS from its tag until TensorFS publishes aarch64 wheels.
       - working-directory: source
-        run: |
-          if [ "$RUNNER_ARCH" != ARM64 ]; then uv sync --locked; exit 0; fi
-          uv sync --locked --no-install-package tensorfs
-          version=$(grep -A1 '^name = "tensorfs"$' uv.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
-          uv pip install "tensorfs @ git+https://github.com/cozy-creator/tensorfs@v$version"
-          echo UV_NO_SYNC=1 >> "$GITHUB_ENV"
+        run: uv sync --locked
       # From here to the wheel check: runtime-publish.yaml's build job, step for step.
       # On either arch the Linux wheel is the pure one plus its kernels.
       - name: Build (sdist + pure-py wheel)

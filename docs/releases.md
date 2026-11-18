@@ -58,6 +58,15 @@ or retry an already published version to test automation.
 See [tracker #348](https://github.com/cozy-creator/tracker/issues/348) for the source/prebuilt
 entrypoint repair and its rehearsal evidence.
 
+## TensorFS on the open RC
+
+The RC's Runtime floors on a build of the RC's TensorFS (xs-216): `tensorfs>=0.27.0.dev<n>,<0.28` on Linux x86_64, the one
+platform cozy-creator's rc-dev builds TensorFS for, and the released line elsewhere. **A Runtime change that needs a newer
+TensorFS API raises that floor in the same PR**: `<n>` is the first-parent count of the cozy-creator RC commit that merged it
+(`git rev-list --count --first-parent <commit>`), and `[tool.uv.sources]`, `uv.lock` and `scripts/typecheck-requirements.in`
+move to an RC TensorFS build at or after it (cozy-creator's `rc-<x.y.z>` prerelease keeps a build these files name).
+A release declares one unmarked range for every platform, `tensorfs>=X.Y.Z,<X.(Y+1)`, and drops the source entry.
+
 ## Kernel conformance
 
 Kernel selection is code rules by tensor-core family (xs-065); no release ships measured data.
