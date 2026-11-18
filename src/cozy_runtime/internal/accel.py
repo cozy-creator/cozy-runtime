@@ -32,6 +32,7 @@ import tensorfs.varena.torch as vt
 from tensorfs.varena import _runtime as varena
 
 from cozy_runtime.author._errors import Fault, fault
+from cozy_runtime.internal.child_env import CUDA_ORDER
 from cozy_runtime.internal.config import sees_no_gpu
 from cozy_runtime.internal.hostfacts import available_memory, physical_memory
 
@@ -129,14 +130,37 @@ def nvml_index(uuid: str) -> int:
     return int(index.value)
 
 
+def device_uuid(torch: ModuleType, index: int) -> str:
+    """Torch device `index`'s NVML identity (`GPU-…`), whatever CUDA's numbering; "" when torch
+    cannot say."""
+    try:
+        return f"GPU-{torch.cuda.get_device_properties(index).uuid}"
+    except Exception:
+        return ""
+
+
+def _identity(device: str) -> str:
+    """How NVML and nvidia-smi know one card: a `GPU-…`/`MIG-…` UUID, or a seal entry's index
+    where CUDA numbers cards as they do (`CUDA_ORDER`). "" for anything else, so no other
+    card is read in its place."""
+    if device.startswith(("GPU-", "MIG-")):
+        return device
+    if device.isdigit() and os.environ.get(CUDA_ORDER[0]) == CUDA_ORDER[1]:
+        return device
+    return ""
+
+
 def _nvml_handle(library: ctypes.CDLL, device: str) -> ctypes.c_void_p | None:
-    """One envelope entry's handle: an index by index, anything else by UUID."""
+    """One card's handle by its identity (`_identity`), or None."""
     handle = ctypes.c_void_p()
+    device = _identity(device)
     try:
         if device.isdigit():
             answer = library.nvmlDeviceGetHandleByIndex_v2(int(device), ctypes.byref(handle))
-        else:
+        elif device:
             answer = library.nvmlDeviceGetHandleByUUID(device.encode(), ctypes.byref(handle))
+        else:
+            return None
     except (OverflowError, ctypes.ArgumentError, UnicodeEncodeError):
         return None
     return handle if answer == _NVML_SUCCESS else None
@@ -164,7 +188,7 @@ def _host_pool() -> DeviceMemory:
 
 def device_capability(device: str) -> int:
     """One envelope entry's CUDA capability as `major * 10 + minor` (sm_120 is 120), from
-    the driver, torch-free; zero where NVML is absent or does not know the entry."""
+    the driver, torch-free; zero where NVML is absent or cannot identify the entry (`_identity`)."""
     library = _nvml_library()
     handle = _nvml_handle(library, device) if library is not None else None
     if library is None or handle is None:
@@ -195,19 +219,21 @@ def half_accumulate(device: str) -> bool:
     return brand.value in _HALF_RATE_BRANDS
 
 
-_NVML_NOT_SUPPORTED = 3
-
-
-def device_settings(index: int) -> tuple[str, str, str]:
-    """NVML device `index`'s driver version, power limit (W) and MIG mode, spelled as
-    `nvidia-smi --query-gpu=driver_version,power.limit,mig.mode.current` spells them. In-process
-    where the library is present, else `nvidia-smi` run to its answer: the answer decides, never
-    how long it took. `[N/A]` is the driver saying so; `unreadable` is no driver answering."""
+def device_settings(device: str) -> tuple[str, str, str]:
+    """The driver's version and one card's power limit (W) and MIG mode, spelled as
+    `nvidia-smi -i <device> --query-gpu=driver_version,power.limit,mig.mode.current` spells
+    them. `device` is the card's identity (`_identity`): a torch ordinal is not one, so ask
+    with `device_uuid`. In-process where the library is present, else `nvidia-smi` run to its
+    answer: the answer decides, never how long it took. `[N/A]` is the driver saying so;
+    `unreadable` is no driver answering; `unmapped` is no card by that identity, never another
+    card's settings."""
+    device = _identity(device)
     library = _nvml_library()
-    handle = _nvml_handle(library, str(index)) if library is not None else None
-    if library is None or handle is None:
+    if library is None:
+        if not device:
+            return "unreadable", "unmapped", "unmapped"
         try:
-            out = _smi("-i", str(index), "--query-gpu=driver_version,power.limit,mig.mode.current")
+            out = _smi("-i", device, "--query-gpu=driver_version,power.limit,mig.mode.current")
         except (OSError, subprocess.SubprocessError):
             return ("unreadable",) * 3
         fields = [field.strip().replace(" ", "") or "unreadable" for field in out.stdout.split(",")]
@@ -220,12 +246,15 @@ def device_settings(index: int) -> tuple[str, str, str]:
         if library.nvmlSystemGetDriverVersion(version, ctypes.c_uint(96)) == _NVML_SUCCESS
         else "unreadable"
     )
+    handle = _nvml_handle(library, device)
+    if handle is None:
+        return driver, "unmapped", "unmapped"
     milliwatts, current, pending = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
 
     def spelled(answer: int, value: str) -> str:
         if answer == _NVML_SUCCESS:
             return value
-        return "[N/A]" if answer == _NVML_NOT_SUPPORTED else "unreadable"
+        return "[N/A]" if answer == _NVML_ERROR_NOT_SUPPORTED else "unreadable"
 
     answer = library.nvmlDeviceGetPowerManagementLimit(handle, ctypes.byref(milliwatts))
     power = spelled(answer, f"{milliwatts.value / 1000:.2f}")
@@ -515,8 +544,8 @@ def device_identity(torch: ModuleType, kind: str, index: int = 0) -> DeviceIdent
 
     Two DRIVER facts replace it, and neither is invented here: `driver_api` is the CUDA
     driver API version torch itself reports (`_cuda_getDriverVersion`, e.g. 13000), and the
-    display driver version proper is an NVML query that `encoding.measure_device` makes with
-    the SELECTED device index. Both ride the key.
+    display driver version proper is an NVML query that `encoding.measure_device` makes for
+    the SELECTED device, by its UUID. Both ride the key.
     """
     if kind == "cpu":
         return {"name": cpu_name(), "sm": 0, "cuda_runtime": "", "driver_api": ""}

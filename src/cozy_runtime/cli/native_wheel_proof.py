@@ -164,8 +164,9 @@ def _proof(
             "OMP_NUM_THREADS": "1",
             "PYTORCH_CUDA_ALLOC_CONF": "",
         }
-        if request.device_index is not None:
+        if request.device_index is not None:  # nvidia-smi's number, as CUDA_ORDER makes it CUDA's
             imposed["CUDA_VISIBLE_DEVICES"] = str(request.device_index)
+            imposed[child_env.CUDA_ORDER[0]] = child_env.CUDA_ORDER[1]
         operator = native_wheel.qualify_operator(
             python=Path(generation.python),
             fixture=request.fixture,

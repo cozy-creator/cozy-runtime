@@ -2,7 +2,8 @@
 
 The executor reports one record per process of its group, in process order, as `gpus`:
 
-    {"gpu": int, "pid": int, "uuid": str, "arch": str, "start_us": int, "end_us": int,
+    {"gpu": int, "pid": int, "uuid": str, "arch": str, "name": str, "settings": str,
+     "start_us": int, "end_us": int,
      "attention": {"requested": str, "observed": str, "impl": str, "class"?: str,
                    "sites"?: {component: [site group]}, "kernels"?: [kernel],
                    "segments"?: [segment]},
@@ -16,8 +17,10 @@ The executor reports one record per process of its group, in process order, as `
                    "compile_ms"?: float}
 
 `gpu` is the number nvidia-smi shows (NVML's index for the card's UUID, else the seal's
-`CUDA_VISIBLE_DEVICES` entry; -1 off CUDA), `uuid` the NVML `GPU-…` identity and `arch` its
-`sm_XY` ("" off CUDA). `start_us`/`end_us` are wall-clock unix MICROseconds bounding the
+`CUDA_VISIBLE_DEVICES` entry; -1 off CUDA), `uuid` the NVML `GPU-…` identity, `arch` its
+`sm_XY`, `name` torch's name for it and `settings` NVML's power limit and MIG mode for that
+UUID (`300.00W/Disabled`, as a plan's device `configuration`; "" off CUDA).
+`start_us`/`end_us` are wall-clock unix MICROseconds bounding the
 GPU's work for the attempt, 0 for one that did none: nanoseconds since the epoch exceed the
 ±2^53 integer range canonical JSON (and every JSON reader) admits. `attention.requested` is
 the request's pin ("" = automatic), `observed` what the process's processors held, in the
@@ -123,6 +126,8 @@ class GpuEvidence(TypedDict):
     pid: int
     uuid: str
     arch: str
+    name: str
+    settings: str
     start_us: int
     end_us: int
     attention: RankAttention
@@ -130,28 +135,41 @@ class GpuEvidence(TypedDict):
 
 
 class Identity(TypedDict, total=False):
-    """Who ran a call: its process, and its GPU's number, UUID and architecture."""
+    """Who ran a call: its process, and its GPU's number, UUID, architecture, name and
+    settings."""
 
     pid: int
     gpu: int
     uuid: str
     arch: str
+    name: str
+    settings: str
 
 
 def identity(torch: ModuleType, cuda: bool, local: int, sealed: Sequence[str]) -> Identity:
-    """This process's `pid`, `gpu`, `uuid` and `arch` for device `local` of its seal."""
+    """This process's identity for device `local` of its seal: NVML is asked by the UUID torch
+    names (`accel.device_uuid`), never by an ordinal."""
     if not cuda:
         return {"pid": os.getpid(), "gpu": -1, "uuid": "", "arch": ""}
     entry = sealed[local] if local < len(sealed) else str(local)
     try:
         properties = torch.cuda.get_device_properties(local)
-        uuid, arch = f"GPU-{properties.uuid}", f"sm_{properties.major}{properties.minor}"
+        name, arch = str(properties.name), f"sm_{properties.major}{properties.minor}"
     except Exception:  # identity is observation: it never fails the attempt
-        uuid, arch = "", ""
+        name, arch = "", ""
+    uuid = accel.device_uuid(torch, local)
+    _, power, mig = accel.device_settings(uuid)
     gpu = accel.nvml_index(uuid)
     if gpu < 0:
         gpu = int(entry) if entry.isdigit() else -1
-    return {"pid": os.getpid(), "gpu": gpu, "uuid": uuid, "arch": arch}
+    return {
+        "pid": os.getpid(),
+        "gpu": gpu,
+        "uuid": uuid,
+        "arch": arch,
+        "name": name,
+        "settings": f"{power}W/{mig}",
+    }
 
 
 def attention(
@@ -212,6 +230,8 @@ def record(
         "pid": int(who.get("pid", 0)),
         "uuid": str(who.get("uuid", "")),
         "arch": str(who.get("arch", "")),
+        "name": str(who.get("name", "")),
+        "settings": str(who.get("settings", "")),
         "start_us": start_us,
         "end_us": end_us,
         "attention": (seen or attention()).copy(),
