@@ -1015,9 +1015,7 @@ def whole(part: Tensor, shape: Sequence[int], key: str, host: bool, zeros: bool 
     if host:
         return _pinned(shape, part.dtype, part.device, zeros)
     try:
-        # Refused, the whole goes to host: cheaper than varena moving live tensors there.
-        with catch.fallback(catch.CURRENT.get() is not None and not _capturing()):
-            return part.new_zeros(shape) if zeros else part.new_empty(shape)
+        return part.new_zeros(shape) if zeros else part.new_empty(shape)
     except BaseException as exc:
         request = catch.CURRENT.get()
         if request is None or not part.is_cuda or not is_capacity(exc) or _capturing():
@@ -1056,10 +1054,9 @@ def ahead(key: str, host: bool, zeros: bool) -> Tensor | None:
     if host:
         return _pinned(shape, dtype, device, zeros)
     try:
-        with catch.fallback(True):  # refused, the split takes the host rung
-            if zeros:
-                return torch.zeros(shape, dtype=dtype, device=device)
-            return torch.empty(shape, dtype=dtype, device=device)
+        if zeros:
+            return torch.zeros(shape, dtype=dtype, device=device)
+        return torch.empty(shape, dtype=dtype, device=device)
     except BaseException as exc:
         if not is_capacity(exc):
             raise
