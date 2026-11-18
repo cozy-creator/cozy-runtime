@@ -223,7 +223,7 @@ def conv(
     """`conv3d(x, w) + bias + residual`, stride 1, zero padding: `q` int8 NDHWC [N, D, H, W, C] with `qs` [N, D, H,
     W], `f`'s filter, `residual` NDHWC like the output (`dtype`, fp16 or bf16). The output NDHWC [N, Z, P, Q, K] (into
     `out` where given); None where the kernels do not serve the shape. A band of output frames passes its `frames` and
-    its `front` padding (the whole's, less the frames before its input): the kernel skips taps outside `q`."""
+    `front` 0: `q` holds its whole window, the padding's zero frames included."""
     n, d, h, w, c = (int(v) for v in q.shape)
     k, t, r, s = (int(v) for v in f.weight.shape[:4])
     pt, pr, ps = f.padding
@@ -270,9 +270,12 @@ def _over(
     return mix is None and pt <= t - 1 - pt
 
 
-def _banded(f: Filter) -> bool:
-    """A band's input frames start at or before its output's (front padding within the filter)."""
-    return f.padding[0] <= int(f.weight.shape[1]) - 1
+def _banded(f: Filter, mix: Mix | None) -> bool:
+    """Whether bands of frames serve: the kernels take a band with no frame padding of its own (its window written out,
+    `frames`), so the filter's frame padding is its symmetric `same` (as the kernels' shape check asks); after the
+    temporal pass, a 1x1x1 filter only (its frames are its output's)."""
+    t, pt = int(f.weight.shape[1]), f.padding[0]
+    return pt <= t - 1 - pt if mix is None else (t, pt) == (1, 0)
 
 
 def need(
@@ -287,10 +290,10 @@ def need(
     reach = int(f.weight.shape[1]) - 1 + (2 * _HALO if mix is not None else 0)
 
     def at(level: int) -> tuple[int, ...]:
-        frames = n * d if not level else min(d, -(-z // (1 << level)) + reach)
+        frames = n * d if not level else -(-z // (1 << level)) + reach
         return new, frames * plane * (CHANNELS + 4)
 
-    return (max(z - 1, 0).bit_length() if _banded(f) else 0), at
+    return (max(z - 1, 0).bit_length() if _banded(f, mix) else 0), at
 
 
 def frames(
@@ -309,8 +312,9 @@ def frames(
 ) -> Tensor | None:
     """The conv of NDHWC `x` [N, D, H, W, 512] after its pass, `silu(a x + b)` per voxel or, with `mix`, the
     temporal one (`temporal`), plus `residual`: whole at level 0, else in 2^level bands of each sample's output frames.
-    Each band's codes hold the input frames its taps read; the frames the next band also reads move down, so each
-    frame quantizes once (the temporal pass computes its own halo's codes again, and drops them). The output goes into
+    Each band's codes hold the input frames its taps read, the frame padding's zeros written out (the kernels take
+    no padding of a band's own); the frames the next band also reads move down, so each frame quantizes once (the
+    temporal pass computes its own halo's codes again, and drops them). The output goes into
     `into` where its shape allows (`_over`), else a new tensor; everything a band holds is made before the first band
     writes, so a refusal leaves `into` as it was. None where the kernels do not serve the shape."""
     from cozy_runtime.internal.execution import catch
@@ -320,36 +324,48 @@ def frames(
     z, t, pt = shape[1], int(f.weight.shape[1]), f.padding[0]
     over = into is not None and _over(x, f, dtype, mix, residual, into)
     out = into if into is not None and over else torch.empty(shape, dtype=dtype, device=x.device)
-    if not level or not _banded(f):
+    if not level or not _banded(f, mix):
         q, qs = temporal(module, x, a, b, *mix) if mix is not None else quantize(module, x, a, b, silu=silu)
         return conv(module, q, qs, f, residual, dtype, out=out)
     size = -(-z // (1 << level))
-    span = min(d, size + t - 1 + (2 * _HALO if mix is not None else 0))
+    span = size + t - 1 + (2 * _HALO if mix is not None else 0)
     q = torch.empty((1, span, *x.shape[2:]), dtype=torch.int8, device=x.device)
     qs = torch.empty((1, span, *x.shape[2:4]), dtype=torch.float32, device=x.device)
     for i in range(n):
-        held = (0, 0)
+        held: tuple[int, int] | None = None  # the input frames the codes hold, the padding's zero frames included
         for z0 in range(0, z, size):
             catch.checkpoint()
             z1 = min(z, z0 + size)
-            lo, hi = max(0, z0 - pt), min(d, z1 + t - 1 - pt)
             if mix is None:
-                keep, shift = max(0, held[1] - lo), lo - held[0]
+                # Frames lo..hi of the input, those outside it the padding's zeros (codes and scale 0, as the kernel's
+                # masked taps read): each band is the whole conv's own window, its padding written out.
+                lo, hi = z0 - pt, z1 + t - 1 - pt
+                keep = max(0, held[1] - lo) if held else 0
+                shift = lo - held[0] if held else 0
                 for j in range(keep if shift else 0):  # upward: a frame moves before a later one lands on it
                     q[:, j].copy_(q[:, shift + j])
                     qs[:, j].copy_(qs[:, shift + j])
-                if lo + keep < hi:
-                    window = (q[:, keep : hi - lo], qs[:, keep : hi - lo])
-                    quantize(module, x[i : i + 1, lo + keep : hi], a[i : i + 1], b[i : i + 1], silu=silu, out=window)
+                start, real0, real1 = lo + keep, max(lo + keep, 0), min(hi, d)
+                if start < real0:
+                    q[:, start - lo : real0 - lo].zero_()
+                    qs[:, start - lo : real0 - lo].zero_()
+                if real0 < real1:
+                    window = (q[:, real0 - lo : real1 - lo], qs[:, real0 - lo : real1 - lo])
+                    quantize(module, x[i : i + 1, real0:real1], a[i : i + 1], b[i : i + 1], silu=silu, out=window)
+                if max(start, real1) < hi:
+                    q[:, max(start, real1) - lo : hi - lo].zero_()
+                    qs[:, max(start, real1) - lo : hi - lo].zero_()
+                held = (lo, hi)
                 codes = q[:, : hi - lo], qs[:, : hi - lo]
             else:
+                # A 1x1x1 conv (`_banded`): its band's frames are its output's, each computed from a 2-frame halo.
+                lo, hi = z0, z1
                 e0, e1 = max(0, lo - _HALO), min(d, hi + _HALO)
                 temporal(module, x[i : i + 1, e0:e1], a[i : i + 1], b[i : i + 1], *mix,
                          out=(q[:, : e1 - e0], qs[:, : e1 - e0]))  # fmt: skip
                 codes = q[:, lo - e0 : hi - e0], qs[:, lo - e0 : hi - e0]
-            held = (lo, hi)
             band = None if residual is None else residual[i : i + 1, z0:z1]
-            found = conv(module, *codes, f, band, dtype, front=pt - z0 + lo, frames=z1 - z0, out=out[i : i + 1, z0:z1])
+            found = conv(module, *codes, f, band, dtype, front=0, frames=z1 - z0, out=out[i : i + 1, z0:z1])
             if found is None:
                 if i or z0:
                     raise RuntimeError("cozy conv8: a band of a conv the kernels served was refused")
