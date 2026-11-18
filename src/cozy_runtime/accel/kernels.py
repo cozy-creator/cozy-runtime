@@ -198,12 +198,23 @@ class PreQuantized:
     provider: str = ROWWISE_FP8
 
 
-class _Shared:
-    __slots__ = ("operands", "tensor")
+@dataclass(slots=True)
+class Readers:
+    """How many leaves read a `shared_scope`'s operand in one call, learned from the calls before: a call site's (a
+    fused block layout's) own count, so the operand goes after its last reader, not at the scope's end."""
 
-    def __init__(self, tensor: Tensor) -> None:
+    count: int | None = None
+
+
+class _Shared:
+    __slots__ = ("left", "operands", "readers", "tensor", "uses")
+
+    def __init__(self, tensor: Tensor, readers: Readers | None) -> None:
         self.tensor = tensor
+        self.readers = readers
         self.operands: dict[str, PreQuantized | None] = {}
+        self.left: dict[str, int] = {}
+        self.uses: dict[str, int] = {}
 
 
 _SHARED: ContextVar[tuple[_Shared, ...]] = ContextVar("cozy_quantize_once", default=())
@@ -214,12 +225,24 @@ def quantize_once(*tensors: Tensor | None) -> Iterator[None]:
     """Inside, the encoded leaves that take one of `tensors` (that object) as input quantize it
     once between them, as a fused qkv GEMM would: q, k and v of one normed input, or an MLP's
     gate and up. None is skipped. A tensor must not change in place inside the scope."""
-    shared = tuple(_Shared(t) for t in tensors if t is not None)
+    with shared_scope(tensors):
+        yield
+
+
+@contextmanager
+def shared_scope(tensors: Iterable[Tensor | None], readers: Readers | None = None) -> Iterator[None]:
+    """`quantize_once`'s scope. With `readers`, the call site's count learned from its calls before, an operand is
+    dropped once that many leaves have read it, not held to the scope's end (an attention's projections, before its
+    kernel runs); a later reader quantizes again, and the count grows to it."""
+    shared = tuple(_Shared(t, readers) for t in tensors if t is not None)
     token = _SHARED.set(_SHARED.get() + shared)
     try:
         yield
     finally:
         _SHARED.reset(token)
+        for one in shared:
+            if one.readers is not None and one.uses:
+                one.readers.count = max(one.readers.count or 0, *one.uses.values())
 
 
 @dataclass(slots=True)
@@ -282,6 +305,33 @@ def _retire(held: _Recent) -> None:
 _RECENT.last = None
 
 
+def release(x: Tensor) -> None:
+    """The operands the open scopes hold of `x` go now (its readers are done, as a fused block's q/k norm says once the
+    projections it follows have run); a later reader quantizes again."""
+    for shared in _SHARED.get():
+        if shared.tensor is x:
+            shared.operands.clear()
+            shared.left.clear()
+
+
+def made(x: Tensor, provider: str) -> bool:
+    """Whether `provider`'s operand for `x` is made already, a scope's or the one sibling leaves hold (`shared_operand`):
+    the next reader allocates none for it."""
+    for shared in _SHARED.get():
+        if shared.tensor is x:
+            return shared.operands.get(provider) is not None
+    held: _Recent | None = getattr(_RECENT, "held", None)
+    return (
+        held is not None
+        and held.operand is not None
+        and held.tensor is not None
+        and held.provider == provider
+        and held.tensor() is x
+        and held.version == x._version
+        and held.key == _geometry(x)
+    )
+
+
 def shared_operand(
     x: Tensor,
     provider: str,
@@ -300,7 +350,15 @@ def shared_operand(
         if shared.tensor is x:
             if provider not in shared.operands:
                 shared.operands[provider] = make()
-            return shared.operands[provider]
+                if shared.readers is not None and shared.readers.count is not None:
+                    shared.left[provider] = shared.readers.count
+            found = shared.operands[provider]
+            shared.uses[provider] = shared.uses.get(provider, 0) + 1
+            if provider in shared.left:
+                shared.left[provider] -= 1
+                if shared.left[provider] <= 0:  # its readers have it: its memory returns now
+                    del shared.operands[provider], shared.left[provider]
+            return found
     held: _Recent | None = getattr(_RECENT, "held", None)
     if consumer is None or x.is_inference():  # an inference tensor counts no in-place change
         if held is not None:
