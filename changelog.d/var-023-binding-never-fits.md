@@ -1,0 +1,1 @@
+A set of weights a model must hold at once that the card could never hold is refused by TensorFS (`Device.fits`), which counts what other uses pin, before any of it loads. The Runtime no longer reads the card's size itself for it (`Memory.most_room` is gone), so the check no longer sees derive's one-card view during construction (cr-326) (var-023).

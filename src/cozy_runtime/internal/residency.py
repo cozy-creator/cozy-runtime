@@ -1002,22 +1002,8 @@ class Binding:
                             f"{self.model.component}: {missing / (1 << 30):.1f} GiB of float32 "
                             "weights to bind, more than the host can give"
                         )
-                if (
-                    not replay
-                    and memory.native is not None
-                    and any(b.data is None and not b.cached() for b in self.groups)
-                ):
-                    # Nor on a card that can never hold it: filled partway, it would only evict
-                    # everything else and then wait for memory that can't make it fit (cr-286:
-                    # an 11.1 GiB decode set on an 8 GiB cap waited 300 s, run 47309).
-                    least = sum(b.least_bytes for b in self.groups)
-                    most, said = memory.most_room()
-                    if least > most:
-                        raise Exhausted(
-                            f"{self.model.component}: {_gib(least)} of weights to hold at once, "
-                            f"more than {said} could ever give it",
-                            least,
-                        )
+                if not replay and any(b.data is None and not b.cached() for b in self.groups):
+                    memory._fits(self.groups)
                 self.used = True
                 with torch.cuda.stream(stream) if memory.cuda else nullcontext():
                     if self.last is not None and stream is not None:
@@ -1331,16 +1317,34 @@ class Memory:
                     owners.remove(model)
                 model.working_phase_keys.remove(key)
 
-    def most_room(self) -> tuple[int, str]:
-        """The most weight bytes this process could ever hold on its card at once, with every
-        other byte of the card or its cap given back, less its own live working memory; and
-        that in words."""
-        index = self.device.index or 0
-        total = int(torch.cuda.get_device_properties(index).total_memory)
-        card = total if self.budget_bytes is None else min(self.budget_bytes, total)
-        live = int(vt.room(index)["working_live"])
-        said = f"GPU {index}'s {_gib(card)}{' cap' if card < total else ''} less {_gib(live)} live"
-        return max(card - live, 0), said
+    def _fits(self, groups: list[_Block]) -> None:
+        """`groups` held at once, refused by varena before any of them fills when the card or its
+        cap could never hold them (`Device.fits`): filled partway, they would only evict everything
+        else and then wait for room that can't come (cr-286: an 11.1 GiB decode set on an 8 GiB
+        cap waited 300 s, run 47309). A block with no Region yet counts its bytes."""
+        if self.native is None:
+            return
+        regions: list[varena.Region] = []
+        more = 0
+        for block in groups:
+            for region, size in (
+                (block.region, block.storage_bytes if block.raw_needed() else 0),
+                (block.final_region, block.final_bytes),
+            ):
+                if size and region is None:
+                    more += size
+                elif size and region is not None:
+                    regions.append(region)
+        try:
+            # The type check pins an older TensorFS stub, which has no `fits` (var-023).
+            self.native.fits(regions, more)  # type: ignore[attr-defined]
+        except Exhausted as refused:
+            raise Exhausted(
+                f"{groups[0].model.component}: {_gib(refused.requested_bytes)} of weights to hold "
+                f"at once, more than GPU {self.device.index or 0} could ever give it beside its "
+                "live working memory and other weights in use",
+                refused.requested_bytes,
+            ) from refused
 
     def _free(self) -> int:
         """Free bytes where no native owner answers (MPS, CPU). A CPU's is what the host can still
