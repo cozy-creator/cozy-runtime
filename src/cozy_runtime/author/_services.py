@@ -741,26 +741,21 @@ class Outputs(_Bound):
         _codec.require_encoder()
         if not videos:
             raise OutputError("a joined video needs at least one video", code="media_header")
-        if not self._attempt.writes:
+        if self._attempt.writes:
+            for video in videos:
+                if (
+                    not isinstance(video, VideoFile)
+                    or video._local is None
+                    or video._attempt != self._attempt.request_id
+                ):
+                    raise CapabilityError(
+                        "joined videos must be hydrated inputs of this attempt", code="foreign_asset"
+                    )
+                video._check_file()
+            rate, frames = _codec.copy_frames(cast(Path, video._local) for video in videos)
+        else:
             shapes = [self._shape(video) for video in videos]
-            source = _AuthorEvents(soundtrack([shape.frame_count for shape in shapes]))
-            header = next(source, None)
-            audio_format = header.audio if isinstance(header, DecodedMediaHeader) else None
-            samples = sum(e.sample_count for e in source if isinstance(e, DecodedAudioChunk))
-            frames = sum(shape.frame_count for shape in shapes)
-            handle = self._attempt.next_handle(VideoFile.kind)
-            return self._unwritten(handle, _Picture.of(shapes[0]), audio_format, frames, samples)
-        for video in videos:
-            if (
-                not isinstance(video, VideoFile)
-                or video._local is None
-                or video._attempt != self._attempt.request_id
-            ):
-                raise CapabilityError(
-                    "joined videos must be hydrated inputs of this attempt", code="foreign_asset"
-                )
-            video._check_file()
-        rate, frames = _codec.copy_frames(video._local for video in videos if video._local is not None)
+            rate, frames = shapes[0].frame_rate, tuple(shape.frame_count for shape in shapes)
         source = _AuthorEvents(soundtrack(frames))
         header = next(source, None)
         if (
@@ -771,8 +766,9 @@ class Outputs(_Bound):
             raise OutputError(
                 "a joined soundtrack must begin with an audio header", code="media_header"
             )
-        # The one join writer (cl-1210): each video's stretch of the soundtrack goes in with it.
-        join = VideoJoin(self, header.audio)
+        # The one join writer (cl-1210), on a group's GPU 0 and its other GPUs alike, so both take the same handles: each
+        # video's stretch of the soundtrack goes in with it.
+        join = self.join_video(header.audio)
         pending: DecodedMediaEvent | None = next(source, None)
         ends = list(accumulate(Fraction(count) / rate for count in frames))
 
@@ -1372,26 +1368,40 @@ class VideoJoin:
         """The joined video, registered as this attempt's output: the last revision byte for
         byte, its parts the same, so publishing it again costs nothing."""
         self._attempt.check_open("VideoJoin.finish")
+        if self._audio is not None and self._join.parts and not self._written:
+            raise OutputError("the joined video declared audio but was given no samples", code="audio_shape")
         parts = self._join.finish()
         handle = self._attempt.next_handle(VideoFile.kind)
-        final = self._attempt.spool / f"video-{handle.rsplit('/', 1)[-1]}"
-        with final.open("xb") as writer:
-            for part, _ in parts:
-                with part.open("rb") as reader:
-                    shutil.copyfileobj(reader, writer, 1 << 20)
-            writer.flush()
-            os.fsync(writer.fileno())
-        facts = _codec.probe_mp4(final)
-        if facts.frame_count != self._join.frames or (
-            self._audio is not None and facts.audio_decoded_samples != self._written
-        ):
-            final.unlink()
-            raise OutputError(
-                f"joined MP4 probe disagrees: {facts.frame_count} frames of {self._join.frames}, "
-                f"{facts.audio_decoded_samples} samples of {self._written}",
-                code="output_probe",
-            )
-        size, digest = self._outputs._measure_file(final)
+        tail = handle.rsplit("/", 1)[-1]
+        # Written whole under a temporary name, then named durably: a crash leaves no half take under the final one.
+        temporary = self._attempt.spool / f".video-{tail}.partial"
+        final = self._attempt.spool / f"video-{tail}"
+        try:
+            with temporary.open("xb") as writer:
+                for part, _ in parts:
+                    with part.open("rb") as reader:
+                        shutil.copyfileobj(reader, writer, 1 << 20)
+                writer.flush()
+                os.fsync(writer.fileno())
+            facts = _codec.probe_mp4(temporary)
+            if facts.frame_count != self._join.frames or (
+                self._audio is not None and facts.audio_decoded_samples != self._written
+            ):
+                raise OutputError(
+                    f"joined MP4 probe disagrees: {facts.frame_count} frames of {self._join.frames}, "
+                    f"{facts.audio_decoded_samples} samples of {self._written}",
+                    code="output_probe",
+                )
+            size, digest = self._outputs._measure_file(temporary)
+            if self._outputs._pending_bytes() + size > self._attempt.max_output_bytes:
+                raise OutputError(
+                    "the joined video would cross the attempt aggregate output limit",
+                    code="output_too_large",
+                )
+            os.link(temporary, final)
+            self._outputs._fsync_directory(final.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
         asset = VideoFile(
             handle,
             media_type="video/mp4",
@@ -1529,6 +1539,8 @@ class _UnwrittenJoin(VideoJoin):
 
     def finish(self) -> SavedVideo:
         self._attempt.check_open("VideoJoin.finish")
+        if self._audio is not None and self._shapes and not self._samples:
+            raise OutputError("the joined video declared audio but was given no samples", code="audio_shape")
         if not self._shapes:
             raise OutputError("a joined video needs at least one video", code="media_header")
         handle = self._attempt.next_handle(VideoFile.kind)

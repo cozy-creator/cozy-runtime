@@ -1022,9 +1022,10 @@ def _payload(data: bytes, box: _Box) -> bytes:
 _ENTRY_FIELDS = {"avc1": 78, "mp4a": 28}
 
 
-def _described(data: bytes, stsd: _Box) -> bytes:
-    """A sample description without its bitrate boxes: a template's `btrt` counts its own
-    one or two samples, not the joined video's."""
+def _described(data: bytes, stsd: _Box, config: bytes | None = None) -> bytes:
+    """A sample description without the template's bitrates, which count its own one or two
+    samples, not the joined video's: no `btrt`, and an `esds` saying variable (0). An `esds`'s
+    AudioSpecificConfig must be `config`, the encoder's that made the packets."""
     _, at, head, size = stsd
     entries = []
     for entry in _boxes(data, at + head + 8, at + size):
@@ -1036,9 +1037,43 @@ def _described(data: bytes, stsd: _Box) -> bytes:
             entries.append(_raw(data, entry))
             continue
         inner = start + entry_head + fields
-        kept = [_raw(data, box) for box in _boxes(data, inner, start + entry[3]) if box[0] != "btrt"]
+        kept = [_esds(_raw(data, box), config) if box[0] == "esds" else _raw(data, box)
+                for box in _boxes(data, inner, start + entry[3]) if box[0] != "btrt"]  # fmt: skip
         entries.append(_box(kind, body[:fields], *kept))
     return _box("stsd", data[at + head : at + head + 8], *entries)
+
+
+def _esds(box: bytes, config: bytes | None) -> bytes:
+    """`box`, an `esds`, its DecoderConfigDescriptor's max and average bitrates 0 (variable),
+    its AudioSpecificConfig checked to be `config` (ISO 14496-1 descriptors)."""
+    data = bytearray(box)
+
+    def descriptor(at: int) -> tuple[int, int, int]:
+        tag, at, length = data[at], at + 1, 0
+        while True:
+            byte, at = data[at], at + 1
+            length = length << 7 | byte & 0x7F
+            if not byte & 0x80:
+                return tag, at, length
+
+    tag, at, _ = descriptor(12)  # past the box header and its version and flags
+    if tag != 3:
+        raise OutputError("the template's esds holds no ES descriptor", code="output_probe")
+    flags, at = data[at + 2], at + 3
+    if flags & 0x80:
+        at += 2
+    if flags & 0x40:
+        at += 1 + data[at]
+    if flags & 0x20:
+        at += 2
+    tag, at, _ = descriptor(at)
+    if tag != 4:
+        raise OutputError("the template's esds holds no decoder config", code="output_probe")
+    data[at + 5 : at + 13] = bytes(8)  # after object type, stream type and buffer size
+    tag, at, length = descriptor(at + 13)
+    if tag != 5 or (config is not None and bytes(data[at : at + length]) != config):
+        raise OutputError("the template's AAC config is not the encoder's", code="output_probe")
+    return bytes(data)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1057,7 +1092,7 @@ class _TrackTemplate:
     sgpd: bytes
 
     @classmethod
-    def read(cls, data: bytes, trak: _Box) -> _TrackTemplate:
+    def read(cls, data: bytes, trak: _Box, config: bytes | None = None) -> _TrackTemplate:
         tkhd = _payload(data, _child(data, trak, "tkhd"))
         version, flags = tkhd[0], int.from_bytes(tkhd[1:4])
         track, shape = (tkhd[20:24], tkhd[36:]) if version else (tkhd[12:16], tkhd[24:])
@@ -1074,7 +1109,7 @@ class _TrackTemplate:
             hdlr=_raw(data, _child(data, mdia, "hdlr")),
             media_header=_raw(data, header),
             dinf=_raw(data, _child(data, minf, "dinf")),
-            stsd=_described(data, _child(data, stbl, "stsd")),
+            stsd=_described(data, _child(data, stbl, "stsd"), config),
             sgpd=_raw(data, sgpd) if sgpd is not None else b"",
         )
 
@@ -1180,6 +1215,8 @@ class GrowingMP4:
         self.frames = 0
         self.samples = 0
         self.flushed = False
+        #: Set by a failed append: its encoder and tracks are past what any part holds, so the join takes nothing more.
+        self.failed = False
         self._size = 0
         self._facts: _CopyFacts | None = None
         self._ftyp = b""
@@ -1209,23 +1246,29 @@ class GrowingMP4:
         self, video: Path, audio: Callable[[int], Iterable[Planar]], *, last: bool = False
     ) -> None:
         """Join one more video and its stretch of the soundtrack, which `audio` returns given
-        the video's frame count; `last` closes the soundtrack."""
+        the video's frame count; `last` closes the soundtrack. One that fails ends the join."""
+        self._whole()
         if self.flushed:
             raise OutputError("the joined video is already finished", code="media_join")
-        facts, pictures = _copy_packets(video)
-        if self._facts is None:
-            self._start(video, facts, pictures)
-        elif facts != self._facts:
-            raise _refuse_copy(f"{video.name} differs in codec parameters or clock")
-        packets = []
-        for planar in audio(len(pictures)):
-            packets += self._encode(planar)
-        if last:
-            packets += self._flush()
-        self._write(pictures, packets)
+        try:
+            facts, pictures = _copy_packets(video)
+            if self._facts is None:
+                self._start(video, facts, pictures)
+            elif facts != self._facts:
+                raise _refuse_copy(f"{video.name} differs in codec parameters or clock")
+            packets = []
+            for planar in audio(len(pictures)):
+                packets += self._encode(planar)
+            if last:
+                packets += self._flush()
+            self._write(pictures, packets)
+        except BaseException:
+            self.failed = True
+            raise
 
     def revision(self) -> list[tuple[Path, int]]:
         """The joined video so far as its parts: each `mdat` as written, then its index."""
+        self._whole()
         if not self.parts:
             raise OutputError("a joined video needs at least one video", code="media_header")
         state = (len(self.parts), self.flushed)
@@ -1244,13 +1287,22 @@ class GrowingMP4:
     def finish(self) -> list[tuple[Path, int]]:
         """Close the soundtrack, its last packets in an `mdat` of their own unless the last
         append took them, and return the final parts."""
+        self._whole()
         if not self.parts:
             raise OutputError("a joined video needs at least one video", code="media_header")
         if not self.flushed:
-            packets = self._flush()
-            if packets:
-                self._write([], packets)
+            try:
+                packets = self._flush()
+                if packets:
+                    self._write([], packets)
+            except BaseException:
+                self.failed = True
+                raise
         return self.revision()
+
+    def _whole(self) -> None:
+        if self.failed:
+            raise OutputError("an append to this joined video failed, so it takes and gives nothing more", code="media_join")
 
     def _start(self, video: Path, facts: _CopyFacts, pictures: list[_Coded]) -> None:
         self._facts = facts
@@ -1268,7 +1320,7 @@ class GrowingMP4:
         self._video = _Track(_TrackTemplate.read(data, traks[b"vide"]), base.denominator, sync=array("q"))
         self._video.start = self._delay * self._scale
         if self._aac is not None:
-            self._sound = _Track(_TrackTemplate.read(data, traks[b"soun"]), self.audio_sample_rate)
+            self._sound = _Track(_TrackTemplate.read(data, traks[b"soun"], bytes(self._aac.extradata or b"")), self.audio_sample_rate)
 
     def _template(self, video: Path) -> bytes:
         """libavformat's MP4 of the first video's first picture and a moment of the soundtrack's
@@ -1374,8 +1426,8 @@ class GrowingMP4:
 
     def _moov(self) -> bytes:
         tracks = [track for track in (self._video, self._sound) if track is not None and track.times]
-        movie = math.lcm(*(track.timescale for track in tracks))
-        movie = movie if movie < 1 << 31 else tracks[0].timescale
+        # One edit a track and no empty edits, so the video's clock serves the movie: the sound's end rounds by under a tick.
+        movie = tracks[0].timescale
         duration = max(track.shown * movie // track.timescale for track in tracks)
         wide = duration >= 1 << 32
         mvhd = _full(
