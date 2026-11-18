@@ -323,6 +323,8 @@ class Decoder:
 
         domain = capture_domain(torch, self.model)
         try:
+            domain.initialize()
+            domain.prime_blas()
             graph, why = capture(torch, step, Pool(torch.cuda.graph_pool_handle()), domain, vt.pool_bytes(64 << 20), alone=True)
         except Exception as exc:  # reported, and the step runs eagerly
             graph, why = None, f"{type(exc).__name__}: {exc}"
