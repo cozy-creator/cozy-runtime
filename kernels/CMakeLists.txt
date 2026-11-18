@@ -295,6 +295,16 @@ target_compile_options(ggml_units PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_m
 kernel_module(_ggml ggml.cpp ggml_units)
 target_include_directories(_ggml PRIVATE csrc)
 
+# The inference engine's step launcher (xs-213, `csrc/engine.cpp`): a captured step graph as the body of a CUDA
+# WHILE node, and the host ring a step reports into. Every target.
+add_library(engine_units OBJECT csrc/engine/loop.cu)
+set_target_properties(engine_units PROPERTIES CUDA_ARCHITECTURES "${EVERY}")
+target_include_directories(engine_units PRIVATE csrc)
+target_compile_options(engine_units PRIVATE $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>
+                       $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus>)
+kernel_module(_engine engine.cpp engine_units)
+target_include_directories(_engine PRIVATE csrc)
+
 # The executor's record of a fatal signal (`csrc/crash.c`, cr-275): plain C on the stable ABI, Linux only.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     enable_language(C)
