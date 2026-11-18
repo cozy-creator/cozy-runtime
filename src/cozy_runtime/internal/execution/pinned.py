@@ -185,10 +185,10 @@ class _Copy2D(ctypes.Structure):
 
 _UNIFIED = 4  # CU_MEMORYTYPE_UNIFIED: an address in the unified space, host or device
 #: `cuMemcpy2DAsync` once loaded: None where the driver library has none
-_COPY2D: list[Callable[..., int] | None] = []
+_COPY2D: list[Callable[[object, ctypes.c_void_p], int] | None] = []
 
 
-def _copy2d() -> Callable[..., int] | None:
+def _copy2d() -> Callable[[object, ctypes.c_void_p], int] | None:
     if not _COPY2D:
         try:
             fn = ctypes.CDLL("libcuda.so.1").cuMemcpy2DAsync_v2
