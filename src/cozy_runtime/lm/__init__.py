@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
 
     from cozy_runtime.author._model import Residency, WarningRow
+    from cozy_runtime.internal.execution import sizing
     from cozy_runtime.graphs.domain import Domain
     from cozy_runtime.internal.residency import Binding, Region
 
@@ -172,6 +173,9 @@ DRAFT_SCORES = 256 << 20
 #: The most one fp32 copy of a gated-delta-net layer's prefill piece holds: its queries, keys,
 #: values and chunk decays, every row (`_prefill_pieces`). The torch path holds several copies.
 PREFILL_BYTES = 256 << 20
+#: What a prompt's pieces end on (`_Engine._prefill`): Transformers' gated-delta rule's chunk, so
+#: each chunk is computed as in the whole prompt.
+PREFILL_ALIGN = 64
 
 
 #: Generation-config fields that add a logits processor to greedy decoding, and their no-op values.
@@ -1120,6 +1124,7 @@ def _transformers(
     if sampling.temperature > 0:
         processors.append(_Draw(prompt, sampling))
     context = CURRENT.get()
+    _pieced(_lm(model).get_decoder())
     with _PLANE, torch.inference_mode(), ExitStack() as held:
         cancel = _Cancel(context, tell, _Keeper(model, held, why), prompt)
         out = _lm(model).generate(
@@ -1429,6 +1434,164 @@ def _taking(model: PreTrainedModel) -> Iterator[list[torch.Tensor]]:
         yield taken
     finally:
         handle.remove()
+
+
+def _pieced(decoder: torch.nn.Module) -> None:
+    """A prompt's prefill as a cut site (`catch.cut`, cr-344): the model's decoder (after any
+    picture's features are merged into its embeddings) over an empty cache, its prompt in 2^level
+    pieces of `PREFILL_ALIGN`-token chunks a row, at the level native selection takes from each
+    piece's need (`_prefill_need`), one level finer after a refusal. Each piece writes its keys
+    and carries its linear-attention state into the next, as a decode step does, so every
+    whole-prompt temporary of a layer shrinks with the piece; a level starts from the empty
+    cache. A call it can't cut (a row padded, an input not one per token) runs whole."""
+    if vars(decoder).get("_cozy_pieced"):
+        return
+    forward, config = decoder.forward, getattr(decoder, "config", None)
+    site = f"{type(decoder).__name__}:prefill"
+
+    def cut(*args: Any, **kwargs: Any) -> Any:  # the decoder's own signature
+        tokens = kwargs.get("inputs_embeds")
+        tokens = kwargs.get("input_ids") if tokens is None else tokens
+        cache = kwargs.get("past_key_values")
+        if (
+            args
+            or not isinstance(tokens, torch.Tensor)
+            or tokens.dim() < 2
+            or int(tokens.shape[1]) <= PREFILL_ALIGN  # a decode step, or a short prompt
+            or not isinstance(cache, Cache)
+            or torch.is_grad_enabled()
+            or (tokens.is_cuda and torch.cuda.is_current_stream_capturing())
+        ):
+            return forward(*args, **kwargs)
+        rows, length = (int(n) for n in tokens.shape[:2])
+        chunks = -(-length // PREFILL_ALIGN)
+        if not _cuttable(kwargs, (rows, length)) or not _empty(cache):
+            return forward(**kwargs)
+        from cozy_runtime.internal.execution import catch, sizing  # it imports the Runtime's own
+
+        itemsize = tokens.element_size() if tokens.is_floating_point() else 2
+        need = _prefill_need(config, rows, length, chunks, itemsize)
+        run = partial(_prefill_level, forward, kwargs, cache, length, chunks)
+        return catch.cut(site, sizing.levels(chunks), need, run)
+
+    vars(decoder)["forward"], vars(decoder)["_cozy_pieced"] = cut, True
+
+
+def _prefill_level(
+    forward: Callable[..., Any],
+    kwargs: dict[str, Any],
+    cache: Cache,
+    length: int,
+    chunks: int,
+    level: int,
+) -> Any:
+    """The decoder's call in 2^level pieces of its prompt, from an empty cache."""
+    from cozy_runtime.internal.execution import sizing
+
+    _emptied(cache)
+    if not level:
+        return forward(**kwargs)
+    piece = sizing.pieces(chunks, level) * PREFILL_ALIGN
+    states: list[torch.Tensor] = []
+    for at in range(0, length, piece):
+        end = min(at + piece, length)
+        call = dict(kwargs)
+        for name, value in kwargs.items():
+            if isinstance(value, torch.Tensor):
+                cut = slice(0, end) if name == "attention_mask" else slice(at, end)
+                seq = value[..., cut] if name in ("position_ids", "cache_position") else None
+                call[name] = value[:, cut] if seq is None else seq
+        out = forward(**call)
+        states.append(out[0])
+    out["last_hidden_state"] = torch.cat(states, 1)
+    return out
+
+
+def _prefill_need(
+    config: object, rows: int, length: int, chunks: int, itemsize: int
+) -> sizing.Need:
+    """A prefill piece's allocations at each level, from its decoder's config: the call's output
+    held throughout, and the widest of a layer's phases over the piece's tokens: an fp32 norm,
+    the gated MLP, a gated delta net's fp32 copies (queries, keys, values, their beta-weighted
+    copies, cumulative decays, the output and two chunk-square terms a head), and attention's
+    projections beside its mask over every key."""
+
+    from cozy_runtime.internal.execution import sizing
+
+    def size(name: str, default: int = 0) -> int:
+        return int(getattr(config, name, None) or default)
+
+    width, inner = size("hidden_size"), size("intermediate_size")
+    heads = size("num_attention_heads", 1)
+    groups = size("num_key_value_heads", heads)
+    head = size("head_dim", width // max(heads, 1))
+    keys = size("linear_num_value_heads") * size("linear_key_head_dim")
+    values = size("linear_num_value_heads") * size("linear_value_head_dim")
+    decays = size("linear_num_value_heads") * PREFILL_ALIGN
+    copies = 4 * keys + 4 * values + 2 * decays  # fp32 elements a token
+
+    def piece(level: int) -> tuple[int, ...]:
+        n = rows * sizing.pieces(chunks, level) * PREFILL_ALIGN
+        return sizing.peak(
+            rows * length * width * itemsize,
+            (n * width * itemsize, 2 * n * width * 4),
+            (n * 2 * inner * itemsize, 2 * n * inner * itemsize),
+            # the rule's own pieces hold at most PREFILL_BYTES a copy (`_prefill_pieces`)
+            (n * 2 * (keys + values) * itemsize, min(4 * n * copies, 4 * PREFILL_BYTES)),
+            # whole, causal attention reads no mask; a piece's is a byte a key, and its bias two
+            (n * (2 * heads + 2 * groups) * head * itemsize, 3 * n * length if level else 0),
+        )
+
+    return piece
+
+
+def _empty(cache: Cache) -> bool:
+    """Whether no layer of `cache` holds a token yet: a prompt's prefill."""
+    return all(
+        not any(getattr(layer, "has_previous_state", {}).values())
+        and not int(getattr(layer, "get_seq_length", lambda: 0)() or 0)
+        for layer in cache.layers
+    )
+
+
+def _emptied(cache: Cache) -> None:
+    """`cache` as empty as `_empty` found it: a cut level refused part-way starts again. Its
+    buffers stay; what they hold is overwritten before it is read."""
+    for layer in cache.layers:
+        states = getattr(layer, "has_previous_state", None)
+        if isinstance(states, dict):
+            for index in states:
+                states[index] = False
+        counted = getattr(layer, "cumulative_length", None)
+        if isinstance(counted, torch.Tensor):
+            counted.zero_()
+        elif getattr(layer, "is_initialized", False) and isinstance(
+            getattr(layer, "keys", None), torch.Tensor
+        ):
+            layer.keys, layer.values = layer.keys[..., :0, :], layer.values[..., :0, :]
+            if isinstance(counted, int):
+                layer.cumulative_length = 0
+
+
+def _cuttable(kwargs: Mapping[str, object], shape: tuple[int, int]) -> bool:
+    """Whether a decoder call can go in pieces: it returns its outputs as a dict, keeps no
+    per-layer outputs, no row is padded (a linear-attention layer masks padding in a prompt's
+    first call only), and every tensor of it is one per token or a position."""
+    mask = kwargs.get("attention_mask")
+    flat = isinstance(mask, torch.Tensor) and mask.ndim == 2
+    unpadded = mask is None or (flat and bool(cast("torch.Tensor", mask).all()))
+    return (
+        kwargs.get("return_dict") is not False
+        and not kwargs.get("output_hidden_states")
+        and not kwargs.get("output_attentions")
+        and unpadded
+        and all(
+            not isinstance(value, torch.Tensor)
+            or name in ("position_ids", "cache_position")
+            or tuple(value.shape[:2]) == shape
+            for name, value in kwargs.items()
+        )
+    )
 
 
 class _RowByRow(TorchFunctionMode):
@@ -2550,11 +2713,13 @@ class _Engine:
         first token, from what `first` (the constraint's ids for no tokens) allows."""
         started = time.perf_counter()
         model, ids = self.model, request.inputs["input_ids"]
+        _pieced(_lm(model).get_decoder())
         fresh = _StaticCache(self.text, request.prompt, request.prompt)
         prepared = _lm(model).prepare_inputs_for_generation(
             ids, past_key_values=fresh, use_cache=True, is_first_iteration=True, **kwargs
         )
-        # Native allocation recovery runs underneath this single prefill invocation.
+        # Native allocation recovery runs underneath this single prefill invocation; a long prompt
+        # is a cut site of its own there (`_pieced`).
         with _taking(model) as taken:
             logits: torch.Tensor = model(**prepared, return_dict=True).logits[:, -1]
         hidden = taken[-1]
