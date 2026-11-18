@@ -842,8 +842,8 @@ def rows(original: _Function) -> _Function:
                 return original(*args, **kwargs)
             began = time.perf_counter()
             local, held = _probe(original, args, kwargs, axis, dims)
-            _LOCAL[key] = local
-            said = f"row-local along axis {axis}: cut" if local else "not row-local: whole"
+            said = f"{'row-local' if local else 'not row-local'}: rejected by this proof build: whole"
+            local = _LOCAL[key] = None  # var-031 proof (3) only: every verdict a rejection; never merged
             print(
                 f"cozy-runtime: {original.__module__}.{getattr(original, '__qualname__', '')} "
                 f"{said} (its probe "
