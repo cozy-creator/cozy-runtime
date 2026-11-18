@@ -23,6 +23,7 @@ from contextlib import AbstractContextManager
 from typing import Protocol, cast
 
 import torch
+from tensorfs import varena
 from torch import Tensor, nn
 
 import cozy_runtime.internal.execution.catch as catch
@@ -975,7 +976,7 @@ def split[T](
         try:
             room = _STARTED[hsite] = catch.usable(request)
             on_host = room <= request.host_rooms.get(hsite, -1)
-        except catch.varena.Error:  # the card's room can't be read now (another thread records)
+        except varena.Error:  # the card's room can't be read now (another thread records)
             hostable = False
     if not on_host:
         try:
