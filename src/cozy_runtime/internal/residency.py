@@ -1360,7 +1360,8 @@ class Memory:
         computer's reserve for programs outside cozy and its own headroom. The Runtime kept 8 GiB
         free besides, or a quarter of a small host (cl-885), tuned until one runner passed."""
         if self.device.type != "mps":
-            return max(varena.host_room(), 0)
+            # The type check pins an older TensorFS stub, which has no `host_room` (var-027).
+            return max(int(varena.host_room()), 0)  # type: ignore[attr-defined]
         figures = allocation(torch, "mps")
         free = int(figures["driver_free_bytes"])
         if self.budget_bytes is not None:
