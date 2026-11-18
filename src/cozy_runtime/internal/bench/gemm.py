@@ -392,9 +392,14 @@ def _graphed(call: Call) -> Call:
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
     with vt.graph(graph):  # varena refuses a raw torch.cuda.graph (44400509329: every ggml case unmeasured)
-        for _ in range(GGML_GRAPHED):
-            call()
-    return graph.replay
+        outs = [call() for _ in range(GGML_GRAPHED)]
+    # Under varena a graph's outputs own their pool's backing: dropped, the replay writes unmapped pages (Xid 31, 44416217064).
+    return partial(_replay, graph, outs)
+
+
+def _replay(graph: torch.cuda.CUDAGraph, held: list[object]) -> None:
+    """`graph` replayed; `held`, its captured outputs, kept alive with it."""
+    graph.replay()
 
 
 def _ggml_linear(ops: ModuleType, x: torch.Tensor, blocks: torch.Tensor, scheme: str, n: int) -> torch.Tensor:
