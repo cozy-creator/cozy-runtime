@@ -5,7 +5,8 @@ name: rc-dev
 # package's floor can name its minor (`cozy-runtime>=0.47.0.dev0`), never a build. They go on the rolling
 # GitHub prerelease `rc-<x.y.z>`, never latest, beside the newest earlier pushes' (KEEP builds in all), so a lock made
 # minutes before a merge still resolves. Its SHA256SUMS names every wheel there, the newest version first: each reader
-# (Calcifer, packages' scripts/rc-runtime.sh, cozy-creator's e2e) takes the first line that fits, the newest build. By hand: gh workflow run rc-dev.yaml -R cozy-creator/cozy-runtime --ref rc/<x.y.z>
+# (Calcifer, packages' scripts/rc-runtime.sh, cozy-creator's e2e) takes the first line that fits, the newest build, and
+# reads SHA256SUMS.old, the last index, when it finds no SHA256SUMS (the swap below). By hand: gh workflow run rc-dev.yaml -R cozy-creator/cozy-runtime --ref rc/<x.y.z>
 on:
   push:
     branches: ['rc/*']
@@ -67,6 +68,10 @@ jobs:
           name: cozy-runtime-${{ github.sha }}
           path: dist
       # New files first, SHA256SUMS next (a reader sees the last builds or these, whole), builds past the newest KEEP last.
+      # SHA256SUMS is swapped by name, never deleted under a reader (cl-1128: `--clobber` deleted it, then uploaded the new one,
+      # and a lock in those seconds found no RC build): the new one uploaded as SHA256SUMS.new, the last renamed SHA256SUMS.old,
+      # the new renamed SHA256SUMS. A reader that finds no SHA256SUMS reads SHA256SUMS.old, which stays until the next swap. A
+      # reader beside the swap, bounded, says what it read: never neither.
       - name: The RC's prerelease holds this build and the newest earlier ones
         working-directory: dist
         env:
@@ -102,8 +107,30 @@ jobs:
           cat SHA256SUMS
           grep -qF "  ${wheels[0]}" SHA256SUMS || { echo "::error::$tag holds $KEEP newer builds than this one"; exit 1; }
           gh release upload "$tag" -R "$REPO" --clobber "${wheels[@]}"
-          gh release upload "$tag" -R "$REPO" --clobber SHA256SUMS
-          listed=" $(awk '{print $2}' SHA256SUMS | tr '\n' ' ') SHA256SUMS "
+          asset() { gh api "repos/$REPO/releases/tags/$tag" --jq ".assets[] | select(.name == \"$1\") | .id"; }
+          rename_asset() { gh api -X PATCH "repos/$REPO/releases/assets/$1" -f name="$2" > /dev/null; }
+          gone=$(asset SHA256SUMS.new); [ -z "$gone" ] || gh api -X DELETE "repos/$REPO/releases/assets/$gone"
+          cp SHA256SUMS SHA256SUMS.new && gh release upload "$tag" -R "$REPO" SHA256SUMS.new
+          base="https://github.com/$REPO/releases/download/$tag"
+          (n=0 sums=0 old=0 neither=0
+           while [ ! -e swapped ] && [ $n -lt 300 ]; do
+             if curl -fsS -o /dev/null --max-time 5 "$base/SHA256SUMS"; then sums=$((sums + 1))
+             elif curl -fsS -o /dev/null --max-time 5 "$base/SHA256SUMS.old"; then old=$((old + 1))
+             else neither=$((neither + 1)); fi
+             n=$((n + 1)); sleep 0.2
+           done
+           echo "$sums $old $neither" > watched) &
+          watcher=$!
+          sleep 2
+          gone=$(asset SHA256SUMS.old); [ -z "$gone" ] || gh api -X DELETE "repos/$REPO/releases/assets/$gone"
+          last=$(asset SHA256SUMS); [ -z "$last" ] || rename_asset "$last" SHA256SUMS.old
+          rename_asset "$(asset SHA256SUMS.new)" SHA256SUMS
+          sleep 2
+          touch swapped && wait "$watcher"
+          read -r sums old neither < watched
+          echo "$tag's index swapped: a reader beside it read SHA256SUMS $sums times, SHA256SUMS.old $old, neither $neither" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$neither" = 0 ] || { echo "::error::a reader found no index $neither times during the swap"; exit 1; }
+          listed=" $(awk '{print $2}' SHA256SUMS | tr '\n' ' ') SHA256SUMS SHA256SUMS.old SHA256SUMS.new "
           for name in $held; do
             case $listed in *" $name "*) ;; *) gh release delete-asset "$tag" "$name" -R "$REPO" -y ;; esac
           done
