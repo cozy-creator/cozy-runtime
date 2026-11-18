@@ -7,7 +7,8 @@ The results stay on the device, at the level native selection takes from each ca
 
 Call cuts: Diffusers' FFNs, and any module shaped as one (`_ffn_like`), by token, a Runtime-fused
 block's gated MLP by token (`gated`), its channel RMS norms by rows, what Diffusers' attention
-processors run before dispatch (their q/k RMS norms by rows, their RoPE by sequence rows: `rope`),
+processors run before dispatch (their q/k RMS norms by rows, and what they call on q/k, their RoPE,
+by sequence rows where a call proves row-local: `rows`),
 attention by head groups then query rows, a Transformers vision tower by pictures, a package's
 `split` by windows.
 """
@@ -18,12 +19,15 @@ import functools
 import inspect
 import math
 import sys
+import time
+import types
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from typing import Protocol, cast
 
 import torch
 from torch import Tensor, nn
+from torch.utils._pytree import tree_leaves
 
 import cozy_runtime.internal.execution.catch as catch
 import cozy_runtime.internal.execution.pinned as pinned
@@ -59,11 +63,11 @@ def install(module: nn.Module) -> int:
     the module's path. A Transformers gated MLP cuts by tokens as Diffusers' FFNs do, and a
     Transformers vision tower that reads packed patches and each picture's
     grid (`forward(hidden_states, grid_thw)`: Qwen2.5-VL, Qwen3-VL, Qwen3.5) runs its pictures in
-    groups. Diffusers' RMS norms (each attention processor's q/k norm) cut by rows, and the RoPE
-    functions Diffusers' processors call (`rope`). A module of linears and activations alone, up
+    groups. Diffusers' RMS norms (each attention processor's q/k norm) cut by rows, and what
+    Diffusers' processors call on q/k (`_ropes`). A module of linears and activations alone, up
     projections from its input's width and one down projection (`_ffn_like`), is a feed-forward
     whoever wrote it, and cuts by tokens. Returns how many it cut."""
-    count = _ropes()
+    count = _ropes(module)
     for path, sub in module.named_modules():
         if _gated_mlp(sub) and "_cozy_cut" not in vars(sub):
             sub.forward = catch.transparent(_ffn(f"{path}:tokens", sub, _forward(sub)))
@@ -459,10 +463,15 @@ class _Whole(Exception):
     """A cut's pieces do not join (a call returned no tensor): it runs whole."""
 
 
-#: a vision tower's working bytes per patch, in widths of its hidden state: 16.5 measured on
-#: Qwen3.5-9B's tower (4.6 GiB live for 129,600 patches of width 1152, bf16, run 46568), and
-#: the rotary table it was refused growing
-_TOWER_WIDTHS = 24
+def _tower_made(module: nn.Module) -> int:
+    """What a vision tower's widest block makes a patch, in elements, from its own layers: every
+    projection's output with two temporaries of its width (an unfused activation's, as
+    `_layout_shape` takes one it doesn't know). Its blocks are its longest list of modules; with
+    none, all of it is one block. An upper bound: the site's measured peak replaces it."""
+    lists = [c for c in module.children() if isinstance(c, nn.ModuleList) and len(c)]
+    longest = max(lists, key=len, default=None)
+    blocks = list(longest) if longest is not None else [module]
+    return max(3 * sum(w[1] for m in block.modules() if (w := _widths(m))) for block in blocks)
 
 
 def _gated_mlp(module: nn.Module) -> bool:
@@ -490,8 +499,10 @@ def _tower(module: nn.Module) -> bool:
 def _pictures(site: str, module: nn.Module, forward: Forward) -> Forward:
     """A vision tower's pictures in groups: each attends only to its own patches (`cu_seqlens`),
     so a group's output rows are the whole call's rows for those pictures. Patch rows, the
-    merged rows and any per-layer features join in picture order."""
+    merged rows and any per-layer features join in picture order. A patch's working bytes: its
+    residual stream beside what the tower's widest block makes (`_tower_made`)."""
     whole: list[bool] = []
+    made = _tower_made(module)
 
     def cut(*given: object, **kwargs: object) -> object:
         args = list(given)
@@ -513,7 +524,7 @@ def _pictures(site: str, module: nn.Module, forward: Forward) -> Forward:
             return forward(patches, grid, **kwargs)
         config = getattr(module, "config", None)
         width = int(getattr(config, "hidden_size", patches.shape[-1]))
-        each = _TOWER_WIDTHS * width * patches.element_size()
+        each = (width + made) * patches.element_size()
         out = sum(rows) * width * patches.element_size()
 
         def need(level: int) -> tuple[int, ...]:
@@ -713,98 +724,141 @@ def _rms_bands(forward: Forward, x: Tensor, axis: int, level: int) -> object:
     return out
 
 
-class Rows(Protocol):
-    """Where a RoPE call's sequence rows are: the axis of its input, or None (it runs whole)."""
+class _Function(Protocol):
+    """A function a processor calls, as its cut takes it: any arguments."""
 
-    def __call__(
-        self, x: Tensor, freqs: object, /, *args: object, **kwargs: object
-    ) -> int | None: ...
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
 
 
-class Rotation(Protocol):
-    """A RoPE function: its input and tables first, then whatever else it takes."""
-
-    def __call__(self, x: Tensor, freqs: object, /, *args: object, **kwargs: object) -> Tensor: ...
-
-
-def _real_rows(x: Tensor, freqs: object, /, *args: object, **kwargs: object) -> int | None:
-    """`diffusers.models.embeddings.apply_rotary_emb`: (cos, sin) tables, [S, D], over the axis
-    it is told (`sequence_dim`, 2 by default). Its complex form (Lumina's) runs whole."""
-    real = args[0] if args else kwargs.get("use_real", True)
-    axis = args[2] if len(args) > 2 else kwargs.get("sequence_dim", 2)
-    return axis if real is True and isinstance(axis, int) and axis in (1, 2) else None
+#: a function's original, on its cut (`rows`)
+_ORIGINAL = "_cozy_rows"
+#: what a call's arguments beside its input may be: tables (tensors, or a tuple or list of them) and
+#: these; any other object (a cache, a module) may be written, so such a call runs whole
+_SCALARS = (bool, int, float, str, type(None))
+#: what the first probe of a call's shape found (`_probe`), by `_call`'s key: its output's bytes
+#: and the bytes it allocates, each an element of its input; None where it is not row-local along
+#: that axis
+_LOCAL: dict[tuple[object, ...], tuple[float, float] | None] = {}
 
 
-def _complex_rows(x: Tensor, freqs: object, /, *args: object, **kwargs: object) -> int | None:
-    """Qwen-Image's `apply_rotary_emb_qwen`: a complex table, [S, D/2], over [B, S, H, D]. Its
-    real form lines its tables up with the heads, and runs whole."""
-    real = args[0] if args else kwargs.get("use_real", True)
-    return 1 if real is False else None
-
-
-#: The RoPE functions Diffusers' attention processors call before dispatch, by the module that
-#: defines each, its name there, and where a call's sequence rows are (`Rows`).
-_QWEN = "diffusers.models.transformers.transformer_qwenimage"
-_ROPES: tuple[tuple[str, str, Rows], ...] = (
-    ("diffusers.models.embeddings", "apply_rotary_emb", _real_rows),
-    (_QWEN, "apply_rotary_emb_qwen", _complex_rows),
-    (f"{_QWEN}21", "apply_rotary_emb_qwen", _complex_rows),
-)
-#: a RoPE function's original, on its cut (`rope`)
-_ORIGINAL = "_cozy_rope"
-#: a piece's temporaries a rotated value: its fp32 upcast and the upcast rotation, a product of
-#: each with its table, and the rotation itself
-_ROTATED = 14
-
-
-def _ropes() -> int:
-    """Cut every `_ROPES` function this process has loaded: each where it is defined, and every
-    loaded Diffusers module's name bound to it (a processor's module imported it by name), so a
-    processor finds the cut whichever way it reaches it. Returns how many it cut now."""
-    cut: dict[int, Rotation] = {}
-    for name, attribute, rows in _ROPES:
-        found = sys.modules.get(name)
-        original = vars(found).get(attribute) if found is not None else None
-        if not callable(original) or _ORIGINAL in vars(original):
+def _ropes(module: nn.Module) -> int:
+    """Cut what the library attention processors under `module` call on their queries and keys
+    before dispatch (their RoPE, whatever its name): every Diffusers function a processor's
+    `__call__` names, and those its own module's functions it calls name in turn, rebound where the
+    processor finds it to its cut (`rows`). A call is cut only where its shape proves row-local
+    (`_probe`); every other runs as written. Returns how many functions it cut now."""
+    count, called = 0, set()
+    for sub in module.modules():
+        processor = getattr(sub, "processor", None)
+        call = getattr(type(processor), "__call__", None) if processor is not None else None
+        if not isinstance(call, types.FunctionType) or id(call) in called:
             continue
-        cut[id(original)] = rope(cast("Rotation", original), rows)
-    if cut:
-        for name, loaded in list(sys.modules.items()):
-            if name.startswith("diffusers.") and loaded is not None:
-                bound = vars(loaded)
-                for key, value in list(bound.items()):
-                    if id(value) in cut and callable(value):
-                        bound[key] = cut[id(value)]
-    return len(cut)
+        called.add(id(call))
+        home = call.__module__
+        if not home.startswith("diffusers."):
+            continue
+        names, stack, walked = call.__globals__, [call.__code__], {id(call)}
+        while stack:
+            code = stack.pop()
+            stack.extend(c for c in code.co_consts if inspect.iscode(c))
+            for name in code.co_names:
+                found = names.get(name)
+                if not isinstance(found, types.FunctionType):
+                    continue
+                original = vars(found).get(_ORIGINAL, found)
+                if not original.__module__.startswith("diffusers."):
+                    continue
+                if original.__module__ == home and id(original) not in walked:
+                    walked.add(id(original))
+                    stack.append(original.__code__)
+                if original is found:
+                    names[name] = rows(original)
+                    count += 1
+    return count
 
 
-def rope(original: Rotation, rows: Rows) -> Rotation:
-    """`original`, a RoPE function a Diffusers attention processor calls on its queries and keys
-    before dispatch, in pieces of their sequence rows (`rows` says where they are; None: whole), at
-    the level native selection takes under the current block. It rotates each value alone with
-    its row's table entry, so a piece is the whole call's rows, byte for byte: PAN2's fp32
-    temporaries were 0.8 GiB a call (cr-320). Whole outside a named block, under autograd, and for
-    an input that is not contiguous [B, ·, ·, D] or tables that are not one row a token."""
-
-    def cut(x: Tensor, freqs: object, /, *args: object, **kwargs: object) -> Tensor:
-        axis = (
-            rows(x, freqs, *args, **kwargs)
-            if isinstance(x, Tensor) and x.dim() == 4 and x.is_contiguous()
-            else None
-        )
-        site = None if axis is None or torch.is_grad_enabled() else catch.site("rope")
-        if site is None or axis is None:
-            return original(x, freqs, *args, **kwargs)
+def _call(
+    x: Tensor, args: Sequence[object], kwargs: dict[str, object]
+) -> tuple[int, tuple[int | None, ...], tuple[object, ...]] | None:
+    """Where a call's sequence rows are: the axis of `x` (neither its first nor its last) whose
+    length its tables are indexed by, each table's axis of that length (None: it has none and is
+    passed whole), and a key for its shape of call. None where the axis isn't one (no table has it,
+    a table has it twice, or two axes could be it), where an argument is neither a table nor a
+    scalar, or where a second tensor is an activation like `x`, its shape and dtype (the call mixes
+    two: attention's keys and values)."""
+    tables: list[Tensor] = []
+    form: list[object] = []
+    for value in (*args[1:], *kwargs.values()):
+        items = value if type(value) in (tuple, list) else (value,)
+        form.append(type(value).__name__)
+        for item in cast("Sequence[object]", items):
+            if isinstance(item, Tensor):
+                if item.shape == x.shape and item.dtype == x.dtype:
+                    return None
+                tables.append(item)
+                form.append((item.dtype, item.dim()))
+            elif isinstance(item, _SCALARS):
+                form.append(item)
+            else:
+                return None
+    found = None
+    for axis in range(1, x.dim() - 1):
         length = int(x.shape[axis])
-        tables = list(freqs) if isinstance(freqs, list | tuple) else [freqs]
-        if length < 2 or not all(
-            isinstance(t, Tensor) and t.dim() >= 1 and t.shape[0] == length for t in tables
+        dims = [[d for d, size in enumerate(t.shape) if size == length] for t in tables]
+        if length < 2 or not any(dims) or any(len(d) > 1 for d in dims):
+            continue
+        if found is not None:
+            return None
+        found = axis, tuple(d[0] if d else None for d in dims)
+    if found is None:
+        return None
+    return *found, (found, x.dtype, x.dim(), tuple(kwargs), *form)
+
+
+def rows(original: _Function) -> _Function:
+    """`original`, a function a Diffusers attention processor calls before dispatch, in pieces of
+    its input's sequence rows (`_call`), each with its tables' rows, at the level native selection
+    takes under the current block, where its first call of that shape proved it row-local
+    (`_probe`): PAN2's RoPE held 0.8 GiB of fp32 temporaries a call (cr-320). Whole outside a
+    named block, under autograd or compilation, and for any other call."""
+
+    def cut(*args: object, **kwargs: object) -> object:
+        x = args[0] if args else None
+        if (
+            not isinstance(x, Tensor)
+            or x.dim() < 3
+            or torch.is_grad_enabled()
+            or torch.compiler.is_compiling()
         ):
-            return original(x, freqs, *args, **kwargs)
+            return original(*args, **kwargs)
+        found = _call(x, args, kwargs)
+        site = None if found is None else catch.site("rows")
+        if found is None or site is None:
+            return original(*args, **kwargs)
+        axis, dims, shape = found
+        key = (id(original), *shape)
+        if key not in _LOCAL:
+            if _capturing():
+                return original(*args, **kwargs)
+            began = time.perf_counter()
+            local, held = _probe(original, args, kwargs, axis, dims)
+            _LOCAL[key] = local
+            said = f"row-local along axis {axis}: cut" if local else "not row-local: whole"
+            print(
+                f"cozy-runtime: {original.__module__}.{getattr(original, '__qualname__', '')} "
+                f"{said} (its probe "
+                f"{(time.perf_counter() - began) * 1e3:.1f} ms, {held / (1 << 20):.2f} MiB)",
+                file=sys.stderr,
+            )
+        local = _LOCAL[key]
+        if local is None:
+            return original(*args, **kwargs)
+        length, (out, made), size = int(x.shape[axis]), local, x.numel()
         need = levelled(
-            length, sizing.norm(length, x.numel() // length, x.element_size(), _ROTATED)
+            length,
+            lambda n: sizing.peak(math.ceil(out * size), (math.ceil(made * size * n / length),)),
         )
-        run = functools.partial(_rotated, original, x, freqs, axis, args, kwargs)
+        run = functools.partial(_rowed, original, args, kwargs, axis, dims)
         return catch.cut(site, levels(length), need, run)
 
     functools.update_wrapper(cut, original)
@@ -812,28 +866,117 @@ def rope(original: Rotation, rows: Rows) -> Rotation:
     return cut
 
 
-def _rotated(
-    original: Rotation,
-    x: Tensor,
-    freqs: object,
-    axis: int,
+def _probe(
+    original: _Function,
     args: Sequence[object],
     kwargs: dict[str, object],
+    axis: int,
+    dims: Sequence[int | None],
+) -> tuple[tuple[float, float] | None, int]:
+    """Whether `original` is row-local along `axis` for this shape of call, from copies of two of
+    the call's middle rows: called on both together and on each alone, it must give the same bits
+    a row, in rows lined up with its input's. Then (its output's bytes, the bytes it allocates),
+    each an element of its input, counted as the pair ran (every fresh tensor its ops made, an upper
+    bound on what it holds at once). None where it is not, or raises. Beside it, the bytes the
+    probe held: its copies of the pair's rows and what the pair's call made."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Made(TorchDispatchMode):
+        made = 0
+
+        def __torch_dispatch__(
+            self,
+            func: object,
+            types: tuple[type, ...],
+            args: tuple[object, ...] = (),
+            kwargs: dict[str, object] | None = None,
+        ) -> object:
+            out = func(*args, **(kwargs or {}))  # type: ignore[operator]  # an OpOverload
+            returns = func._schema.returns  # type: ignore[attr-defined]  # an OpOverload's
+            outs = out if isinstance(out, tuple | list) else (out,)
+            for tensor, slot in zip(outs, returns, strict=False):
+                if isinstance(tensor, Tensor) and slot.alias_info is None:
+                    self.made += tensor.numel() * tensor.element_size()
+            return out
+
+    x = cast(Tensor, args[0])
+    middle = (int(x.shape[axis]) - 2) // 2
+    counted, copied = Made(), 0  # type: ignore[no-untyped-call]  # TorchDispatchMode's __init__
+    try:
+        given, named = _sliced(args, kwargs, axis, dims, middle, 2, copy=True)
+        leaves = tree_leaves((given, named))
+        copied = sum(t.numel() * t.element_size() for t in leaves if isinstance(t, Tensor))
+        elements = cast(Tensor, given[0]).numel()
+        with counted:
+            pair = original(*given, **named)
+        if not (
+            isinstance(pair, Tensor)
+            and pair.dim() > axis
+            and pair.shape[:axis] == x.shape[:axis]
+            and pair.shape[axis] == 2
+        ):
+            return None, copied + counted.made
+        for row in (0, 1):
+            given, named = _sliced(args, kwargs, axis, dims, middle + row, 1, copy=True)
+            one = original(*given, **named)
+            if not (isinstance(one, Tensor) and torch.equal(pair.narrow(axis, row, 1), one)):
+                return None, copied + counted.made
+    except Exception:  # a call it can't take in pieces runs whole
+        return None, copied + counted.made
+    made = (pair.numel() * pair.element_size() / elements, counted.made / elements)
+    return made, copied + counted.made
+
+
+def _sliced(
+    args: Sequence[object],
+    kwargs: dict[str, object],
+    axis: int,
+    dims: Sequence[int | None],
+    at: int,
+    n: int,
+    copy: bool = False,
+) -> tuple[tuple[object, ...], dict[str, object]]:
+    """The call's arguments for its rows [at, at + n): its input along `axis`, each table along its
+    own (`dims`, in `_call`'s order), the rest as given; with `copy`, every tensor copied."""
+    tables = iter(dims)
+
+    def table(t: Tensor) -> Tensor:
+        dim = next(tables)
+        part = t if dim is None else t.narrow(dim, at, n)
+        return part.clone() if copy else part
+
+    def value(v: object) -> object:
+        if isinstance(v, Tensor):
+            return table(v)
+        if type(v) in (tuple, list):
+            parts = [table(t) if isinstance(t, Tensor) else t for t in cast("Sequence[object]", v)]
+            return parts if type(v) is list else tuple(parts)
+        return v
+
+    x = cast(Tensor, args[0]).narrow(axis, at, n)
+    rest = tuple(value(v) for v in args[1:])
+    named = {k: value(v) for k, v in kwargs.items()}
+    return (x.clone() if copy else x, *rest), named
+
+
+def _rowed(
+    original: _Function,
+    args: Sequence[object],
+    kwargs: dict[str, object],
+    axis: int,
+    dims: Sequence[int | None],
     level: int,
-) -> Tensor:
+) -> object:
     if not level:
-        return original(x, freqs, *args, **kwargs)
+        return original(*args, **kwargs)
+    x = cast(Tensor, args[0])
     length = int(x.shape[axis])
     size, out = pieces(length, level), None
     for at in range(0, length, size):
         catch.checkpoint()
         n = min(size, length - at)
-        tables = (
-            type(freqs)(cast(Tensor, t).narrow(0, at, n) for t in freqs)
-            if isinstance(freqs, list | tuple)
-            else cast(Tensor, freqs).narrow(0, at, n)
-        )
-        part = original(x.narrow(axis, at, n), tables, *args, **kwargs)
+        given, named = _sliced(args, kwargs, axis, dims, at, n)
+        part = cast(Tensor, original(*given, **named))
         if out is None:
             out = part.new_empty((*x.shape[:axis], length, *part.shape[axis + 1 :]))
         out.narrow(axis, at, n).copy_(part)
