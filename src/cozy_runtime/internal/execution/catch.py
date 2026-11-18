@@ -122,7 +122,10 @@ def _gib(n: int) -> str:
 
 def _holders(device: int, refused: Mapping[str, int] | None = None) -> str:
     """What holds `device`'s memory: live tensors, weights in use, graph pools and caches, as the
-    refused allocation found them (`refused`, `vt.refusal`), else now."""
+    refused allocation found them (`refused`, `vt.refusal`), else now, with the working pages
+    mapped beside the live tensors (free but in pages a live tensor shares, or freed and awaiting
+    their stream)."""
+    beside = ""
     if refused is None:
         room, stats = vt.room(device), vt.stats(device)
         refused = {
@@ -133,6 +136,9 @@ def _holders(device: int, refused: Mapping[str, int] | None = None) -> str:
             "pools": stats["pools_bytes"],
             "caches": stats["cache_mapped_bytes"],
         }
+        mapped = max(stats["mapped_bytes"] - room["working_live"], 0)
+        pending = _gib(stats["pending_bytes"])
+        beside = f" and {_gib(mapped)} mapped beside them ({pending} awaiting their stream)"
     pools, caches = refused["pools"], refused["caches"]
     held = (
         f"{_gib(pools)} of graph pools, {_gib(caches)} of caches"
@@ -140,10 +146,15 @@ def _holders(device: int, refused: Mapping[str, int] | None = None) -> str:
         else "no graph pools or caches"
     )
     return (
-        f"{_gib(refused['working_live'])} of live tensors, {_gib(refused['pinned'])} of weights in "
-        f"use ({_gib(refused['weights_resident'])} resident), {held}, of "
+        f"{_gib(refused['working_live'])} of live tensors{beside}, {_gib(refused['pinned'])} of "
+        f"weights in use ({_gib(refused['weights_resident'])} resident), {held}, of "
         f"{_gib(refused['capacity'])} on GPU {device}"
     )
+
+
+def room(device: int) -> str:
+    """`device`'s room now, as a device OOM's line says it."""
+    return _holders(device)
 
 
 def _room_line() -> str:
@@ -171,10 +182,15 @@ if not ROOM:
     ROOM.append(_room_line)
 
 
-def refuse(device: int, name: str, level: str, need: int, exc: BaseException) -> DoesNotFit:
+class Unplaced(DoesNotFit):
+    """No level of a cut can be given room before it runs (or, for a pure op, runs again): its
+    caller may run it another way."""
+
+
+def refuse(device: int, name: str, level: str, need: int, exc: BaseException) -> Unplaced:
     """Native selection cannot make room for `name` at `level` (`need` bytes) with everything
     evictable gone, before any piece ran."""
-    return DoesNotFit(
+    return Unplaced(
         f"{name}: {level} needs {_gib(need)} beside {_holders(device)} ({exc}): run it smaller, "
         "or rent a larger card: `cozy run … --on new`"
     )
@@ -233,7 +249,8 @@ def cut[T](
 ) -> T:
     """`run(level)` for a call that cuts itself into 2^level pieces down to `finest` (FFN tokens,
     attention pieces, a norm's or a conv's bands, a package's split). Without native memory, or
-    small, it runs whole; inside a capture or another site's leaf, at this key's last level."""
+    small, it runs whole; inside a capture, at this key's last level; inside another site's leaf,
+    at the level the card's free room takes now (`nested`)."""
     checkpoint()
     request = CURRENT.get()
     native = request is not None and request.memory.cuda
@@ -243,8 +260,11 @@ def cut[T](
         (str(level), row) for level, row in enumerate(useful([need(n) for n in range(finest + 1)]))
     )
     key = f"{name}:{hash(menu):x}"
-    if not native or not LEAF.acquire(blocking=False):
+    if not native or _capturing():
         return run(LEVELS.get(key, 0))
+    if not LEAF.acquire(blocking=False):
+        assert request is not None
+        return nested(request, key, name, menu, run, pure)
     assert request is not None
     try:
         device = request.memory.device.index or 0
@@ -259,7 +279,8 @@ def cut[T](
             LEVELS[key] = level
             note(request, key, name, level, selection)
             try:
-                result = run(level)
+                with fallback(pure and level + 1 < len(menu)):
+                    result = run(level)
             except BaseException as exc:
                 again = retry(device, key, name, menu, level, token, stream, exc, pure)
                 if again is None:
@@ -272,6 +293,55 @@ def cut[T](
             return result
     finally:
         LEAF.release()
+
+
+#: A nested site's level a refusal moved it to, by key: its next call starts no coarser.
+_NESTED: dict[str, int] = {}
+
+
+def fallback(on: bool) -> AbstractContextManager[object]:
+    """Allocations inside with a cheaper way out than varena moving live tensors to host pages (its
+    last lever, cr-305 rung 5): a finer level of a pure op, or a split's whole on host. A refusal
+    then comes back here, and the cheaper rung runs. An enclosing one holds inside."""
+    set_fallback = getattr(vt, "fallback", None)  # a TensorFS that moves live tensors to host
+    return set_fallback(on) if set_fallback is not None else nullcontext()
+
+
+def nested[T](
+    request: Request,
+    key: str,
+    name: str,
+    menu: Sequence[tuple[str, Sequence[int]]],
+    run: Callable[[int], T],
+    pure: bool,
+) -> T:
+    """A cut inside another site's leaf (an FFN or attention in a split's window), where native
+    selection can't open a second leaf: the coarsest level whose need the card's room holds now,
+    no coarser than one refused before. The room is the card less what is live and the weights in
+    use: what is unmapped, cached or held by idle weights, which varena reclaims for it. A pure op
+    refused there runs again a level finer, the windows of the leaf around it kept (cr-305: H3's
+    upscale ran its MLP whole inside a window and ran out). The last level's refusal stands."""
+    device = request.memory.device.index or 0
+    room = vt.room(device)
+    usable = int(room["capacity"]) - int(room["working_live"]) - int(room["pinned"])
+    fitting = next((at for at, (_, row) in enumerate(menu) if sum(row) <= usable), len(menu) - 1)
+    level = max(fitting, _NESTED.get(key, 0))
+    while True:
+        LEVELS[key] = level
+        note(request, key, name, level)
+        try:
+            with fallback(pure and level + 1 < len(menu)):
+                return run(level)
+        except BaseException as exc:
+            if not (pure and is_capacity(exc)) or level + 1 >= len(menu):
+                raise
+            _unwind(exc)
+        request.retries += 1
+        print(
+            f"cozy-runtime: {name} refused at level {level} inside another cut: level {level + 1}",
+            file=sys.stderr,
+        )
+        level = _NESTED[key] = level + 1
 
 
 def retry(
