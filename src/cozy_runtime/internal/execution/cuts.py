@@ -22,13 +22,11 @@ from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from typing import Protocol, cast
 
-import tensorfs.varena.torch as vt
 import torch
 from torch import Tensor, nn
 
 import cozy_runtime.internal.execution.catch as catch
 import cozy_runtime.internal.execution.pinned as pinned
-import cozy_runtime.internal.execution.rungs as rungs
 import cozy_runtime.internal.execution.sizing as sizing
 from cozy_runtime.author._errors import is_capacity, unwind
 from cozy_runtime.internal.encoding.leaves import NVFP4
@@ -942,20 +940,16 @@ def split[T](
     first allocation; from then on its measured bytes are the levels' need and it is allocated
     before any window runs (`ahead`), so a card short of it refuses before work is done. Where
     `hostable` and no level fits with the whole on the card, the whole goes to pinned host memory
-    and the levels need only their windows. The rung is remembered per machine (`rungs`): a later
-    process starts at it while the room it was chosen in holds. A refusal judged on the package's
-    estimate holds for this call only. `exact` names this call's input shape, which the whole's
-    measure and the rung are kept under; `key` leaves out the cut extents, so the levels learned
-    serve every length."""
+    and the levels need only their windows. A host decision holds for its request only (cr-337): a
+    refusal judged on the package's estimate for this call only. `exact` names this call's input
+    shape, which the whole's measure is kept under; `key` leaves out the cut extents, so the levels
+    learned serve every length."""
     deepest = levels(-(-total // max(finest, 1)))
     site = f"split:{key}"
     request = catch.CURRENT.get()
     if request is None or not request.memory.cuda or _capturing():  # a capture allocates no host
         hostable = False
     exact = exact or key
-    rung_key, room, kept = _remembered(f"split:{exact}", request)
-    if kept is not None and exact not in _WHOLES and request is not None:
-        _WHOLES[exact] = (kept.shape, _dtype(kept.dtype), request.memory.device)
     measured = _WHOLES.get(exact)
     whole_bytes = (  # a whole of windows the op returns on the host takes none of the card
         out_bytes if measured is None else _nbytes(measured[0], measured[1]) * _on_card(exact)
@@ -972,35 +966,21 @@ def split[T](
 
     hsite = f"split:{exact}"  # a host decision holds for this shape: another may fit the card
     on_host = (
-        hostable
-        and request is not None
-        and (
-            request.hosted.get(hsite, _ESTIMATED) != _ESTIMATED or (kept is not None and kept.host)
-        )
+        hostable and request is not None and request.hosted.get(hsite, _ESTIMATED) != _ESTIMATED
     )
     if not on_host:
         try:
-            result = catch.cut(
+            return catch.cut(
                 site, deepest, need, lambda level: run(window(level), False), pure=pure
             )
-            if rung_key and request is not None and _on_card(exact):
-                # a whole the card refused in the run went to host (`whole`): that is its rung
-                rungs.put(rung_key, _rung(hsite in request.hosted, exact, room))
-            return result
         except catch.Unplaced as exc:  # refused before a window ran (or the op is pure)
             if not hostable or request is None:
                 raise
             unwind(exc)
             _hosted(request, hsite, name, _ESTIMATED if measured is None else _MEASURED)
-    assert request is not None  # `hostable` holds only in a request
-    if hsite not in request.hosted:
-        _hosted(request, hsite, name, _REMEMBERED)
-    result = catch.cut(
+    return catch.cut(
         f"{site}:host", deepest, windows_only, lambda level: run(window(level), True), pure=pure
     )
-    if rung_key and _on_card(exact) and request.hosted.get(hsite) != _ESTIMATED:
-        rungs.put(rung_key, _rung(True, exact, room))
-    return result
 
 
 def whole(part: Tensor, shape: Sequence[int], key: str, host: bool, zeros: bool = False) -> Tensor:
@@ -1104,44 +1084,23 @@ def read[X](window: X) -> X:
 #: each split call shape's whole output, its shape, dtype and device, as its allocation measured it
 _WHOLES: dict[str, tuple[tuple[int, ...], torch.dtype, torch.device]] = {}
 #: `Request.hosted`'s reason for a whole sent to host without a refusal in the run: selection
-#: judged the package's estimate (for that call only) or the measured whole (for the request), or
-#: the machine remembered the rung (`rungs`)
-_ESTIMATED, _MEASURED, _REMEMBERED = "estimated", "measured", "remembered"
+#: judged the package's estimate (for that call only) or the measured whole (for the request)
+_ESTIMATED, _MEASURED = "estimated", "measured"
 
 
 def _nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
     return math.prod(shape) * dtype.itemsize
 
 
-def _dtype(name: str) -> torch.dtype:
-    found = getattr(torch, name.removeprefix("torch."), None)
-    return found if isinstance(found, torch.dtype) else torch.float32
-
-
-def _remembered(site: str, request: Request | None) -> tuple[str, int, rungs.Rung | None]:
-    """The site's rung key on this machine, the room now and the rung kept for it, if it holds."""
-    if request is None or not request.memory.cuda or _capturing():
-        return "", 0, None
-    device = request.memory.device
-    room = int(vt.room(device.index or 0)["capacity"])
-    rung_key = rungs.key(site, sorted(request.current), device.index or 0)
-    return rung_key, room, rungs.get(rung_key, room)
-
-
 def _on_card(key: str) -> bool:
-    """Whether `key`'s measured whole is a card's: only those have a card or host rung."""
+    """Whether `key`'s measured whole is a card's: only those take the card's room."""
     known = _WHOLES.get(key)
     return known is not None and known[2].type == "cuda"
 
 
-def _rung(host: bool, key: str, room: int) -> rungs.Rung:
-    shape, dtype, _ = _WHOLES[key]
-    return rungs.Rung(host, shape, str(dtype), room)
-
-
 def _hosted(request: Request, site: str, name: str, why: str) -> None:
     request.hosted[site] = why
-    named = (_ESTIMATED, _MEASURED, _REMEMBERED)
+    named = (_ESTIMATED, _MEASURED)
     print(
         f"cozy-runtime: {name}: no room for its whole output beside its windows; it is kept in "
         f"host memory ({why if why in named else f'refused beside {why}'})",
