@@ -27,10 +27,11 @@ pool are decided before its prefill (`_Engine._enter`): allocated or mapped then
 decoding rows to leave. Running short never ends a call while a lever remains: graphs whose pool
 has no room go (decode runs eagerly, captured again where room allows), a draft head's keys go,
 and slots or a prefill that still do not fit beside the leased weights decode through
-Transformers' loop, its weights streamed and its cache only as long as its tokens. Short is one
-rule for every such lever (`_short_of_room`): an allocation refused, or a native refusal
-(`DoesNotFit`). Only slots larger than the whole card are `DoesNotFit` up front, naming what would
-fit. Errors after execution starts are final; package code is never restarted.
+Transformers' loop, its weights streamed and its cache only as long as its tokens, on the host
+when it outgrows the card's room (`_paged`). Short is one rule for every such lever
+(`_short_of_room`): an allocation refused, or a native refusal (`DoesNotFit`). Slots larger than
+the whole card go to that loop up front. Errors after execution starts are final; package code
+is never restarted.
 On a CPU, or after a safe capture refusal (a run warning), the same step runs eagerly. A model this
 does not serve (a layer type other than full or linear attention, an attention other than SDPA or
 eager, a generation config that adds logits processors) generates through Transformers, said once.
@@ -110,6 +111,7 @@ try:
     from transformers import LogitsProcessorList, StoppingCriteria, StoppingCriteriaList
     from transformers.cache_utils import (
         Cache,
+        DynamicCache,
         LinearAttentionLayer,
         StaticLayer,
         get_layer_types_and_kwargs,
@@ -1125,10 +1127,14 @@ def _transformers(
         processors.append(_Draw(prompt, sampling))
     context = CURRENT.get()
     _pieced(_lm(model).get_decoder())
+    rows, device = int(inputs["input_ids"].shape[0]), inputs["input_ids"].device
+    paged = _paged(model, device, rows, prompt + max_new_tokens)
+    cache = {"past_key_values": DynamicCache(config=model.config, offloading=True)} if paged else {}
     with _PLANE, torch.inference_mode(), ExitStack() as held:
         cancel = _Cancel(context, tell, _Keeper(model, held, why), prompt)
         out = _lm(model).generate(
             **inputs,
+            **cache,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             eos_token_id=stops,
@@ -1138,6 +1144,22 @@ def _transformers(
         )
         cancel.keeper.report(prompt, cancel.steps)
     return out[:, prompt:]
+
+
+def _paged(model: PreTrainedModel, device: torch.device, rows: int, tokens: int) -> bool:
+    """Whether Transformers' loop keeps a call's keys and values on the host (its offloaded
+    cache, cr-344): they would outgrow the room the card has now, its capacity less what is
+    live and pinned. Each attention layer's come to the card for its own attention, the next
+    one's on their way meanwhile (`Cache.prefetch`), so a decode step reads them a layer at a
+    time; a linear-attention layer's state stays."""
+    shapes, why = _shapes(model)
+    if device.type != "cuda" or why:
+        return False
+    itemsize = cast("torch.dtype", model.dtype).itemsize
+    each = sum(s[1] * (s[2] + s[3]) * itemsize for s in shapes if s[0] == "keys")
+    room = vt.room(device.index or 0)
+    left = int(room["capacity"]) - int(room["working_live"]) - int(room["pinned"])
+    return rows * tokens * each > left
 
 
 #: What a streamed decode step needs beyond its kept weights and live memory (its cache's growth,
@@ -2555,9 +2577,9 @@ class _Engine:
         place it is: the slots held now where they can take it (the decode graphs' pool mapped
         back for them), else slots for every row's prompt and `max_new_tokens` allocated now
         (`_buffers`; `_need` is what they take). False: it waits for the rows decoding now to
-        leave. `DoesNotFit` before anything of it ran: up front only where the slots exceed the
-        whole card (`_never`), else where their allocation, which asks idle executors for their
-        memory, evicts and waits as every allocation does, was refused after all of that."""
+        leave. Slots larger than the whole card (`_never`) go to Transformers' loop up front, and
+        so do slots whose allocation, which asks idle executors for their memory, evicts and waits
+        as every allocation does, was refused after all of that."""
         rows = len(request.tokens)
         reach = request.prompt + request.max_new + DEPTH * (LAG + 2)
         free = sum(row is None for row in self.slots)
@@ -2599,7 +2621,10 @@ class _Engine:
                     return False
                 if self._undraft(request, "its keys do not fit on this card"):
                     return False
-                raise DoesNotFit(self._refused(request, alone, position, card))
+                # Transformers' loop keeps them on the host (`_paged`): slow, never refused.
+                refused = DoesNotFit(self._refused(request, alone, position, card))
+                self._shed(request, "its keys and state, more than the whole card", refused)
+                return True
         if not occupied:
             self._drop()  # the idle slots go before the new ones come
         try:
