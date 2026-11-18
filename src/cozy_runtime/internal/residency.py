@@ -37,7 +37,7 @@ from cozy_runtime import graphs
 from cozy_runtime.author import _phases, _retained
 from cozy_runtime.author._errors import CapabilityError, DoesNotFit, Fault, fault, is_capacity
 from cozy_runtime.author._model import TRANSPARENT, WARNINGS, WarningRow, recovered
-from cozy_runtime.internal import cache_owners, pacing
+from cozy_runtime.internal import cache_owners, pacing, proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
     StaleBinding,
@@ -121,6 +121,8 @@ _NOTED = 256 << 20
 _INDEX = re.compile(r"(?<![^.])\d+(?![^.])")
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
 _OPENING = threading.Lock()
+#: the CPU steps measuring on this thread (`Memory.growth`)
+_GROWTH = threading.local()
 # A failed graph completion must retain the actual storage owners until executor exit.
 _UNPROVEN: list[Binding] = []
 
@@ -615,6 +617,9 @@ class Model:
         #: loops streaming it (`gathering`): an embedding table of it that left the device gathers
         #: its rows on the host instead of filling whole again
         self.gathers = 0
+        #: what one CPU step of it grew by above what it held as the step began, the most measured
+        #: (`Memory.growth`); None until a step has run
+        self.cpu_working: int | None = None
 
     def sites_in(self, groups: Iterable[_Block]) -> list[_Site]:
         """The weight sites `groups` hold, mapped once: a LoRA bake binds one source block per
@@ -985,7 +990,7 @@ class Binding:
                     # Bound whole, its blocks cannot stream: past the host's room it refuses as
                     # an allocation would, and a decode streams them per forward instead.
                     missing = sum(b.allocation_bytes for b in self.groups if b.data is None)
-                    if missing and missing > memory._free():
+                    if missing and missing > memory._free() - (self.model.cpu_working or 0):
                         raise torch.OutOfMemoryError(
                             f"{self.model.component}: {missing / (1 << 30):.1f} GiB of float32 "
                             "weights to bind, more than the host can give"
@@ -1346,15 +1351,19 @@ class Memory:
 
     def _fitting(self, model: Model, groups: list[_Block]) -> list[_Block]:
         """A CPU step's hold, decided once: the longest prefix of `groups` whose bytes as served
-        fit what the host's number still leaves (`_free`), once other models' holds
-        outside the step have gone. The rest stream, read and widened per forward (`_idle`)."""
+        fit what the host's number still leaves (`_free`) beside what its step grows by
+        (`Model.cpu_working`), once other models' holds outside the step have gone. The rest
+        stream, read and widened per forward (`_idle`). Before a step has measured that, it holds
+        nothing: held weights beside a forward that outgrows the number are killed by the kernel."""
+        if model.cpu_working is None:
+            return []
         request = _REQUEST.get()
         step = request.phase(model.name) if request is not None else frozenset({model.name})
         for other in list(self.models.values()):
             if other.name not in step and not other.users:
                 for hold in [h for h in other.holds if h.reclaimable]:
                     hold.shed()
-        room = self._free()
+        room = self._free() - model.cpu_working
         held: list[_Block] = []
         for block in groups:
             room -= 0 if block.data is not None else block.allocation_bytes
@@ -1362,6 +1371,31 @@ class Memory:
                 break
             held.append(block)
         return held
+
+    @contextmanager
+    def growth(self, models: Collection[Model]) -> Iterator[None]:
+        """What a CPU step of `models` grows by above what this process holds as it begins: its
+        resident high-water mark over the step less its resident bytes at the start, each model's
+        most kept (`Model.cpu_working`). A step inside another sets the outer one's mark aside and
+        restarts it, and the outer one's is the greater. Where the kernel keeps the mark for the
+        process's life it is an upper bound. Linux; elsewhere nothing is measured."""
+        if self.device.type != "cpu" or sys.platform != "linux":
+            yield
+            return
+        frames: list[list[int]] = vars(_GROWTH).setdefault("frames", [])
+        resident, peak = proctree.own_memory()
+        if frames:
+            frames[-1][1] = max(frames[-1][1], peak)
+        proctree.reset_own_peak()
+        frames.append([resident, 0])
+        try:
+            yield
+        finally:
+            start, before = frames.pop()
+            peak = max(before, proctree.own_memory()[1])
+            if start >= 0 and peak >= start:
+                for model in models:
+                    model.cpu_working = max(model.cpu_working or 0, peak - start)
 
     def load(self, module: nn.Module, level: Level | str = Level.GPU) -> Model:
         level = Level(level) if isinstance(level, str) else level
