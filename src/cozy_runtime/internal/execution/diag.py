@@ -118,16 +118,11 @@ def take() -> list[dict[str, Any]]:
 
 
 def say(dumps: list[dict[str, Any]]) -> None:
-    """The dumps on stderr, a row a line, which the machine's log keeps."""
-    lists = ("frames", "tensors", "unnamed", "events", "weights")
+    """Each dump's head on stderr, one short line: the record carries the rest, and TensorD keeps
+    only a failed call's last 64 KiB of stderr, which varena's own lines need."""
+    keys = ("where", "final", "requested", "block", "refused_room", "totals")
     for n, dump in enumerate(dumps):
-        head = {k: v for k, v in dump.items() if k not in lists}
-        _line(n, "head", head)
-        if not dump.get("final") and n >= 2:
-            continue
-        for key in lists:
-            for row in dump.get(key) or []:
-                _line(n, key, row)
+        _line(n, "head", {k: dump.get(k) for k in keys})
 
 
 def _line(n: int, key: str, row: object) -> None:
@@ -135,7 +130,7 @@ def _line(n: int, key: str, row: object) -> None:
         text = json.dumps(row, default=str, separators=(",", ":"))
     except Exception as exc:
         text = f"unsaid ({type(exc).__name__})"
-    print(f"cozy-var030 #{n} {key} {text[:3000]}", file=sys.stderr, flush=True)
+    print(f"cozy-var030 #{n} {key} {text[:900]}", file=sys.stderr, flush=True)
 
 
 def _request() -> object:
@@ -267,7 +262,8 @@ def _frames(exc: BaseException) -> tuple[list[str], dict[int, dict[str, Any]]]:
         while tb is not None:
             frame, code = tb.tb_frame, tb.tb_frame.f_code
             path = code.co_filename.rsplit("site-packages/", 1)[-1].rsplit("/source/", 1)[-1]
-            frames.append(f"{path}:{tb.tb_lineno} {getattr(code, 'co_qualname', code.co_name)}")
+            name = getattr(code, "co_qualname", code.co_name)
+            frames.append(f"{len(frames)} {path}:{tb.tb_lineno} {name}")
             found: list[tuple[str, Tensor]] = []
             if not first and code.co_flags & 0x1 and frame.f_locals is not frame.f_globals:
                 try:
