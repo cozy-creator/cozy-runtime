@@ -292,6 +292,8 @@ class call:
                 label = f"{s.names[s.stack[-1]].split(' | ')[0]} > {label}"
             self.row["i0"] = len(s.marks)
             self.row["t0"] = time.perf_counter()
+            self.row["unix_ms"] = round(time.time() * 1000, 1)
+            self.row["parent"] = s.call_stack[-1] if s.call_stack else -1
             if not self.nested:
                 self.row["before"] = _counters()
             s.calls.append(self.row)
@@ -331,6 +333,39 @@ class call:
             s.error = f"call exit {type(failed).__name__}: {failed}"
 
 
+class kernel:
+    """One compiled kernel's launch, labelled with which of its tensor arguments are windows of a
+    host whole (their positions among its tensors): those it reads or writes over the link."""
+
+    __slots__ = ("name", "span", "tensors")
+
+    def __init__(self, name: str, tensors: Any) -> None:
+        self.name, self.tensors, self.span = name, tensors, None
+
+    def __enter__(self) -> kernel:
+        if not _ok() or not _S.stack:
+            return self
+        s = _S
+        try:
+            from cozy_runtime.internal.execution import pinned
+
+            host = [i for i, t in enumerate(self.tensors) if pinned.held(t)]
+            nbytes = sum(int(self.tensors[i].numel()) * int(self.tensors[i].element_size()) for i in host)
+            label = f"{s.names[s.stack[-1]]} > kernel {self.name}"
+            if host:
+                label += f" [host {','.join(map(str, host))}]"
+                moved("kernel_host_bytes", nbytes)
+            self.span = span(label)
+            self.span.__enter__()
+        except Exception as exc:
+            s.error = f"kernel {type(exc).__name__}: {exc}"
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self.span is not None:
+            self.span.__exit__(None, None, None)
+
+
 def piece() -> None:
     """A window begins (`catch.checkpoint`)."""
     if not _ok() or not _S.stack:
@@ -366,8 +401,13 @@ def inplace(window: Any) -> None:
 
 _SUMS = (
     "windows", "read_host", "read_host_strided", "wrote_host", "wrote_host_strided", "wrote_card",
-    "inplace_host", "inplace_card", "host_ms",
+    "inplace_host", "inplace_card", "kernel_host_bytes", "host_ms",
 )  # fmt: skip
+_ROW = (
+    "windows", "read_host", "read_host_strided", "wrote_host", "wrote_host_strided", "wrote_card",
+    "inplace_host", "kernel_host_bytes",
+)  # fmt: skip
+_DEVICE = ("span", "w", "read", "write", "kernel", "kernel_host", "inner")
 
 
 def take(request_id: str = "") -> dict[str, Any] | None:
@@ -398,7 +438,10 @@ def take(request_id: str = "") -> dict[str, Any] | None:
             row[2] += 1
             if at_call >= 0:
                 name = s.names[label]
-                part = name.rsplit(" | ", 1)[-1] if " | " in name else "span"
+                if " > kernel " in name:
+                    part = "kernel_host" if "[host " in name else "kernel"
+                else:
+                    part = name.rsplit(" | ", 1)[-1] if " | " in name else "span"
                 sums = per_call.setdefault(at_call, {})
                 sums[part] = sums.get(part, 0.0) + ms
                 sums["host"] = sums.get("host", 0.0) + (host_after - host) * 1000
@@ -414,6 +457,46 @@ def take(request_id: str = "") -> dict[str, Any] | None:
                 group["device_ms"][part] = group["device_ms"].get(part, 0.0) + ms
             for name, value in (row.get("delta") or {}).items():
                 group["delta"][name] = group["delta"].get(name, 0) + value
+        # Each leaf call's own row, its nested calls' device time folded in as `inner`.
+        inner: dict[int, float] = {}
+        for index, row in enumerate(s.calls):
+            if row["nested"]:
+                parent = row.get("parent", -1)
+                while parent >= 0 and s.calls[parent]["nested"]:
+                    parent = s.calls[parent].get("parent", -1)
+                if parent >= 0:
+                    mine = per_call.get(index, {})
+                    inner[parent] = inner.get(parent, 0.0) + sum(v for k, v in mine.items() if k != "host")
+        rows = []
+        for index, row in enumerate(s.calls):
+            if row["nested"] or len(rows) >= 6000:
+                continue
+            mine = dict(per_call.get(index, {}))
+            mine["inner"] = inner.get(index, 0.0)
+            delta = row.get("delta") or {}
+            rows.append(
+                [
+                    row.get("step", -1),
+                    _id(row["site"]),
+                    row["level"],
+                    1 if row.get("raised") else 0,
+                    *[row.get(name, 0) for name in _ROW],
+                    round(row.get("host_ms", 0.0), 1),
+                    *[round(mine.get(part, 0.0), 1) for part in _DEVICE],
+                    round(delta.get("reclaim_ns", 0) / 1e6, 1),
+                    round(delta.get("reclaim_weights_ns", 0) / 1e6, 1),
+                    round(delta.get("reclaim_pending_working_ns", 0) / 1e6, 1),
+                    delta.get("w_evictions", 0),
+                    delta.get("w_fills", 0),
+                    row.get("unix_ms", 0),
+                ]
+            )
+        out["rows_columns"] = (
+            "step site(label id) level raised " + " ".join(_ROW) + " host_ms "
+            + " ".join(f"device_{p}_ms" for p in _DEVICE)
+            + " reclaim_ms reclaim_weights_ms reclaim_pending_ms evictions fills unix_ms"
+        )
+        out["rows"] = rows
         out["labels"] = s.names
         out["steps"] = s.steps
         out["by_columns"] = "step label device_ms host_ms marks"

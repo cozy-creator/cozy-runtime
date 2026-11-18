@@ -566,7 +566,10 @@ class _Launcher:
             operands = list(args)
             for i, value in zip(at, real, strict=True):
                 operands[i] = value
-            found[(*grid, 1, 1)[:3]](*operands)  # a compiled kernel reads all three dims
+            from cozy_runtime.internal import var030  # PROOF ONLY (var-030), never merge
+
+            with var030.kernel(kernel.__name__, [args[i] for i in at]):
+                found[(*grid, 1, 1)[:3]](*operands)  # a compiled kernel reads all three dims
 
 
 #: Loaded sets by (name, device index).
