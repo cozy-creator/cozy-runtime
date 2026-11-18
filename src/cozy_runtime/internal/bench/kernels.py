@@ -77,7 +77,7 @@ NATIVE = {
     "_fa3": "attention:flash-attn3",
     "_sage3": "attention:sageattention3-fp4",
     "_attn4": "attention:kitchen-int4qk",
-    "_conv": "native:conv",
+    "_conv": "native:conv native:conv8",
 }
 
 
@@ -235,7 +235,7 @@ def declared(row: arch.Row, sm: int) -> Declared:
             continue
         names.append(f"triton:{name}")
     # A format's kernels exist where its row has it; FP8 GEMMs only where the wheel carries them.
-    names += ["native:int8", "native:norm", "native:conv", "decode:conform", "kitchen:int8", "big:gemm-int8"]
+    names += ["native:int8", "native:norm", "native:conv", "native:conv8", "decode:conform", "kitchen:int8", "big:gemm-int8"]
     if row.fp8:
         names += ["native:fp8", "big:gemm-fp8"]
     names.append("native:w4a8")
@@ -934,6 +934,17 @@ def _conv(index: int) -> Outcome:
     return _verdict(conv._probe(index, _kernels._conv))
 
 
+def _conv8(index: int) -> Outcome:
+    """The int8 conv, its statistics, quantize and temporal passes against float64, and each in bands of frames
+    against the whole, bit for bit (`accel.fusion._conv8`'s probe, the one it serves after)."""
+    from cozy_runtime.accel.fusion import _conv8 as conv8
+
+    major, minor = torch.cuda.get_device_capability(index)
+    if conv8.config(major * 10 + minor) is None:
+        return {"passed": True, "detail": f"not run: sm{major}{minor} convolves an int8 filter decoded on torch"}
+    return _verdict(conv8._probe(index, _kernels._conv))
+
+
 def _big_gemm(name: str, index: int) -> Outcome:
     """The 8-bit GEMM at H3's largest: past 2^31 elements of its activation, sampled rows against
     the product in float64 (M x K wraps an int32 in upstream's CUTLASS, if anywhere)."""
@@ -995,6 +1006,7 @@ EXERCISES: dict[str, Callable[[int], Outcome]] = {
     "native:w4a8": _w4a8,
     "native:norm": _norm,
     "native:conv": _conv,
+    "native:conv8": _conv8,
     "native:svdq": _svdq_native,
     "kitchen:int8": lambda i: _kitchen(i, int8_linear._probe_kitchen),
     "kitchen:nvfp4": lambda i: _kitchen(i, nvfp4_linear._probe_kitchen),
