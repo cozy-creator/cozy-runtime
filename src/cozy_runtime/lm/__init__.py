@@ -3219,11 +3219,16 @@ class _Engine:
         start: list[torch.Tensor] | None = None
         try:
             start, at = [value.clone() for value in held], self.length[:size].clone()
+            _cr337_stage("clones of the held state", held, start, domain.device)
             vt.replay(graph, stream=stream)  # its pool is held since its capture
+            _cr337_stage("the graph's replay", held, start, domain.device)
             replayed = [*(value.clone() for value in state), *self._written(size, at)]
+            _cr337_stage("the replay's clones", held, start, domain.device)
             for tensor, value in zip(held, start, strict=True):
                 tensor.copy_(value)
+            _cr337_stage("the put-back", held, start, domain.device)
             self._advance(size)
+            _cr337_stage("the eager step", held, start, domain.device)
         except Exception as exc:
             if not _short_of_room(exc):
                 raise
@@ -3860,7 +3865,50 @@ def _cr337_differs(
     import torch
 
     def report(stage: str, exc: BaseException) -> None:
-        lines = [f"cr-337 diag: {stage}: {type(exc).__name__}: {str(exc).splitlines()[0]}"]
+        _cr337_report(stage, exc, eager, replayed, held, start, device)
+
+    try:
+        torch.cuda.synchronize(device)
+    except Exception as exc:
+        report("synchronize before the check", exc)
+        raise
+    try:
+        return vt.replay_differs(eager, replayed)
+    except Exception as exc:
+        report("replay_differs after a clean synchronize", exc)
+        raise
+
+
+def _cr337_stage(
+    stage: str, held: list[torch.Tensor], start: list[torch.Tensor], device: torch.device
+) -> None:
+    """A synchronize after one stage of the check: an error here is that stage's, or earlier."""
+    import torch
+
+    try:
+        torch.cuda.synchronize(device)
+    except Exception as exc:
+        _cr337_report(f"after {stage}", exc, [], [], held, start, device)
+        raise
+
+
+def _cr337_report(
+    stage: str,
+    exc: BaseException,
+    eager: list[torch.Tensor],
+    replayed: list[torch.Tensor],
+    held: list[torch.Tensor],
+    start: list[torch.Tensor] | None,
+    device: torch.device,
+) -> None:
+    import torch
+
+    if True:
+        cloned = sum(t.nbytes for t in (start or []) if isinstance(t, torch.Tensor))
+        lines = [
+            f"cr-337 diag: {stage}: {type(exc).__name__}: {str(exc).splitlines()[0]}",
+            f"  held {len(held)} tensors, cloned {cloned} bytes",
+        ]
         try:
             stats = cast("Mapping[str, object]", vt.stats(device.index or 0))
             keys = (
@@ -3885,14 +3933,3 @@ def _cr337_differs(
         text = "\n".join(lines)
         print(text, file=sys.stderr, flush=True)
         exc.add_note(text[:6000])
-
-    try:
-        torch.cuda.synchronize(device)
-    except Exception as exc:
-        report("synchronize before the check", exc)
-        raise
-    try:
-        return vt.replay_differs(eager, replayed)
-    except Exception as exc:
-        report("replay_differs after a clean synchronize", exc)
-        raise
