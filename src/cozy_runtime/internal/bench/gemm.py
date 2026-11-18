@@ -20,6 +20,7 @@ from functools import partial
 from types import ModuleType
 from typing import TypedDict
 
+import tensorfs.varena.torch as vt
 import torch
 
 import cozy_runtime
@@ -390,7 +391,7 @@ def _graphed(call: Call) -> Call:
         call()
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with vt.graph(graph):  # varena refuses a raw torch.cuda.graph (44400509329: every ggml case unmeasured)
         for _ in range(GGML_GRAPHED):
             call()
     return graph.replay
