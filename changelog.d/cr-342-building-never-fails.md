@@ -1,1 +1,0 @@
-A run's first language-model step no longer fails `Building: …` when a kernel for the card is still being built (a fresh machine's first prompt upsampling): it decodes eagerly until a kernel lands, as a graph capture already did (cr-342).
