@@ -64,7 +64,10 @@ jobs:
   e2e:
     needs: siblings
     if: github.event_name != 'merge_group' || !startsWith(github.event.merge_group.base_ref, 'refs/heads/rc/')
-    uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@f85096b9d6a97a623515526ece6940b6635b3200
+    # The workflow is the open RC's (cozy-creator rc/0.27.0 1572852bd9), moved to the next RC's at each cut; the harness it runs
+    # (ci/, e2e/: fixtures, references) is the line's own, as the stack and packages are. xs-217: pinned at 11-11's f85096b9d6,
+    # it judged the RC's packages by fixtures and references the RC had replaced.
+    uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@1572852bd92e09f74b25ca89a8ba23a4b2de9706
     secrets:
       TENSORHUB_READ_KEY: ${{ secrets.TENSORHUB_READ_KEY }}
     with:
@@ -72,7 +75,7 @@ jobs:
       ref: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha || github.sha }}
       base: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
       select: ${{ inputs.select }}
-      creator_ref: f85096b9d6a97a623515526ece6940b6635b3200
+      creator_ref: ${{ needs.siblings.outputs.stack }}
       stack_ref: ${{ needs.siblings.outputs.stack }}
       runtime_ref: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha || github.sha }}
       packages_ref: ${{ needs.siblings.outputs.packages }}
