@@ -247,6 +247,7 @@ def _authored(frame: FrameType | None) -> bool:
     the Runtime runs a package's `load()` and factories, says yes; any other Runtime frame says no,
     as does a stack with none (a TensorFS or library thread). Library frames between (torch,
     Diffusers) belong to whoever called them."""
+    return False  # cr-335's red: the one-card view removed, a construction reads the real card
     while frame is not None:
         code = frame.f_code
         if code is _HANDOFF:
