@@ -1,0 +1,1 @@
+An LM decoding through Transformers' streamed loop no longer refills its embedding table whole when the table leaves the device: it gathers each token's rows on the host. MiniMax-H3-Image's expander on a 4090 refilled its 2.37 GiB table 685 times in 1,573 tokens and decoded at 2.90 tokens/s (cr-332).
