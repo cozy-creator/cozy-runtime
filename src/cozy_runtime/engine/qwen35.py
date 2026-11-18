@@ -295,10 +295,13 @@ class Qwen35:
         a = block.in_proj_a(x)
         channels = text.conv_channels
         conv = torch.empty_like(mixed)
+        # Every pointer a kernel is given must lie on a mapped page (Triton's launcher asks the
+        # driver of each): one token writes no scratch, so it is given the state again.
         windows, kept_windows = kv.state(0), kv.state_scratch[0]
+        window_scratch = kept_windows[:, :, index] if span > 1 else windows[:, index]
         _kernels.conv_span_kernel[(rows, -(-channels // CONV_BLOCK))](
             mixed, block.conv1d.weight, kv.state_slot[:rows], windows[:, index],
-            kept_windows[:, :, index], conv, channels, int(windows.stride(0)),
+            window_scratch, conv, channels, int(windows.stride(0)),
             int(kept_windows.stride(0)), int(kept_windows.stride(1)),
             S=span, W=text.conv - 1, BLOCK=CONV_BLOCK, num_warps=4,
         )  # fmt: skip
@@ -308,8 +311,9 @@ class Qwen35:
         g = (-block.A_log.float().exp() * F.softplus(a.float() + block.dt_bias)).contiguous()
         out = torch.empty((rows, span, text.v_heads, text.dv), dtype=x.dtype, device=x.device)
         states, kept_states = kv.state(1), kv.state_scratch[1]
+        state_scratch = kept_states[:, :, index] if span > 1 else states[:, index]
         _kernels.delta_span_kernel[(rows * text.v_heads, text.dv // VALUE_BLOCK)](
-            q, k, v, g, beta, kv.state_slot[:rows], states[:, index], kept_states[:, :, index],
+            q, k, v, g, beta, kv.state_slot[:rows], states[:, index], state_scratch,
             out, text.v_heads, text.v_heads // text.k_heads, int(conv.stride(1)),
             int(conv.stride(1)), int(states.stride(0)), int(kept_states.stride(0)),
             int(kept_states.stride(1)), float(text.dk) ** 0.5,
