@@ -2411,6 +2411,7 @@ class Memory:
         block.gathered = None
         return True
 
+    @torch.inference_mode(False)
     def _gather(self, block: _Block, overlay: Hashable) -> None:
         """An embedding table that does not fit the room stays on the host: its forward looks up
         there and moves only the rows it read (`_gathering`), so a room below the table never
@@ -3909,7 +3910,12 @@ def _widened(
     )
 
 
+@torch.inference_mode(False)
 def _assign(block: _Block) -> list[tuple[_Site, Tensor]]:
+    """`block`'s values for its sites, made outside inference mode whatever its caller's (a
+    forward's hook, a read in a package's `inference_mode`): a CPU's widened copy made inside it
+    was an inference tensor, and its Parameter failed `Cannot set version_counter for inference
+    tensor` once a CPU model's blocks entered per forward (CPU e2e 44407890827)."""
     model = block.model
     if block.data is None:
         raise ResidencyError("weight assignment before a complete fill")
