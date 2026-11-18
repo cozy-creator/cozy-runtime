@@ -1,0 +1,1 @@
+A CPU executor's weights draw on the host's number through TensorFS (`varena.host_room`), the one owner of host room, which keeps the computer's reserve for programs outside cozy. The Runtime's own 8 GiB headroom (a quarter of a small host, cl-885) is gone (var-027).
