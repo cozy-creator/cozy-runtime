@@ -1,0 +1,1 @@
+`VisionLM.ask` and its engines' `Params` take `top_k` (default 0, none), passed to `lm.generate`: a sampling row keeps its `top_k` largest logits first. MiniMax-H3-Image-PE's reference samples at top-k 20.
