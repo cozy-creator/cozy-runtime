@@ -88,9 +88,9 @@ def arm(checks: Mapping[str, bool] | None = None, press: Press = "") -> None:
         try:
             selection = select(device, key, name, menu, stream)
         except DoesNotFit:
-            _mark(catch, key, len(menu) - 1, "refused")
+            _mark(key, len(menu) - 1, "refused")
             raise
-        _mark(catch, key, int(selection["choice_id"]), str(selection["basis"]))
+        _mark(key, int(selection["choice_id"]), str(selection["basis"]))
         return selection
 
     def recorded(*args: object, **kwargs: object) -> object:
@@ -124,19 +124,25 @@ def _bytes(torch: ModuleType, tensor: Tensor) -> bytes:
     return bytes(wide.numpy().tobytes())
 
 
-def _add(torch: ModuleType, vt: ModuleType, name: str, value: object) -> None:
-    from cozy_runtime.internal.residency import _REQUEST
+def _request() -> str:
+    """The request a component call serves, by id ("" outside one)."""
+    from cozy_runtime.author._context import CURRENT
 
-    request = _REQUEST.get()
-    if request is None:
+    context = CURRENT.get()
+    return context.request_id if context is not None else ""
+
+
+def _add(torch: ModuleType, vt: ModuleType, name: str, value: object) -> None:
+    request = _request()
+    if not request:
         return
-    rows = _rows.setdefault(request.id, [])
+    rows = _rows.setdefault(request, [])
     row = next((row for row in rows if "digests" in row), None)
     if row is None:
-        row = Row(steps=0, digests={}, split_trace=_traces.setdefault(request.id, {}))
+        row = Row(steps=0, digests={}, split_trace=_traces.setdefault(request, {}))
         rows.append(row)
-        _sums[request.id] = {}
-    digest = _sums[request.id].setdefault(name, hashlib.sha256())
+        _sums[request] = {}
+    digest = _sums[request].setdefault(name, hashlib.sha256())
     for leaf in torch.utils._pytree.tree_leaves(value):
         if isinstance(leaf, torch.Tensor):
             digest.update(_bytes(torch, leaf))
@@ -148,12 +154,11 @@ def _press(torch: ModuleType, module: Module, press: Press) -> None:
     """Before the second request's first component call: the card filled, and let go ("refill")
     or kept ("hold")."""
     from cozy_runtime.internal.contract import unsealed
-    from cozy_runtime.internal.residency import _REQUEST
 
-    request = _REQUEST.get()
-    if request is None or request.id in _requests:
+    request = _request()
+    if not request or request in _requests:
         return
-    _requests.append(request.id)
+    _requests.append(request)
     if press in ("refill", "hold") and len(_requests) == 2:
         device = next(module.parameters()).device
         _, total = cast("tuple[int, int]", unsealed(torch, "mem_get_info")(device))
@@ -164,10 +169,9 @@ def _press(torch: ModuleType, module: Module, press: Press) -> None:
             _held.append(held)
 
 
-def _mark(catch: ModuleType, key: str, level: int, basis: str) -> None:
-    request = catch.CURRENT.get()
-    if request is not None:
-        trace = _traces.setdefault(request.id, {}).setdefault(key, [])
+def _mark(key: str, level: int, basis: str) -> None:
+    if request := _request():
+        trace = _traces.setdefault(request, {}).setdefault(key, [])
         mark: Mark = [level, basis]
         if trace and trace[-1][:2] == mark:
             trace[-1][2] = int(trace[-1][2]) + 1  # a mark's third item is its count
