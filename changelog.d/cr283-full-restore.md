@@ -1,0 +1,1 @@
+An LM decode graph's one check puts back everything its step writes in place (its capture's write set: the draft head's keys and values, the model's K/V buffers), not only the decode state it listed, before the eager step it compares the replay with (cr-283). A dev machine's record (`decode.partial_restore`) says what the eager step without that write set would have given.
