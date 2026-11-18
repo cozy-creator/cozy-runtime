@@ -15,7 +15,54 @@ on:
         type: string
         default: ''
 jobs:
+  # cozy-creator's and packages' lines beside this change (cl-1186), named by no hard-coded RC: the line it is on or goes into (an
+  # RC's `rc/<x>`, a patch release's `release/X.Y.Z` or its tag, a task branch's open PR's base, else the patch release it is cut
+  # from), else the open RC (one at a time, as OPEN.md names it: the newest `rc/*`), as for a merge into master; in each repo its
+  # own branch of that line, else the release a patch release patches, else its newest RC, else master.
+  siblings:
+    if: github.event_name != 'merge_group' || !startsWith(github.event.merge_group.base_ref, 'refs/heads/rc/')
+    runs-on: ubuntu-latest
+    outputs:
+      stack: ${{ steps.line.outputs.stack }}
+      packages: ${{ steps.line.outputs.packages }}
+    steps:
+      - id: line
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.merge_group.base_ref || github.event.pull_request.base.ref || github.ref_name }}
+        run: |
+          is_line() { [[ $1 == rc/* ]] || [[ $1 =~ ^release/[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+          line=${BASE#refs/heads/}
+          [[ $line =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]] && line=release/${BASH_REMATCH[1]}
+          if ! is_line "$line" && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls?head=${GITHUB_REPOSITORY%%/*}:$line&state=open" -q '.[0].base.ref // empty' 2>/dev/null) || pr=
+            if is_line "$pr"; then line=$pr
+            else
+              cut=
+              for b in $(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/release/" -q '.[].ref' 2>/dev/null | sed 's|^refs/heads/||' | grep -xE 'release/[0-9]+\.[0-9]+\.[0-9]+' | sort -rV | head -3); do
+                case $(gh api "repos/$GITHUB_REPOSITORY/compare/$b...$line" -q .status 2>/dev/null) in ahead | identical) cut=$b; break ;; esac
+              done
+              [ -z "$cut" ] || line=$cut
+            fi
+          fi
+          is_line "$line" || line=$(gh api repos/cozy-creator/cozy-creator/git/matching-refs/heads/rc/ -q '.[].ref' | sed 's|^refs/heads/||' | grep -xE 'rc/[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1)
+          sibling() {
+            local names newest
+            [ -n "$line" ] || { echo master; return; }
+            if gh api "repos/$1/branches/$line" -q .name >/dev/null 2>&1; then echo "$line"; return; fi
+            if [[ $line == release/* ]]; then
+              names=$(gh api "repos/$1/git/matching-refs/heads/${line%.*}." -q '.[].ref' 2>/dev/null) || names=
+              newest=$(printf '%s\n' ${names//refs\/heads\//} "$line" | grep -xE 'release/[0-9]+\.[0-9]+\.[0-9]+' | sort -uV | awk -v at="$line" '$0 == at { exit } { print }' | tail -1)
+            else
+              newest=$(gh api "repos/$1/git/matching-refs/heads/rc/" -q '.[].ref' 2>/dev/null | sed 's|^refs/heads/||' | grep -xE 'rc/[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1)
+            fi
+            echo "${newest:-master}"
+          }
+          stack=$(sibling cozy-creator/cozy-creator) packages=$(sibling cozy-creator/packages)
+          echo "### Siblings: cozy-creator $stack, packages $packages (the line: ${line:-none})" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "stack=$stack" >> "$GITHUB_OUTPUT"; echo "packages=$packages" >> "$GITHUB_OUTPUT"
   e2e:
+    needs: siblings
     if: github.event_name != 'merge_group' || !startsWith(github.event.merge_group.base_ref, 'refs/heads/rc/')
     uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@f85096b9d6a97a623515526ece6940b6635b3200
     secrets:
@@ -26,6 +73,6 @@ jobs:
       base: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
       select: ${{ inputs.select }}
       creator_ref: f85096b9d6a97a623515526ece6940b6635b3200
-      stack_ref: rc/0.25.0
+      stack_ref: ${{ needs.siblings.outputs.stack }}
       runtime_ref: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha || github.sha }}
-      packages_ref: rc/0.25.0
+      packages_ref: ${{ needs.siblings.outputs.packages }}
