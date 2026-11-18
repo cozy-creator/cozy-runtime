@@ -59,7 +59,7 @@ jobs:
           enable-cache: true
       - if: steps.scope.outputs.run == 'true'
         run: uv sync --locked
-      # Advisories in the locked dependencies (xs-196): one not in pip-audit-known.txt fails.
+      # Advisories in the locked dependencies (xs-196): one not in advisories-known.txt fails.
       - if: steps.scope.outputs.run == 'true'
         run: scripts/audit.sh
       # The release workflows run each action by its commit, never a tag that can move (xs-196).

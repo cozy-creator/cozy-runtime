@@ -1,0 +1,3 @@
+# Advisories known in locked pins (xs-196): `build` asks OSV about the lock (scripts/audit.sh) and fails on any advisory
+# not listed here by its ID or an alias, each as `<ID>` under a `# <package> <version>: <why it stays>` line. Empty: every
+# pin is past its advisories (xs-200).
