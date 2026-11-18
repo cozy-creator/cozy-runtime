@@ -39,7 +39,7 @@ from cozy_runtime.author._model import PLACED, LoRAServing
 from cozy_runtime.internal import execution, lora_bake
 from cozy_runtime.internal.accel import ResidencyError, StaleBinding
 from cozy_runtime.internal.derive import placing
-from cozy_runtime.internal.encoding.formats import TORCH_DTYPES, Leaf, LeafProvider
+from cozy_runtime.internal.encoding.formats import TORCH_DTYPES, Leaf, LeafProvider, is_conv_declared
 from cozy_runtime.internal.encoding.leaves import sites as leaf_sites
 from cozy_runtime.internal.encoding.selection import (
     DeviceFacts,
@@ -341,7 +341,8 @@ class Backend:
                 [key],
             )
         shape = tuple(destination.shape)
-        if shape != tuple(row.shape) or (spec.nbytes and spec.nbytes != row.nbytes):
+        conv = row.encoded.scheme == "int8.convrot" and is_conv_declared(row.shape, shape)
+        if (shape != tuple(row.shape) and not conv) or (spec.nbytes and spec.nbytes != row.nbytes):
             raise _refuse(
                 "length_mismatch",
                 f"{key}: the destination is {shape} and the checkpoint supplies {row.shape} "
@@ -515,16 +516,13 @@ class Backend:
         owner = root.get_submodule(owner_path) if root is not None and owner_path else root
         replaced = getattr(owner, attribute, None) if attribute else None
         weight = getattr(replaced, "weight", None)
-        if (
-            not local.endswith(".weight")
-            or len(row.shape) != 2
-            or weight is None
-            or tuple(weight.shape) != tuple(row.shape)
-        ):
+        linear = weight is not None and len(row.shape) == 2 and tuple(weight.shape) == tuple(row.shape)
+        conv = weight is not None and is_conv_declared(row.shape, weight.shape)
+        if not local.endswith(".weight") or not (linear or conv):
             raise _refuse(
                 "leaf_schema",
-                f"{key}: the native route replaces a rank-2 linear op named by its `.weight`; "
-                "this destination has no such module",
+                f"{key}: the native route replaces a rank-2 linear op, or a conv whose filter is stored "
+                "channels-last, named by its `.weight`; this destination has no such module",
                 [key],
             )
         provider = self.selected[key].provider

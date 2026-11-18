@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import math
 import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -153,6 +154,26 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
             row = by_key.get((component, key))
             chosen = encoding_of(component, key)
             block = column_block(chosen or encoding)
+            if (
+                row is not None
+                and (chosen or encoding) == "int8.convrot"
+                and key.endswith(".weight")
+                and row.readable
+                and row.logical_dtype in {"f16", "bf16", "f32"}
+                and len(row.shape) >= 3
+                and row.shape[0] > 0
+                and row.shape[1] > 0
+                and row.shape[1] % block == 0
+            ):
+                # A conv's filter: its channels-last rows, one a (output channel, tap) (cr-327).
+                taps = math.prod(row.shape[2:])
+                selected.append(
+                    QuantizationTensor(
+                        component, key, row.logical_dtype, (row.shape[0] * taps, row.shape[1]),
+                        encoding=chosen, filter=tuple(row.shape),
+                    )
+                )  # fmt: skip
+                continue
             if row is None or (
                 not key.endswith(".weight")
                 or not row.readable

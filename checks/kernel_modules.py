@@ -72,6 +72,12 @@ try:
     raise AssertionError("norm_pad took 12 channels")
 except ValueError:
     pass
+try:
+    _conv.conv8(*(0,) * 7, 1, 3, 8, 8, 48, 8, 3, 3, 3, 1, 1, 1, 3, 8, 8, True, False, 0, 0)
+    raise AssertionError("conv8 took 48 input channels")
+except ValueError:
+    pass
+assert _conv.conv8(*(0,) * 7, 1, 3, 8, 8, 512, 8, 3, 3, 3, 1, 1, 1, 3, 8, 8, True, False, 0, 0) != 0
 print(f"{sys.version.split()[0]}: gemv without a GPU -> {code} {_gemm.error_name(code)}")
 """
 

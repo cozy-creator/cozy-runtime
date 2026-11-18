@@ -25,6 +25,7 @@ from cozy_runtime.internal.encoding.formats import (
     TORCH_DTYPES,
     Encoded,
     RolePart,
+    is_conv_declared,
     params_of,
     part_rule,
 )
@@ -456,7 +457,12 @@ def fit(
                     component,
                     key,
                 )
-            if tuple(info.shape) != tuple(requirement.shape):
+            conv = (
+                info.encoding is not None
+                and info.encoding.scheme == "int8.convrot"
+                and is_conv_declared(info.shape, requirement.shape)
+            )
+            if tuple(info.shape) != tuple(requirement.shape) and not conv:
                 return refused(
                     "shape_mismatch",
                     f"{component}/{key}: the code builds {list(requirement.shape)}, the checkpoint "

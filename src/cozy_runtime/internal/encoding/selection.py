@@ -38,6 +38,7 @@ from cozy_runtime.internal.encoding.formats import (
     refuse,
 )
 from cozy_runtime.internal.encoding.leaves import (
+    Int8ConvRotConvLeaf,
     Int8ConvRotNativeLeaf,
     MicroScaledNativeLeaf,
     Nvfp4NativeLeaf,
@@ -258,6 +259,7 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         RowwiseNativeLeaf,
         Int8ConvRotDequant,
         Int8ConvRotNativeLeaf,
+        Int8ConvRotConvLeaf,
         Nvfp4Dequant,
         Nvfp4NativeLeaf,
         SvdqNvfp4NativeLeaf,

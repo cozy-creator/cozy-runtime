@@ -256,7 +256,14 @@ target_compile_options(conv_units PRIVATE -O3 --use_fast_math --expt-relaxed-con
                        -U__CUDA_NO_BFLOAT16_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__
                        $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>
                        $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus -Xcompiler=/Zc:preprocessor>)
-kernel_module(_conv conv.cpp conv_units)
+# Cozy's int8-convrot conv3d and the passes that feed it (`csrc/conv/conv8.cuh`, cr-327): int8 mma.sync, so every card
+# with int8 tensor cores (not sm103's); Runtime takes it where it beats the family's 16-bit conv (`accel.fusion._conv8`).
+add_library(conv8_units OBJECT csrc/conv/conv8.cu)
+set_target_properties(conv8_units PROPERTIES CUDA_ARCHITECTURES "80;86-real;89-real;90-real;100-real;120-real;121-real")
+target_compile_options(conv8_units PRIVATE -O3 --use_fast_math --expt-relaxed-constexpr
+                       $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>
+                       $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus>)
+kernel_module(_conv conv.cpp conv_units conv8_units)
 
 # The executor's record of a fatal signal (`csrc/crash.c`, cr-275): plain C on the stable ABI, Linux only.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

@@ -24,7 +24,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import ModuleType
-from typing import TYPE_CHECKING, ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol, cast
 
 from cozy_runtime.accel.kernels import (
     INT8_CONVROT,
@@ -66,6 +66,7 @@ from cozy_runtime.internal.encoding.formats import (
 )
 
 NVFP4 = "cozy.nvfp4.native-leaf/1"
+CONV8 = "cozy.int8-convrot.conv-leaf/1"
 MXFP8 = "cozy.mxfp8.native-leaf/2"
 W4A8 = "cozy.w4a8-convrot256.native-leaf/1"
 SVDQ = "cozy.svdq-nvfp4.native-leaf/1"
@@ -166,8 +167,25 @@ class _ScaledMm:
         return None
 
 
+class _Conv8:
+    """The int8 conv leaves' kernels (`accel.fusion._conv8`), imported when asked: this module imports no torch."""
+
+    @staticmethod
+    def serving(index: int) -> str:
+        from cozy_runtime.accel.fusion import _conv8
+
+        return _conv8.serving(index)
+
+    @staticmethod
+    def prime(torch: ModuleType, index: int) -> None:
+        from cozy_runtime.accel.fusion import _conv8
+
+        _conv8.prime(index)
+
+
 #: Each leaf provider's lane format, as a run's `gemm.selected` names it.
 FORMATS = {
+    CONV8: "int8",
     INT8_CONVROT: "int8",
     ROWWISE_FP8: "fp8",
     NVFP4: "nvfp4",
@@ -176,6 +194,7 @@ FORMATS = {
     SVDQ: "svdq-nvfp4",
 }
 _MODULES: dict[str, _Serving] = {
+    CONV8: _Conv8,
     INT8_CONVROT: int8_linear,
     ROWWISE_FP8: fp8_linear,
     NVFP4: nvfp4_linear,
@@ -635,6 +654,247 @@ class Int8ConvRotNativeLeaf:
             in_features,
             out_features,
         )
+
+
+class _ConvLeaf(Protocol):
+    """An `EncodedConv` as `fusion.ConvBlocks` and the fill read it."""
+
+    provider: str
+    out_dtype: Dtype
+
+    def __call__(self, x: Tensor, /) -> Tensor: ...
+    def served(self, x: Tensor) -> bool: ...
+    def convolve(
+        self, module: ModuleType, q: Tensor, qs: Tensor, residual: Tensor | None, dtype: Dtype
+    ) -> Tensor | None: ...
+
+
+class _ConvLeafClass(Protocol):
+    def __call__(
+        self, weight: Tensor, scale: Tensor, bias: Tensor | None, out_dtype: Dtype, provider: str,
+        encoding: str, replaced: object,
+    ) -> _ConvLeaf: ...  # fmt: skip
+
+
+def _conv_leaf_class(torch: ModuleType) -> _ConvLeafClass:
+    """`EncodedConv`, built once, lazily (this module imports no torch)."""
+    cached: _ConvLeafClass | None = getattr(_conv_leaf_class, "_cached", None)
+    if cached is not None:
+        return cached
+    from torch import nn
+
+    from cozy_runtime.accel.fusion import _conv8
+
+    class EncodedConv(nn.Module):
+        """A Conv3d whose weight is its stored int8-convrot filter (`formats.conv_declared`, cr-327): its input rotated
+        and quantized a voxel, then `_conv8`'s int8 conv with its bias, NDHWC (`channels_last_3d`) out. It stands where
+        the Conv3d stood and returns that conv's output. A conv the kernels do not serve (a stride, dilation or groups,
+        another padding mode, not 512 input channels, a card without them) convolves the decoded filter on torch;
+        `fusion.ConvBlocks` fuses a block's norms into the quantize and its residual into the conv."""
+
+        BUFFERS: ClassVar[dict[str, str]] = {}
+        #: Whether `linear` takes `out` (an encoded linear's contract; a conv never does).
+        WRITES_INTO: ClassVar[bool] = False
+
+        if TYPE_CHECKING:
+            weight: Tensor
+            scale: Tensor
+            bias: Tensor | None
+
+        def __init__(
+            self, weight: Tensor, scale: Tensor, bias: Tensor | None, out_dtype: Dtype, provider: str,
+            encoding: str, replaced: object,
+        ) -> None:  # fmt: skip
+            super().__init__()
+            self.register_buffer("_logical_dtype", weight.new_empty(0, dtype=out_dtype), persistent=False)
+            self._cozy_roles = ("scale", "weight")
+            self.register_buffer("weight", weight)
+            self.register_buffer("scale", scale)
+            self.register_buffer("bias", bias)
+            self.out_dtype = out_dtype
+            self.provider = provider
+            self.encoding = encoding
+            conv = cast("nn.Conv3d", replaced)
+            self.out_channels, self.in_channels = int(weight.shape[0]), int(weight.shape[-1])
+            self.kernel_size = tuple(int(v) for v in weight.shape[1:-1])
+            self.stride = tuple(int(v) for v in conv.stride)
+            self.dilation = tuple(int(v) for v in conv.dilation)
+            self.groups = int(conv.groups)
+            self.padding_mode = str(conv.padding_mode)
+            padding = conv.padding
+            self.padding: str | tuple[int, ...] = (
+                padding if isinstance(padding, str) else tuple(int(v) for v in padding)
+            )
+
+        def roles(self) -> dict[str, Tensor]:
+            return {"scale": self.scale, "weight": self.weight}
+
+        def served(self, x: Tensor) -> bool:
+            """Whether `_conv8` convolves `x` (CUDA, half, 512 channels) with this filter: stride and dilation 1, one
+            group, zero padding of at most the filter's extent."""
+            return (
+                x.is_cuda
+                and x.dtype in (torch.float16, torch.bfloat16)
+                and x.dim() == 5
+                and int(x.shape[1]) == _conv8.CHANNELS
+                and self.stride == (1, 1, 1)
+                and self.dilation == (1, 1, 1)
+                and self.groups == 1
+                and self.padding_mode == "zeros"
+                and isinstance(self.padding, tuple)
+            )
+
+        def filter(self, dtype: Dtype) -> Tensor:
+            """The decoded filter, `[O, I, *k]` in `dtype`: each (output channel, tap) row times its scale, rotated
+            back (`scale[i] * (data[i] · H) / 16`, as `formats.Int8ConvRotDequant`)."""
+            rows = _conv8.rotate(self.weight.float()) * self.scale.float()[..., None]
+            return rows.movedim(-1, 1).to(dtype).contiguous(memory_format=torch.channels_last_3d)
+
+        def forward(self, x: Tensor) -> Tensor:
+            if self.served(x):
+                module = _conv8.kernels(x.device.index if x.device.index is not None else 0)
+                if module is not None:
+                    n = int(x.shape[0])
+                    rows = x.contiguous(memory_format=torch.channels_last_3d).permute(0, 2, 3, 4, 1)
+                    one = torch.ones((n, _conv8.CHANNELS), dtype=torch.float32, device=x.device)
+                    q, qs = _conv8.quantize(module, rows, one, torch.zeros_like(one), silu=False)
+                    fused = self.convolve(module, q, qs, None, x.dtype)
+                    if fused is not None:
+                        return fused.permute(0, 4, 1, 2, 3)
+            bias = None if self.bias is None else self.bias.to(x.dtype)
+            eager: Tensor = torch.nn.functional.conv3d(
+                x, self.filter(x.dtype), bias, self.stride, self.padding, self.dilation, self.groups
+            )
+            return eager
+
+        def convolve(
+            self, module: ModuleType, q: Tensor, qs: Tensor, residual: Tensor | None, dtype: Dtype
+        ) -> Tensor | None:
+            """`_conv8.conv` with this filter, its bias and `residual` (NDHWC), on quantized rows; None where the
+            kernels do not serve it."""
+            assert isinstance(self.padding, tuple)
+            pad = cast("tuple[int, int, int]", self.padding)
+            bias = None if self.bias is None else self.bias.float()
+            scale = self.scale.reshape(self.out_channels, -1)
+            return _conv8.conv(module, q, qs, self.weight, scale, bias, residual, pad, dtype)
+
+        def extra_repr(self) -> str:
+            return (
+                f"{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, "
+                f"padding={self.padding}, provider={self.provider!r}"
+            )
+
+    made = cast("_ConvLeafClass", EncodedConv)
+    _conv_leaf_class._cached = made  # type: ignore[attr-defined]
+    return made
+
+
+#: The conv filters `Int8ConvRotConvLeaf` serves: their input channels (the passes' voxel) and the most taps an axis.
+CONV_CHANNELS = 512
+CONV_MAX_TAPS = 8
+
+
+@dataclass(frozen=True, slots=True)
+class Int8ConvRotConvLeaf:
+    """`int8-convrot256/1` conv filters as an ENCODED conv (cr-327): W8A8 on the int8 tensor cores (`accel.fusion._conv8`).
+
+    A Conv3d's filter is stored channels-last, `[O, kt, kh, kw, I]` (`formats.conv_declared`): one row a (output
+    channel, tap), rotated over the input channels by H256, one scale a row. The leaf rotates and quantizes each input
+    voxel the same way, and each tap's int32 sum is promoted with its voxel and row scales: exact per tap. H3's latent
+    upscaler, against bf16 on f32: 63.65 against 63.85 dB, at 2.8x its eager bf16 speed on an RTX 5060 Ti.
+    """
+
+    encoding: str = "int8.convrot"
+    params: Params = ()
+
+    @property
+    def name(self) -> str:
+        return CONV8
+
+    @property
+    def route(self) -> str:
+        return "encoded_gemm"
+
+    @property
+    def device_predicate(self) -> str:
+        return "cuda.sm80+"
+
+    @property
+    def schemes(self) -> frozenset[str]:
+        return frozenset({"int8.convrot"})
+
+    @property
+    def code_revision(self) -> str:
+        return "1"
+
+    @property
+    def suite(self) -> str:
+        return "int8-convrot-conv"
+
+    @property
+    def formats(self) -> frozenset[str]:
+        return frozenset({"int8"})
+
+    @property
+    def out_dtypes(self) -> frozenset[str]:
+        return frozenset({"bfloat16", "float16"})
+
+    @property
+    def required(self) -> frozenset[str]:
+        return frozenset({"weight", "scale"})
+
+    @property
+    def optional(self) -> frozenset[str]:
+        return frozenset()
+
+    @property
+    def output_dtype_rule(self) -> str:
+        return "contract"
+
+    def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
+        """A Conv3d filter stored channels-last: `[O, kt, kh, kw, 512]`, O a multiple of 8, each extent at most 8, the
+        rotation in 256-groups."""
+        why = Int8ConvRotDequant().supports(shape, params)
+        if not why and params.get("rotation_size") != CONVROT_GROUP:
+            why = f"the int8 kernel rotates {CONVROT_GROUP}-groups; this weight's are {params.get('rotation_size')}"
+        if why:
+            return why
+        if len(shape) != 5:
+            return f"a Conv3d filter stored channels-last is rank 5 and this tensor is rank {len(shape)}"
+        out, *taps, channels = (int(v) for v in shape)
+        if channels != CONV_CHANNELS or out % 8 or max(taps) > CONV_MAX_TAPS:
+            return (
+                f"the int8 conv takes {CONV_CHANNELS} input channels, output channels in eights and at most "
+                f"{CONV_MAX_TAPS} taps an axis; this filter is {list(shape)}"
+            )
+        return ""
+
+    def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
+        raise AssertionError(
+            "an encoded_gemm provider REPLACES the leaf; it never writes a float "
+            "destination — see LeafProvider.leaf"
+        )
+
+    def resident_bytes(self, parts: Mapping[str, RolePart]) -> int:
+        return sum(p.nbytes for p in parts.values())
+
+    def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
+        return 8.0 * self.resident_bytes(parts) / max(numel, 1)
+
+    def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
+        return 0
+
+    def leaf(
+        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: object, out_dtype: Dtype
+    ) -> Leaf:
+        if not isinstance(replaced, torch.nn.Conv3d):
+            raise TypeError(f"{self.name} replaces a Conv3d, not {type(replaced).__name__}")
+        bias: Tensor | None = getattr(replaced, "bias", None)
+        leaf = _conv_leaf_class(torch)(
+            parts["weight"], parts["scale"].to(torch.float32), bias, out_dtype, self.name, self.encoding,
+            replaced,
+        )  # fmt: skip
+        return cast("Leaf", leaf)
 
 
 def _w4a8_leaf_class(torch: ModuleType) -> _LeafClass:

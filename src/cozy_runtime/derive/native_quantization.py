@@ -91,6 +91,8 @@ def supported(source: Checkpoint, selection: ArtifactQuantizationPlan, encoding:
     """One native selection of plain or rowwise floats; TensorFS validates stored parts."""
     for row in selection.tensors:
         info = source.components[row.component].tensors[row.key]
+        if row.filter is not None:  # a conv filter's channels-last rows are the Python encoder's (cr-327)
+            return False
         if (
             (row.encoding or encoding) not in _STRATEGIES
             or info.dtype not in {"F16", "BF16", "F32"}

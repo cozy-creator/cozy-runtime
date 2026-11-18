@@ -26,6 +26,7 @@ from cozy_runtime._cpus import cpus
 from cozy_runtime.author import Context, Telemetry, UnsupportedInput, _numeric
 from cozy_runtime.author._loader import TENSORFS_DTYPES, TENSORFS_NAMES
 from cozy_runtime.internal import call_scope
+from cozy_runtime.internal.encoding.formats import conv_declared
 from cozy_runtime.internal.model_values import read_values_into
 from cozy_runtime.weights_store import Checkpoint, Output, PartData, read_into
 
@@ -213,7 +214,7 @@ def refuse_quantized(
 
 
 class QuantizationTensor(msgspec.Struct, forbid_unknown_fields=True):
-    """One source tensor selected by the reviewed structural plan."""
+    """One source tensor selected by the reviewed structural plan: the matrix it encodes as (`shape`)."""
 
     component: str
     key: str
@@ -221,6 +222,14 @@ class QuantizationTensor(msgspec.Struct, forbid_unknown_fields=True):
     shape: tuple[int, int]
     #: This weight's own scheme, when it is not the lane's.
     encoding: str | None = None
+    #: A conv's filter `[O, I, *k]` (cr-327), encoded as its channels-last rows `[O * prod(k), I]` and stored
+    #: `formats.conv_declared`: `int8.convrot` only.
+    filter: tuple[int, ...] | None = None
+
+    @property
+    def stored(self) -> tuple[int, ...]:
+        """The logical shape the output stores it under."""
+        return self.shape if self.filter is None else conv_declared(self.filter)
 
 
 class ArtifactQuantizationPlan(msgspec.Struct, forbid_unknown_fields=True):
@@ -485,8 +494,13 @@ def quantize_component_into(
                         )
                     ),
                 ]
+                if tensor.filter is not None:  # rows a (output channel, tap): stored `[O, *k, I]`, scales `[O, *k]`
+                    parts = [
+                        (role, dtype, tensor.stored if role == "weight" else tensor.stored[:-1], data)
+                        for role, dtype, _, data in parts
+                    ]
                 output.put_encoded(
-                    component, tensor.key, TENSORFS_NAMES[logical_dtype(tensor)], tensor.shape,
+                    component, tensor.key, TENSORFS_NAMES[logical_dtype(tensor)], tensor.stored,
                     name, PARAMS[name], parts,
                 )  # fmt: skip
                 new_bytes += spill_bytes + sum(len(raw) for raw in result.scales)
@@ -527,8 +541,14 @@ def _encode_tensor(
 ) -> _Encoded:
     encoder = _ENCODINGS[encoding]
     expected = encoder.companions(*tensor.shape)
-    read_chunks = functools.partial(
-        _read_chunks, source, tensor.component, tensor.key, tensor.logical_dtype, tensor.shape
+    read_chunks = (
+        functools.partial(
+            _read_chunks, source, tensor.component, tensor.key, tensor.logical_dtype, tensor.shape
+        )
+        if tensor.filter is None
+        else functools.partial(
+            _filter_rows, source, tensor.component, tensor.key, tensor.logical_dtype, tensor.filter
+        )
     )
     if encoder.calibrated:
         raise UnsupportedInput("calibrated fitting must use the native Writer")
@@ -629,6 +649,27 @@ def _read_chunks(
         if not bool(np.isfinite(values).all()):
             raise UnsupportedInput(f"source {component}.{key} contains non-finite weights")
         yield values
+
+
+def _filter_rows(
+    source: Checkpoint, component: str, key: str, logical_dtype: str, shape: tuple[int, ...]
+) -> Iterator[NDArray[np.float32]]:
+    """A plain conv filter `[O, I, *k]`'s channels-last rows `[O * prod(k), I]`, float32, in whole output channels
+    about `_SOURCE_READ_CHUNK` source bytes at a time."""
+    out, channels, taps = shape[0], shape[1], math.prod(shape[2:])
+    if source.components[component].tensors[key].encoding is not None:
+        raise UnsupportedInput(f"source {component}.{key}: a conv filter quantizes from its plain weights")
+    itemsize = _WIDTH[logical_dtype]
+    per = channels * taps * itemsize
+    step = max(1, _SOURCE_READ_CHUNK // max(per, 1))
+    for first in range(0, out, step):
+        count = min(step, out - first)
+        raw = bytearray(count * per)
+        read_into(source, component, key, "", first * per, raw)
+        values = st.to_f32(raw, TENSORFS_NAMES[logical_dtype], [count, channels, taps])
+        if not bool(np.isfinite(values).all()):
+            raise UnsupportedInput(f"source {component}.{key} contains non-finite weights")
+        yield np.ascontiguousarray(np.moveaxis(values, 1, -1)).reshape(count * taps, channels)
 
 
 def _decoded_chunks(
