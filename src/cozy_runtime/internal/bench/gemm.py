@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from types import ModuleType
-from typing import TypedDict
+from typing import TypedDict, cast
 
 import tensorfs.varena.torch as vt
 import torch
@@ -366,6 +366,7 @@ def _ggml(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
         n, size = ggml_types.STRUCTS[name]
         blocks = torch.randint(0, 256, (s.n, s.k // n, size), generator=g, device="cuda:0", dtype=torch.uint8)
         matmul = partial(ggml_linear.matmul, ops, torch, rows, blocks, scheme, s.n)
+        rules[f"ordered:{name}"] = _ordered(matmul)
         calls[f"ggml-matmul{GGML_GRAPHED}:{name}"] = _graphed(matmul)
         calls[f"ggml-linear{GGML_GRAPHED}:{name}"] = _graphed(partial(_ggml_linear, ops, x, blocks, scheme, s.n))
         rules[f"kernel:{name}"] = ggml_linear.kernel(torch, 0, scheme, s.k, s.n, s.m, blocks)
@@ -405,6 +406,19 @@ def _graphed(call: Call) -> Call:
 def _replay(graph: torch.cuda.CUDAGraph, held: list[object]) -> None:
     """`graph` replayed; `held`, what it reads and writes, kept alive with it."""
     graph.replay()
+
+
+def _ordered(call: Call) -> str:
+    """Whether a read on torch's default stream queued right after `call`, with no sync, sees its output bit for bit
+    (xs-213: ggml launched on a stream of its own when the caller's was the legacy default one)."""
+    with torch.cuda.stream(torch.cuda.default_stream()):
+        want = cast("torch.Tensor", call()).clone()
+        torch.cuda.synchronize()
+        for _ in range(4):
+            got = cast("torch.Tensor", call()).clone()
+            if not torch.equal(got.view(torch.int32), want.view(torch.int32)):
+                return "false"
+    return "true"
 
 
 def _ggml_linear(ops: ModuleType, x: torch.Tensor, blocks: torch.Tensor, scheme: str, n: int) -> torch.Tensor:
