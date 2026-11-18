@@ -30,7 +30,7 @@ from cozy_runtime.internal.encoding.formats import conv_declared
 from cozy_runtime.internal.model_values import read_values_into
 from cozy_runtime.weights_store import Checkpoint, Output, PartData, read_into
 
-from . import native_quantization, svdq
+from . import ggml, native_quantization, svdq
 from . import safetensors_io as st
 from .microscale import (
     CONVROT_GROUP,
@@ -324,8 +324,21 @@ def prepare_bf16(
     return Bf16Plan(components, [(c, k) for c, k, _ in rows], tensors, kept)
 
 
+def known(encoding: str) -> bool:
+    """A lane encoding a plan may name: a scheme the Runtime or TensorFS encodes, or a
+    llama-quantize mix."""
+    return encodes(encoding) or encoding in ggml.TYPES or encoding in ggml.MIXES
+
+
+def encodes(encoding: str) -> bool:
+    """The Runtime's own encoder writes `encoding` (`quantize_component_into`)."""
+    return encoding in _ENCODINGS
+
+
 def column_block(encoding: str | None) -> int:
     """The column multiple a scheme's tensors need; 32 is fp8.rowwise's."""
+    if encoding in ggml.TYPES or encoding in ggml.MIXES:
+        return ggml.block(encoding)
     found = _ENCODINGS.get(encoding or "")
     return found.block if found is not None else 32
 
