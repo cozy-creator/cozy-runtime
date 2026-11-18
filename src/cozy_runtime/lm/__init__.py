@@ -3244,7 +3244,9 @@ class _Engine:
             self.eager += 1
             return
         self.eager += 1
-        why = vt.replay_differs([*state, *self._written(size, at)], replayed)
+        why = _cr337_differs(
+            [*state, *self._written(size, at)], replayed, held, start, domain.device
+        )
         if why:
             why += "; " + self._explain(
                 key[2], size, state, held, start, at, replayed, ops, launch, graph
@@ -3794,3 +3796,103 @@ __all__ = [
 
 
 DECODERS.append((_graph_snapshot, release))
+
+
+# cr-337 proof only, never merged: where the decode check's `CUDA error: invalid argument` comes from.
+_CR337_CUDA: Any = None
+
+
+def _cr337_pointer(t: torch.Tensor) -> str:
+    """The driver's view of a tensor's address: memory type, ordinal, range, mapped, access."""
+    import ctypes
+
+    global _CR337_CUDA
+    if _CR337_CUDA is None:
+        _CR337_CUDA = ctypes.CDLL("libcuda.so.1")
+    ptr = t.data_ptr()
+    out = [f"ptr={ptr:#x} bytes={t.nbytes} shape={tuple(t.shape)} {t.dtype} {t.device}"]
+    if not t.is_cuda:
+        return " ".join(out)
+    for name, attr in (("type", 2), ("ordinal", 9), ("start", 11), ("size", 12), ("mapped", 13), ("access", 16)):
+        value = ctypes.c_uint64(0)
+        code = _CR337_CUDA.cuPointerGetAttribute(ctypes.byref(value), ctypes.c_int(attr), ctypes.c_uint64(ptr))
+        out.append(f"{name}={value.value:#x}" if code == 0 else f"{name}=err{code}")
+    return " ".join(out)
+
+
+def _cr337_steps(eager: list[torch.Tensor], replayed: list[torch.Tensor], device: torch.device) -> str:
+    """replay_differs again, one op at a time with a synchronize after each: the first that raises."""
+    import torch
+
+    for index, (a, b) in enumerate(zip(eager, replayed, strict=True)):
+        ops: list[tuple[str, Callable[[], object]]] = []
+        held: dict[str, Any] = {}
+        ops.append(("ne", lambda: held.__setitem__("ne", a != b)))
+        ops.append(("isnan", lambda: held.__setitem__("nan", a.isnan() & b.isnan())))
+        ops.append(("and", lambda: held.__setitem__("d", held["ne"] & ~held["nan"])))
+        ops.append(("sum", lambda: held.__setitem__("s", held["d"].sum())))
+        ops.append(("item", lambda: held.__setitem__("n", int(held["s"]))))
+        for name, op in ops:
+            try:
+                op()
+                torch.cuda.synchronize(device)
+            except Exception as exc:
+                parts = [f"retry: output {index} op {name}: {str(exc).splitlines()[0]}"]
+                for key in ("ne", "nan", "d", "s"):
+                    if isinstance(held.get(key), torch.Tensor):
+                        parts.append(f"    {key} {_cr337_pointer(held[key])}")
+                parts.append(f"    a {_cr337_pointer(a)}")
+                parts.append(f"    b {_cr337_pointer(b)}")
+                return "\n".join(parts)
+    return "retry: every op of every output passed"
+
+
+def _cr337_differs(
+    eager: list[torch.Tensor],
+    replayed: list[torch.Tensor],
+    held: list[torch.Tensor],
+    start: list[torch.Tensor] | None,
+    device: torch.device,
+) -> str:
+    """vt.replay_differs with a synchronize before it, and on an error the driver's view of every
+    pointer the check touched, varena's counters and a step-by-step retry, on stderr and in the
+    error's notes."""
+    import torch
+
+    def report(stage: str, exc: BaseException) -> None:
+        lines = [f"cr-337 diag: {stage}: {type(exc).__name__}: {str(exc).splitlines()[0]}"]
+        try:
+            stats = cast("Mapping[str, object]", vt.stats(device.index or 0))
+            keys = (
+                "mapped_bytes", "pending_bytes", "free_bytes", "allocated_bytes", "reclaim_ns",
+                "reclaim_pending_working_ns", "reclaim_completed_working_ns", "reclaim_idle_pools_ns",
+                "reclaim_weights_ns", "demotions", "pools", "pools_bytes", "ooms",
+            )
+            lines.append("  varena " + " ".join(f"{k}={stats.get(k)}" for k in keys))
+        except Exception as error:  # noqa: BLE001 - a diagnostic never hides the fault it reports
+            lines.append(f"  varena stats unreadable: {error}")
+        try:
+            lines.append("  " + _cr337_steps(eager, replayed, device))
+        except Exception as error:  # noqa: BLE001
+            lines.append(f"  retry raised: {str(error).splitlines()[0]}")
+        for name, tensors in (("eager", eager), ("replayed", replayed), ("held", held), ("start", start or [])):
+            for i, t in enumerate(tensors):
+                if isinstance(t, torch.Tensor):
+                    try:
+                        lines.append(f"  {name}[{i}] {_cr337_pointer(t)}")
+                    except Exception as error:  # noqa: BLE001
+                        lines.append(f"  {name}[{i}] unreadable: {error}")
+        text = "\n".join(lines)
+        print(text, file=sys.stderr, flush=True)
+        exc.add_note(text[:6000])
+
+    try:
+        torch.cuda.synchronize(device)
+    except Exception as exc:
+        report("synchronize before the check", exc)
+        raise
+    try:
+        return vt.replay_differs(eager, replayed)
+    except Exception as exc:
+        report("replay_differs after a clean synchronize", exc)
+        raise
