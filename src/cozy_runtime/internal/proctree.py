@@ -1191,6 +1191,28 @@ def rss_bytes(pid: int) -> int:
     return -1
 
 
+def own_memory() -> tuple[int, int]:
+    """This process's resident bytes and their high-water mark (since `reset_own_peak`, where the
+    kernel took it, else since it started): (-1, -1) when unreadable."""
+    found: dict[str, int] = {}
+    try:
+        with open("/proc/self/status") as handle:
+            for line in handle:
+                key, _, value = line.partition(":")
+                if key in ("VmRSS", "VmHWM"):
+                    found[key] = int(value.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        return -1, -1
+    return found.get("VmRSS", -1), found.get("VmHWM", -1)
+
+
+def reset_own_peak() -> None:
+    """Restart this process's high-water mark at its resident bytes (`clear_refs`), where the
+    kernel lets it; else the mark stays its life's."""
+    with contextlib.suppress(OSError), open("/proc/self/clear_refs", "w") as handle:
+        handle.write("5")
+
+
 class HostMemory(NamedTuple):
     """What the host can still give this process, and the shared memory it already counts."""
 
