@@ -118,7 +118,7 @@ class CozyEngine:
 
         request = Request(
             prompts=prompts, max_new=params.max_new_tokens, stops=stops, temperature=params.temperature,
-            top_p=params.top_p, top_k=params.top_k, penalty=params.presence_penalty, seed=params.seed,
+            top_p=params.top_p, top_k=params.top_k, presence=params.presence_penalty, seed=params.seed,
         )  # fmt: skip
         out = self.decoder(request, told=tokens)
         reasons: list[str] = []
