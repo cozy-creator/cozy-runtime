@@ -1,0 +1,1 @@
+An LM call's decode note says "drafting 2: … tokens a step" only when its steps drafted. It said so for every model with a draft head, so a CPU call, which never drafts, read "drafting 2: 1.00 tokens a step", as if its drafts were all refused (cr-339).

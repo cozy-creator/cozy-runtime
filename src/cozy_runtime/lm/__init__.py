@@ -1765,7 +1765,8 @@ class _Request:
         self.prefill_s = self.began = self.ended = 0.0
         #: the engine's (captures, capture seconds, eager steps) at admission, then over its life
         self.at: tuple[float, ...] = (0, 0.0, 0)
-        self.steps = self.live = 0
+        #: its steps, the drafted ones among them, and its rows summed over them
+        self.steps = self.drafted = self.live = 0
         self.warnings: list[WarningRow] = []
         #: the attempt it serves (cancellation), and whether its rows left for it
         self.context: Context | None = CURRENT.get()
@@ -1994,8 +1995,9 @@ class _Engine:
         mode = "eager" if _set(self.cache_device).type != "cuda" else "graphs"
         if eager:
             mode = "partly eager" if mode == "graphs" else mode
-        if self.draft is not None:
-            mode += f", drafting {DEPTH}: {looped / max(request.steps, 1):.2f} tokens a step"
+        if request.drafted:  # a head held but never drafted with (a CPU's steps) says nothing
+            some = "" if request.drafted == request.steps else f" in {request.drafted} of its steps"
+            mode += f", drafting {DEPTH}{some}: {looped / max(request.steps, 1):.2f} tokens a step"
         mode += f", {request.live / max(request.steps, 1):.1f} rows a step"
         facts = (
             f"prefill {request.prefill_s:.3f} s",
@@ -2226,6 +2228,7 @@ class _Engine:
             row.reach = min(row.reach + per, self.capacity)
         for request in {id(row.request): row.request for row in rows}.values():
             request.steps += 1
+            request.drafted += drafting
             request.live += len(rows)
 
     def _settle(self, incoming: list[_Request]) -> None:
