@@ -724,6 +724,15 @@ def batch_shapes() -> Row:
     return bench.measure()
 
 
+@case
+def engine_loop() -> Row:
+    """The engine's step launcher: steps as one WHILE-node launch, records through a host ring, and the
+    engine's kernels captured into its body against eager (`bench/engine_loop.py`)."""
+    from cozy_runtime.internal.bench import engine_loop as bench
+
+    return bench.measure()
+
+
 def main(name: str) -> None:
     function = CASES.get(name)
     if function is None:
