@@ -53,6 +53,17 @@ def kernels(index: int) -> ModuleType | None:
     return kernel_ready.serve(f"cozy conv8 cuda:{index}", partial(_open, index), capturing)
 
 
+def prime(index: int) -> None:
+    """Opens the int8 conv on cuda:`index` at device init, beside the weight fill (`kernel_ready.prime`), so a first
+    call serves it rather than the decoded filter."""
+    kernel_ready.prime(f"cozy conv8 cuda:{index}", partial(_open, index))
+
+
+def serving(index: int) -> str:
+    """The kernel an int8 conv leaf on cuda:`index` serves now: read once a run (`gemm.selected`)."""
+    return "cozy-conv8" if kernel_ready.opened(f"cozy conv8 cuda:{index}") is not None else "torch.conv3d"
+
+
 def _open(index: int, wait: bool) -> ModuleType:
     missing = _kernels.ABSENT or getattr(_kernels, "NO_CONV", "")
     if missing:

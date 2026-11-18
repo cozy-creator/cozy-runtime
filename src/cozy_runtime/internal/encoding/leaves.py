@@ -66,6 +66,7 @@ from cozy_runtime.internal.encoding.formats import (
 )
 
 NVFP4 = "cozy.nvfp4.native-leaf/1"
+CONV8 = "cozy.int8-convrot.conv-leaf/1"
 MXFP8 = "cozy.mxfp8.native-leaf/2"
 W4A8 = "cozy.w4a8-convrot256.native-leaf/1"
 SVDQ = "cozy.svdq-nvfp4.native-leaf/1"
@@ -166,8 +167,25 @@ class _ScaledMm:
         return None
 
 
+class _Conv8:
+    """The int8 conv leaves' kernels (`accel.fusion._conv8`), imported when asked: this module imports no torch."""
+
+    @staticmethod
+    def serving(index: int) -> str:
+        from cozy_runtime.accel.fusion import _conv8
+
+        return _conv8.serving(index)
+
+    @staticmethod
+    def prime(torch: ModuleType, index: int) -> None:
+        from cozy_runtime.accel.fusion import _conv8
+
+        _conv8.prime(index)
+
+
 #: Each leaf provider's lane format, as a run's `gemm.selected` names it.
 FORMATS = {
+    CONV8: "int8",
     INT8_CONVROT: "int8",
     ROWWISE_FP8: "fp8",
     NVFP4: "nvfp4",
@@ -176,6 +194,7 @@ FORMATS = {
     SVDQ: "svdq-nvfp4",
 }
 _MODULES: dict[str, _Serving] = {
+    CONV8: _Conv8,
     INT8_CONVROT: int8_linear,
     ROWWISE_FP8: fp8_linear,
     NVFP4: nvfp4_linear,
@@ -790,7 +809,7 @@ class Int8ConvRotConvLeaf:
 
     @property
     def name(self) -> str:
-        return "cozy.int8-convrot.conv-leaf/1"
+        return CONV8
 
     @property
     def route(self) -> str:
