@@ -1,0 +1,1 @@
+Each weight region names its model component as its set, so varena packs a component's small units into shared pages (cr-317): Qwen3.6-35B-A3B's experts page one by one at their own size, on every card, with no joined units and no card query at registration.
