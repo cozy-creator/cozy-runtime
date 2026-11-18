@@ -129,6 +129,8 @@ class Made:
     """What a call made: each row's tokens and the times it took."""
 
     tokens: list[list[int]]
+    #: each row's tokens kept a decode step (1 a plain step; 1 to depth + 1 a drafted one)
+    kept: list[list[int]] = field(default_factory=list)
     prefill_s: float = 0.0
     decode_s: float = 0.0
     steps: int = 0
@@ -183,7 +185,7 @@ class Decoder:
         size = next(b for b in BUCKETS if b >= rows) if rows <= BUCKETS[-1] else rows
         sampling = self._sampling(request, size)
         drafted = self.drafting
-        made = Made(tokens=[[] for _ in range(rows)])
+        made = Made(tokens=[[] for _ in range(rows)], kept=[[] for _ in range(rows)])
         with torch.cuda.stream(self.stream), torch.inference_mode():
             began = time.perf_counter()
             for row, prompt in enumerate(request.prompts):
@@ -363,6 +365,7 @@ class Decoder:
                     count, *tokens = report[row]
                     if count > 0 and live[row]:
                         made.tokens[row].extend(tokens[:count])
+                        made.kept[row].append(count)
                         if told is not None:
                             told(row, tokens[:count])
                 del k
