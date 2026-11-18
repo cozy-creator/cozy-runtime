@@ -1,0 +1,1 @@
+A dev machine's extra decode check (what the check before cr-283 would have found, `decode.partial_restore`) records its own failure and serves; a device fault, a yield or a cancel still ends the call. It re-raised anything but a capacity error, so on a dev machine a failure there failed the user's call (44202545137).
