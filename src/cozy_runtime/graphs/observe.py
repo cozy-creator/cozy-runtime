@@ -21,7 +21,8 @@ so each replay can check it still has that value.
 from __future__ import annotations
 
 import bisect
-from collections.abc import Iterable, Sequence
+import functools
+from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -150,13 +151,22 @@ def trace(
 ) -> tuple[object, list[tuple[object, ...]]]:
     """A dispatch mode over a call and each op it ran (`step`): what a capture's ops are set
     beside (`diverged`). With `writes`, each tensor it writes in place whose storage it didn't
-    make, once by layout: the state a check of its graph puts back (cr-283)."""
+    make, once by layout: the state a check of its graph puts back (cr-283). The mode holds
+    `writes` itself and its class nothing: a class goes only when the cycle collector runs, and
+    one that closed over the list kept a decode's slots allocated after their engine dropped them
+    (cr-333)."""
+    ops: list[tuple[object, ...]] = []
+    return _tracer(torch)(ops, writes), ops
+
+
+@functools.cache
+def _tracer(
+    torch: ModuleType,
+) -> Callable[[list[tuple[object, ...]], list[Tensor] | None], object]:
+    """`trace`'s mode: its ops, write set, and the storages and layouts it has seen are its own."""
     from torch.utils._python_dispatch import TorchDispatchMode
     from torch.utils._pytree import tree_leaves
 
-    ops: list[tuple[object, ...]] = []
-    made: set[int] = set()
-    seen: set[tuple[object, ...]] = set()
     tensor_type = torch.Tensor
 
     def ptr(tensor: Tensor) -> int:
@@ -166,6 +176,12 @@ def trace(
             return 0
 
     class Trace(TorchDispatchMode):
+        def __init__(self, ops: list[tuple[object, ...]], writes: list[Tensor] | None) -> None:
+            super().__init__()  # type: ignore[no-untyped-call]  # TorchDispatchMode's __init__
+            self.ops, self.writes = ops, writes
+            self.made: set[int] = set()
+            self.seen: set[tuple[object, ...]] = set()
+
         def __torch_dispatch__(
             self,
             func: object,
@@ -174,7 +190,8 @@ def trace(
             kwargs: dict[str, object] | None = None,
         ) -> object:
             kwargs = kwargs or {}
-            ops.append(step(torch, func, (args, kwargs)))
+            writes, made = self.writes, self.made
+            self.ops.append(step(torch, func, (args, kwargs)))
             if writes is not None:
                 schema = func._schema  # type: ignore[attr-defined]  # an OpOverload
                 for at, argument in enumerate(schema.arguments):
@@ -191,8 +208,8 @@ def trace(
                             continue
                         layout = (where, tensor.storage_offset(), tuple(tensor.shape),
                                   tuple(tensor.stride()), tensor.dtype)  # fmt: skip
-                        if where and layout not in seen:
-                            seen.add(layout)
+                        if where and layout not in self.seen:
+                            self.seen.add(layout)
                             writes.append(tensor)
             out = func(*args, **kwargs)  # type: ignore[operator]  # an OpOverload
             if writes is not None:  # storages new here: an in-place op's output is its input's
@@ -203,7 +220,7 @@ def trace(
                 )  # fmt: skip
             return out
 
-    return Trace(), ops  # type: ignore[no-untyped-call]  # TorchDispatchMode's __init__
+    return Trace
 
 
 def diverged(written: Sequence[tuple[object, ...]], captured: Sequence[tuple[object, ...]]) -> str:

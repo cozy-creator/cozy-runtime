@@ -130,6 +130,9 @@ LAG = 2
 #: Tokens a draft head proposes a step. Qwen3.5-9B's head on FLUX.3's prompt upsampler keeps
 #: ~0.7 of first drafts and few third ones: 2 is fastest on a 4090 (1 and 3 lose 5%, 4 more).
 DEPTH = 2
+#: The positions from a row's length that one step can write in a key buffer: the model's for its
+#: token and `DEPTH` drafts, and the head's for them, which start one further.
+STEP_SLOTS = DEPTH + 2
 _DRAFT: contextvars.ContextVar[torch.nn.Module | None] = contextvars.ContextVar(
     "cozy_lm_draft", default=None
 )
@@ -3149,9 +3152,11 @@ class _Engine:
             except Building:  # eager until a kernel lands
                 graph, why, self.building = None, "", LANDED[0]
             finally:
-                if graph is None and not self.graphs and self.pool is not None:
-                    close_pool(self.pool, domain.device)
-                    self.pool = None
+                if graph is None:
+                    writes.clear()  # no graph to check: none of the step's state stays held
+                    if not self.graphs and self.pool is not None:
+                        close_pool(self.pool, domain.device)
+                        self.pool = None
             if graph is not None:
                 self.graphs[key] = graph
             # A capture's end, recorded or not, ends the pool's use: held again for the rows
@@ -3166,7 +3171,10 @@ class _Engine:
                     vt.pool_scratch(_set(self.pool).handle, (), domain.device)
                 except (RuntimeError, ValueError) as exc:  # A live allocation: it stays mapped.
                     safeguard("scratch_declined", str(exc))
-                self._verify(key, graph, size, ops, launch, writes)
+                try:
+                    self._verify(key, graph, size, ops, launch, writes)
+                finally:
+                    writes.clear()  # its check is over, however it ended
                 return
             elif why:
                 self._unrecorded(key, why)
@@ -3199,6 +3207,23 @@ class _Engine:
         layers = [layer for layer in _layers(_set(self.cache)) if isinstance(layer, _Keys)]
         return [buffer[rows, :, at] for layer in layers for buffer in (layer.keys, layer.values)]
 
+    def _keyed(self) -> list[torch.Tensor]:
+        """Each buffer a step writes by position, at most `STEP_SLOTS` from a row's length: the
+        model's keys and values, and the draft head's."""
+        layers = [layer for layer in _layers(_set(self.cache)) if isinstance(layer, _Keys)]
+        if self.draft is not None:
+            layers.append(self.dkeys)
+        return [buffer for layer in layers for buffer in (layer.keys, layer.values)]
+
+    def _before(
+        self, state: list[torch.Tensor], writes: list[torch.Tensor], at: torch.Tensor
+    ) -> _Before:
+        """A check's snapshot: `state` and any other device tensor its capture wrote, whole, and
+        the key buffers it wrote at each row's `STEP_SLOTS` positions from `at`."""
+        keyed, others = _beyond(writes, state, self._keyed())
+        slots = at[:, None] + torch.arange(STEP_SLOTS, device=at.device)
+        return _Before([*state, *others], keyed, slots.clamp(max=self.capacity - 1))
+
     def _verify(
         self,
         key: _Key,
@@ -3210,64 +3235,68 @@ class _Engine:
     ) -> None:
         """A new graph's one check: its replay, then this token's eager step from the same
         state, last so that what serves the call is eager's. The same state is all the step writes
-        (`writes`, its capture's), not only `_token_state`: the draft head's keys and values, which
-        a replay writes ahead of the eager step, made Klein's check fail a sound graph (cr-283). A
-        difference discards the graph and explains itself (`_explain`)."""
+        on the device (`writes`, its capture's), not only `_token_state`: the draft head's keys and
+        values, which a replay writes ahead of the eager step, made Klein's check fail a sound
+        graph (cr-283). Of a key buffer that is the slots a step reaches, never the buffer
+        (`_Before`), and all of it goes as the check ends. A difference discards the graph and
+        explains itself (`_explain`)."""
         domain = _set(self.domain)
         state, stream = self._token_state(key[2]), torch.cuda.current_stream(domain.device)
-        held = [*state, *_beyond(writes, state)]
-        start: list[torch.Tensor] | None = None
+        start: _Before | None = None
+        replayed: list[torch.Tensor] = []
         try:
-            start, at = [value.clone() for value in held], self.length[:size].clone()
-            vt.replay(graph, stream=stream)  # its pool is held since its capture
-            replayed = [*(value.clone() for value in state), *self._written(size, at)]
-            for tensor, value in zip(held, start, strict=True):
-                tensor.copy_(value)
-            self._advance(size)
-        except Exception as exc:
-            if not _short_of_room(exc):
-                raise
-            # No room to check it beside its held pool (cr-319: Qwen3.6-27B on a 4090 failed the
-            # run here): the graph and its pool go, and this token and its key's later ones
-            # decode eagerly, from the state before it (what a step wrote at its slot is written
-            # again).
-            if start is not None:
-                for tensor, value in zip(held, start, strict=True):
-                    tensor.copy_(value)
-            start = None
-            self._discard(key, graph, stream)
-            why = no_room(domain.device, "its graph's check", 0, exc)
-            _unwind(exc)
-            _answered(exc)
-            self._unrecorded(key, f"{why}: it decodes eagerly")
-            self._advance(size)
-            self.eager += 1
-            return
-        self.eager += 1
-        why = vt.replay_differs([*state, *self._written(size, at)], replayed)
-        if why:
-            why += "; " + self._explain(
-                key[2], size, state, held, start, at, replayed, ops, launch, graph
-            )
-            self._discard(key, graph, stream)
-            self._unrecorded(key, why, "replay_mismatch")
-        elif _graphs.AUDIT and len(held) > len(state):
             try:
-                self.partial.append(self._partial(size, state, held, start, at, graph, stream))
-            except Exception as exc:  # a dev machine's diagnosis never fails the call it rides on
-                if not is_capacity(exc):
-                    raise
-                self.partial.append(f"no room to check without them: {exc}"[:200])
-                for tensor, value in zip(held, start, strict=True):
-                    tensor.copy_(value)
+                at = self.length[:size].clone()
+                start = self._before(state, writes, at)
+                vt.replay(graph, stream=stream)  # its pool is held since its capture
+                replayed = [*(value.clone() for value in state), *self._written(size, at)]
+                start.restore()
                 self._advance(size)
+            except Exception as exc:
+                if not _short_of_room(exc):
+                    raise
+                # No room to check it beside its held pool (cr-319: Qwen3.6-27B on a 4090 failed
+                # the run here): the graph and its pool go, and this token and its key's later
+                # ones decode eagerly, from the state before it.
+                if start is not None:
+                    start.restore()
+                    start.release()
+                replayed.clear()
+                self._discard(key, graph, stream)
+                why = no_room(domain.device, "its graph's check", 0, exc)
+                _unwind(exc)
+                _answered(exc)
+                self._unrecorded(key, f"{why}: it decodes eagerly")
+                self._advance(size)
+                self.eager += 1
+                return
+            self.eager += 1
+            why = vt.replay_differs([*state, *self._written(size, at)], replayed)
+            if why:
+                why += "; " + self._explain(
+                    key[2], size, state, start, at, replayed, ops, launch, graph
+                )
+                self._discard(key, graph, stream)
+                self._unrecorded(key, why, "replay_mismatch")
+            elif _graphs.AUDIT and start.beyond(len(state))[0]:
+                try:
+                    self.partial.append(self._partial(size, state, start, at, graph, stream))
+                except Exception as exc:  # a dev machine's diagnosis never fails its call
+                    if not is_capacity(exc):
+                        raise
+                    self.partial.append(f"no room to check without them: {exc}"[:200])
+                    start.restore()
+                    self._advance(size)
+        finally:
+            if start is not None:
+                start.release()
+            replayed.clear()
 
     def _partial(
         self,
         size: int,
         state: list[torch.Tensor],
-        held: list[torch.Tensor],
-        start: list[torch.Tensor],
+        start: _Before,
         at: torch.Tensor,
         graph: torch.cuda.CUDAGraph,
         stream: torch.cuda.Stream,
@@ -3275,28 +3304,23 @@ class _Engine:
         """A dev machine's record of what the check before cr-283 would have found: the replay,
         then the eager step with only `_token_state` put back. The last run serves as before."""
         here = [*(value.clone() for value in state), *self._written(size, at)]
-        for tensor, value in zip(held, start, strict=True):
-            tensor.copy_(value)
+        start.restore()
         vt.replay(graph, stream=stream)
-        for tensor, value in zip(state, start[: len(state)], strict=True):
-            tensor.copy_(value)
+        start.restore(len(state))
         self._advance(size)
         old = [*(value.clone() for value in state), *self._written(size, at)]
-        for tensor, value in zip(held, start, strict=True):
-            tensor.copy_(value)
+        start.restore()
         self._advance(size)
-        extra = sum(t.nbytes for t in held[len(state) :])
+        more, extra = start.beyond(len(state))
         said = vt.replay_differs(here, old) or "the same"
-        more = len(held) - len(state)
-        return f"{more} more tensors put back ({extra >> 20} MiB); without them: {said}"
+        return f"{more} more tensors put back ({extra >> 10} KiB); without them: {said}"
 
     def _explain(
         self,
         drafted: bool,
         size: int,
         state: list[torch.Tensor],
-        held: list[torch.Tensor],
-        start: list[torch.Tensor],
+        start: _Before,
         at: torch.Tensor,
         replayed: list[torch.Tensor],
         ops: list[tuple[object, ...]],
@@ -3310,8 +3334,7 @@ class _Engine:
         reads memory that changed). The last run is the check's eager step again, which serves."""
 
         def run(on_capture: bool, mode: object = None) -> list[torch.Tensor]:
-            for tensor, value in zip(held, start, strict=True):
-                tensor.copy_(value)
+            start.restore()
             with (
                 self._graph_memory(drafted) if on_capture else nullcontext(),
                 cast("AbstractContextManager[object]", mode or nullcontext()),
@@ -3323,8 +3346,7 @@ class _Engine:
         mode, written = observe.trace(torch)
         served = False
         try:
-            for tensor, value in zip(held, start, strict=True):
-                tensor.copy_(value)
+            start.restore()
             vt.replay(graph, stream=torch.cuda.current_stream())
             twice = [*(value.clone() for value in state), *self._written(size, at)]
             again = run(False, mode)
@@ -3339,8 +3361,7 @@ class _Engine:
             return "no room to run the step again"
         finally:
             if not served:
-                for tensor, value in zip(held, start, strict=True):
-                    tensor.copy_(value)
+                start.restore()
                 self._advance(size)
         if noise := vt.replay_differs(here, again):
             return f"the step as written differs run to run ({noise}): a nondeterministic kernel"
@@ -3741,11 +3762,53 @@ class _Engine:
             vars(self).pop(name, None)
 
 
-def _beyond(writes: list[torch.Tensor], state: list[torch.Tensor]) -> list[torch.Tensor]:
-    """What a step writes in place beyond `_token_state`'s storages (the draft head's keys and
-    values, the model's K/V buffers): its graph's check puts these back too."""
-    held = {value.untyped_storage().data_ptr() for value in state}
-    return [t for t in writes if t.untyped_storage().data_ptr() not in held]
+def _beyond(
+    writes: list[torch.Tensor], state: list[torch.Tensor], keyed: list[torch.Tensor]
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """What a step writes in place on the device beyond `_token_state`'s storages, from its
+    capture's write set: the key buffers among `keyed`, and any other tensor. What it writes on
+    the host (the flags and tokens the host reads back) is its output, never put back."""
+
+    def storage(tensor: torch.Tensor) -> int:
+        return int(tensor.untyped_storage().data_ptr())
+
+    held = {storage(value) for value in state}
+    named = {storage(t) for t in writes if t.is_cuda} - held
+    buffers = [buffer for buffer in keyed if storage(buffer) in named]
+    known = held | {storage(buffer) for buffer in buffers}
+    return buffers, [t for t in writes if t.is_cuda and storage(t) not in known]
+
+
+class _Before:
+    """What a step writes in place, as it was before the step, for its graph's check to put back
+    (`restore`) and let go (`release`): `whole` tensors entire, and of each `keyed` buffer
+    (`[rows, heads, positions, width]`) only `slots`, the positions a step reaches in each row.
+    Key buffers saved whole were the decode cache again, 10 GiB at 16 rows of Qwen3.8-27B,
+    allocated between a capture and its first replay (cr-333)."""
+
+    def __init__(
+        self, whole: list[torch.Tensor], keyed: list[torch.Tensor], slots: torch.Tensor
+    ) -> None:
+        self.whole, self.keyed, self.slots = whole, keyed, slots
+        self.rows = torch.arange(slots.shape[0], device=slots.device)[:, None]
+        self.saved = [value.clone() for value in whole]
+        self.kept = [buffer[self.rows, :, slots] for buffer in keyed]
+
+    def restore(self, first: int | None = None) -> None:
+        """Everything as it was; with `first`, only that many of `whole`."""
+        for tensor, value in zip(self.whole[:first], self.saved[:first], strict=True):
+            tensor.copy_(value)
+        if first is None:
+            for buffer, value in zip(self.keyed, self.kept, strict=True):
+                buffer[self.rows, :, self.slots] = value
+
+    def beyond(self, first: int) -> tuple[int, int]:
+        """The tensors it put back past the first `first` of `whole`, and the bytes it kept."""
+        kept = [*self.saved[first:], *self.kept]
+        return len(kept), sum(value.nbytes for value in kept)
+
+    def release(self) -> None:
+        self.whole, self.keyed, self.saved, self.kept = [], [], [], []
 
 
 def _unwind(exc: BaseException) -> None:
