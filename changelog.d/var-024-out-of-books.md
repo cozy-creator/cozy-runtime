@@ -1,0 +1,1 @@
+A run's memory record reads TensorFS's device figures after the request ended, where TensorFS measures what the process holds on the card outside its books (`out_of_books_bytes`): the release's table of what the driver takes per card and driver is made from them (var-024).

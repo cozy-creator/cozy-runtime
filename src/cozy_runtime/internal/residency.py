@@ -2822,6 +2822,10 @@ class Memory:
                     _REQUEST.reset(token)
                     if self.cuda and not idle:
                         varena.request_boundary(self.device.index or 0, begin=False)
+                        if request.ended is not None and self.native is not None:
+                            # Read again once ended, as varena measures there what this process
+                            # holds outside its books: the run record's `out_of_books_bytes` (var-024).
+                            request.ended["weight_residency"] = self.native.stats()
 
     def stats(self) -> RequestStats | None:
         return self.last
