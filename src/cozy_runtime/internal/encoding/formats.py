@@ -556,15 +556,6 @@ class RowwiseDequant:
         return "a per-column scale is a rank-2 weight's"
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
-        size = int(str(dict(self.params)["rotation_size"]))
-        if destination.dim() >= 3 and int(destination.shape[-1]) % size:
-            # A conv filter stored channels-last (`conv_declared`): decoded so, then moved back.
-            stored = torch.empty(
-                conv_declared(destination.shape), dtype=destination.dtype, device=destination.device
-            )
-            self.decode(torch, parts, stored)
-            destination.copy_(stored.movedim(-1, 1))
-            return
         rows, cols = matrix(destination.shape)
         destination = destination.view(rows, cols)
         payload = parts["weight"].view(rows, cols)
@@ -645,15 +636,6 @@ class MicroScaledDequant:
         return why
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
-        size = int(str(dict(self.params)["rotation_size"]))
-        if destination.dim() >= 3 and int(destination.shape[-1]) % size:
-            # A conv filter stored channels-last (`conv_declared`): decoded so, then moved back.
-            stored = torch.empty(
-                conv_declared(destination.shape), dtype=destination.dtype, device=destination.device
-            )
-            self.decode(torch, parts, stored)
-            destination.copy_(stored.movedim(-1, 1))
-            return
         rows, cols = matrix(destination.shape)
         destination = destination.view(rows, cols)
         payload = parts["weight"].view(rows, cols)
