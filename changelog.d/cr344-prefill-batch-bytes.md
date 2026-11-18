@@ -1,0 +1,1 @@
+An LM prefill's gated-delta-net pieces are sized by all their rows and the layer's own widths, within 256 MiB a copy, instead of 4,096 tokens a row: 16 prompts on Qwen3.8-27B ran out of a 24 GB card uncapped, asking 1.5 GiB for one tensor of a 65,536-token piece (cr-344).
