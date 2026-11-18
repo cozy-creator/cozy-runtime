@@ -1244,9 +1244,9 @@ class Memory:
         self._executing: dict[Model, int] = {}
         #: the birth site last set on this device (`_born`)
         self._site = 0
-        #: (model, pass shape) whose first block this process measured (`_Probe`), and the one
-        #: measuring now
-        self._probed: set[tuple[str, int]] = set()
+        #: (model, pass shape) whose first block this process measured (`_Probe`): its working peak above
+        #: its entry (`block_need`); and the one measuring now
+        self._probed: dict[tuple[str, int], int] = {}
         self._probe: _Probe | None = None
         if self.cuda:
             try:
@@ -2610,6 +2610,11 @@ class Memory:
             self._exit(block)
             raise
 
+    def block_need(self, shape: int) -> int:
+        """The largest working peak above its entry this process measured for a model's first block at pass shape
+        `shape` (`_end_probe`), 0 where none was: what a block of a stack at that shape needs beside what is live."""
+        return max((need for (_, at), need in self._probed.items() if at == shape), default=0)
+
     def _start_probe(self, block: _Block, capturing: bool) -> None:
         """Measure `block` if it is its model's first at this pass shape in this process: the
         working peak resets here, and `_end_probe` reads it beside varena's room (cr-305)."""
@@ -2640,13 +2645,14 @@ class Memory:
 
     def _end_probe(self, probe: _Probe) -> None:
         self._probe = None
-        self._probed.add(probe.key)
+        self._probed[probe.key] = 0
         device = self.device.index or 0
         request = _REQUEST.get()
         if request is None:
             return
         stats, room = vt.stats(device), vt.room(device)
         peak, allocated = int(stats["allocated_peak"]), int(stats["allocated_bytes"])
+        self._probed[probe.key] = peak - probe.allocated
         request.first_blocks.append(
             {
                 "block": f"{probe.block.model.component}/{probe.block.path}",
