@@ -151,13 +151,16 @@ models a request needs, from the request alone, on every machine it might send i
     `lane`, `scale`. The row of that card nearest the request; for a card with none, another
     card's, its times scaled by how the two compare; on a card smaller than the row's peak, the
     row measured under the memory budget nearest at or below it; with no GPU, the CPU row.
-    `measured(machine, "generate")` reads another function's rows.
-  - `pow(x, y)` and `sum(list)`.
+    `measured(machine, "generate")` reads another function's rows; `measured(machine, "x", {...})`
+    gives that map until a row of `x` exists (a placeholder).
+  - `pow(x, y)`, `sum(list)`, `min(...)`, `max(...)`.
 - No `ms`: the platform's default, the nearest row scaled. No `size`: the request's
   `megapixels` (or `width` by `height`), `frames`, `steps`, `tokens` and every `duration` summed.
 - Every number in `size`, `machine` and a row is a double: `request.steps` is a whole number, so
   write `double(request.steps)` beside them. `cozy` checks each expression when it reads the
-  package: a field that isn't there, a mixed whole number, or one that gives no number refuses it.
+  package: a field that isn't there, a mixed whole number, or one that gives no number refuses it
+  at describe and publish. A run of a package read otherwise only says so, once, and is sized and
+  timed as if it declared none.
 
 ## Optional
 
