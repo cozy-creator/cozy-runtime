@@ -67,6 +67,7 @@ from cozy_runtime.internal.residency import (
     Level,
     Memory,
     Model,
+    Placeholder,
     Region,
     Request,
     TensorLayout,
@@ -130,6 +131,8 @@ class Backend:
         #: id(module) -> the loaded model (of any construction) and path holding it, and the module
         self.owned: dict[int, tuple[Model, str, object]] = {}
         self.indexed: tuple[int, ...] = ()
+        #: its construction's key: a bake reads only that construction's models (`_owner`)
+        self.key = construction.partition("#")[0]
         self.derived: dict[str, dict[tuple[Module, str], Tensor]] = {}
         #: Persistent buffers the checkpoint does not store (full keys): they keep their values.
         self.unstored: set[str] = set()
@@ -418,9 +421,12 @@ class Backend:
     # -- construction internals
 
     def _owner(self, module: object) -> tuple[Model, str] | None:
-        """The loaded model and module path that hold `module`, when a component this process
-        loaded does, of any construction (H3's turbo overlay is its own). Indexed once per set
-        of loaded models: a fill asks for every hooked linear of every block it fills."""
+        """The loaded model and module path that hold `module`: one of this construction's, its
+        own or another slot's (H3's turbo overlay beside its base); None for tensors the package
+        holds itself. Weights of a model another construction loaded, or of one no longer loaded,
+        refuse: a call reads only what its construction loaded, so a release takes nothing one
+        reads. Indexed once per set of loaded models: a fill asks for every hooked linear of every
+        block it fills."""
         models = list(self.memory.models.values())
         loaded = tuple(map(id, models))
         if loaded != self.indexed:  # a model loaded, closed or reloaded since
@@ -431,7 +437,23 @@ class Backend:
                 for path, sub in model.module.named_modules()
             }
         held = self.owned.get(id(module))
-        return None if held is None or held[2] is not module else (held[0], held[1])
+        if held is not None and held[2] is module:
+            if held[0].construction != self.key:
+                raise CapabilityError(
+                    f"LoRA factors at {held[1]} are weights of {held[0].name}, which another "
+                    "construction loaded: a call reads only the models its own construction loaded",
+                    code="model_not_in_construction",
+                )
+            return held[0], held[1]
+        if isinstance(module, self.torch.nn.Module) and any(
+            isinstance(t, Placeholder) for t in module.parameters()
+        ):
+            raise CapabilityError(
+                "LoRA factors are weights of a model no longer loaded (its construction was "
+                "released): a call reads only the models its own construction loaded",
+                code="model_not_loaded",
+            )
+        return None
 
     @contextmanager
     def _reading(self, module: object) -> Iterator[None]:
@@ -487,6 +509,7 @@ class Backend:
         # At RAM: pages reach the device through placement (passes, the plan, an explicit warm),
         # never at construction (v6 13633 filled the card with H3's transformer before its TE).
         model = self.memory.load(root, Level.RAM)
+        model.construction = self.key
         if self.device.type == "cpu":
             self.widened[name] = tuple(sorted({r.dtype for r in rows.values()} & {"f16", "bf16"}))
             _float32(self.torch, root)
