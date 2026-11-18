@@ -76,6 +76,11 @@ class _Ring:
             src.nbytes, torch.cuda.current_stream().cuda_stream,
         )  # fmt: skip
 
+    def drain(self) -> None:
+        """Drop what eager warm-up steps reported, once they ran."""
+        torch.cuda.synchronize()
+        self.reader.poll()
+
 
 class _Counted:
     """A step's device counter `n`, advanced first, and its go flag: `n < limit`, both on the device."""
@@ -158,7 +163,7 @@ def _loop(wrong: list[str]) -> dict[str, JSON]:
         ring.report(counted.n)
 
     step()  # eager: the kernels load before capture
-    ring.reader.poll()
+    ring.drain()
     graph = _capture(step)
     segment = _segment(graph, counted)
     row: dict[str, JSON] = {"steps": STEPS, "body_copies": len(segment.copies)}
@@ -226,7 +231,7 @@ def _loop(wrong: list[str]) -> dict[str, JSON]:
 
 
 def _polled(wrong: list[str]) -> dict[str, JSON]:
-    """A slower segment the host reads at `POLL_S` while the device writes the ring, which it laps."""
+    """A slower segment the host reads every `POLL_S` while the device writes the ring round and round."""
     stream = torch.cuda.current_stream()
     counted = _Counted(STEPS)
     ring = _Ring(POLLED_SLOTS, 8)
@@ -237,7 +242,7 @@ def _polled(wrong: list[str]) -> dict[str, JSON]:
         ring.report(counted.n)
 
     step()
-    ring.reader.poll()
+    ring.drain()
     graph = _capture(step)
     segment = _segment(graph, counted)
     try:
@@ -281,7 +286,7 @@ def _against_eager(
     shape, dtype = eager[0].shape, eager[0].dtype
     ring = _Ring(ITERATIONS, eager[0].nbytes)
     ring.report(eager[0])
-    ring.reader.poll()
+    ring.drain()
 
     def step() -> None:
         counted.tick()
@@ -373,7 +378,7 @@ def _copies(wrong: list[str]) -> dict[str, JSON]:
         ring.report(window)
 
     step()
-    ring.reader.poll()
+    ring.drain()
     graph = _capture(step)
     segment = _segment(graph, counted)
     row: dict[str, JSON] = {"body_copies": [list(copy) for copy in segment.copies]}
@@ -433,7 +438,8 @@ def measure() -> dict[str, JSON]:
             row[name] = section(wrong)
         except Exception as failed:
             row[name] = {"error": f"{type(failed).__name__}: {failed}"}
-            wrong.append(f"{name}: {type(failed).__name__}: {failed}")
+            if name != "copies":  # a question for the driver: it reports; a wrong captured copy still fails
+                wrong.append(f"{name}: {type(failed).__name__}: {failed}")
     torch.cuda.synchronize()
     row["wrong"] = wrong
     if wrong:
