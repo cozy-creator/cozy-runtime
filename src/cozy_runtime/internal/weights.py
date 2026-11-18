@@ -38,7 +38,6 @@ from cozy_runtime.author._loader import (
 from cozy_runtime.author._model import PLACED, LoRAServing
 from cozy_runtime.internal import execution, lora_bake
 from cozy_runtime.internal.accel import ResidencyError, StaleBinding
-from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding.formats import TORCH_DTYPES, Leaf, LeafProvider, is_conv_declared
 from cozy_runtime.internal.encoding.leaves import sites as leaf_sites
 from cozy_runtime.internal.encoding.selection import (
@@ -323,15 +322,14 @@ class Backend:
         roots = dict(_members(obj))
         live = dict(walked.live)
         stored = {d.key for d in walked.destinations if d.buffer}
-        with placing():
-            for name in walked.components:
-                member = roots.get(name)
-                if not isinstance(member, self.torch.nn.Module):
-                    continue
-                self.roots[name] = member
-                live.update(_weightless_buffers(member, name, stored))
-                self.derived[name] = _derived_values(member, name, self.unstored)
-                _restore_derived(self.derived[name], self.device)
+        for name in walked.components:
+            member = roots.get(name)
+            if not isinstance(member, self.torch.nn.Module):
+                continue
+            self.roots[name] = member
+            live.update(_weightless_buffers(member, name, stored))
+            self.derived[name] = _derived_values(member, name, self.unstored)
+            _restore_derived(self.derived[name], self.device)
         return live
 
     def fill(self, key: str, spec: TensorSpec, destination: TensorLike) -> None:
@@ -565,11 +563,10 @@ class Backend:
             "_forward_hooks_always_called",
         ):
             setattr(leaf, hooks, getattr(replaced, hooks))
-        with placing():
-            for name in leaf._non_persistent_buffers_set:
-                held = leaf._buffers.get(name)
-                if held is not None:
-                    leaf._buffers[name] = torch.empty_like(held, device=self.device)
+        for name in leaf._non_persistent_buffers_set:
+            held = leaf._buffers.get(name)
+            if held is not None:
+                leaf._buffers[name] = torch.empty_like(held, device=self.device)
         setattr(owner, attribute, leaf)
         return leaf, replaced, _derived(leaf, parts)
 

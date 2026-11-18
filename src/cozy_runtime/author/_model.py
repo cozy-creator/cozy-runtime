@@ -66,6 +66,7 @@ from cozy_runtime.author._loader import (
     Mode,
     ModelFitRefused,
     Scheduler,
+    authored,
     loading,
 )
 from cozy_runtime.author._stage_memo import StageMemo, is_memoized, memoized
@@ -1498,9 +1499,11 @@ class ModelRegistry:
                     stack.enter_context(self._substrate())
                 began = time.perf_counter()
                 with loading(loader):
-                    model.load(loader)
+                    authored(model.load, loader)
                 loaded = time.perf_counter()
             exited = time.perf_counter()
+            # The fill and the Runtime's registration, once the construction has ended (`_commit`).
+            loader._commit()
             records = loader.records()
             if not records:
                 raise ConformanceError(
