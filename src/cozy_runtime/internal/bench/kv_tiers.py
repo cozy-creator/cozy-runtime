@@ -173,15 +173,17 @@ def measure() -> dict[str, JSON]:
     else:
         row["host"] = probe["why"]
 
+    unit = host_cache.granularity if host_cache is not None else 1
     d2h_s = 0.0
     with torch.cuda.stream(stream):
         for layer in range(layers):
             values = _values(layer, blocks)
             card[:, layer].copy_(values)
-            if host_cpu is not None:
+            if host_cpu is not None:  # window by window: a copy may not span two registrations
                 stream.synchronize()
                 began = time.perf_counter()
-                host_cpu[layer].copy_(values)
+                for a, b in _windows(layer * blocks * layer_bytes, layer_bytes, blocks, unit):
+                    host_cpu[layer, a:b].copy_(values[a:b])
                 d2h_s += time.perf_counter() - began
             del values
         # Scores a few units wide, so a wrong key shows in the output as surely as a wrong value.
@@ -191,7 +193,6 @@ def measure() -> dict[str, JSON]:
     if host_cpu is not None:
         row["d2h_gb_s"] = layers * blocks * layer_bytes / d2h_s / 1e9
 
-    unit = host_cache.granularity if host_cache is not None else 1
     matrix_bytes = STANDIN_ROWS * STANDIN_COLS * 2
     per_layer = standin_bytes // layers
 
