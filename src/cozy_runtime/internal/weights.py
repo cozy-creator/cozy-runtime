@@ -1308,7 +1308,9 @@ class Placement:
         with ExitStack() as passes:
             for name in sorted(entering):
                 passes.enter_context(self.models[name].passing(method))
-            yield
+            # What the step grows by beside its holds, so the next one holds only what leaves it.
+            with self.memory.growth([self.models[name] for name in entering]):
+                yield
 
     def release(self, keep: Collection[str] = ()) -> None:
         """The holds of components outside `keep`: all of them at the request's end."""
