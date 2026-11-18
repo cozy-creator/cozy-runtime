@@ -109,8 +109,9 @@ ARCHITECTURES = {
 }
 
 #: A routed expert's weight, one per expert here, one stack per layer there. A fused gate and up
-#: becomes two stacks: its first half of rows `ffn_gate_exps`, its second `ffn_up_exps`.
-_EXPERT = re.compile(r"mlp\.experts\.(\d+)\.(gate|up|down|gate_up)_proj\.weight")
+#: (the canonical layout's `gate_and_up_proj`, `accel.moe.RoutedExpert`) becomes two stacks: its
+#: first half of rows `ffn_gate_exps`, its second `ffn_up_exps`.
+_EXPERT = re.compile(r"mlp\.experts\.(\d+)\.(gate|up|down|gate_and_up)_proj\.weight")
 #: The multi-token-prediction layer's own tensors (`_QwenMtpMixin`'s remapper), at block `n_layer`.
 _NEXTN = {
     "fc.weight": "nextn.eh_proj.weight",
@@ -211,7 +212,7 @@ def _place(arch: Architecture, name: str, main: int) -> list[tuple[str, int]] | 
 
 def _layer(arch: Architecture, bid: int, rest: str) -> list[tuple[str, int]] | None:
     if e := _EXPERT.fullmatch(rest):
-        if e.group(2) == "gate_up":
+        if e.group(2) == "gate_and_up":
             return [(f"blk.{bid}.ffn_gate_exps.weight", 2), (f"blk.{bid}.ffn_up_exps.weight", 2)]
         return [(f"blk.{bid}.ffn_{e.group(2)}_exps.weight", 1)]
     tail = arch.layer.get(rest)
