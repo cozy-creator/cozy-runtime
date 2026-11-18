@@ -1,0 +1,1 @@
+The Runtime's TensorFS range admits the open RC's two lines, `tensorfs>=0.26.0,<0.28`: the released 0.26 the RC's builds said until now, and 0.27.0's dev line they move to (xs-216). The floor on a build of that line follows once those builds exist.
