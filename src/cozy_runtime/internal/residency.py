@@ -37,12 +37,11 @@ from cozy_runtime import graphs
 from cozy_runtime.author import _phases, _retained
 from cozy_runtime.author._errors import CapabilityError, DoesNotFit, Fault, fault, is_capacity
 from cozy_runtime.author._model import TRANSPARENT, WARNINGS, WarningRow, recovered
-from cozy_runtime.internal import cache_owners, pacing, proctree
+from cozy_runtime.internal import cache_owners, pacing
 from cozy_runtime.internal.accel import (
     ResidencyError,
     StaleBinding,
     allocation,
-    host_memory,
     release_cached,
 )
 
@@ -86,16 +85,6 @@ def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
 #: Other overlays' pages a block keeps parked: base and a LoRA alternate with one.
 _PARKED = 2
 _HOST_STAGING = 64 << 20
-#: Host RAM that host-resident weights leave free: the host tier's pages, a CPU's held blocks.
-_HOST_HEADROOM = 8 << 30
-
-
-@functools.cache
-def _headroom() -> int:
-    """`_HOST_HEADROOM`, or a quarter of a smaller host's RAM: 8 GiB was half a 16 GB laptop's or
-    CI runner's, whose free RAM was most often less, so every CPU binding was refused (cl-885)."""
-    total = host_memory().total_bytes
-    return min(_HOST_HEADROOM, total // 4) if total > 0 else _HOST_HEADROOM
 
 
 #: Stored float dtypes a CPU executor serves widened to float32 (`weights._float32`).
@@ -1020,7 +1009,7 @@ class Binding:
                     # Bound whole, its blocks cannot stream: past the host's room it refuses as
                     # an allocation would, and a decode streams them per forward instead.
                     missing = sum(b.allocation_bytes for b in self.groups if b.data is None)
-                    if missing and missing > memory._free() - _headroom():
+                    if missing and missing > memory._free():
                         raise torch.OutOfMemoryError(
                             f"{self.model.component}: {missing / (1 << 30):.1f} GiB of float32 "
                             "weights to bind, more than the host can give"
@@ -1366,14 +1355,12 @@ class Memory:
         return max(card - live, 0), said
 
     def _free(self) -> int:
-        """Free bytes where no native owner answers (MPS, CPU). A CPU's is what the host can still
-        give this process: on Linux its tightest cgroup's, page cache counted as room (a pod's
-        `memory.max` is a fraction of the host's MemAvailable)."""
+        """Free bytes where no native owner answers (MPS, CPU). A CPU's is what the host's number
+        leaves this process (`varena.host_room`): host room has that one owner, which keeps the
+        computer's reserve for programs outside cozy and its own headroom. The Runtime kept 8 GiB
+        free besides, or a quarter of a small host (cl-885), tuned until one runner passed."""
         if self.device.type != "mps":
-            if sys.platform == "linux":
-                return max(proctree.available_host_bytes(), 0)
-            else:
-                return host_memory().free_bytes
+            return max(varena.host_room(), 0)
         figures = allocation(torch, "mps")
         free = int(figures["driver_free_bytes"])
         if self.budget_bytes is not None:
@@ -1382,7 +1369,7 @@ class Memory:
 
     def _fitting(self, model: Model, groups: list[_Block]) -> list[_Block]:
         """A CPU step's hold, decided once: the longest prefix of `groups` whose bytes as served
-        fit what the host can still give less its headroom (`_headroom`), once other models' holds
+        fit what the host's number still leaves (`_free`), once other models' holds
         outside the step have gone. The rest stream, read and widened per forward (`_idle`)."""
         request = _REQUEST.get()
         step = request.phase(model.name) if request is not None else frozenset({model.name})
@@ -1390,7 +1377,7 @@ class Memory:
             if other.name not in step and not other.users:
                 for hold in [h for h in other.holds if h.reclaimable]:
                     hold.shed()
-        room = self._free() - _headroom()
+        room = self._free()
         held: list[_Block] = []
         for block in groups:
             room -= 0 if block.data is not None else block.allocation_bytes
