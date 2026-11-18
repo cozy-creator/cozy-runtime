@@ -166,8 +166,7 @@ def _room_line() -> str:
         if not torch.cuda.is_initialized():
             return "a card this process has not started"
         device = torch.cuda.current_device()
-        read = getattr(vt, "refusal", None)  # a TensorFS that keeps its refusals' room
-        refused = cast("Mapping[str, int] | None", read(device) if read is not None else None)
+        refused = cast("Mapping[str, int] | None", vt.refusal(device))
         holders = _holders(device, refused)
     except Exception as exc:  # the line only describes the failure; it never replaces it
         return f"a room that could not be read ({type(exc).__name__})"

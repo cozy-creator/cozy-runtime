@@ -1,0 +1,1 @@
+The Runtime no longer probes for an older TensorFS (`pass_mark`, `Pages.read_ahead`, `Retained`, `varena.fill`, `refusal`): its floor has them all, so those paths were dead, and a binding always fills its blocks together (var-031, hack audit varena #11).

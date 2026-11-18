@@ -126,12 +126,6 @@ _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", defa
 #: The shape key of the component forward running now (`execution.catch.passing`), its passes'
 #: shape where its blocks mark them (`_entered`): 0 where none runs.
 PASS_SHAPE: ContextVar[int] = ContextVar("cozy_pass_shape", default=0)
-#: TensorFS tallies working memory by the pass and site it was born in (`vt.pass_mark`); an older
-#: one has no tally, and nothing is marked.
-_ESCAPES = hasattr(vt, "pass_mark")
-#: TensorFS keeps a derive's pages on disk for later processes and reads pages ahead of their use
-#: (`varena.Pages.read_ahead`); an older one keeps them for the process and reads on demand.
-_DERIVED = hasattr(varena.Pages, "read_ahead")
 _U64 = (1 << 64) - 1
 #: Escaped bytes a run's warning names.
 _NOTED = 256 << 20
@@ -155,24 +149,6 @@ class Weights:
     shard: str = "0/1"
     keys: Collection[str] | None = None
     bound: Mapping[str, str] | None = None
-
-
-class _SlottedSource(Protocol):
-    """`varena.Source` of a TensorFS whose derived pages persist (`_DERIVED`): `slot` names them."""
-
-    def __call__(
-        self,
-        pages: varena.Pages,
-        set: str,
-        block: int,
-        bytes: int,
-        *,
-        checkpoint: object,
-        parts: Sequence[tuple[str, int, int]],
-        page: str | None,
-        derive: Callable[[Tensor], object] | None,
-        slot: str,
-    ) -> varena.Source: ...
 
 
 class Filling(Protocol):
@@ -1892,9 +1868,8 @@ class Memory:
         """Where a call keeps `nbytes` of cross-step state, decided once before its loop: varena
         regions. They stay on the card where half the room nothing live holds takes them, with
         none of it spilled; else each is spilled to a pinned host page behind compute and evicted
-        like a weight, and varena keeps trying to fit them as it does any memory. A TensorFS
-        without retained regions holds the tensors as they are."""
-        if self.native is None or not (hasattr(varena, "Retained") and hasattr(vt, "room")):
+        like a weight, and varena keeps trying to fit them as it does any memory."""
+        if self.native is None:
             return Retained(None)
         room = vt.room(self.device.index or 0)
         card = room["capacity"] - room["working_live"] - room["pinned"]
@@ -1970,21 +1945,9 @@ class Memory:
         derive, slot = None, None
         if model.fill is not None:
             derive = functools.partial(_derive, owner, "region", _bake)
-            if _DERIVED and page is not None:
+            if page is not None:
                 slot = _slot(block, identity, overlay)
-        if slot is None:
-            return varena.Source(
-                self._tier(),
-                model.name,
-                block.index,
-                block.storage_bytes,
-                checkpoint=model.source.ck,
-                parts=parts,
-                page=page,
-                derive=derive,
-            )
-        # A newer TensorFS's (`_DERIVED`), which the pinned stubs do not know yet.
-        return cast(_SlottedSource, varena.Source)(
+        return varena.Source(
             self._tier(),
             model.name,
             block.index,
@@ -2016,9 +1979,8 @@ class Memory:
         time read each alone, serialized (Qwen3.6's 10,541 expert blocks: 37.6 GB at ~1.3 GB/s).
         Each one's Use waits on its block (`_use`). A model whose fill bakes (LoRAs) fills block by
         block: its bake runs on the thread that binds it."""
-        together = getattr(varena, "fill", None)  # a newer TensorFS's
         request = _REQUEST.get()
-        if together is None or not self.cuda or (request is not None and request.idle):
+        if not self.cuda or (request is not None and request.idle):
             return
         wanted = [
             block
@@ -2049,7 +2011,7 @@ class Memory:
             sum(block.nbytes for block in wanted),
             functools.partial(self._unread, model),
         ):
-            uses = together(regions, sources, self._cuda_stream().cuda_stream)
+            uses = varena.fill(regions, sources, self._cuda_stream().cuda_stream)
         for block, use in zip(wanted, uses, strict=True):
             block.prefilled = use
 
@@ -2214,7 +2176,7 @@ class Memory:
         overlay armed inside its forward moved its blocks. A page a derive made in an earlier
         process is read from disk, made again by no one."""
         request = _REQUEST.get()
-        if not _DERIVED or self.pages is None or request is None or request.idle:
+        if self.pages is None or request is None or request.idle:
             return
         request.entered |= names
         active = [m for m in self.models.values() if m.name in names and not m.closed]
@@ -2233,10 +2195,7 @@ class Memory:
         self._coming = {m.name for m in later}
         reading = (active if current else []) + later
         self._staging = [source for model in reading for source in self._staged(model)]
-        # A newer TensorFS's (`_DERIVED`), which the pinned stubs do not know yet.
-        tier = self._tier()
-        read: Callable[[list[varena.Source]], None] = getattr(tier, "read_ahead")  # noqa: B009
-        read(self._staging)
+        self._tier().read_ahead(self._staging)
 
     def _staged(self, model: Model) -> list[varena.Source]:
         """`model`'s raw pages' Sources in block order, under the fill identity its next use wants:
@@ -2797,7 +2756,7 @@ class Memory:
                     request.record_fills()
                     self.pages.request_ended()  # the pages it refilled are their worth
                     self._staging, self._coming = [], set()
-                if _ESCAPES and self.cuda and not idle and torch.cuda.is_initialized():
+                if self.cuda and not idle and torch.cuda.is_initialized():
                     # or a capacity failure raised through here, never a package's own error
                     raised = sys.exc_info()[1]
                     failed = request.failed or (raised is not None and is_capacity(raised))
@@ -3839,7 +3798,7 @@ def uncached(module: nn.Module) -> None:
 
 def _hooks(model: Model) -> None:
     memory = model.memory
-    tally = _ESCAPES and memory.cuda
+    tally = memory.cuda
     if tally:
         model.escape_site = vt.site_id(model.component)
     for entry, sub in (("", model.module), *model.module.named_children()):
