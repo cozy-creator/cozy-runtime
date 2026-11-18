@@ -2915,6 +2915,9 @@ class RequestStats(TypedDict):
     retries: int
     #: `Request.hosted`
     hosted: dict[str, str]
+    #: bytes its host wholes crossed the link by, and the wholes brought back
+    #: (`execution.pinned.crossed`): the reader is a capped run's proof (var-030)
+    host_wholes: NotRequired[dict[str, int]]
     #: `Request.first_blocks`
     first_blocks: list[FirstBlock]
     regrown: int
@@ -3189,6 +3192,12 @@ class Request:
         #: the card's room when its allocation was refused there, else whether selection judged
         #: the package's estimate of it or its measure (`execution.cuts._hosted`)
         self.hosted: dict[str, str] = {}
+        #: per split input shape, the largest room its whole was sent to host in
+        #: (`execution.cuts.split`): a call in a larger room asks the card again. It dies with the
+        #: request, so no other request size or card inherits it.
+        self.host_rooms: dict[str, int] = {}
+        #: `execution.pinned.crossed` as the request began, on a card
+        self.crossed: dict[str, int] | None = None
         #: refusals a CUDA graph capture answered by recording again with room for them
         #: (`graphs.capture`): what runs is the same
         self.regrown = 0
@@ -3216,6 +3225,10 @@ class Request:
         self.allocator = _allocator(memory)
         self._trace: list[FillEntry] = []
         self.ended: RequestStats | None = None
+        if memory.cuda and not idle:
+            from cozy_runtime.internal.execution import pinned  # execution imports residency
+
+            self.crossed = pinned.crossed()
         if memory.cuda and torch.cuda.is_initialized() and not memory.requests:
             # The working peak is process-wide since its reset: alone, a request starts its own,
             # or its floor is the largest decode the process ever ran (sieg: SDXL gave nothing)
@@ -3349,6 +3362,10 @@ class Request:
             "gathered": self.gathered,
             "host": None,
         }
+        if self.crossed is not None:
+            from cozy_runtime.internal.execution import pinned  # execution imports residency
+
+            out["host_wholes"] = {k: n - self.crossed[k] for k, n in pinned.crossed().items()}
         if self.memory.cuda and torch.cuda.is_initialized():
             groups = [b for model in self.memory.models.values() for b in model.groups()]
             out.update(

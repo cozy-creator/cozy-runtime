@@ -73,13 +73,30 @@ def empty(shape: Sequence[int], dtype: torch.dtype, device: torch.device) -> Ten
     return flat[:nbytes].view(dtype).view(tuple(shape))
 
 
+#: bytes that crossed the link for host wholes in this process: by copies to host and to the
+#: card, and by kernels over pinned memory; and the wholes brought back (`cuts.landed`)
+_CROSSED = {"to_host": 0, "to_card": 0, "kernel": 0, "landed": 0}
+
+
+def count(how: str, n: int) -> None:
+    _CROSSED[how] += n
+
+
+def crossed() -> dict[str, int]:
+    """`_CROSSED` now: a request's record is what it added (`Request.stats`)."""
+    return dict(_CROSSED)
+
+
 def write(dst: Tensor, src: Tensor) -> None:
     """`dst.copy_(src)`: into pinned memory a contiguous window is a host copy the stream orders."""
     host = _host(dst)
     if host is not None and dst.is_contiguous():
         host.copy_(src, non_blocking=True)
+        count("to_host", dst.numel() * dst.element_size())
     else:
         dst.copy_(src)  # a strided window of pinned memory: a kernel writes it in place
+        if host is not None:
+            count("kernel", dst.numel() * dst.element_size())
 
 
 def read(src: Tensor) -> Tensor:
@@ -90,6 +107,7 @@ def read(src: Tensor) -> Tensor:
         return src
     out = torch.empty(src.shape, dtype=src.dtype, device=src.device)
     out.copy_(host if src.is_contiguous() else src, non_blocking=True)
+    count("to_card" if src.is_contiguous() else "kernel", src.numel() * src.element_size())
     return out
 
 

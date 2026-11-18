@@ -940,10 +940,12 @@ def split[T](
     first allocation; from then on its measured bytes are the levels' need and it is allocated
     before any window runs (`ahead`), so a card short of it refuses before work is done. Where
     `hostable` and no level fits with the whole on the card, the whole goes to pinned host memory
-    and the levels need only their windows. A host decision holds for its request only (cr-337): a
-    refusal judged on the package's estimate for this call only. `exact` names this call's input
-    shape, which the whole's measure is kept under; `key` leaves out the cut extents, so the levels
-    learned serve every length."""
+    and the levels need only their windows. A host decision is made per use (var-030): its request
+    keeps the largest room this input shape's whole was refused in (`Request.host_rooms`), and a
+    call whose room is larger asks the card again; a refusal judged on the package's estimate
+    holds for its call only. `exact` names this call's input shape, which the whole's measure and
+    that room are kept under; `key` leaves out the cut extents, so the levels learned serve every
+    length."""
     deepest = levels(-(-total // max(finest, 1)))
     site = f"split:{key}"
     request = catch.CURRENT.get()
@@ -964,10 +966,17 @@ def split[T](
     def windows_only(level: int) -> tuple[int, ...]:
         return (*[int(window(level) * item_bytes)] * holds,)
 
-    hsite = f"split:{exact}"  # a host decision holds for this shape: another may fit the card
-    on_host = (
-        hostable and request is not None and request.hosted.get(hsite, _ESTIMATED) != _ESTIMATED
-    )
+    hsite = f"split:{exact}"  # a host decision is this shape's: another may fit the card
+    room, on_host = 0, False
+    if hostable and request is not None:
+        # Per use, from measured room (var-030): on host while the room is no larger than one this
+        # shape's whole was refused in. A refused selection has evicted every weight by then, so
+        # the card is asked again only once something no eviction could move has gone.
+        try:
+            room = _STARTED[hsite] = catch.usable(request)
+            on_host = room <= request.host_rooms.get(hsite, -1)
+        except catch.varena.Error:  # the card's room can't be read now (another thread records)
+            hostable = False
     if not on_host:
         try:
             return catch.cut(
@@ -977,6 +986,8 @@ def split[T](
             if not hostable or request is None:
                 raise
             unwind(exc)
+            if measured is not None:  # judged on the package's estimate: this call only
+                request.host_rooms[hsite] = max(room, request.host_rooms.get(hsite, -1))
             _hosted(request, hsite, name, _ESTIMATED if measured is None else _MEASURED)
     return catch.cut(
         f"{site}:host", deepest, windows_only, lambda level: run(window(level), True), pure=pure
@@ -1008,7 +1019,9 @@ def whole(part: Tensor, shape: Sequence[int], key: str, host: bool, zeros: bool 
             raise exc from None
         unwind(exc)
         request.retries += 1
-        _hosted(request, f"split:{key}", key, room)
+        hsite = f"split:{key}"  # the room its call began with: what the next call compares
+        request.host_rooms[hsite] = max(_STARTED.get(hsite, -1), request.host_rooms.get(hsite, -1))
+        _hosted(request, hsite, key, room)
         return out
 
 
@@ -1048,6 +1061,48 @@ def ahead(key: str, host: bool, zeros: bool) -> Tensor | None:
         ) from None
 
 
+def landed(out: Tensor) -> Tensor:
+    """`out`, a whole kept in host memory, on the card where it now fits: one copy at the link's
+    speed, so what computes on it in place (`split(out=)`) runs on device memory (var-030). `out`
+    itself where it is no host whole, does not fit, or is refused; a refused size is asked again
+    only in a larger room, as a split's host decision is (`Request.host_rooms`)."""
+    request = catch.CURRENT.get()
+    if request is None or _capturing() or not pinned.held(out) or not out.is_contiguous():
+        return out
+    nbytes = out.numel() * out.element_size()
+    site, room = f"land:{nbytes}", catch.usable(request)
+    if nbytes > room or room <= request.host_rooms.get(site, -1):
+        return out
+    try:
+        on_card = pinned.read(out)
+    except BaseException as exc:
+        if not is_capacity(exc):
+            raise
+        unwind(exc)
+        request.retries += 1
+        request.host_rooms[site] = room
+        return out
+    pinned.count("landed", 1)
+    return on_card
+
+
+def staged(window: Tensor) -> Tensor:
+    """A window of a whole kept on host, on the card for an op that writes it in place (`write`
+    copies it back); `window` itself where it is no host window, or the card refuses the copy
+    (it is then written over the link, as before)."""
+    if not pinned.held(window):
+        return window
+    try:
+        return pinned.read(window)
+    except BaseException as exc:
+        request = catch.CURRENT.get()
+        if request is None or not is_capacity(exc):
+            raise
+        unwind(exc)
+        request.retries += 1
+        return window
+
+
 def moved(out: Tensor) -> Tensor:
     """A split's partly written whole on host: the windows it finished come with it."""
     if pinned.held(out) or not out.is_cuda:
@@ -1083,6 +1138,8 @@ def read[X](window: X) -> X:
 
 #: each split call shape's whole output, its shape, dtype and device, as its allocation measured it
 _WHOLES: dict[str, tuple[tuple[int, ...], torch.dtype, torch.device]] = {}
+#: the room (`catch.usable`) each hostable split shape's running call began with
+_STARTED: dict[str, int] = {}
 #: `Request.hosted`'s reason for a whole sent to host without a refusal in the run: selection
 #: judged the package's estimate (for that call only) or the measured whole (for the request)
 _ESTIMATED, _MEASURED = "estimated", "measured"

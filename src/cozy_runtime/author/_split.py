@@ -34,7 +34,8 @@ class Pieces(Protocol):
     (only where `hostable`); `piece` marks each window's start. `whole` is the output windows are
     assembled in (`ahead`: allocated before the first window, where measured), `write` puts a
     window there, `read` brings an input's window to the device and `moved` a partly written
-    whole to host."""
+    whole to host. For `split(out=)`, `landed` brings an `out` kept on host back to the card where
+    it fits, and `staged` a window of one that stays there."""
 
     def split[T](
         self,
@@ -60,6 +61,10 @@ class Pieces(Protocol):
     def ahead(self, key: str, host: bool, zeros: bool) -> Tensor | None: ...
 
     def moved(self, out: Tensor) -> Tensor: ...
+
+    def landed(self, out: Tensor) -> Tensor: ...
+
+    def staged(self, window: Tensor) -> Tensor: ...
 
     def narrowed(self, whole: Tensor, dtype: torch.dtype) -> Tensor: ...
 
@@ -134,7 +139,8 @@ def split[W](
     window of `x` to that window of its result. Without a managing memory it runs whole.
 
     With `out`, `fn(window, out_window)` writes each window's result into the same window of
-    `out`, which `split` returns: nothing whole is allocated beside it, so an op may write its
+    `out`, and `split` returns the tensor that holds them (`out`, or its copy on the device where
+    the memory kept `out` on the host): nothing whole is allocated beside it, so an op may write its
     input's rows in place (H3's block tail into its attention output). Its cuts keep their
     extent: no scale and no overlap.
 
@@ -158,6 +164,8 @@ def split[W](
     pure = out is None and getattr(fn, "PURE_WINDOWS", False)
     if out is not None and any(c.scale != 1 or c.overlap for c in cuts):
         raise ValueError("split(out=) writes windows in place: its cuts take no scale or overlap")
+    if out is not None and runtime is not None:
+        out = runtime.landed(out)  # a whole kept on host comes back to the card where it now fits
     # A blended whole accumulates in float32 (`_run`).
     widen = max(4 // x.element_size(), 1) if any(c.overlap for c in cuts) else 1
     whole = 0 if out is not None or host else _bytes(shape, cuts, x) * widen
@@ -173,7 +181,7 @@ def split[W](
         largest = max(math.prod(b - a for a, b in w) for w in windows) * (
             math.prod(shape) // math.prod(shape[c.dim] for c in cuts)
         )
-        return runtime.split(
+        fixed = runtime.split(
             _name(fn),
             key,
             largest,
@@ -186,13 +194,14 @@ def split[W](
             hostable,
             exact,
         )
+        return fixed if out is None else runtime.landed(fixed)
     if runtime is None or not cuts:
         entire = cast("W", x)  # run whole, `fn` takes `x` as its own window (`Sliceable`)
         if out is None:
             return cast("Callable[[W], Tensor]", fn)(entire)  # no `out`: the first overload
         cast("Callable[[W, Tensor], object]", fn)(entire, out)  # `out`: the second overload
         return out
-    return runtime.split(
+    result = runtime.split(
         _name(fn),
         key,
         math.prod(shape),
@@ -207,6 +216,7 @@ def split[W](
         hostable,
         exact,
     )
+    return result if out is None else runtime.landed(result)
 
 
 @dataclass(frozen=True)
@@ -435,9 +445,17 @@ def _run[W](
             index = [slice(None)] * ndim
             for d, (a, b) in zip(dims, window, strict=True):
                 index[d] = slice(a, b)
-            if runtime is not None:
-                runtime.piece()
-            write(at(index), into[tuple(index)])
+            target = into[tuple(index)]
+            if runtime is None:
+                write(at(index), target)
+                continue
+            runtime.piece()
+            # Nothing computes in place on host memory: a window of a whole kept there is brought
+            # to the card, written, and copied back.
+            staged = runtime.staged(target)
+            write(at(index), staged)
+            if staged is not target:
+                runtime.write(target, staged)
         return into
     fn = cast("Callable[[W], Tensor]", fn)  # no `out`: the first overload
     if len(windows) == 1 and not progress.done:
