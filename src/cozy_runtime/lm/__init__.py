@@ -1493,13 +1493,14 @@ def _pieced(decoder: torch.nn.Module) -> None:
 
         itemsize = tokens.element_size() if tokens.is_floating_point() else 2
         need = _prefill_need(config, rows, length, chunks, itemsize)
-        run = partial(_prefill_level, forward, kwargs, cache, length, chunks)
+        run = partial(_prefill_level, decoder, forward, kwargs, cache, length, chunks)
         return catch.cut(site, sizing.levels(chunks), need, run)
 
     vars(decoder)["forward"], vars(decoder)["_cozy_pieced"] = cut, True
 
 
 def _prefill_level(
+    decoder: torch.nn.Module,
     forward: Callable[..., Any],
     kwargs: dict[str, Any],
     cache: Cache,
@@ -1507,14 +1508,22 @@ def _prefill_level(
     chunks: int,
     level: int,
 ) -> Any:
-    """The decoder's call in 2^level pieces of its prompt, from an empty cache."""
+    """The decoder's call in 2^level pieces of its prompt, from an empty cache. Its tokens are
+    embedded once, before the pieces (the table is read once, beside nothing of the prompt yet),
+    and each piece's states are written where its embeddings were, which no later piece reads:
+    the prompt's states are held once."""
     from cozy_runtime.internal.execution import sizing
 
     _emptied(cache)
     if not level:
         return forward(**kwargs)
+    embeds, ids = kwargs.get("inputs_embeds"), kwargs.get("input_ids")
+    if embeds is None:
+        states = embeds = cast("torch.nn.Module", decoder.get_input_embeddings())(ids)
+    else:  # the caller's own: it may read them again
+        states = torch.empty_like(embeds)
+    kwargs = {**kwargs, "input_ids": None, "inputs_embeds": embeds}
     piece = sizing.pieces(chunks, level) * PREFILL_ALIGN
-    states: list[torch.Tensor] = []
     for at in range(0, length, piece):
         end = min(at + piece, length)
         call = dict(kwargs)
@@ -1524,8 +1533,8 @@ def _prefill_level(
                 seq = value[..., cut] if name in ("position_ids", "cache_position") else None
                 call[name] = value[:, cut] if seq is None else seq
         out = forward(**call)
-        states.append(out[0])
-    out["last_hidden_state"] = torch.cat(states, 1)
+        states[:, at:end] = out[0]
+    out["last_hidden_state"] = states
     return out
 
 
