@@ -518,6 +518,7 @@ class Params:
     presence_penalty: float
     seed: int
     no_repeat_ngram: int | None = None
+    top_k: int = 0
 
 
 class Engine(Protocol):
@@ -576,6 +577,7 @@ class VisionLM(Model[Pipeline]):
         temperature: float,
         top_p: float,
         seed: int,
+        top_k: int = 0,
         progress: Callable[[int], None] | None = None,
         no_repeat_ngram: int | None = None,
         reasoning_effort: str | None = None,
@@ -597,6 +599,7 @@ class VisionLM(Model[Pipeline]):
             presence_penalty=presence_penalty,
             seed=seed,
             no_repeat_ngram=no_repeat_ngram,
+            top_k=top_k,
         )
         shown = [_Words(stop) for _ in questions]
 
@@ -670,6 +673,7 @@ class TransformersEngine:
             "presence_penalty": params.presence_penalty,
             "temperature": params.temperature,
             "top_p": params.top_p,
+            "top_k": params.top_k,
             "seed": params.seed,
             "progress": progress,
             "no_repeat_ngram": params.no_repeat_ngram,
@@ -839,6 +843,7 @@ class _Decoding(TypedDict):
     presence_penalty: float
     temperature: float
     top_p: float
+    top_k: int
     seed: int
     progress: Callable[[int], None] | None
     no_repeat_ngram: int | None
