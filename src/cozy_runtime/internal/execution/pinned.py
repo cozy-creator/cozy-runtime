@@ -3,15 +3,17 @@ output (cr-305).
 
 With unified addressing a kernel reads and writes pinned host pages directly, so a CUDA tensor
 made over them works in any op, at the host link's speed. The Runtime's own copies to and from
-them (`write`, `read`) go through the pinned host tensor as ordinary host copies, so no
-device-to-device copy ever names a host address.
+them (`write`, `read`) are copies the stream orders: a contiguous window an ordinary host copy, a
+window of rows at a fixed pitch (a head window of a whole cut by heads) one pitched copy, so no
+device-to-device copy ever names a host address and no kernel writes a window over the link.
 """
 
 from __future__ import annotations
 
+import ctypes
 import math
 import weakref
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 from torch import Tensor
@@ -74,23 +76,132 @@ def empty(shape: Sequence[int], dtype: torch.dtype, device: torch.device) -> Ten
 
 
 def write(dst: Tensor, src: Tensor) -> None:
-    """`dst.copy_(src)`: into pinned memory a contiguous window is a host copy the stream orders."""
+    """`dst.copy_(src)`: into pinned memory a contiguous window is a host copy the stream orders,
+    a window of rows at a pitch one pitched copy; a kernel writes it in place only where its
+    strides are neither, or `src` is not the same tensor on the card."""
     host = _host(dst)
-    if host is not None and dst.is_contiguous():
+    if host is None:
+        dst.copy_(src)
+        return
+    nbytes = dst.numel() * dst.element_size()
+    if dst.is_contiguous():
         host.copy_(src, non_blocking=True)
-    else:
-        dst.copy_(src)  # a strided window of pinned memory: a kernel writes it in place
+        return
+    rows = _rows(dst)
+    same = src.is_cuda and src.dtype == dst.dtype and src.shape == dst.shape and not held(src)
+    if rows is None or not same or not nbytes:
+        dst.copy_(src)
+        return
+    width, height, pitch = rows
+    src = src.contiguous()
+    _pitched(dst.data_ptr(), pitch, src.data_ptr(), width, width, height, dst.device)
 
 
 def read(src: Tensor) -> Tensor:
     """`src` on the device: a window of pinned memory is copied there, since an op may read its
-    input many times."""
+    input many times; by a pitched copy where it is rows at a pitch."""
     host = _host(src)
     if host is None:
         return src
     out = torch.empty(src.shape, dtype=src.dtype, device=src.device)
-    out.copy_(host if src.is_contiguous() else src, non_blocking=True)
+    nbytes = src.numel() * src.element_size()
+    rows = None if src.is_contiguous() else _rows(src)
+    if src.is_contiguous():
+        out.copy_(host, non_blocking=True)
+    elif rows is not None and nbytes:
+        width, height, pitch = rows
+        _pitched(out.data_ptr(), width, src.data_ptr(), pitch, width, height, src.device)
+    else:
+        out.copy_(src)
+        return out
     return out
+
+
+def _rows(tensor: Tensor) -> tuple[int, int, int] | None:
+    """`tensor`'s bytes as `(width, height, pitch)`: `height` rows of `width` contiguous bytes,
+    `pitch` bytes apart, in its own element order; None where its strides are not that, or no
+    pitched copy is at hand."""
+    if _copy2d() is None:
+        return None
+    dims = [(n, s) for n, s in zip(tensor.shape, tensor.stride(), strict=True) if n != 1]
+    run = 1  # elements in the innermost contiguous run
+    while dims and dims[-1][1] == run:
+        run *= dims.pop()[0]
+    item = tensor.element_size()
+    if not dims:
+        return run * item, 1, run * item
+    height, step = dims.pop()
+    if step < run:
+        return None
+    while dims:  # outer dims fold into the rows where each steps over the ones inside it
+        n, s = dims.pop()
+        if s != step * height:
+            return None
+        height *= n
+    return run * item, height, step * item
+
+
+class _Copy2D(ctypes.Structure):
+    """The driver's `CUDA_MEMCPY2D`."""
+
+    _fields_ = [
+        ("srcXInBytes", ctypes.c_size_t),
+        ("srcY", ctypes.c_size_t),
+        ("srcMemoryType", ctypes.c_int),
+        ("srcHost", ctypes.c_void_p),
+        ("srcDevice", ctypes.c_uint64),
+        ("srcArray", ctypes.c_void_p),
+        ("srcPitch", ctypes.c_size_t),
+        ("dstXInBytes", ctypes.c_size_t),
+        ("dstY", ctypes.c_size_t),
+        ("dstMemoryType", ctypes.c_int),
+        ("dstHost", ctypes.c_void_p),
+        ("dstDevice", ctypes.c_uint64),
+        ("dstArray", ctypes.c_void_p),
+        ("dstPitch", ctypes.c_size_t),
+        ("WidthInBytes", ctypes.c_size_t),
+        ("Height", ctypes.c_size_t),
+    ]
+
+
+_UNIFIED = 4  # CU_MEMORYTYPE_UNIFIED: an address in the unified space, host or device
+#: `cuMemcpy2DAsync` once loaded: None where the driver library has none
+_COPY2D: list[Callable[..., int] | None] = []
+
+
+def _copy2d() -> Callable[..., int] | None:
+    if not _COPY2D:
+        try:
+            fn = ctypes.CDLL("libcuda.so.1").cuMemcpy2DAsync_v2
+        except (OSError, AttributeError):
+            _COPY2D.append(None)
+        else:
+            fn.argtypes = [ctypes.POINTER(_Copy2D), ctypes.c_void_p]
+            fn.restype = ctypes.c_int
+            _COPY2D.append(fn)
+    return _COPY2D[0]
+
+
+def _pitched(
+    dst: int, dpitch: int, src: int, spitch: int, width: int, height: int, device: torch.device
+) -> None:
+    """One copy of `height` rows of `width` bytes, ordered on `device`'s current stream."""
+    copy = _Copy2D(
+        srcMemoryType=_UNIFIED,
+        srcDevice=src,
+        srcPitch=spitch,
+        dstMemoryType=_UNIFIED,
+        dstDevice=dst,
+        dstPitch=dpitch,
+        WidthInBytes=width,
+        Height=height,
+    )
+    fn = _copy2d()
+    assert fn is not None  # `_rows` found it
+    stream = torch.cuda.current_stream(device).cuda_stream
+    code = fn(ctypes.byref(copy), ctypes.c_void_p(stream))
+    if code:
+        raise RuntimeError(f"cuMemcpy2DAsync: {height} rows of {width} bytes, CUresult {code}")
 
 
 def held(tensor: Tensor) -> bool:
