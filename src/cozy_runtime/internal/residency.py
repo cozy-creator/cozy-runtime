@@ -3382,14 +3382,12 @@ def _allocator(memory: Memory) -> dict[str, int]:
     """Cumulative native working-allocator counters; live/backing gauges are separate."""
     if not memory.cuda or memory.native is None:
         return {}
-    stats = cast("Mapping[str, int]", vt.stats(memory.device.index or 0))
+    stats = vt.stats(memory.device.index or 0)
     return {
-        key: int(stats.get(key, 0))  # a TensorFS before rung 5 has no demotions
+        key: int(stats[key])
         for key in (
             "allocations", "frees", "ooms", "driver_memory_calls",
             "event_queries", "event_records", "event_waits", "context_joins",
-            # live working bytes varena moved to host pages, and the moves (cr-305 rung 5)
-            "demoted_total", "demotions",
         )
     }
 

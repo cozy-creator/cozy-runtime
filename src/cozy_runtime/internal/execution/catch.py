@@ -279,8 +279,7 @@ def cut[T](
             LEVELS[key] = level
             note(request, key, name, level, selection)
             try:
-                with fallback(pure and level + 1 < len(menu)):
-                    result = run(level)
+                result = run(level)
             except BaseException as exc:
                 again = retry(device, key, name, menu, level, token, stream, exc, pure)
                 if again is None:
@@ -297,14 +296,6 @@ def cut[T](
 
 #: A nested site's level a refusal moved it to, by key: its next call starts no coarser.
 _NESTED: dict[str, int] = {}
-
-
-def fallback(on: bool) -> AbstractContextManager[object]:
-    """Allocations inside with a cheaper way out than varena moving live tensors to host pages (its
-    last lever, cr-305 rung 5): a finer level of a pure op, or a split's whole on host. A refusal
-    then comes back here, and the cheaper rung runs. An enclosing one holds inside."""
-    set_fallback = getattr(vt, "fallback", None)  # a TensorFS that moves live tensors to host
-    return set_fallback(on) if set_fallback is not None else nullcontext()
 
 
 def nested[T](
@@ -330,8 +321,7 @@ def nested[T](
         LEVELS[key] = level
         note(request, key, name, level)
         try:
-            with fallback(pure and level + 1 < len(menu)):
-                return run(level)
+            return run(level)
         except BaseException as exc:
             if not (pure and is_capacity(exc)) or level + 1 >= len(menu):
                 raise
