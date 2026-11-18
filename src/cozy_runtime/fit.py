@@ -8,16 +8,15 @@ layout the engine declares, so the two can't disagree.
   (MTP) layer; not a vision tower, which only a prefill with pictures reads.
 - `kv`: K and V bytes one token adds at 16 bits, every attention layer's, the draft layer's too.
 - `state`: one row's recurrent state (each gated-delta layer's conv and recurrent state).
-- `step`: an estimate of one row's working bytes beside those (a prefill chunk's widest
-  activations, a drafted step's logits and candidate states), until the function's measured
-  peak on the card replaces it.
+- `step`: an estimate of one row's step room beside those, calibrated to err high on today's `lm`
+  (`STEP_FIXED`), until the function's measured peak on the card replaces it.
 """
 
 from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from math import prod
+from math import ceil, prod
 from typing import TYPE_CHECKING
 
 from tensorfs import raw
@@ -33,6 +32,16 @@ KEY = "decode"
 DEPTH = 2
 #: The most prompt tokens a prefill step computes at once (`lm.PREFILL_TOKENS`).
 CHUNK = 4096
+#: The step estimate is `STEP_MARGIN * (STEP_FIXED + STEP_SLOPE * activations)`, a row's
+#: activations being a prefill chunk's widest, a drafted span's fp32 logits and its candidate
+#: states. The line runs through the most each model needed with today's `lm` (`lm.STEP_ROOM`'s
+#: rows, Qwen3.6, one row drafting, "out of memory with N GiB left"): 27B int8 2.2 GiB
+#: (44080295662; its w4a8 1.9, 44077054825) at 0.740 GiB of activations and 35B-A3B 1.3 GiB
+#: (cl-1119) at 0.270, rounded up; the margin is 1.25. So 2.76 GiB for the 27B, 1.63 for the
+#: 35B-A3B and 1.86 for the 9B.
+STEP_FIXED = 842_000_000
+STEP_SLOPE = 1.92
+STEP_MARGIN = 1.25
 #: The draft head's tensors, kept beside the model's own (`vlm.construct`).
 DRAFT = "mtp."
 #: Each state tensor's alignment in a row's slot (`engine.kv`).
@@ -126,12 +135,13 @@ def numbers(checkpoint: Checkpoint, component: str) -> dict[str, int] | None:
         _int(text, "intermediate_size"), routed + _int(text, "shared_expert_intermediate_size")
     )
     span = DEPTH + 1 if shape.drafts else 1
-    step = CHUNK * (_int(text, "hidden_size") + 2 * wide) * 2 + span * _int(text, "vocab_size") * 4
+    activations = CHUNK * (_int(text, "hidden_size") + 2 * wide) * 2
+    activations += span * _int(text, "vocab_size") * 4 + (span * shape.state if shape.drafts else 0)
     return {
         "bytes": sum(n for key, n in stored.items() if not key.startswith(unread)),
         "kv": shape.kv,
         "state": shape.state,
-        "step": step + (span * shape.state if shape.drafts else 0),
+        "step": ceil(STEP_MARGIN * (STEP_FIXED + STEP_SLOPE * activations)),
     }
 
 
