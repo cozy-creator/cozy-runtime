@@ -70,8 +70,8 @@ from tensorfs.varena import Exhausted
 from cozy_runtime.accel.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT, Context
-from cozy_runtime.author._errors import Cancelled, DoesNotFit, is_capacity
-from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, recovered
+from cozy_runtime.author._errors import Cancelled, DoesNotFit, Fault, fault, is_capacity
+from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded, recovered
 from cozy_runtime.author._services import counting, stage_tokens
 from cozy_runtime import graphs as _graphs
 from cozy_runtime.graphs import (
@@ -3283,6 +3283,12 @@ class _Engine:
                 try:
                     self.partial.append(self._partial(size, state, start, at, graph, stream))
                 except Exception as exc:  # a dev machine's diagnosis never fails its call
+                    # A device fault, a yield or a cancel is the call's, never the diagnosis's.
+                    if isinstance(exc, (Cancelled, Yielded)) or fault(exc) in (
+                        Fault.STICKY,
+                        Fault.DEVICE,
+                    ):
+                        raise
                     said = "no room to check without them" if is_capacity(exc) else "failed"
                     self.partial.append(f"{said}: {type(exc).__name__}: {exc}"[:200])
                     _unwind(exc)
