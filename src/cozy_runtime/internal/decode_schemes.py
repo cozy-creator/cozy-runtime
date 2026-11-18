@@ -26,6 +26,7 @@ from cozy_runtime.internal.decode_cores import (
     round_into,
     unpack,
 )
+from cozy_runtime.internal.encoding import ggml_types
 
 if TYPE_CHECKING:
     from torch import Generator, Tensor
@@ -662,25 +663,10 @@ MXFP4 = Adapter(
     {"block_size": 32, "transposed": True},
 )
 
-# ------------------------------------------------------------------------------- gguf.*
+# ------------------------------------------------------------------------------- ggml.*
 
 #: ggml type: (elements, bytes) per struct
-GGUF = {
-    "q4_0": (32, 18),
-    "q4_1": (32, 20),
-    "q5_0": (32, 22),
-    "q5_1": (32, 24),
-    "q8_0": (32, 34),
-    "q2_k": (256, 84),
-    "q3_k": (256, 110),
-    "q4_k": (256, 144),
-    "q5_k": (256, 176),
-    "q6_k": (256, 210),
-    "mxfp4": (32, 17),
-    "nvfp4": (64, 36),
-    "q1_0": (128, 18),
-    "q2_0": (64, 18),
-}
+GGML = ggml_types.STRUCTS
 #: ggml's kvalues for FP4: E2M1 doubled (spec Appendix A.2)
 KVALUES = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
 
@@ -835,7 +821,7 @@ if HAS_TRITON:
         q = (dc.u8_at(base, 2 + el // 4, mask) >> (2 * (el % 4))) & 3
         return (q - 1).to(tl.float32) * dc.f16_at(base, 0, mask)
 
-    GGUF_KERNELS: dict[str, object] = {
+    GGML_KERNELS: dict[str, object] = {
         "q4_0": _q4_0,
         "q4_1": _q4_1,
         "q5_0": _q5_0,
@@ -852,10 +838,10 @@ if HAS_TRITON:
         "q2_0": _q2_0,
     }
 else:
-    GGUF_KERNELS = {}
+    GGML_KERNELS = {}
 
 
-def _gguf_eager(name: str) -> Callable[[ModuleType, Tensor], Tensor]:
+def _ggml_eager(name: str) -> Callable[[ModuleType, Tensor], Tensor]:
     """ggml's dequantize_row for `name`, every struct of `[count, size]` u8 at once, f32 in ggml's
     order of operations."""
 
@@ -882,7 +868,7 @@ def _gguf_eager(name: str) -> Callable[[ModuleType, Tensor], Tensor]:
             bits: Tensor = torch.where(x >= -126, (x + 127) << 23, 1 << (x.clamp(-149, -127) + 149))
             return bits.to(torch.int32).view(f32)
 
-        t: Tensor = torch.arange(GGUF[name][0], device=s.device)
+        t: Tensor = torch.arange(GGML[name][0], device=s.device)
         if name in ("q4_0", "q4_1", "q5_0", "q5_1"):
             at, base = {"q4_0": (2, 0), "q4_1": (4, 0), "q5_0": (6, 2), "q5_1": (8, 4)}[name]
             q: Tensor = nibbles(at, 16)
@@ -948,8 +934,8 @@ def _gguf_eager(name: str) -> Callable[[ModuleType, Tensor], Tensor]:
     return decode
 
 
-def _gguf_blocks(name: str) -> Callable[[View], Shape]:
-    n, size = GGUF[name]
+def _ggml_blocks(name: str) -> Callable[[View], Shape]:
+    n, size = GGML[name]
 
     def shape(v: View) -> Shape:
         numel = math.prod(v.shape)
@@ -963,7 +949,7 @@ def _gguf_blocks(name: str) -> Callable[[View], Shape]:
 
 
 #: Each struct's F16 fields (byte offsets): finite in a sample.
-GGUF_F16 = {
+GGML_F16 = {
     "q4_0": (0,),
     "q4_1": (0, 2),
     "q5_0": (0,),
@@ -981,11 +967,11 @@ GGUF_F16 = {
 }
 
 
-def _gguf_fix(name: str) -> Callable[[ModuleType, View, dict[str, Tensor]], None]:
+def _ggml_fix(name: str) -> Callable[[ModuleType, View, dict[str, Tensor]], None]:
     def fix(torch: ModuleType, v: View, parts: dict[str, Tensor]) -> None:
-        size = GGUF[name][1]
+        size = GGML[name][1]
         structs = parts["blocks"].reshape(-1, size)
-        for at in GGUF_F16[name]:
+        for at in GGML_F16[name]:
             d = (torch.randn(structs.shape[0]) * 0.05).to(torch.float16)
             structs[:, at : at + 2] = d.view(torch.uint8).reshape(-1, 2)
         if name == "mxfp4":  # its E8M0 exponent, near 1
@@ -994,8 +980,8 @@ def _gguf_fix(name: str) -> Callable[[ModuleType, View, dict[str, Tensor]], None
     return fix
 
 
-def _gguf(name: str) -> Adapter:
-    n, size = GGUF[name]
+def _ggml(name: str) -> Adapter:
+    n, size = GGML[name]
 
     def decode(
         c: Cores,
@@ -1009,25 +995,25 @@ def _gguf(name: str) -> Adapter:
             n,
             size,
             out,
-            kernel_fn=GGUF_KERNELS.get(name),
-            eager_fn=_gguf_eager(name),
+            kernel_fn=GGML_KERNELS.get(name),
+            eager_fn=_ggml_eager(name),
             post=parts.get("scale"),
         )
 
-    parts: tuple[Part, ...] = (Part("blocks", ("u8",), _gguf_blocks(name)),)
+    parts: tuple[Part, ...] = (Part("blocks", ("u8",), _ggml_blocks(name)),)
     if name == "nvfp4":
         parts += (
             Part("scale", ("f32",), _count(1), required=False),
             Part("input_scale", ("f32",), _count(1), required=False),
         )
     return Adapter(
-        f"gguf.{name}",
+        f"ggml.{name}",
         {"block_size": (n,)},
         parts,
         decode,
         {"block_size": n},
         flat=True,
-        fix=_gguf_fix(name),
+        fix=_ggml_fix(name),
     )
 
 
@@ -1415,7 +1401,7 @@ ADAPTERS: tuple[Adapter, ...] = (
     MXFP8,
     FP8_BLOCKWISE,
     MXFP4,
-    *(_gguf(name) for name in GGUF),
+    *(_ggml(name) for name in GGML),
     *(_gptq(bits) for bits in (2, 3, 4, 8)),
     AWQ_INT4,
     *(_ct(bits) for bits in range(1, 9)),
