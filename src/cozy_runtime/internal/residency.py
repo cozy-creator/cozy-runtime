@@ -620,6 +620,9 @@ class Model:
         #: its loop's head site in the escaped-memory tally, and one block's weights with its common
         self.escape_site = 0
         self.escape_floor: int | None = None
+        #: loops streaming it (`gathering`): an embedding table of it that left the device gathers
+        #: its rows on the host instead of filling whole again
+        self.gathers = 0
 
     def sites_in(self, groups: Iterable[_Block]) -> list[_Site]:
         """The weight sites `groups` hold, mapped once: a LoRA bake binds one source block per
@@ -681,7 +684,8 @@ class Model:
         `reserve` bytes and room for the largest of the rest to stream through, largest first. A
         binding over them, which the caller prepares and holds while the loop runs, so each
         forward reads only the others again; with the bytes kept and those still read a forward.
-        None when none fits. An embedding table is no block a forward reads whole (`_Block.table`)."""
+        None when none fits. An embedding table is no block a forward reads whole: under the loop
+        it gathers its rows on the host (`gathering`)."""
         if self.memory.native is None:
             return None
         # The common group (embeddings, the head, final norms) serves every forward, entered
@@ -710,6 +714,21 @@ class Model:
             return Binding(self, kept), held, sum(b.least_bytes for b in used) - held
         finally:
             self._release()
+
+    @contextmanager
+    def gathering(self) -> Iterator[None]:
+        """While a loop streams it (`keep`): its embedding tables, which `keep` leaves no room,
+        serve from their device page while varena keeps it and otherwise gather their rows on the
+        host (`Memory._gather`), never filling whole again. Filled whole, a table took the room
+        the loop's working memory had, which took it back the next token: MiniMax-H3-Image's
+        expander on a 4090 refilled its 2.37 GiB table 685 times in 1,573 tokens (cr-332)."""
+        with self.memory.lock:
+            self.gathers += 1
+        try:
+            yield
+        finally:
+            with self.memory.lock:
+                self.gathers -= 1
 
     def retain(self, paths: Collection[str] = ("",)) -> Binding:
         self._claim()
@@ -2417,8 +2436,19 @@ class Memory:
                 if block.escape_site and request is not None and not request.idle and not capturing:
                     block.born_before = self._entered(block, request)
                 try:
-                    self._ensure(block, reclaim, overlay)
-                    block.gathered = None
+                    gathered = block.gathered is not None and block.gathered[0] == overlay
+                    if (
+                        block.table
+                        and model.gathers
+                        and self.native is not None
+                        and not capturing
+                        and (gathered or not block.cached())
+                    ):  # `Model.gathering`: on the host, it stays there to the loop's end
+                        with nullcontext() if gathered else self._read_told(block):
+                            self._gather(block, overlay)
+                    else:
+                        self._ensure(block, reclaim, overlay)
+                        block.gathered = None
                 except Exhausted:  # varena refused its region before its forward ran
                     if not (reclaim and self.cuda and not capturing):
                         raise

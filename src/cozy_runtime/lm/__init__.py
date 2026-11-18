@@ -1156,6 +1156,7 @@ class _Keeper:
             return
         if steps == 1:  # the prompt's token: the decode begins
             self.since, self.decoded = time.monotonic_ns(), time.perf_counter()
+            self.held.enter_context(self.placed[0].gathering(self.placed[1]))
             return
         self.again = False
         try:

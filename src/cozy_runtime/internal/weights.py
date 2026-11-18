@@ -1343,6 +1343,9 @@ class Placement:
     def keep(self, component: str, since_ns: int, reserve: int) -> tuple[Binding, int, int] | None:
         return self.models[component].keep(since_ns, reserve)
 
+    def gathering(self, component: str) -> AbstractContextManager[None]:
+        return self.models[component].gathering()
+
     def represent(
         self, component: str, dtype: torch.dtype, *, resident_only: bool = False
     ) -> Callable[[], None]:

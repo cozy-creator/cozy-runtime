@@ -343,6 +343,11 @@ class Residency(Protocol):
         read a forward; None when none fits."""
         ...
 
+    def gathering(self, component: str) -> AbstractContextManager[None]:
+        """While a loop streams it: its embedding tables gather their rows on the host once
+        their device page has gone, never filling whole again."""
+        ...
+
     def represent(
         self, component: str, dtype: torch.dtype, *, resident_only: bool = False
     ) -> Callable[[], None]:
