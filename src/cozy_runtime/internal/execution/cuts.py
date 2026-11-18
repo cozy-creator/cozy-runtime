@@ -980,14 +980,20 @@ def split[T](
             hostable = False
     if not on_host:
         try:
+            fallback = hostable and request is not None  # a refusal here sends the whole to host
             return catch.cut(
-                site, deepest, need, lambda level: run(window(level), False), pure=pure
+                site,
+                deepest,
+                need,
+                lambda level: run(window(level), False),
+                pure=pure,
+                last=not fallback,
             )
         except catch.Unplaced as exc:  # refused before a window ran (or the op is pure)
             if not hostable or request is None:
                 raise
             unwind(exc)
-            if measured is not None:  # judged on the package's estimate: this call only
+            if measured is not None:  # judged on its measure: later calls in no larger room too
                 request.host_rooms[hsite] = max(room, request.host_rooms.get(hsite, -1))
             _hosted(request, hsite, name, _ESTIMATED if measured is None else _MEASURED)
     return catch.cut(

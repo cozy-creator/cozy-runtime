@@ -2994,6 +2994,9 @@ class SplitRecord(TypedDict):
     levels: dict[str, int]
     chosen: dict[str, SplitChoice]
     refused: NotRequired[SplitRefusal]
+    #: calls run at the finest level without a native choice: only a measured peak refused it
+    #: (`execution.catch.unselected`); the reader is a capped run's proof (var-030)
+    unselected: NotRequired[int]
 
 
 class TorchStats(TypedDict):
