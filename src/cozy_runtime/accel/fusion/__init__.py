@@ -382,9 +382,7 @@ if TYPE_CHECKING:
         provider: str
 
         def served(self, x: Tensor) -> bool: ...
-        def convolve(
-            self, module: ModuleType, q: Tensor, qs: Tensor, residual: Tensor | None, dtype: torch.dtype
-        ) -> Tensor | None: ...
+        def encoded(self) -> _conv8.Filter: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -1543,7 +1541,8 @@ class ConvBlocks:
     are the int8 conv leaves of an int8 lane (`encoding.leaves.Int8ConvRotConvLeaf`), and each `silu(norm(x))` in front
     of one is a single pass that also rotates and quantizes it (`accel.fusion._conv8`): a GroupNorm over the whole
     sample (all its frames), its affine and any modulation folded into one per-channel affine. A residual rides the
-    conv's epilogue. `blocks` declare the forwards Runtime takes over: `ConvResidual` (with a `ConvModulation`, its
+    conv's epilogue. Each conv runs in bands of frames where the room is short (`_conv8.cut`), as the Conv3d it stands
+    for is cut, and a step's output goes over the intermediate it read. `blocks` declare the forwards Runtime takes over: `ConvResidual` (with a `ConvModulation`, its
     forward takes `(x, emb)`) and `TemporalMix`. A block whose convs are not int8 leaves (a 16-bit lane), a card or
     shape the kernels do not serve, runs eager."""
 
@@ -1581,10 +1580,11 @@ class ConvBlocks:
 
 @dataclass(frozen=True, slots=True)
 class _BlocksSite:
-    """An installed `ConvBlocks` block: its declaration and the device it serves on."""
+    """An installed `ConvBlocks` block: its declaration, the device it serves on and its path (its cuts' sites)."""
 
     declared: ConvResidual | TemporalMix
     index: int
+    path: str
 
 
 def _int8_leaf(module: nn.Module | None) -> bool:
@@ -1628,14 +1628,16 @@ def _int8_residual_forward(self: nn.Module, x: Tensor, *args: object, **kwargs: 
             scale, shift = made.reshape(made.shape[0], -1).chunk(2, dim=1)
         mean, rstd = _conv8.stats(module, h, norm.num_groups, norm.eps)
         a, b = _conv8.affine(mean, rstd, norm.weight, norm.bias, scale, shift)
-        q, qs = _conv8.quantize(module, h, a, b, silu=True)
         residual = None
         if at == len(steps) - 1:
             shortcut = None if declared.shortcut is None else self.get_submodule(declared.shortcut)
             residual = rows
             if shortcut is not None and type(shortcut) is not torch.nn.Identity:
                 residual = _rows(cast("Tensor", shortcut(x)))
-        out = conv.convolve(module, q, qs, residual, x.dtype)
+        # Cut by frames as the Conv3d it stands for is; a step's own intermediate is dead once read, so the next
+        # step's output goes over it.
+        out = _conv8.cut(f"{site.path}:frames#{at}", module, h, a, b, conv.encoded(), x.dtype,
+                         residual=residual, into=None if h is rows else h)  # fmt: skip
         if out is None:
             raise RuntimeError(f"cozy conv8: a served conv of {type(self).__name__} was refused")
         h = out
@@ -1657,8 +1659,8 @@ def _int8_temporal_forward(self: nn.Module, x: Tensor, *args: object, **kwargs: 
     a, b = _conv8.affine(mean, rstd, norm.weight, norm.bias)
     taps = depthwise.weight.float().reshape(_conv8.CHANNELS, _conv8.TEMPORAL_TAPS)
     bias = None if depthwise.bias is None else depthwise.bias.float()
-    q, qs = _conv8.temporal(module, rows, a, b, taps, bias)
-    out = pointwise.convolve(module, q, qs, rows, x.dtype)
+    out = _conv8.cut(f"{site.path}:frames", module, rows, a, b, pointwise.encoded(), x.dtype, mix=(taps, bias),
+                     residual=rows)  # fmt: skip
     if out is None:
         raise RuntimeError(f"cozy conv8: the pointwise conv of {type(self).__name__} was refused")
     return out.permute(0, 4, 1, 2, 3)
@@ -1735,7 +1737,7 @@ def install_conv_blocks(plan: Plan, layout: ConvBlocks, *roots: nn.Module) -> st
                 if type(block) is not declared.block or "forward" in vars(block):
                     continue
                 _check_blocks(declared, block, path)
-                sites.append((block, kind, _BlocksSite(declared, index)))
+                sites.append((block, kind, _BlocksSite(declared, index, path)))
     except _Mismatch as exc:
         return report(str(exc))
     read = [

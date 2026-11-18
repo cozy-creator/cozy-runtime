@@ -65,6 +65,9 @@ from cozy_runtime.internal.encoding.formats import (
     to_blocked,
 )
 
+if TYPE_CHECKING:
+    from cozy_runtime.accel.fusion import _conv8
+
 NVFP4 = "cozy.nvfp4.native-leaf/1"
 CONV8 = "cozy.int8-convrot.conv-leaf/1"
 MXFP8 = "cozy.mxfp8.native-leaf/2"
@@ -664,9 +667,7 @@ class _ConvLeaf(Protocol):
 
     def __call__(self, x: Tensor, /) -> Tensor: ...
     def served(self, x: Tensor) -> bool: ...
-    def convolve(
-        self, module: ModuleType, q: Tensor, qs: Tensor, residual: Tensor | None, dtype: Dtype
-    ) -> Tensor | None: ...
+    def encoded(self) -> _conv8.Filter: ...
 
 
 class _ConvLeafClass(Protocol):
@@ -757,8 +758,8 @@ def _conv_leaf_class(torch: ModuleType) -> _ConvLeafClass:
                     n = int(x.shape[0])
                     rows = x.contiguous(memory_format=torch.channels_last_3d).permute(0, 2, 3, 4, 1)
                     one = torch.ones((n, _conv8.CHANNELS), dtype=torch.float32, device=x.device)
-                    q, qs = _conv8.quantize(module, rows, one, torch.zeros_like(one), silu=False)
-                    fused = self.convolve(module, q, qs, None, x.dtype)
+                    # In bands of frames where the room is short, as the Conv3d it stands for is cut.
+                    fused = _conv8.cut(None, module, rows, one, torch.zeros_like(one), self.encoded(), x.dtype, silu=False)
                     if fused is not None:
                         return fused.permute(0, 4, 1, 2, 3)
             bias = None if self.bias is None else self.bias.to(x.dtype)
@@ -767,16 +768,12 @@ def _conv_leaf_class(torch: ModuleType) -> _ConvLeafClass:
             )
             return eager
 
-        def convolve(
-            self, module: ModuleType, q: Tensor, qs: Tensor, residual: Tensor | None, dtype: Dtype
-        ) -> Tensor | None:
-            """`_conv8.conv` with this filter, its bias and `residual` (NDHWC), on quantized rows; None where the
-            kernels do not serve it."""
+        def encoded(self) -> _conv8.Filter:
+            """This filter, its scales a (output channel, tap) and its f32 bias, as `_conv8` convolves it."""
             assert isinstance(self.padding, tuple)
             pad = cast("tuple[int, int, int]", self.padding)
             bias = None if self.bias is None else self.bias.float()
-            scale = self.scale.reshape(self.out_channels, -1)
-            return _conv8.conv(module, q, qs, self.weight, scale, bias, residual, pad, dtype)
+            return _conv8.Filter(self.weight, self.scale.reshape(self.out_channels, -1), bias, pad)
 
         def extra_repr(self) -> str:
             return (
