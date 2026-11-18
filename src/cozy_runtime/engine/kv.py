@@ -310,6 +310,21 @@ class KvManager:
         )
         return mapping
 
+    def slot(self, row: int) -> int:
+        """`row`'s state slot."""
+        return self._slots[row]
+
+    def committed(self, row: int) -> int:
+        """The positions of `row` its mapped blocks hold: no step may write at or past it."""
+        return len(self._held[row]) * self.layout.block_tokens
+
+    def token_slots(self, row: int, start: int, count: int) -> Tensor:
+        """The token slots (int64 `[count]`) of `row`'s positions `start + [0, count)`, all of them
+        on mapped blocks (`reserve_ahead` first)."""
+        tokens, held = self.layout.block_tokens, self._held[row]
+        at = range(start, start + count)
+        return self._ints([held[p // tokens] * tokens + p % tokens for p in at], torch.int64)
+
     def settle(self, row: int, length: int) -> None:
         """The host read `row`'s length back: `reserve_ahead` counts from it."""
         self._known[row] = length
