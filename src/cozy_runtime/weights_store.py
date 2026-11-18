@@ -26,7 +26,7 @@ from tensorfs import Checkpoint as Checkpoint
 from tensorfs import TensorMetadata as TensorMetadata
 from tensorfs import raw
 
-from cozy_runtime import canonical_json
+from cozy_runtime import canonical_json, fit
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._errors import CapabilityError
 
@@ -195,6 +195,8 @@ class Derivation:
     order: Sequence[tuple[str, str]] = ()
     #: The header's `provenance`: the recipe that writes it (`derive.recipes`).
     provenance: Mapping[str, MetadataInput] | None = None
+    #: The components whose `fit.KEY` numbers the header carries: a decode-phase model's.
+    decode: Sequence[str] = ()
 
     def work(self, max_new_bytes: int) -> DerivationWork:
         """The derivation as its replay key reads it."""
@@ -252,6 +254,7 @@ class Output:
         self.store, self.slot, self.transaction = store, slot, transaction
         self.max_new_bytes, self.written = max_new_bytes, 0
         self.order = tuple(derivation.order)
+        self.decode = tuple(derivation.decode)
         self._fresh = derivation.base is None and not derivation.sources
         #: each component a write may name, declared as its base (else first source) declares it
         froms = (*reversed(derivation.sources), *([derivation.base] if derivation.base else []))
@@ -592,7 +595,33 @@ class Output:
                 self.component(component).order(ordered)
             self.done = self._writer.commit()
             self.close()
+        if self.decode:
+            self.done = self._decoded(self.done)
         return self.done
+
+    def _decoded(self, ck: Checkpoint) -> Checkpoint:
+        """`ck` with its decode numbers (`fit.numbers`) in its header: they need its tensors'
+        stored bytes, so they are written over it in a commit of their own, its chunks reused."""
+        numbers = {c: n for c in self.decode if c in ck.components and (n := fit.numbers(ck, c))}
+        if not numbers or ck.metadata.get(fit.KEY) == numbers:
+            return ck
+        writer = tensorfs.Writer(
+            base=ck,
+            repo_id=derived_model_id(self.transaction),
+            lane=self.slot,
+            cache_dir=self.store,
+        )
+        try:
+            # A writer drops its base's provenance (spec §4): the same recipe wrote these tensors.
+            if "provenance" in ck.metadata:
+                writer.metadata["provenance"] = ck.metadata["provenance"]
+            writer.metadata[fit.KEY] = cast("MetadataInput", numbers)
+            decoded = writer.commit()
+        except BaseException:
+            writer.abandon()
+            raise
+        ck.close()
+        return decoded
 
     def _spend(self, nbytes: int) -> None:
         self.written += nbytes
