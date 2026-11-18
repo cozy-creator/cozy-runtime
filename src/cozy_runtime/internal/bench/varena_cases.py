@@ -684,6 +684,15 @@ def batch_shapes() -> Row:
     return bench.measure()
 
 
+@case
+def engine_step() -> Row:
+    """The engine's decode step on a small random Qwen3.5 against Transformers' forward: plain,
+    drafted, four rows in one bucket and one alone, the step's graph (`bench/engine_step.py`)."""
+    from cozy_runtime.internal.bench import engine_step as bench
+
+    return bench.measure()
+
+
 def main(name: str) -> None:
     function = CASES.get(name)
     if function is None:
