@@ -355,3 +355,22 @@ if not TRITON_ABSENT:
             words_out = state_ptr.to(tl.pointer_type(tl.int32))
             src = words_in + row * scratch_stride + kept.to(tl.int64) * scratch_step
             tl.store(words_out + slot.to(tl.int64) * slot_stride + w, tl.load(src + w, mask=ok), mask=ok)
+
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
+    def rms_norm_kernel(  # type: ignore[no-untyped-def]
+        x_ptr,
+        w_ptr,
+        out_ptr,
+        width,
+        eps,
+        BLOCK: tl.constexpr,
+    ):
+        """`Qwen3_5RMSNorm` for one row of `width`, one launch for every row: in f32, times 1 + the
+        weight, rounded once to the output's dtype, as Transformers rounds it."""
+        row = tl.program_id(0)
+        c = tl.arange(0, BLOCK)
+        ok = c < width
+        x = tl.load(x_ptr + row * width + c, mask=ok, other=0.0).to(tl.float32)
+        rms = tl.rsqrt(tl.sum(x * x, axis=0) / width + eps)
+        w = tl.load(w_ptr + c, mask=ok, other=0.0).to(tl.float32)
+        tl.store(out_ptr + row * width + c, (x * rms * (1.0 + w)).to(out_ptr.dtype.element_ty), mask=ok)

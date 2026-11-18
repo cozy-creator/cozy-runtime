@@ -117,7 +117,10 @@ class Request:
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int = 0
-    penalty: float = 0.0
+    min_p: float = 0.0
+    presence: float = 0.0
+    frequency: float = 0.0
+    repetition: float = 1.0
     seed: int = 0
 
 
@@ -160,7 +163,8 @@ class Decoder:
             return torch.zeros(max_rows, dtype=dtype, device=device)
 
         #: the rows' decoding, at fixed addresses a graph holds; each call fills them
-        self.decoding = (full(torch.float32), full(torch.float32), full(torch.int64), full(torch.float32), full(torch.int64))
+        self.decoding = tuple(full(t) for t in (torch.float32, torch.float32, torch.int64, torch.float32,
+                                                    torch.float32, torch.float32, torch.float32, torch.int64))  # fmt: skip
         #: a bucket's step and its graph, by (rows, drafted, sampled, top_k kept)
         self.steps: dict[tuple[int, bool, bool, int], tuple[Step, torch.cuda.CUDAGraph | None]] = {}
         #: the step's weights, retained from the model's placement where it has one, and the
@@ -203,14 +207,16 @@ class Decoder:
 
     def _sampling(self, request: Request, size: int) -> Sampling:
         sampled = request.temperature > 0
+        # Every row of a call samples alike, so a top-k bounds every sampling row's draw.
         kept = request.top_k if sampled and request.top_k > 0 else 0
-        temperature, top_p, top_k, penalty, seed = self.decoding
-        temperature.fill_(request.temperature)
-        top_p.fill_(request.top_p)
-        top_k.fill_(request.top_k if sampled else 0)
-        penalty.fill_(request.penalty)
-        seed.fill_(request.seed)
-        return Sampling(temperature, top_p, top_k, penalty, seed, kept=kept, sampled=sampled)
+        penalized = bool(request.presence or request.frequency or request.repetition != 1.0)
+        values = (request.temperature, request.top_p, request.top_k if sampled else 0, request.min_p,
+                  request.presence, request.frequency, request.repetition, request.seed)  # fmt: skip
+        for tensor, value in zip(self.decoding, values, strict=True):
+            tensor.fill_(value)
+        temperature, top_p, top_k, min_p, presence, frequency, repetition, seed = self.decoding
+        return Sampling(temperature, top_p, top_k, min_p, presence, frequency, repetition, seed,
+                        kept=kept, sampled=sampled, penalized=penalized)  # fmt: skip
 
     # ------------------------------------------------------------------ prefill
 
@@ -226,9 +232,11 @@ class Decoder:
         cache = DynamicCache(config=hf.config.get_text_config(decoder=True))  # type: ignore[arg-type]  # its own config type
         out = hf.get_decoder()(input_ids=ids, past_key_values=cache, use_cache=True)
         y = out.last_hidden_state[0]  # [P, hidden], final-normed
+        r.counts[row].zero_()
+        r.prompt[row].zero_()
+        r.prompt[row, ids[0]] = True
         logits = qwen.logits(y[-1:])
-        seen = torch.zeros_like(logits)
-        scores = sampling.keep(logits, 1) - sampling.penalty[:1, None] * seen
+        scores = sampling.penalties(logits, 1, r.counts[row : row + 1], r.prompt[row : row + 1])
         first = int(sampling.pick(scores, 1, torch.zeros(1, dtype=torch.long, device=self.device))[0])
         slots = kv.admit(row, length, drafted=drafted)
         for layer, index in qwen.slot_of.items():
@@ -253,8 +261,7 @@ class Decoder:
             r.stops[row, : len(stops)] = torch.tensor(stops, dtype=torch.long, device=self.device)
         r.done[row] = first in stops or request.max_new <= 1
         r.delta[row] = 0
-        r.seen[row].zero_()
-        r.seen[row, first] = 1.0
+        r.counts[row, first] += 1.0
         r.budget[row] = kv.committed(row)
         return first
 
