@@ -126,6 +126,39 @@ def generate(ctx: Context, payload: Request, model: Flow, upsampler: Upsampler, 
 - `ctx.need("edit_model")`: what only the run itself learns. The fetch starts at once, ahead of
   every other download, while the function goes on.
 
+## What a request costs
+
+Say what a request's cost depends on, and how, beside `needs=`. The planner computes it with the
+models a request needs, from the request alone, on every machine it might send it to:
+
+```python
+@app.tool(label="Shot", named="shot", needs=_SHOT_NEEDS, estimate={
+    "size": {"seconds": "sum(request.beats.map(b, double(b.duration)))",
+             "steps": "request.turbo ? 8.0 : 40.0"},
+    "ms": "measured(machine).warm_ms * pow(size.seconds / measured(machine).request.seconds, 1.05)"
+          " * size.steps / 8.0",
+})
+```
+
+- `size`: each variable a request's cost depends on, named freely, one CEL number over `request`.
+  A run's record keeps them as its size; `cozy package benchmarks` writes them as its rows'
+  `request`. One that gives no number for a request is left out, and the run says so once.
+- `ms`, `cold_ms`, `peak_device_bytes`, `peak_host_bytes`: optional CEL numbers over `request`,
+  `size` and `machine` (`gpu`, `gpus`, `memory_bytes`, `lane`, `cpu`, `cores`, `threads`). They
+  call three helpers:
+  - `measured(machine)`: the package's own `benchmarks.json` row for that machine: `warm_ms`,
+    `cold_ms`, `peak_device_bytes`, `peak_host_bytes`, `budget_bytes`, `request` (its size), `gpu`,
+    `lane`, `scale`. The row of that card nearest the request; for a card with none, another
+    card's, its times scaled by how the two compare; on a card smaller than the row's peak, the
+    row measured under the memory budget nearest at or below it; with no GPU, the CPU row.
+    `measured(machine, "generate")` reads another function's rows.
+  - `pow(x, y)` and `sum(list)`.
+- No `ms`: the platform's default, the nearest row scaled. No `size`: the request's
+  `megapixels` (or `width` by `height`), `frames`, `steps`, `tokens` and every `duration` summed.
+- Every number in `size`, `machine` and a row is a double: `request.steps` is a whole number, so
+  write `double(request.steps)` beside them. `cozy` checks each expression when it reads the
+  package: a field that isn't there, a mixed whole number, or one that gives no number refuses it.
+
 ## Optional
 
 - `@uses_components("vae")` on a Model method: a hint. The Runtime fetches and holds those
