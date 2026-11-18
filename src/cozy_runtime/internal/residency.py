@@ -1891,7 +1891,8 @@ class Memory:
             source = self._source(block, final=final)
             # Its set: varena packs a component's small units into shared pages (cr-317).
             set_ = f"{block.model.content}/final" if final else block.model.content
-            region = self._device_native().region(size, source, set_)
+            # The type check pins TensorFS 0.25.0, whose stub has no `set` (cozy-creator#3837).
+            region = self._device_native().region(size, source, set_)  # type: ignore[call-arg]
             setattr(block, field, region)
             if not final:
                 self._sources[region] = source
