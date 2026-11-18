@@ -1,0 +1,1 @@
+A cut site lists every level down to its finest window, not only to 1/64 of level 0's bytes: a site whose need is its windows (a split whose whole is on host, an encode's tiles) can go down to one window a piece when the card has no room for more. Levels past the first within 1/64 of the finest's bytes, where a whole output is the need, are still left out (var-030).
