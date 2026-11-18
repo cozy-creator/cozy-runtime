@@ -169,8 +169,9 @@ BUCKETS = (1, 2, 4, 8, 16)
 DRAFT_ROWS = 4
 #: The most the draft head's prompt pass holds of attention scores at once (`_drafted_prompt`).
 DRAFT_SCORES = 256 << 20
-#: The most prompt tokens a gated-delta-net layer's prefill computes at once (`_prefill_pieces`).
-PREFILL_TOKENS = 4096
+#: The most one fp32 copy of a gated-delta-net layer's prefill piece holds: its queries, keys,
+#: values and chunk decays, every row (`_prefill_pieces`). The torch path holds several copies.
+PREFILL_BYTES = 256 << 20
 
 
 #: Generation-config fields that add a logits processor to greedy decoding, and their no-op values.
@@ -637,11 +638,13 @@ def _conv_slot(original: _ConvUpdate, launch: Launch) -> _ConvUpdate:
 
 
 def _prefill_pieces(original: _DeltaRule) -> _DeltaRule:
-    """A gated-delta-net layer's prompt in pieces of `PREFILL_TOKENS`, each starting from the
+    """A gated-delta-net layer's prompt in pieces within `PREFILL_BYTES`, each starting from the
     recurrent state the one before ended on: the torch path holds several fp32 copies of a
     piece's queries, keys, values and decays, so a long prompt's held all at once (Qwen3.5's
-    upsampler at 31,804 tokens, 6.3 GiB live under an 8 GiB cap, run 46625). Pieces end on its
-    chunk boundaries, so each chunk is computed as in the whole call."""
+    upsampler at 31,804 tokens, 6.3 GiB live under an 8 GiB cap, run 46625). A piece is sized by
+    all its rows and the layer's own widths: 16 rows of 4,096 tokens on Qwen3.8-27B asked 1.5 GiB
+    for one of its tensors (cr-344). Pieces end on its chunk boundaries, so each chunk is
+    computed as in the whole call."""
 
     def pieces(
         query: torch.Tensor,
@@ -655,8 +658,10 @@ def _prefill_pieces(original: _DeltaRule) -> _DeltaRule:
         use_qk_l2norm_in_kernel: bool = False,
         **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        length = int(query.shape[1])
-        piece = max(chunk_size, PREFILL_TOKENS // chunk_size * chunk_size)
+        rows, length = int(query.shape[0]), int(query.shape[1])
+        widths = query.shape[2:].numel() + key.shape[2:].numel() + value.shape[2:].numel()
+        token = 4 * rows * (widths + int(value.shape[2]) * chunk_size)  # + each head's decays
+        piece = max(chunk_size, PREFILL_BYTES // max(token, 1) // chunk_size * chunk_size)
         if length <= piece or kwargs.get("cu_seqlens") is not None:
             return original(
                 query, key, value, g, beta, chunk_size=chunk_size, initial_state=initial_state,
