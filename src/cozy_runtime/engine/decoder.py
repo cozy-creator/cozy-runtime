@@ -9,7 +9,9 @@ row's prompt is prefilled alone, text only. The step itself is the engine's whol
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import contextlib
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Protocol, cast
 
@@ -75,6 +77,16 @@ class _Model(Protocol):
     mtp: _Head
 
     def get_decoder(self) -> _Decoder: ...
+
+
+class _Binding(Protocol):
+    """A placement's retained weights (`Residency.retain`)."""
+
+    identity: object
+
+    def valid(self) -> bool: ...
+
+    def prepare(self) -> contextlib.AbstractContextManager[object]: ...
 
 
 class _Keys(Protocol):
@@ -151,6 +163,10 @@ class Decoder:
         self.decoding = (full(torch.float32), full(torch.float32), full(torch.int64), full(torch.float32), full(torch.int64))
         #: a bucket's step and its graph, by (rows, drafted, sampled, top_k kept)
         self.steps: dict[tuple[int, bool, bool, int], tuple[Step, torch.cuda.CUDAGraph | None]] = {}
+        #: the step's weights, retained from the model's placement where it has one, and the
+        #: identity the graphs above were recorded against
+        self.binding: object | None = None
+        self.recorded: object | None = None
 
     # ------------------------------------------------------------------ a call
 
@@ -267,6 +283,35 @@ class Decoder:
         kv.write(mine, held.keys[0].transpose(0, 1), held.values[0].transpose(0, 1), slots)
         return mtp.norm(x)[0, -1]
 
+    # ------------------------------------------------------------------ weights
+
+    @contextmanager
+    def _leased(self) -> Iterator[None]:
+        """The weights a step reads (the language model, its head and, drafting, the draft head)
+        held where they are while a graph records or replays: varena moves no Region a graph
+        holds the address of. A model with no placement (a bench's plain tensors) holds nothing.
+        Where the binding's identity changed since the graphs were recorded, they are dropped."""
+        from cozy_runtime.author._model import PLACED
+
+        placed = PLACED.get(self.model)
+        if placed is None:
+            yield
+            return
+        residency, name = placed
+        binding = cast("_Binding | None", self.binding)
+        if binding is None or not binding.valid():
+            model = self.model
+            reads = (model.get_decoder(), model.get_output_embeddings(), getattr(model, "mtp", None))  # type: ignore[operator]  # Transformers'
+            wanted = {id(m) for m in reads if m is not None}
+            paths = tuple(n for n, m in model.named_modules() if n and id(m) in wanted) or ("",)
+            binding = cast("_Binding", residency.retain(name, paths))
+            self.binding = binding
+        with binding.prepare():
+            if self.recorded is not None and self.recorded != binding.identity:
+                self.steps.clear()
+            self.recorded = binding.identity
+            yield
+
     # ------------------------------------------------------------------ decode
 
     def _decode(
@@ -291,17 +336,20 @@ class Decoder:
                     kv.settle(row, int(kv.lengths[row]))
                     kv.reserve_ahead(row, (SEGMENT + 1) * reach)
                     r.budget[row] = kv.committed(row)
-            for k in range(SEGMENT):
-                if graph is not None:
-                    graph.replay()
-                elif made.steps and key not in self.steps:  # the second step is recorded, then run
-                    graph = self._capture(step, made)
-                    self.steps[key] = (step, graph)
-                    graph.replay() if graph is not None else step()
-                else:
-                    step()
-                ring[k].copy_(r.report[:size])
-                made.steps += 1
+            with self._leased():
+                if key not in self.steps and graph is not None:
+                    graph = None  # recorded against weights that have since moved
+                for k in range(SEGMENT):
+                    if graph is not None:
+                        graph.replay()
+                    elif made.steps and key not in self.steps:  # the second step is recorded, then run
+                        graph = self._capture(step, made)
+                        self.steps[key] = (step, graph)
+                        graph.replay() if graph is not None else step()
+                    else:
+                        step()
+                    ring[k].copy_(r.report[:size])
+                    made.steps += 1
             self.stream.synchronize()
             for k, report in enumerate(ring.cpu().tolist()):
                 for row in range(rows):
