@@ -124,6 +124,8 @@ _DTYPES = {
     )
 }
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
+#: A placement's fills run here (`Memory._place`): what their derives bake, the call waits on.
+_PLACING: ContextVar[bool] = ContextVar("cozy_residency_placing", default=False)
 #: The shape key of the component forward running now (`execution.catch.passing`), its passes'
 #: shape where its blocks mark them (`_entered`): 0 where none runs.
 PASS_SHAPE: ContextVar[int] = ContextVar("cozy_pass_shape", default=0)
@@ -2223,6 +2225,34 @@ class Memory:
         self._staging = [source for model in reading for source in self._staged(model)]
         self._tier().read_ahead(self._staging)
 
+    def read_ahead_models(self, models: Iterable[Model]) -> None:
+        """cr-330: a call's models read into the host tier as its attempt opens, before its first
+        phase, largest first: a group's follower opens when the group's call reaches it, and its
+        first phase is its conditioner (PRO6-61's GPU 1 read its 27 GB text encoder on demand, 7.1 s
+        of a 20.4 s condition). Each phase's own read ahead goes on from what this queued
+        (`_coming`), and a page already read is not read again."""
+        if self.pages is None:
+            return
+        with self.lock:
+            if self._active_beside(_REQUEST.get()):
+                return  # the queue is another call's now
+            # A many-model call opens each slot's attempt in turn: the queue is all of theirs.
+            queued = [m for m in self.models.values() if m.name in self._coming]
+            wanted = sorted(
+                {
+                    m
+                    for m in (*queued, *models)
+                    if not m.closed and not all(b.cached() for b in m.groups())
+                },
+                key=lambda m: -sum(b.storage_bytes for b in m.groups()),
+            )
+            staging = [source for model in wanted for source in self._staged(model)]
+            if not staging:
+                return
+            self._coming = {m.name for m in wanted}
+            self._staging = staging
+            self._tier().read_ahead(self._staging)
+
     def _staged(self, model: Model) -> list[varena.Source]:
         """`model`'s raw pages' Sources in block order, under the fill identity its next use wants:
         its Regions' where they are current, else made for the read alone."""
@@ -2298,6 +2328,68 @@ class Memory:
             with self.lock:
                 block.loading = False
 
+    def _place(self, first: _Block, overlay: Hashable, request: Request) -> None:
+        """cr-330: a LoRA-baked model's absent blocks filled and baked together at its first
+        demand under `overlay`, on this thread, before its forward computes. The core's fill worker
+        fills ahead only what needs no caller, so each block's bake waited inline for the step's
+        work before it (PRO6-61: step 1 72.5 s against 61.8 s). The core admits each by the rule its
+        worker follows (`Region.use_ahead`: the phase's measured working memory beside it, idle
+        weights of earlier phases going for it), here where its derive can run; one it declines
+        fills as its forward reaches it. Each stays the core's cache, unpinned: one evicted before
+        use refills from the page its bake kept. The call waits on all of it, its reads and its
+        bakes (`_PLACING`): one spell of its load."""
+        model = first.model
+        key = (model.name, overlay)
+        if key in request.placed or request.idle or self.native is None or self.capturing():
+            return
+        with self.lock:
+            if self._active_beside(request):
+                return  # another call's room is not this one's to take
+        request.placed.add(key)
+        assert model.fill is not None
+        blocks: list[_Block] = []
+        for block in model.groups():
+            if (
+                block is first
+                or block.data is not None
+                or block.count
+                or block.retained
+                or block.loading
+                or block.table
+                or not block.storage_bytes
+                or block.final_only()
+                or model.fill.overlay(block.path, block.parts) != overlay
+            ):
+                continue
+            if block.overlay != overlay:
+                if block.paged() or block.parked:
+                    continue  # its own entry moves it (`_switch_overlay`)
+                block.overlay = overlay
+            if not block.cached():
+                blocks.append(block)
+        if not blocks:
+            return
+        stream = self._cuda_stream().cuda_stream
+        name = f"loading {model.component}"
+        spell = _phases.begin(
+            name, name, unit="bytes", total=functools.partial(self._unread, model), row=name
+        )
+        token = _PLACING.set(True)
+        try:
+            for block in blocks:
+                use = self._native_region(block).use_ahead(stream)
+                if use is None:
+                    continue  # declined: no room by the core's rule, or its fill already runs
+                request.first_read(block)
+                if spell is not None:
+                    spell[0].add(block.nbytes)
+                del use  # unpinned: the next use on this stream finds it filled
+        except Exhausted:
+            pass  # room went: the rest fill as their forward reaches them
+        finally:
+            _PLACING.reset(token)
+            _phases.end(spell)
+
     def _read_told(self, block: _Block) -> AbstractContextManager[None]:
         """A read of `block`'s weights, told as its component's load (`_phases.loading`): none for
         one resident. A block this request read before is read again (paging): its step's time."""
@@ -2334,8 +2426,9 @@ class Memory:
                     read_bytes += part.nbytes
                     views[role] = _view(key, role, part, raw)
             if block.model.fill is not None:
-                baking = Bake.begin(self.stream())
-                bake = baking.end(self.stream()) if block.model.fill(block.path, data) else None
+                with _phases.aside():
+                    baking = Bake.begin(self.stream())
+                    bake = baking.end(self.stream()) if block.model.fill(block.path, data) else None
                 block.overlay = overlay
         finally:
             if (request := _REQUEST.get()) is not None and read_bytes:
@@ -2528,6 +2621,8 @@ class Memory:
                         with nullcontext() if gathered else self._read_told(block):
                             self._gather(block, overlay)
                     else:
+                        if reclaim and request is not None and model.fill is not None:
+                            self._place(block, overlay, request)
                         self._ensure(block, reclaim, overlay)
                         block.gathered = None
                 except Exhausted:  # varena refused its region before its forward ran
@@ -3342,6 +3437,8 @@ class Request:
         self.heads: dict[Model, tuple[set[int], int]] = {}
         #: the models whose phases this request entered: what it has not is read ahead
         self.entered: set[str] = set()
+        #: each baked model and overlay whose blocks this request placed together (`Memory._place`)
+        self.placed: set[tuple[str, Hashable]] = set()
         #: the blocks it read (`Memory._read_told`), by identity: one read again is paging
         self.read_blocks: set[int] = set()
         #: the attempt failed (its executor says): a refused allocation in its last pass is learned
@@ -3676,12 +3773,14 @@ def _derive(
 ) -> bool:
     """A Source's computed bytes, on the thread that called `use`. A failed one may have exported
     storage to its code: its Region's identity retires, those exports keep their own pins and
-    never see a later fill's bytes."""
+    never see a later fill's bytes. Its time is its step's work, not the read's wait (cr-330)."""
     block = owner()
     if block is None:
         raise ResidencyError("a fill's block is gone")
+    waited: AbstractContextManager[None] = nullcontext() if _PLACING.get() else _phases.aside()
     try:
-        return write(block, view)
+        with waited:
+            return write(block, view)
     except BaseException:
         block.model.memory._retire_phase_plan("weight_fill_failed", model=block.model)
         setattr(block, field, None)

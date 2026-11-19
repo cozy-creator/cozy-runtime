@@ -5,7 +5,11 @@ A phase that has held its call `SHOWN_S` shows as `<stage> / <name>` with its nu
 a second, and when it ends the stage shows its own name again. Its time is then off the stage and
 step clocks (`_activity.off_clock`) and its own row of the record, so a first step that read its
 weights does not read as the steps' pace. A load or a burst of compiles is a run of spells: it ends
-once its call has spent `IDLE_S` on other work, or a load once it has read all it had to.
+once its call has spent `IDLE_S` on other work, or a load once it has read all it had to. A run
+shows only while its call waits in one of its spells (it did at the watcher's last look too), and
+its stage says its own name between them: a step that reads each block as it reaches it and then
+computes is that step (cr-330: PRO6-61's step 1 read as "loading" throughout). What a spell does
+for its call that is not its wait (a fill's derive, a LoRA bake) is `aside`.
 
 A phase is told where its call runs: the attempt's live lane under the stage open on its thread
 (`attempt`, `_services`), else the executor command it serves (`command`, the executor); anywhere
@@ -97,6 +101,8 @@ class Phase:
     since: float | None = None
     #: When its last spell ended (it opened): a run idle `IDLE_S` since has ended.
     last: float = field(default_factory=time.perf_counter)
+    #: Its call waited in a spell at the watcher's last look.
+    waiting: bool = False
     shown: bool = False
     told_at: float = 0.0
     told: int = -1
@@ -189,7 +195,52 @@ def _begin(phase: Phase, nests: bool = True) -> tuple[float, bool]:
     began = time.perf_counter()
     if phase.since is None:
         phase.since = began
+    _open().append(_Open(phase))
     return began, depth == 0
+
+
+@dataclass(eq=False, slots=True)
+class _Open:
+    """A spell open on this thread, and the seconds set aside inside it (`aside`)."""
+
+    phase: Phase
+    aside: float = 0.0
+
+
+def _open() -> list[_Open]:
+    """This thread's open spells, innermost last."""
+    spells: list[_Open] | None = getattr(_LOCAL, "spells", None)
+    if spells is None:
+        spells = _LOCAL.spells = []
+    return spells
+
+
+def _closed(phase: Phase) -> float:
+    """The innermost open spell of `phase` on this thread closes: the seconds set aside in it."""
+    spells = _open()
+    for at in range(len(spells) - 1, -1, -1):
+        if spells[at].phase is phase:
+            return spells.pop(at).aside
+    return 0.0
+
+
+@contextlib.contextmanager
+def aside() -> Iterator[None]:
+    """What the spells open on this thread do for their call that is not its wait (a fill's
+    derive: a LoRA bake is its step's GPU work, cr-330): none of their time, nor held while it
+    runs."""
+    spells = list(_open())
+    began = time.perf_counter()
+    for spell in spells:
+        spell.phase.since = None
+    try:
+        yield
+    finally:
+        now = time.perf_counter()
+        for spell in spells:
+            spell.aside += now - began
+            if not spell.phase.ended:
+                spell.phase.since = now
 
 
 def _close(
@@ -201,7 +252,7 @@ def _close(
     if nests:
         _LOCAL.depth = getattr(_LOCAL, "depth", 1) - 1
     now = time.perf_counter()
-    spent = now - began
+    spent = max(0.0, now - began - _closed(phase))
     phase.since, phase.last = None, now
     phase.held += spent
     if outermost and not clocked:
@@ -309,6 +360,7 @@ def drop(spell: Spell | None) -> None:
     run, _, _, _, nests = spell
     if nests:
         _LOCAL.depth = getattr(_LOCAL, "depth", 1) - 1
+    _closed(run)
     run.since, run.last = None, time.perf_counter()
 
 
@@ -373,7 +425,14 @@ def _look(phase: Phase, now: float) -> None:
         _end(phase)
         return
     held = phase.held + (now - phase.since if phase.since is not None else 0.0)
+    waited, phase.waiting = phase.waiting, phase.since is not None
     if phase.quiet or held < SHOWN_S:
+        return
+    if phase.run and not (waited and phase.waiting):
+        # Its call is not waiting on it now: the stage it is in says what it does.
+        if phase.shown and not phase.waiting:
+            phase.shown = False
+            phase.teller.back()
         return
     if phase.shown:
         since = now - phase.told_at
