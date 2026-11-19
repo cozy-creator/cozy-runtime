@@ -1591,6 +1591,15 @@ def _ggml_leaf_class(torch: ModuleType) -> _LeafClass:
                 torch, x, blocks, self.encoding, self.out_features, bias, out_dtype
             )
 
+        def product(self, x: Tensor) -> Tensor:
+            """The linear in f32, as llama.cpp's kernels write it, with no rounding to the
+            model's dtype: for a caller whose next op rounds it where the model does (the
+            engine's fused kernels), which saves a cast a call."""
+            blocks, bias = read(self.blocks), read(self.bias)
+            return ggml_linear.linear(
+                torch, x, blocks, self.encoding, self.out_features, bias, torch.float32
+            )
+
     class GgmlEmbedding(_leaf_class(torch)):  # type: ignore[misc]
         """A token table in ggml blocks, as llama.cpp's get_rows reads one: only the looked-up
         rows decode."""

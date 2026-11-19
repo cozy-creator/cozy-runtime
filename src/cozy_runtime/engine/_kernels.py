@@ -130,8 +130,9 @@ if not TRITON_ABSENT:
             at = (entry * L + layer) * 2 * T * KVH * D + (slot % T) * KVH * D
             hd = tl.arange(0, KVH * D)
             src = (row * S + s) * KVH * D + hd
-            tl.store(card_ptr + at + hd, tl.load(k_ptr + src))
-            tl.store(card_ptr + at + T * KVH * D + hd, tl.load(v_ptr + src))
+            dtype = card_ptr.dtype.element_ty  # an f32 product is rounded to the cache's dtype here
+            tl.store(card_ptr + at + hd, tl.load(k_ptr + src).to(dtype))
+            tl.store(card_ptr + at + T * KVH * D + hd, tl.load(v_ptr + src).to(dtype))
 
     @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
     def paged_step_kernel(  # type: ignore[no-untyped-def]
@@ -256,7 +257,8 @@ if not TRITON_ABSENT:
             k2 = tl.load(weight_ptr + c * (W + 1) + 2, mask=ok, other=0.0).to(tl.float32)
             k3 = tl.load(weight_ptr + c * (W + 1) + 3, mask=ok, other=0.0).to(tl.float32)
             for t in tl.static_range(S):
-                x = tl.load(x_ptr + (row * S + t) * channels + c, mask=ok, other=0.0).to(tl.float32)
+                x = tl.load(x_ptr + (row * S + t) * channels + c, mask=ok, other=0.0)
+                x = x.to(out_ptr.dtype.element_ty).to(tl.float32)  # an f32 product, rounded as the model's linear
                 y = (k0 * w0 + k1 * w1 + k2 * w2 + k3 * x).to(tl.bfloat16).to(tl.float32)
                 tl.store(out_ptr + (row * S + t) * channels + c, (y * tl.sigmoid(y)).to(tl.bfloat16), mask=ok)
                 w0, w1, w2 = w1, w2, x
@@ -332,9 +334,10 @@ if not TRITON_ABSENT:
                     g = tl.load(a_ptr + at * heads + h).to(tl.float32)
                     beta = tl.load(b_ptr + at * heads + h).to(tl.float32)
                 else:
-                    raw = tl.load(b_ptr + at * heads + h)
-                    beta = tl.sigmoid(raw.to(tl.float32)).to(raw.dtype).to(tl.float32)
-                    a = tl.load(a_ptr + at * heads + h).to(tl.float32) + bias
+                    dtype = out_ptr.dtype.element_ty  # a and b rounded to it first, as the model's linears
+                    raw = tl.load(b_ptr + at * heads + h).to(dtype)
+                    beta = tl.sigmoid(raw.to(tl.float32)).to(dtype).to(tl.float32)
+                    a = tl.load(a_ptr + at * heads + h).to(dtype).to(tl.float32) + bias
                     g = decay * tl.where(a > 20.0, a, libdevice.log1p(tl.exp(a)))  # softplus, torch's threshold
                 state = state * tl.exp(g)
                 delta = (v - tl.sum(state * k[:, None], axis=0)) * beta
@@ -411,26 +414,27 @@ if not TRITON_ABSENT:
         y = joined.to(out_ptr.dtype.element_ty)
         if GATED:
             raw = tl.load(gate_ptr + (row * S + s).to(tl.int64) * gate_stride + h * gate_head + d)
+            raw = raw.to(out_ptr.dtype.element_ty)
             sig = tl.sigmoid(raw.to(tl.float32)).to(raw.dtype)
             y = (y.to(tl.float32) * sig.to(tl.float32)).to(out_ptr.dtype.element_ty)
         tl.store(out_ptr + ((row * S + s).to(tl.int64) * heads + h) * D + d, y)
 
     @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
-    def _normed_rotated(src, w_ptr, pos, inv_ptr, eps, D: tl.constexpr, R: tl.constexpr):  # type: ignore[no-untyped-def]
-        """`Qwen3_5RMSNorm` of one head (`D` at `src`), rounded to its dtype, then the split-half
-        RoPE of its first `R` at text position `pos`: each product and the sum rounded to that
-        dtype, cos and sin of position * inverse frequency rounded to it first, as Transformers'
+    def _normed_rotated(src, w_ptr, pos, inv_ptr, eps, out_ptr, D: tl.constexpr, R: tl.constexpr):  # type: ignore[no-untyped-def]
+        """`Qwen3_5RMSNorm` of one head (`D` at `src`, rounded to `out_ptr`'s dtype first: an f32
+        product is the model's linear rounded), rounded to that dtype, then the split-half RoPE of
+        its first `R` at text position `pos`: each product and the sum rounded to that dtype, cos
+        and sin of position * inverse frequency rounded to it first, as Transformers'
         `apply_rotary_pos_emb` computes them in the model's dtype."""
         c = tl.arange(0, D)
-        raw = tl.load(src + c)
-        dtype = raw.dtype
-        x = raw.to(tl.float32)
+        dtype = out_ptr.dtype.element_ty
+        x = tl.load(src + c).to(dtype).to(tl.float32)
         rms = tl.rsqrt(tl.sum(x * x, axis=0) / D + eps)
         n = (x * rms * (1.0 + tl.load(w_ptr + c).to(tl.float32))).to(dtype)
         rotary = c < R
         half = R // 2
         partner = tl.where(c < half, c + half, c - half)
-        xp = tl.load(src + partner, mask=rotary, other=0.0).to(tl.float32)
+        xp = tl.load(src + partner, mask=rotary, other=0.0).to(dtype).to(tl.float32)
         wp = tl.load(w_ptr + partner, mask=rotary, other=0.0).to(tl.float32)
         np_ = (xp * rms * (1.0 + wp)).to(dtype).to(tl.float32)
         turned = tl.where(c < half, -np_, np_)
@@ -467,11 +471,11 @@ if not TRITON_ABSENT:
         c = tl.arange(0, D)
         pos = tl.load(positions_ptr + rs).to(tl.float32)
         if h < heads:
-            y = _normed_rotated(q_ptr + (rs * heads + h) * q_stride, q_w_ptr, pos, inv_ptr, eps, D, R)
+            y = _normed_rotated(q_ptr + (rs * heads + h) * q_stride, q_w_ptr, pos, inv_ptr, eps, q_out_ptr, D, R)
             tl.store(q_out_ptr + (rs * heads + h) * D + c, y)
         else:
             kh = h - heads
-            y = _normed_rotated(k_ptr + (rs * kv_heads + kh) * D, k_w_ptr, pos, inv_ptr, eps, D, R)
+            y = _normed_rotated(k_ptr + (rs * kv_heads + kh) * D, k_w_ptr, pos, inv_ptr, eps, k_out_ptr, D, R)
             tl.store(k_out_ptr + (rs * kv_heads + kh) * D + c, y)
 
     @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
@@ -482,15 +486,15 @@ if not TRITON_ABSENT:
         width,
         BLOCK: tl.constexpr,
     ):
-        """An MLP's SiLU(gate) * up, one launch: SiLU rounded to the gate's dtype, the product to
-        the output's, as Transformers computes `act_fn(gate_proj(x)) * up_proj(x)`."""
+        """An MLP's SiLU(gate) * up, one launch: gate and up rounded to the output's dtype, SiLU
+        rounded to it, the product to it, as Transformers computes `act_fn(gate_proj(x)) * up_proj(x)`."""
         row = tl.program_id(0).to(tl.int64)
         c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         ok = c < width
-        raw = tl.load(gate_ptr + row * width + c, mask=ok, other=0.0)
-        g = raw.to(tl.float32)
-        act = (g / (1.0 + tl.exp(-g))).to(raw.dtype).to(tl.float32)
-        up = tl.load(up_ptr + row * width + c, mask=ok, other=0.0).to(tl.float32)
+        dtype = out_ptr.dtype.element_ty  # f32 products are rounded to it first, as the model's linears
+        g = tl.load(gate_ptr + row * width + c, mask=ok, other=0.0).to(dtype).to(tl.float32)
+        act = (g / (1.0 + tl.exp(-g))).to(dtype).to(tl.float32)
+        up = tl.load(up_ptr + row * width + c, mask=ok, other=0.0).to(dtype).to(tl.float32)
         tl.store(out_ptr + row * width + c, (act * up).to(out_ptr.dtype.element_ty), mask=ok)
 
     @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
@@ -510,7 +514,8 @@ if not TRITON_ABSENT:
         c = tl.arange(0, BLOCK)
         ok = c < width
         raw = tl.load(x_ptr + row * width + c, mask=ok, other=0.0)
-        y = (raw.to(tl.float32) + tl.load(h_ptr + row * width + c, mask=ok, other=0.0).to(tl.float32)).to(raw.dtype)
+        h = tl.load(h_ptr + row * width + c, mask=ok, other=0.0).to(raw.dtype)  # an f32 product, rounded
+        y = (raw.to(tl.float32) + h.to(tl.float32)).to(raw.dtype)
         tl.store(sum_ptr + row * width + c, y, mask=ok)
         x = y.to(tl.float32)
         rms = tl.rsqrt(tl.sum(x * x, axis=0) / width + eps)
@@ -538,7 +543,7 @@ if not TRITON_ABSENT:
         y = tl.load(w_ptr + c).to(tl.float32) * y
         if WEIGHT_ROUNDS:
             y = y.to(raw.dtype).to(tl.float32)
-        z = tl.load(gate_ptr + row * D + c).to(tl.float32)
+        z = tl.load(gate_ptr + row * D + c).to(raw.dtype).to(tl.float32)  # an f32 product, rounded
         tl.store(out_ptr + row * D + c, (y * (z * tl.sigmoid(z))).to(out_ptr.dtype.element_ty))
 
     @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
