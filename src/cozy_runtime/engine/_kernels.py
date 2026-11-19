@@ -151,7 +151,6 @@ if not TRITON_ABSENT:
         host_layer,
         host_blocks,
         first_seen,
-        window,
         scale,
         L: tl.constexpr,
         S: tl.constexpr,
@@ -163,10 +162,9 @@ if not TRITON_ABSENT:
         P: tl.constexpr,
     ):
         """As `paged_partial_kernel`, for a step of `S` queries a row (its token and its drafts),
-        causal within the span: query `s` sees positions `[first_seen, length + s]`, and with a
-        `window` above 0 (a sliding layer's) only the last `window` of them, where `length` is
-        where the step's first query sits and its own K/V is already written (the draft head's
-        layer has no K/V at position 0: it sees from 1). The `S * G`
+        causal within the span: query `s` sees positions `[first_seen, length + s]`, where
+        `length` is where the step's first query sits and its own K/V is already written (the
+        draft head's layer has no K/V at position 0: it sees from 1). The `S * G`
         query heads sharing K/V head `kvh` read each block once (`Q` is that, rounded up to a
         power of two). q is `[rows, S, heads, D]`; parts `[rows * KVH, P, S * G]`."""
         rk = tl.program_id(0)
@@ -210,7 +208,6 @@ if not TRITON_ABSENT:
             sc = tl.sum(q[:, None, :] * k[None, :, :], axis=2)
             pos = (i * T + t)[None, :]
             seen = (pos >= first_seen) & (pos <= sees[:, None])
-            seen = seen & ((window <= 0) | (pos > sees[:, None] - window))
             sc = tl.where(seen & live[:, None], sc, float("-inf"))
             m_new = tl.maximum(m, tl.max(sc, axis=1))
             m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)

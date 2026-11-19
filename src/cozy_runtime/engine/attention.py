@@ -1,6 +1,6 @@
 """Paged decode attention (cr-336): a step's queries over each row's K/V, read through its block
 table (`paged_step`: the step's own K/V written through `slot_mapping` first, the verify span
-causal within it, a sliding layer's window). `register` serves it as a Transformers attention
+causal within it). `register` serves it as a Transformers attention
 implementation (`NAME`), for a caller that runs a model's own forward over the engine's K/V
 (`lm`): the step it sets in `PAGED` attends.
 
@@ -136,7 +136,6 @@ def paged_step(
     scale: float,
     first_seen: int = 0,
     gate: Tensor | None = None,
-    window: int = 0,
     fused: bool = True,
     run: Run = JIT,
 ) -> Tensor:
@@ -145,8 +144,7 @@ def paged_step(
     `S` columns), then each row's `S` queries (`q`, `[rows, S, heads, head_dim]`: its token and
     its drafts) attended over its cached tokens and the span, causal within it. `lengths` are the
     rows' tokens before this step (where its first query sits); a row at -1 writes and reads
-    nothing (its output is zero). Positions below `first_seen` are never read, nor, with a `window`
-    above 0 (a sliding layer's), a position `window` or more behind its query. `gate`, an output
+    nothing (its output is zero). Positions below `first_seen` are never read. `gate`, an output
     gate (`[rows, S, heads, head_dim]`, its last dimension contiguous; Qwen3.5's), multiplies each
     head's output by its sigmoid. `fused`: the parts joined (and gated) in one launch, else by
     torch's ops (the reference). `run` launches the kernels (the model's set, `engine.kernels`).
@@ -168,7 +166,7 @@ def paged_step(
     run(_kernels.paged_step_kernel, (rows * kvh, parts),
         q.contiguous(), card, host.blocks, block_table, lengths, part_m, part_l, part_acc,
         heads, int(block_table.shape[1]), int(card.shape[0]), layer, host.layer,
-        int(host.blocks.shape[1]), first_seen, window, scale,
+        int(host.blocks.shape[1]), first_seen, scale,
         layout.attn_layers, span, tokens, kvh, group, _power_of_two(span * group), dim, parts, num_warps=4,
     )  # fmt: skip
     if not fused:

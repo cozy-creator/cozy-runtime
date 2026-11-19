@@ -883,8 +883,8 @@ def _unsupported(model: PreTrainedModel) -> str:
     if attention not in ("sdpa", "eager"):
         return f"attention {attention!r} (SDPA and eager are served)"
     types, _ = get_layer_types_and_kwargs(text)
-    other = sorted(set(types) - {*_ATTENTION, "linear_attention"})
-    if other:
+    other = sorted(set(types) - {"full_attention", "linear_attention"})
+    if other:  # a sliding layer among them: the paged attention reads every position before a query
         return f"layer types {other}"
     shapes, why = _shapes(model)
     if why:
@@ -1770,8 +1770,7 @@ class _PagedCache(Cache):
 class _Attending:
     """The paged attention of the engine's step (`engine.attention.PAGED`): over the K/V layer the
     cache's last update named, the model's through the rows' lengths and slots, the draft head's a
-    position ahead and from position 1 (`_Engine._tables`); a sliding layer's window, its
-    module's."""
+    position ahead and from position 1 (`_Engine._tables`)."""
 
     def __init__(self, engine: _Engine) -> None:
         self.engine = engine
@@ -1808,7 +1807,6 @@ class _Attending:
             PARTS,
             scaling,
             first_seen=1 if self.head else 0,
-            window=int(getattr(module, "sliding_window", 0) or 0),
         )
         return out
 
