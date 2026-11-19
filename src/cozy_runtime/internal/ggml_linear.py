@@ -113,16 +113,19 @@ def unserved(blocks: Tensor, k: int) -> str:
 
 
 def matmul(
-    ops: ModuleType, torch: ModuleType, x: Tensor, blocks: Tensor, scheme: str, n: int
+    ops: ModuleType, torch: ModuleType, x: Tensor, blocks: Tensor, scheme: str, n: int,
+    out: Tensor | None = None,
 ) -> Tensor:
-    """f32 `x[..., K] @ W.T` for `n` rows of `scheme` blocks; raises what the module said. A bf16
-    or f16 `x` is quantized to q8_1 as it is; another dtype goes through f32."""
+    """f32 `x[..., K] @ W.T` for `n` rows of `scheme` blocks, into `out` (contiguous f32
+    `[rows, n]`) where given; raises what the module said. A bf16 or f16 `x` is quantized to q8_1
+    as it is; another dtype goes through f32."""
     k = int(x.shape[-1])
     name = str(x.dtype).removeprefix("torch.")
     if name not in ops.ACTIVATIONS:
         x, name = x.to(torch.float32), "float32"
     rows = x.reshape(-1, k).contiguous()
-    out = torch.empty(rows.shape[0], n, dtype=torch.float32, device=x.device)
+    if out is None:
+        out = torch.empty(rows.shape[0], n, dtype=torch.float32, device=x.device)
     index = x.get_device()
 
     def allocate(nbytes: int) -> Tensor:
@@ -164,10 +167,14 @@ def linear(
                 raise ValueError(why)
             step = max(1, WORKING // (4 * k + 2 * k + 4 * n))
             for at in range(0, m, step):
-                y = matmul(ops, torch, rows[at : at + step], blocks, scheme, n)
+                if out_dtype == torch.float32:  # the product as the kernel writes it: no copy
+                    y = matmul(ops, torch, rows[at : at + step], blocks, scheme, n, out[at : at + step])
+                else:
+                    y = matmul(ops, torch, rows[at : at + step], blocks, scheme, n)
                 if bias is not None:
                     y += bias.to(torch.float32)
-                out[at : at + step].copy_(y)
+                if out_dtype != torch.float32:
+                    out[at : at + step].copy_(y)
                 del y
             return out.view(*x.shape[:-1], n)
         except Exception as exc:
