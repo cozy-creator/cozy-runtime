@@ -68,6 +68,8 @@ assert _attn4.attention(0, *(0,) * 11, 1, 2, 2, 128, 128, 128, True, 1.0, *((0, 
 _ggml = load("_ggml")
 assert _ggml.kernel(0, 8, 4096, 4096, 1, 256) == 0, "a ggml kernel chosen with no GPU"
 assert _ggml.matmul(0, 8, 0, 0, 1, 0, 4096, 4096, 1, None, 0) != 0, "a ggml matmul without a GPU"
+assert _ggml.quantized_bytes(4096, 2) == 2 * 4096 // 32 * 36, "q8_1 rows' bytes"
+assert _ggml.matmul_quantized(0, 8, 0, 0, 0, 4096, 4096, 1, None, 0) != 0, "a ggml matmul of q8_1 rows without a GPU"
 import ctypes
 _engine = load("_engine")
 ring = ctypes.create_string_buffer(256)

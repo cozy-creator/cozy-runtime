@@ -113,16 +113,19 @@ def unserved(blocks: Tensor, k: int) -> str:
 
 
 def matmul(
-    ops: ModuleType, torch: ModuleType, x: Tensor, blocks: Tensor, scheme: str, n: int
+    ops: ModuleType, torch: ModuleType, x: Tensor, blocks: Tensor, scheme: str, n: int,
+    out: Tensor | None = None,
 ) -> Tensor:
-    """f32 `x[..., K] @ W.T` for `n` rows of `scheme` blocks; raises what the module said. A bf16
-    or f16 `x` is quantized to q8_1 as it is; another dtype goes through f32."""
+    """f32 `x[..., K] @ W.T` for `n` rows of `scheme` blocks, into `out` (contiguous f32
+    `[rows, n]`) where given; raises what the module said. A bf16 or f16 `x` is quantized to q8_1
+    as it is; another dtype goes through f32."""
     k = int(x.shape[-1])
     name = str(x.dtype).removeprefix("torch.")
     if name not in ops.ACTIVATIONS:
         x, name = x.to(torch.float32), "float32"
     rows = x.reshape(-1, k).contiguous()
-    out = torch.empty(rows.shape[0], n, dtype=torch.float32, device=x.device)
+    if out is None:
+        out = torch.empty(rows.shape[0], n, dtype=torch.float32, device=x.device)
     index = x.get_device()
 
     def allocate(nbytes: int) -> Tensor:
@@ -139,6 +142,48 @@ def matmul(
         raise RuntimeError(f"ggml matmul ({scheme}, {k}x{n}, {rows.shape[0]} rows): {said}")
     shaped: Tensor = out.view(*x.shape[:-1], n)
     return shaped
+
+
+def products(torch: ModuleType, x: Tensor, weights: list[tuple[Tensor, str, int]]) -> list[Tensor] | None:
+    """Each weight's f32 product `x[..., K] @ W.T` of one 16-bit `x`, from one q8_1 quantize of it,
+    where ggml's rule takes MMVQ for every one of them on this card (a few rows): the quantize
+    sibling linears of one input would each launch, once. `weights` are (blocks, scheme, n). None
+    where they can't share it (another kernel, another dtype, a module without it), for the caller
+    to call each linear."""
+    if not x.is_cuda:
+        return None
+    index = x.get_device()
+    ops = native(torch, index)
+    name = str(x.dtype).removeprefix("torch.")
+    if ops is None or not hasattr(ops, "quantize") or name not in ("bfloat16", "float16"):
+        return None
+    k = int(x.shape[-1])
+    rows = x.reshape(-1, k).contiguous()
+    m = int(rows.shape[0])
+    for blocks, scheme, n in weights:
+        if unserved(blocks, k) or kernel(torch, index, scheme, k, n, m, blocks) != "mmvq":
+            return None
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+    q8_1: Tensor = torch.empty(int(ops.quantized_bytes(k, m)), dtype=torch.uint8, device=x.device)
+    code = ops.quantize(index, rows.data_ptr(), ops.ACTIVATIONS.index(name), q8_1.data_ptr(), k, m, stream)
+    if code != 0:
+        raise RuntimeError(f"ggml quantize ({k} columns, {m} rows): {ops.error_name(code)}")
+
+    def allocate(nbytes: int) -> Tensor:
+        held: Tensor = torch.empty(nbytes, dtype=torch.uint8, device=x.device)
+        return held
+
+    made: list[Tensor] = []
+    for blocks, scheme, n in weights:
+        out: Tensor = torch.empty(m, n, dtype=torch.float32, device=x.device)
+        code = ops.matmul_quantized(
+            index, TYPES[scheme], blocks.data_ptr(), q8_1.data_ptr(), out.data_ptr(), k, n, m, allocate, stream
+        )
+        if code != 0:
+            said = ops.error() if code == ops.UNKNOWN else ops.error_name(code)
+            raise RuntimeError(f"ggml matmul of a shared q8_1 ({scheme}, {k}x{n}, {m} rows): {said}")
+        made.append(out.view(*x.shape[:-1], n))
+    return made
 
 
 def linear(
@@ -164,10 +209,14 @@ def linear(
                 raise ValueError(why)
             step = max(1, WORKING // (4 * k + 2 * k + 4 * n))
             for at in range(0, m, step):
-                y = matmul(ops, torch, rows[at : at + step], blocks, scheme, n)
+                if out_dtype == torch.float32:  # the product as the kernel writes it: no copy
+                    y = matmul(ops, torch, rows[at : at + step], blocks, scheme, n, out[at : at + step])
+                else:
+                    y = matmul(ops, torch, rows[at : at + step], blocks, scheme, n)
                 if bias is not None:
                     y += bias.to(torch.float32)
-                out[at : at + step].copy_(y)
+                if out_dtype != torch.float32:
+                    out[at : at + step].copy_(y)
                 del y
             return out.view(*x.shape[:-1], n)
         except Exception as exc:

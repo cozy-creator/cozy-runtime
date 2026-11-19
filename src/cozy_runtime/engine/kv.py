@@ -19,6 +19,16 @@ device or releases pages does so on the calling thread's current stream.
 
 Every size comes from the model's layout, the request and the card's page size. Pages of a row
 that left are released as it leaves, so nothing here is idle memory for the core to ask back.
+
+A host tier (`host`, V2's HostCache in pinned host memory the device addresses) holds the K/V the
+card doesn't: block ids at and above `card_blocks` are its blocks, laid out layer-major
+(`[layer][block][K|V][token][kv_head][head_dim]`, `host_view`), so one layer's off-card blocks are
+one range. Which of a row's blocks are there is decided when it joins (`admit`'s `host_tokens`): its
+oldest whole blocks, never its tail, so a step writes nothing on the host. A step reads them through
+a window on the card each attention layer's off-card blocks are copied to one layer ahead, on a copy
+stream while the layer before computes (`CopyAhead`; cr-336's decision from the kv-tiers
+measurement); reading them in place (`host_view`) is the fallback. A prefill writes and reads them by
+copies too. Where a host block is read from is the attention op's one `resolve`.
 """
 
 from __future__ import annotations
@@ -30,6 +40,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from cozy_runtime.engine.attention import HostTier
 from cozy_runtime.engine.rungs import KvNeed
 
 if TYPE_CHECKING:
@@ -143,6 +154,43 @@ class _Pages:
         return all(p in self.held for p in self._span(offset, nbytes))
 
 
+class _HostPages:
+    """`_Pages` for a HostCache: windows mapped at their first holder and released at their last.
+    A commit the host has no room for raises, naming the bytes."""
+
+    def __init__(self, cache: varena.HostCache) -> None:
+        self.cache, self.page = cache, cache.granularity
+        self.held: dict[int, int] = {}
+
+    def _span(self, offset: int, nbytes: int) -> range:
+        return range(offset // self.page, (offset + nbytes - 1) // self.page + 1)
+
+    def take(self, ranges: Sequence[tuple[int, int]]) -> None:
+        fresh = sorted({p for at, n in ranges for p in self._span(at, n) if p not in self.held})
+        mapped: list[tuple[int, int]] = []
+        for first, count in _runs(fresh):
+            if not self.cache.commit(first * self.page, count * self.page):
+                for at, n in mapped:
+                    self.cache.release(at * self.page, n * self.page)
+                raise RuntimeError(f"the host has no room for {count * self.page} more bytes of K/V now")
+            mapped.append((first, count))
+        for at, n in ranges:
+            for p in self._span(at, n):
+                self.held[p] = self.held.get(p, 0) + 1
+
+    def drop(self, ranges: Sequence[tuple[int, int]]) -> None:
+        """Release what none holds now; it waits for the device's queued work (HostCache.release)."""
+        gone: list[int] = []
+        for at, n in ranges:
+            for p in self._span(at, n):
+                self.held[p] -= 1
+                if not self.held[p]:
+                    del self.held[p]
+                    gone.append(p)
+        for first, count in _runs(sorted(gone)):
+            self.cache.release(first * self.page, count * self.page)
+
+
 def _runs(pages: Sequence[int]) -> list[tuple[int, int]]:
     """Sorted pages as (first, count) of each consecutive run."""
     runs: list[tuple[int, int]] = []
@@ -163,7 +211,12 @@ class KvManager:
     step's), never the default stream: the core orders releases on it."""
 
     def __init__(
-        self, gpu: varena.Device, layout: KvLayout, max_rows: int, max_blocks: int
+        self,
+        gpu: varena.Device,
+        layout: KvLayout,
+        max_rows: int,
+        max_blocks: int,
+        host: varena.Pages | None = None,
     ) -> None:
         self.layout, self.max_rows, self.max_blocks = layout, max_rows, max_blocks
         self.device = torch.device("cuda", gpu.device)
@@ -173,6 +226,9 @@ class KvManager:
         self.card_blocks = min(max_rows * max_blocks, card // block)
         self._kv = gpu.cache(self.card_blocks * block)
         self._kv_pages = _Pages(self._kv, self.device)
+        # Block 0's page stays mapped for the manager's life: the card tier's base is every K/V
+        # kernel's pointer, and a launcher asks the driver of it (an unmapped one is refused).
+        self._kv_pages.take([(0, block)])
         page = self._kv.granularity
         span = layout.span
         tables = (
@@ -229,11 +285,56 @@ class KvManager:
         self._known: dict[int, int] = {}
         self._slots: dict[int, int] = {}
         self._drafting: set[int] = set()
-        self._free: set[int] = set(range(self.card_blocks))
+        self._free: set[int] = set(range(1, self.card_blocks))
         #: free blocks on pages a held block keeps mapped: taken before any page is mapped
         self._spare: set[int] = set()
         #: the other free blocks, lowest first; an entry may be stale (`_take` checks it)
-        self._fresh: list[int] = list(range(self.card_blocks))
+        self._fresh: list[int] = list(range(1, self.card_blocks))
+        self._respare([0])
+        # The host tier: address space for a whole row's blocks a row, its first window mapped for
+        # the manager's life (the tier's base is a kernel's pointer: Triton asks the driver of it).
+        self.host_blocks = 0
+        self._host: varena.HostCache | None = None
+        self._host_pages: _HostPages | None = None
+        self._host_free: list[int] = []
+        self._window: varena.Cache | None = None
+        self._window_pages: _Pages | None = None
+        self._window_extent = 0
+        self._window_taken: list[tuple[int, int]] = []
+        self.window_blocks = 0
+        if host is not None:
+            layer_bytes = layout.block_bytes // layout.attn_layers
+            self.host_blocks = max_rows * max_blocks
+            self._host = host.cache(layout.attn_layers * self.host_blocks * layer_bytes)
+            self._host_pages = _HostPages(self._host)
+            self._host_pages.take([(0, layer_bytes)])
+            self._host_free = list(range(self.host_blocks))
+            # Two slots of one layer's host blocks on the card, each indexed by host block id: address
+            # space for as many as the card could hold (`window_blocks`), mapped as the extent grows.
+            self.window_blocks = min(self.host_blocks, card // (2 * layer_bytes))
+            self._window = gpu.cache(2 * self.window_blocks * layer_bytes)
+            self._window_pages = _Pages(self._window, self.device)
+            self._window_taken = [(0, layer_bytes), (self.window_blocks * layer_bytes, layer_bytes)]
+            self._window_pages.take(self._window_taken)
+        #: [attn_layers, host_blocks, 2, block_tokens, kv_heads, head_dim] as the device addresses it
+        #: (a view over the whole host reservation; only mapped windows are touched), or a 1-block
+        #: stand-in on the card where there is no host tier
+        self.host_view: Tensor = (
+            self._host.tensor(layout.dtype, (layout.attn_layers, self.host_blocks, 2, layout.block_tokens,
+                                             layout.kv_heads, layout.head_dim))
+            if self._host is not None
+            else self.blocks[:1].transpose(0, 1)
+        )  # fmt: skip
+        #: the same host bytes as pinned host memory: what copies to and from the card read and write
+        self.host_cpu: Tensor | None = (
+            self._host.host(layout.dtype, tuple(self.host_view.shape)) if self._host is not None else None
+        )
+        #: [2, host_blocks, 2, block_tokens, kv_heads, head_dim]: the copy-ahead windows on the card
+        self.windows: Tensor | None = (
+            self._window.tensor(layout.dtype, (2, self.window_blocks, *self.host_view.shape[2:]))
+            if self._window is not None
+            else None
+        )
 
     # ------------------------------------------------------------------ what a call needs
 
@@ -272,10 +373,11 @@ class KvManager:
 
     # ------------------------------------------------------------------ rows
 
-    def admit(self, row: int, prompt_tokens: int, *, drafted: bool = False) -> Tensor:
+    def admit(self, row: int, prompt_tokens: int, *, drafted: bool = False, host_tokens: int = 0) -> Tensor:
         """`row` joins with a prompt of `prompt_tokens`: its blocks, a state slot and, drafting,
-        its scratch are mapped, all or none. Returns the token slot of each prompt position
-        (int64 [prompt_tokens]) for `write`. Its state is the prefill's to write."""
+        its scratch are mapped, all or none. Its first `host_tokens // block_tokens` blocks (whole
+        ones, never its tail) are on the host tier, the rest on the card. Returns the token slot of
+        each prompt position (int64 [prompt_tokens]) for `write`. Its state is the prefill's to write."""
         if row in self._held or not 0 <= row < self.max_rows:
             raise ValueError(f"row {row}: already decoding, or not one of {self.max_rows}")
         layout = self.layout
@@ -288,8 +390,12 @@ class KvManager:
         if first:
             state.append((0, self._tables))
         self._state_pages.take(state)
+        count = -(-prompt_tokens // layout.block_tokens)
+        hosted = min(host_tokens // layout.block_tokens, max(count - 1, 0))
+        if hosted and self._host is None:
+            raise ValueError(f"{hosted} blocks asked of a host tier this manager has none of")
         try:
-            blocks = self._take(-(-prompt_tokens // layout.block_tokens))
+            blocks = self._take_host(hosted) + self._take(count - hosted)
         except BaseException:
             self._state_pages.drop(state)
             raise
@@ -310,6 +416,42 @@ class KvManager:
         )
         return mapping
 
+    def slot(self, row: int) -> int:
+        """`row`'s state slot."""
+        return self._slots[row]
+
+    def committed(self, row: int) -> int:
+        """The positions of `row` its mapped blocks hold: no step may write at or past it."""
+        return len(self._held[row]) * self.layout.block_tokens
+
+    def token_slots(self, row: int, start: int, count: int) -> Tensor:
+        """The token slots (int64 `[count]`) of `row`'s positions `start + [0, count)`, all of them
+        on mapped blocks (`reserve_ahead` first)."""
+        tokens, held = self.layout.block_tokens, self._held[row]
+        at = range(start, start + count)
+        return self._ints([held[p // tokens] * tokens + p % tokens for p in at], torch.int64)
+
+    def gather(self, layer: int, row: int, start: int, count: int) -> tuple[Tensor, Tensor]:
+        """`row`'s K and V of `layer` at positions `start + [0, count)`, each contiguous
+        `[count, kv_heads, head_dim]`: what a prefill's attention reads (its blocks mapped), from
+        either tier."""
+        tokens, held = self.layout.block_tokens, self._held[row]
+        first, last = start // tokens, (start + count - 1) // tokens
+        chosen = held[first : last + 1]
+        at = start - first * tokens
+        parts: list[tuple[Tensor, Tensor]] = []
+        for on_card, run in _tier_runs(chosen, self.card_blocks):
+            if on_card:
+                keys, values = self.kv(layer)
+                index = self._ints(run, torch.int64)
+                parts.append((keys.index_select(0, index), values.index_select(0, index)))
+            else:
+                pieces = self._from_host(layer, [b - self.card_blocks for b in run])
+                parts.append((pieces[:, 0], pieces[:, 1]))
+        keys = torch.cat([k for k, _ in parts]) if len(parts) > 1 else parts[0][0]
+        values = torch.cat([v for _, v in parts]) if len(parts) > 1 else parts[0][1]
+        return keys.flatten(0, 1)[at : at + count], values.flatten(0, 1)[at : at + count]
+
     def settle(self, row: int, length: int) -> None:
         """The host read `row`'s length back: `reserve_ahead` counts from it."""
         self._known[row] = length
@@ -327,17 +469,33 @@ class KvManager:
 
     def write(self, layer: int, k: Tensor, v: Tensor, slots: Tensor) -> None:
         """A prefill's K and V for `layer` ([n, kv_heads, head_dim], contiguous in the prompt)
-        into their token slots (`admit`'s)."""
+        into their token slots (`admit`'s), on whichever tier each block is."""
         tokens = self.layout.block_tokens
-        where = (slots // tokens, slots % tokens)
+        entry, offset = slots // tokens, slots % tokens
         keys, values = self.kv(layer)
-        keys.index_put_(where, k.to(keys.dtype))
-        values.index_put_(where, v.to(values.dtype))
+        if self._host is None:
+            keys.index_put_((entry, offset), k.to(keys.dtype))
+            values.index_put_((entry, offset), v.to(values.dtype))
+            return
+        card = entry < self.card_blocks
+        keys.index_put_((entry[card], offset[card]), k[card].to(keys.dtype))
+        values.index_put_((entry[card], offset[card]), v[card].to(values.dtype))
+        hosted = sorted({int(e) - self.card_blocks for e in entry[~card].tolist()})
+        if not hosted:
+            return
+        # The host blocks this write touches, read to the card, written there, and copied back.
+        pieces = self._from_host(layer, hosted)
+        where = torch.searchsorted(self._ints(hosted, torch.int64), entry[~card] - self.card_blocks)
+        pieces[:, 0].index_put_((where, offset[~card]), k[~card].to(pieces.dtype))
+        pieces[:, 1].index_put_((where, offset[~card]), v[~card].to(pieces.dtype))
+        self._to_host(layer, hosted, pieces)
 
     def free(self, row: int) -> None:
         """`row` leaves: its table entries go, and every page only it held is released behind
         the current stream."""
-        blocks, slot = self._held.pop(row), self._slots.pop(row)
+        held, slot = self._held.pop(row), self._slots.pop(row)
+        blocks = [b for b in held if b < self.card_blocks]
+        self._give_host([b for b in held if b >= self.card_blocks])
         del self._known[row]
         self.block_table[row].fill_(-1)
         self.lengths[row] = -1
@@ -387,6 +545,84 @@ class KvManager:
         self._respare(fresh)
         return blocks
 
+    def _host_runs(self, layer: int, blocks: Sequence[int]) -> list[tuple[int, int, int]]:
+        """Sorted host block ids of `layer` as (first id, count, at): runs of consecutive ids that lie
+        in one host registration window each (a copy may not span two), `at` the run's place in
+        `blocks`. A block's piece is a whole fraction of a window, so none straddles two."""
+        piece = self.layout.block_bytes // self.layout.attn_layers
+        assert self._host is not None
+        window = self._host.granularity
+        runs: list[tuple[int, int, int]] = []
+        for i, b in enumerate(blocks):
+            starts = ((layer * self.host_blocks + b) * piece) % window == 0
+            if runs and runs[-1][0] + runs[-1][1] == b and not starts:
+                runs[-1] = (runs[-1][0], runs[-1][1] + 1, runs[-1][2])
+            else:
+                runs.append((b, 1, i))
+        return runs
+
+    def _from_host(self, layer: int, blocks: Sequence[int]) -> Tensor:
+        """Host blocks `blocks` (sorted ids) of `layer`, copied to the card: `[n, 2, T, kv_heads, head_dim]`."""
+        assert self.host_cpu is not None
+        out = torch.empty((len(blocks), *self.host_cpu.shape[2:]), dtype=self.layout.dtype, device=self.device)
+        for first, count, at in self._host_runs(layer, blocks):
+            out[at : at + count].copy_(self.host_cpu[layer, first : first + count], non_blocking=True)
+        return out
+
+    def _to_host(self, layer: int, blocks: Sequence[int], pieces: Tensor) -> None:
+        """`pieces` (`_from_host`'s shape) copied back to host blocks `blocks` of `layer`."""
+        assert self.host_cpu is not None
+        for first, count, at in self._host_runs(layer, blocks):
+            self.host_cpu[layer, first : first + count].copy_(pieces[at : at + count], non_blocking=True)
+
+    def host_extent(self) -> int:
+        """One past the highest host block id a row holds: what a step's copies move a layer."""
+        hosted = [b - self.card_blocks for held in self._held.values() for b in held if b >= self.card_blocks]
+        return max(hosted) + 1 if hosted else 0
+
+    def map_windows(self, extent: int) -> None:
+        """Both copy-ahead windows mapped for host block ids below `extent`."""
+        if extent <= self._window_extent or self._window_pages is None:
+            return
+        if extent > self.window_blocks:
+            raise RuntimeError(f"{extent} host blocks a layer to copy ahead; the card's windows hold {self.window_blocks}")
+        piece = self.layout.block_bytes // self.layout.attn_layers
+        ranges = [(slot * self.window_blocks * piece, extent * piece) for slot in (0, 1)]
+        self._window_pages.take(ranges)
+        self._window_taken += ranges
+        self._window_extent = extent
+
+    def _host_range(self, block: int, layer: int) -> tuple[int, int]:
+        piece = self.layout.block_bytes // self.layout.attn_layers
+        return (layer * self.host_blocks + block) * piece, piece
+
+    def _take_host(self, count: int) -> list[int]:
+        """`count` host blocks (ids from `card_blocks`), the lowest free; their windows mapped."""
+        if not count:
+            return []
+        assert self._host_pages is not None
+        if count > len(self._host_free):
+            raise RuntimeError(f"{count} host K/V blocks asked with {len(self._host_free)} free")
+        chosen = heapq.nsmallest(count, self._host_free)
+        self._host_pages.take([self._host_range(b, layer) for b in chosen for layer in range(self.layout.attn_layers)])
+        taken = set(chosen)
+        self._host_free = [b for b in self._host_free if b not in taken]
+        heapq.heapify(self._host_free)
+        return [self.card_blocks + b for b in chosen]
+
+    def _give_host(self, blocks: Sequence[int]) -> None:
+        if not blocks:
+            return
+        assert self._host_pages is not None
+        own = [b - self.card_blocks for b in blocks]
+        self._host_pages.drop([self._host_range(b, layer) for b in own for layer in range(self.layout.attn_layers)])
+        for b in own:
+            heapq.heappush(self._host_free, b)
+
+    def host_bytes(self) -> int:
+        """The host tier's bytes held by rows now."""
+        return sum(1 for held in self._held.values() for b in held if b >= self.card_blocks) * self.layout.block_bytes
+
     def _give(self, blocks: Sequence[int]) -> None:
         self._kv_pages.drop([self._range(b) for b in blocks])
         self._free.update(blocks)
@@ -415,5 +651,95 @@ class KvManager:
         del self.block_table, self.lengths, self.slot_mapping, self.state_slot, self.blocks
         self._states.clear()
         self.state_scratch.clear()
+        self._kv_pages.drop([(0, self.layout.block_bytes)])
         self._kv.close()
         self._state.close()
+        if self._host is not None and self._host_pages is not None:
+            piece = self.layout.block_bytes // self.layout.attn_layers
+            del self.host_view, self.host_cpu, self.windows
+            self._host_pages.drop([(0, piece)])
+            self._host.close()
+            if self._window is not None and self._window_pages is not None:
+                self._window_pages.drop(self._window_taken)
+                self._window.close()
+
+
+def _tier_runs(blocks: Sequence[int], card_blocks: int) -> list[tuple[bool, list[int]]]:
+    """`blocks` in order as runs on one tier each: (on the card, the run)."""
+    runs: list[tuple[bool, list[int]]] = []
+    for b in blocks:
+        on_card = b < card_blocks
+        if runs and runs[-1][0] == on_card:
+            runs[-1][1].append(b)
+        else:
+            runs.append((on_card, [b]))
+    return runs
+
+
+class CopyAhead:
+    """A step's reads of host blocks (cr-336's decision): before each attention layer reads its
+    off-card blocks, they were copied into one of two windows on the card, on a copy stream while the
+    layer before computed; a window is refilled only once the attention that read it is done.
+    `begin` takes the step's attention layers in the order it reads them; `tier(layer)` is what that
+    layer's attention reads its off-card blocks from, `done()` follows each, and `end()` joins the copy
+    stream back. Captured into a step's graph, every copy is a node of it: the graph is recorded for
+    one `extent` (host block ids in use), so the decoder keys its graphs by it. `in_place` reads the
+    host blocks where they are instead (the fallback where the device addresses them)."""
+
+    def __init__(self, kv: KvManager, *, in_place: bool = False) -> None:
+        self.kv, self.in_place = kv, in_place
+        self.copier = torch.cuda.Stream(kv.device)
+        self.order: list[int] = []
+        self.at = 0
+        self.copied: dict[int, torch.cuda.Event] = {}
+        self.read: list[torch.cuda.Event | None] = [None, None]
+
+    def begin(self, order: Sequence[int]) -> None:
+        kv = self.kv
+        extent = kv.host_extent() if not self.in_place else 0
+        self.order = list(order) if extent else []
+        self.extent, self.at, self.copied, self.read = extent, 0, {}, [None, None]
+        if not self.order:
+            return
+        kv.map_windows(extent)
+        self.copier.wait_stream(torch.cuda.current_stream(kv.device))
+        self._issue(0)
+        self._issue(1)
+
+    def _issue(self, i: int) -> None:
+        if i >= len(self.order):
+            return
+        kv, slot = self.kv, i % 2
+        assert kv.windows is not None and kv.host_cpu is not None
+        with torch.cuda.stream(self.copier):
+            if (last := self.read[slot]) is not None:
+                self.copier.wait_event(last)
+            layer = self.order[i]
+            for first, count, _ in kv._host_runs(layer, range(self.extent)):
+                kv.windows[slot, first : first + count].copy_(kv.host_cpu[layer, first : first + count], non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(self.copier)
+            self.copied[i] = event
+
+    def tier(self, layer: int) -> HostTier:
+        if not self.order:
+            return HostTier(self.kv.host_view, layer)
+        assert self.order[self.at] == layer, f"attention read layer {layer}, the step declared {self.order[self.at]}"
+        assert self.kv.windows is not None
+        torch.cuda.current_stream(self.kv.device).wait_event(self.copied[self.at])
+        slot = self.at % 2
+        return HostTier(self.kv.windows[slot : slot + 1], 0)
+
+    def done(self) -> None:
+        if not self.order:
+            return
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self.kv.device))
+        self.read[self.at % 2] = event
+        self.at += 1
+        self._issue(self.at + 1)
+
+    def end(self) -> None:
+        if self.order:
+            torch.cuda.current_stream(self.kv.device).wait_stream(self.copier)
+        self.order = []
