@@ -1,6 +1,8 @@
-"""Paged decode attention (cr-336), bring-up form: one query a head over a row's K/V, read
-through its block table. It attends only: writing the step's own K/V through `slot_mapping`, the
-verify span and registration with Transformers' `AttentionInterface` come with the engine core.
+"""Paged decode attention (cr-336): a step's queries over each row's K/V, read through its block
+table (`paged_step`: the step's own K/V written through `slot_mapping` first, the verify span
+causal within it, a sliding layer's window). `register` serves it as a Transformers attention
+implementation (`NAME`), for a caller that runs a model's own forward over the engine's K/V
+(`lm`): the step it sets in `PAGED` attends.
 
 Where a block off the card is read from is the caller's `HostTier`, not the kernel's: host memory
 the device addresses in place, or a window on the card the blocks were copied to. How those are
@@ -9,8 +11,9 @@ served is open pending measurement (cr-336's tracker file); nothing else here kn
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -19,8 +22,54 @@ from cozy_runtime.engine.launch import JIT, Run
 
 if TYPE_CHECKING:
     from torch import Tensor
+    from torch.nn import Module
 
     from cozy_runtime.engine.kv import KvLayout
+
+#: The attention implementation `register` adds to Transformers' `AttentionInterface`.
+NAME = "cozy_paged"
+
+
+class Paged(Protocol):
+    """A step's attention over the engine's K/V, as `register`'s implementation calls it: `query`
+    `[rows, heads, S, head_dim]`, the step's own `key` and `value` `[rows, kv_heads, S, head_dim]`
+    (a cache layer of the caller's returns them as given); returns `[rows, S, heads, head_dim]`."""
+
+    def __call__(
+        self, module: Module, query: Tensor, key: Tensor, value: Tensor, scaling: float
+    ) -> Tensor: ...
+
+
+#: The step a model's forward attends through while its config names `NAME` (the caller's).
+PAGED: ContextVar[Paged | None] = ContextVar("cozy_paged_step", default=None)
+
+
+def register() -> str:
+    """`NAME` in Transformers' `AttentionInterface`, once a process, and returns it: a model whose
+    config names it attends through `PAGED`'s step. Transformers makes no mask for an
+    implementation it has no mask function for, and this one needs none (lengths are device data)."""
+    from transformers import AttentionInterface
+
+    if NAME not in AttentionInterface._global_mapping:
+        AttentionInterface.register(NAME, _attend)
+    return NAME
+
+
+def _attend(  # Transformers' attention-function shape
+    module: Module,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attention_mask: Tensor | None,
+    dropout: float = 0.0,
+    scaling: float | None = None,
+    **kwargs: object,
+) -> tuple[Tensor, None]:
+    step = PAGED.get()
+    if step is None:
+        raise RuntimeError(f"{NAME} attention ran outside a paged step")
+    scale = float(scaling) if scaling is not None else float(query.shape[-1]) ** -0.5
+    return step(module, query, key, value, scale), None
 
 
 @dataclass(frozen=True)
@@ -87,6 +136,7 @@ def paged_step(
     scale: float,
     first_seen: int = 0,
     gate: Tensor | None = None,
+    window: int = 0,
     fused: bool = True,
     run: Run = JIT,
 ) -> Tensor:
@@ -95,7 +145,8 @@ def paged_step(
     `S` columns), then each row's `S` queries (`q`, `[rows, S, heads, head_dim]`: its token and
     its drafts) attended over its cached tokens and the span, causal within it. `lengths` are the
     rows' tokens before this step (where its first query sits); a row at -1 writes and reads
-    nothing (its output is zero). Positions below `first_seen` are never read. `gate`, an output
+    nothing (its output is zero). Positions below `first_seen` are never read, nor, with a `window`
+    above 0 (a sliding layer's), a position `window` or more behind its query. `gate`, an output
     gate (`[rows, S, heads, head_dim]`, its last dimension contiguous; Qwen3.5's), multiplies each
     head's output by its sigmoid. `fused`: the parts joined (and gated) in one launch, else by
     torch's ops (the reference). `run` launches the kernels (the model's set, `engine.kernels`).
@@ -117,7 +168,7 @@ def paged_step(
     run(_kernels.paged_step_kernel, (rows * kvh, parts),
         q.contiguous(), card, host.blocks, block_table, lengths, part_m, part_l, part_acc,
         heads, int(block_table.shape[1]), int(card.shape[0]), layer, host.layer,
-        int(host.blocks.shape[1]), first_seen, scale,
+        int(host.blocks.shape[1]), first_seen, window, scale,
         layout.attn_layers, span, tokens, kvh, group, _power_of_two(span * group), dim, parts, num_warps=4,
     )  # fmt: skip
     if not fused:

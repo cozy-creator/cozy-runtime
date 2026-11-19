@@ -373,16 +373,22 @@ class KvManager:
 
     # ------------------------------------------------------------------ rows
 
-    def admit(self, row: int, prompt_tokens: int, *, drafted: bool = False, host_tokens: int = 0) -> Tensor:
+    def admit(
+        self, row: int, prompt_tokens: int, *, drafted: bool = False, host_tokens: int = 0, own_slot: bool = False
+    ) -> Tensor:
         """`row` joins with a prompt of `prompt_tokens`: its blocks, a state slot and, drafting,
         its scratch are mapped, all or none. Its first `host_tokens // block_tokens` blocks (whole
         ones, never its tail) are on the host tier, the rest on the card. Returns the token slot of
-        each prompt position (int64 [prompt_tokens]) for `write`. Its state is the prefill's to write."""
+        each prompt position (int64 [prompt_tokens]) for `write`. Its state is the prefill's to write.
+        `own_slot`: its state slot is slot `row`, so `state(i)[:n]` is rows `0..n-1` in order (a caller
+        whose kernels read a row's state by its row, `lm`'s); else the lowest free."""
         if row in self._held or not 0 <= row < self.max_rows:
             raise ValueError(f"row {row}: already decoding, or not one of {self.max_rows}")
         layout = self.layout
         first = not self._held
-        slot = min(set(range(self.max_rows)) - set(self._slots.values()))
+        if own_slot and row in self._slots.values():
+            raise ValueError(f"slot {row} is another row's")
+        slot = row if own_slot else min(set(range(self.max_rows)) - set(self._slots.values()))
         state = [(self._tables + slot * self._slot, self._slot)] if self._slot else []
         if drafted and self._scratch:
             state.append((self._tables + self.max_rows * self._slot + row * self._scratch,
@@ -489,6 +495,38 @@ class KvManager:
         pieces[:, 0].index_put_((where, offset[~card]), k[~card].to(pieces.dtype))
         pieces[:, 1].index_put_((where, offset[~card]), v[~card].to(pieces.dtype))
         self._to_host(layer, hosted, pieces)
+
+    def replace(self, row: int, other: int) -> None:
+        """`other` takes `row`'s place, `row` leaving (`free`): `other`'s blocks and length move to
+        row `row`, and its state into `row`'s slot, which `row` kept; `other`'s slot (and, drafting,
+        its scratch, which only a step reads) goes. A caller whose rows sit at the lowest indices
+        (`admit`'s `own_slot`) keeps them there as rows leave. The copy is on the current stream,
+        ordered with every step that reads the slots."""
+        if row not in self._held or other not in self._held or row == other:
+            raise ValueError(f"rows {row} and {other}: both must be decoding")
+        drafting = other in self._drafting
+        if (row in self._drafting) != drafting:
+            raise ValueError(f"rows {row} and {other}: one drafts, the other not")
+        mine, theirs = self._slots[row], self._slots.pop(other)
+        for state in self._states:
+            state[mine].copy_(state[theirs])
+        blocks = self._held.pop(row)
+        self._give_host([b for b in blocks if b >= self.card_blocks])
+        self._give([b for b in blocks if b < self.card_blocks])
+        self._held[row], self._known[row] = self._held.pop(other), self._known.pop(other)
+        self.block_table[row].copy_(self.block_table[other])
+        self.lengths[row] = self.lengths[other]
+        self.slot_mapping[row].copy_(self.slot_mapping[other])
+        self.block_table[other].fill_(-1)
+        self.lengths[other] = -1
+        self.slot_mapping[other].fill_(-1)
+        self.state_slot[other] = -1
+        gone = [(self._tables + theirs * self._slot, self._slot)] if self._slot else []
+        if drafting:
+            self._drafting.discard(other)
+            if self._scratch:
+                gone.append((self._tables + self.max_rows * self._slot + other * self._scratch, self._scratch))
+        self._state_pages.drop(gone)
 
     def free(self, row: int) -> None:
         """`row` leaves: its table entries go, and every page only it held is released behind
