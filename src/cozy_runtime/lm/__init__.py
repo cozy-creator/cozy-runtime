@@ -3101,8 +3101,17 @@ class _Engine:
             if key not in self.warmed:
                 # This is the caller's actual next token, never an extra speculative warmup; its
                 # working peak, as varena measured it, is its capture pool's first guess.
-                with self._graph_memory(drafted), _measured(domain.device) as peak:
+                try:
+                    with self._graph_memory(drafted), _measured(domain.device) as peak:
+                        self._advance(size)
+                except Building:
+                    # A kernel still opening on this card (a primed probe, a build) refuses the
+                    # domain's first capture before the step runs: the token decodes eagerly, as a
+                    # capture that meets one does, until a kernel lands; never a failed call.
+                    self.building = LANDED[0]
                     self._advance(size)
+                    self.eager += 1
+                    return
                 self.warmed.add(key)
                 if peak:
                     self.peaks[key] = peak[0]
