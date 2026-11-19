@@ -63,6 +63,23 @@ int matmul(int device, int type, uintptr_t w, uintptr_t x, int x_type, uintptr_t
                              reinterpret_cast<cudaStream_t>(stream));
 }
 
+int quantize(int device, uintptr_t x, int x_type, uintptr_t q8_1, int64_t K, int64_t M, uintptr_t stream) {
+    const OnDevice guard(device);
+    if (guard.error() != cudaSuccess) return guard.error();
+    return cozy_ggml::quantize(device, reinterpret_cast<const void*>(x), x_type, reinterpret_cast<void*>(q8_1), K, M,
+                               reinterpret_cast<cudaStream_t>(stream));
+}
+
+int matmul_quantized(int device, int type, uintptr_t w, uintptr_t q8_1, uintptr_t out, int64_t K, int64_t N, int64_t M,
+                     nb::handle allocator, uintptr_t stream) {
+    const OnDevice guard(device);
+    if (guard.error() != cudaSuccess) return guard.error();
+    Held held{allocator, {}};
+    return cozy_ggml::matmul_quantized(device, type, reinterpret_cast<const void*>(w), reinterpret_cast<const void*>(q8_1),
+                                       reinterpret_cast<float*>(out), K, N, M, &allocate, &held,
+                                       reinterpret_cast<cudaStream_t>(stream));
+}
+
 }  // namespace
 
 NB_MODULE(_ggml, m) {
@@ -76,5 +93,9 @@ NB_MODULE(_ggml, m) {
     m.def("kernel", &kernel, "device"_a, "type"_a, "K"_a, "N"_a, "M"_a, "w"_a);
     m.attr("ACTIVATIONS") = nb::make_tuple("float32", "bfloat16", "float16");
     m.def("matmul", &matmul, "device"_a, "type"_a, "w"_a, "x"_a, "x_type"_a, "out"_a, "K"_a, "N"_a, "M"_a,
+          "allocate"_a.none(), "stream"_a);
+    m.def("quantized_bytes", &cozy_ggml::quantized_bytes, "K"_a, "M"_a);
+    m.def("quantize", &quantize, "device"_a, "x"_a, "x_type"_a, "q8_1"_a, "K"_a, "M"_a, "stream"_a);
+    m.def("matmul_quantized", &matmul_quantized, "device"_a, "type"_a, "w"_a, "q8_1"_a, "out"_a, "K"_a, "N"_a, "M"_a,
           "allocate"_a.none(), "stream"_a);
 }
