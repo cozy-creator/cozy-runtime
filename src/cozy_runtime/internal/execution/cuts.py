@@ -57,16 +57,16 @@ _FFN = frozenset({"FeedForward", "GELU", "GEGLU", "SwiGLU", "ApproximateGELU", "
 def install(module: nn.Module) -> int:
     """Call cuts under `module`: token pieces for Diffusers' FFNs and their activation
     projections (GELU, GEGLU, SwiGLU and subclasses; a block that calls its FFN's parts still
-    cuts at the projection, whose [tokens, inner] intermediate is the widest), row bands for its
-    channel RMS norms, and image or output-channel bands for its 2-D and 3-D convs (at the
-    conv itself, so a subclass's forward around it, a causal pad, is untouched). Each site is
-    the module's path. A Transformers gated MLP cuts by tokens as Diffusers' FFNs do, and a
-    Transformers vision tower that reads packed patches and each picture's
-    grid (`forward(hidden_states, grid_thw)`: Qwen2.5-VL, Qwen3-VL, Qwen3.5) runs its pictures in
-    groups. Diffusers' RMS norms (each attention processor's q/k norm) cut by rows, and what
-    Diffusers' processors call on q/k (`_ropes`). A module of linears and activations alone, up
-    projections from its input's width and one down projection (`_ffn_like`), is a feed-forward
-    whoever wrote it, and cuts by tokens. Returns how many it cut."""
+    cuts at the projection, whose [tokens, inner] intermediate is the widest), row pieces for any
+    norm-like module proven row-local (`norm_like`, `_norm`), and image or output-channel bands
+    for its 2-D and 3-D convs (at the conv itself, so a subclass's forward around it, a causal
+    pad, is untouched). Each site is the module's path. A Transformers gated MLP cuts by tokens as
+    Diffusers' FFNs do, and a Transformers vision tower that reads packed patches and each
+    picture's grid (`forward(hidden_states, grid_thw)`: Qwen2.5-VL, Qwen3-VL, Qwen3.5) runs its
+    pictures in groups. What Diffusers' processors call on q/k cuts by rows where proven row-local
+    (`_ropes`). A module of linears and activations alone, up projections from its input's width
+    and one down projection (`_ffn_like`), is a feed-forward whoever wrote it, and cuts by tokens.
+    Returns how many it cut."""
     count = _ropes(module)
     for path, sub in module.named_modules():
         if _gated_mlp(sub) and "_cozy_cut" not in vars(sub):
@@ -89,15 +89,12 @@ def install(module: nn.Module) -> int:
             sub._conv_forward = _conv_bands(f"{path}:bands", sub, _conv_of(sub))  # type: ignore[method-assign,assignment]
             vars(sub)["_cozy_cut"] = True
             count += 1
-        # torch's RMS norm reduces each row alone: token pieces are the whole (v7 H3 13826 ran
-        # out in a DiT block's 546 MiB rms_norm, a site with no cut).
-        if (
-            (type(sub) is nn.RMSNorm or _diffusers_rms(sub))
-            and "forward" not in vars(sub)
-            and "_cozy_cut" not in vars(sub)
-        ):
+        # A norm reduces each row alone: row pieces are the whole (v7 H3 13826 ran out in a DiT
+        # block's 546 MiB rms_norm, a site with no cut), whoever wrote it (`norm_like`).
+        own = vars(sub)
+        if norm_like(sub) is not None and "forward" not in own and "_cozy_cut" not in own:
             norm: nn.Module = sub
-            norm.forward = catch.transparent(_norm(f"{path}:tokens", sub, _forward(sub)))
+            norm.forward = catch.transparent(_norm(f"{path}:rows", sub, _forward(sub)))
             vars(sub)["_cozy_cut"] = True
             count += 1
             continue
@@ -594,55 +591,151 @@ def _tokens(forward: Forward, x: Tensor, tokens: int, level: int, rank: bool = F
     return out.view(*x.shape[:-1], *out.shape[1:])
 
 
-def _diffusers_rms(module: nn.Module) -> bool:
-    """Diffusers' `RMSNorm` as written: every row of its last axis alone (each attention
-    processor's q/k norm, over [batch, tokens, heads, head_dim])."""
-    kind = type(module)
-    return kind.__name__ == "RMSNorm" and kind.__module__ == "diffusers.models.normalization"
+def _norm_widths(module: nn.Module) -> frozenset[int] | None:
+    """The widths of the last axis a leaf module may be a norm over: its own weights' lengths where
+    every one is a vector (a norm's scale and shift, whoever wrote it), or any width (empty) where
+    it holds none and states an `eps` (a norm without an affine: LTX's block norms). None for
+    anything else."""
+    if next(module.children(), None) is not None:
+        return None
+    own = [*module.parameters(recurse=False), *module.buffers(recurse=False)]
+    if not own:
+        return frozenset() if hasattr(module, "eps") else None
+    if any(t.dim() != 1 for t in own):
+        return None
+    return frozenset(int(t.shape[0]) for t in own)
+
+
+def norm_like(module: nn.Module) -> frozenset[int] | None:
+    """`_norm_widths` of a leaf with a forward of its own (torch's, Diffusers', Transformers', a
+    package's, never the Runtime's): a module that may be a norm, which its first call of a shape
+    proves or refuses (`_norm`). `execution.fused` matches these modules too."""
+    forward = type(module).forward
+    if forward is nn.Module.forward or forward.__module__.startswith("cozy_runtime."):
+        return None
+    return _norm_widths(module)
+
+
+#: what `nn.Module` itself keeps on every instance (its mode, hooks and registries)
+_MODULE = frozenset(vars(nn.Module()))
+
+
+def _config(module: nn.Module) -> tuple[object, ...]:
+    """What sets an instance apart from another of its class beside its weights' values: the
+    attributes its class gave it that are scalars or tuples of them (a group norm's groups, a layer
+    norm's shape)."""
+    return tuple(
+        (name, value)
+        for name, value in vars(module).items()
+        if name not in _MODULE
+        and not name.startswith("_")
+        and (
+            isinstance(value, _SCALARS)
+            or (type(value) in (tuple, torch.Size) and all(isinstance(v, _SCALARS) for v in value))
+        )
+    )
+
+
+def _form(args: Sequence[object], kwargs: dict[str, object]) -> tuple[object, ...] | None:
+    """A call's form, what its cut is decided from: each tensor's shape and dtype, each scalar and
+    the names given. None where an argument is anything else."""
+    form: list[object] = [*kwargs]
+    for value in (*args, *kwargs.values()):
+        if isinstance(value, Tensor):
+            form += (value.shape, value.dtype)
+        elif isinstance(value, _SCALARS):
+            form.append(value)
+        else:
+            return None
+    return tuple(form)
+
+
+def _norm_call(
+    widths: frozenset[int], x: object, args: Sequence[object], kwargs: dict[str, object]
+) -> tuple[int, tuple[int | None, ...], tuple[object, ...]] | None:
+    """Where a norm-like call's rows are: its input's longest leading axis, where the input's last
+    axis is as wide as one of the module's vectors (any, for a module with none); each other tensor
+    cut with it where it is as long there at the same rank, else passed whole; and a key for its
+    shape of call. None for any other call, and for an argument that is neither a tensor nor a
+    scalar."""
+    if not isinstance(x, Tensor) or x.dim() < 2 or (widths and int(x.shape[-1]) not in widths):
+        return None
+    lead = [int(n) for n in x.shape[:-1]]
+    axis = lead.index(max(lead))
+    if lead[axis] < 2:
+        return None
+    dims: list[int | None] = []
+    form: list[object] = []
+    for value in (*args[1:], *kwargs.values()):
+        if isinstance(value, Tensor):
+            cut = value.dim() == x.dim() and int(value.shape[axis]) == lead[axis]
+            dims.append(axis if cut else None)
+            form.append((value.dtype, value.dim(), cut))
+        elif isinstance(value, _SCALARS):
+            form.append(value)
+        else:
+            return None
+    return axis, tuple(dims), (axis, x.dtype, x.dim(), tuple(kwargs), *form)
 
 
 def _norm(site: str, module: nn.Module, forward: Forward) -> Forward:
-    """A norm over its trailing `normalized_shape` (torch's), or its last axis (Diffusers' RMSNorm),
-    in pieces of whole rows (tokens). Diffusers' holds an fp32 upcast and its square, then an fp32
-    product: two fp32 temporaries a value."""
-    torch_norm = isinstance(module, nn.RMSNorm)
-    dims = len(cast("tuple[int, ...]", module.normalized_shape)) if torch_norm else 1
-    intermediate = 4 if torch_norm else 8
+    """A norm-like module (`_norm_widths`) in pieces of rows along its input's longest leading axis,
+    where the first call of that shape by its class in its configuration (`_config`) proved its
+    forward row-local there (`_probe`, which also measures what a row allocates). Whole without
+    native memory, in training, under autograd or compilation, and for any other call. A call of the
+    form of the last that ran whole for its form (not a norm's call, not row-local, or too small for
+    a cut to be asked, `catch.cut`'s rule) runs whole at once: an LM's decode calls every norm of
+    every layer each token."""
+    widths = _norm_widths(module)
+    if widths is None:
+        return forward
+    kind = (type(module), _config(module), widths)
+    whole: list[object] = [None]
 
-    def cut(x: object, *args: object, **kwargs: object) -> object:
+    def cut(*args: object, **kwargs: object) -> object:
+        form = _form(args, kwargs)
+        if form is not None and form == whole[0]:
+            return forward(*args, **kwargs)
+        x = args[0] if args else None
+        request = catch.CURRENT.get()
         if (
-            args
-            or kwargs
-            or not isinstance(x, Tensor)
+            module.training
             or torch.is_grad_enabled()
-            or x.dim() <= dims
+            or torch.compiler.is_compiling()
+            or not (request is not None and request.memory.cuda)
         ):
-            return forward(x, *args, **kwargs)
-        row = math.prod(int(n) for n in x.shape[-dims:])
-        tokens = x.numel() // max(row, 1)
-        if tokens < 2:
-            return forward(x)
-        flat = x.reshape(tokens, *x.shape[-dims:])
-        run = functools.partial(_rows, forward, flat, tokens)
-        # torch's rms_norm holds an fp32 upcast of its rows where it is not fused
-        need = levelled(tokens, sizing.norm(tokens, row, x.element_size(), intermediate))
-        out = catch.cut(site, levels(tokens), need, run)
-        return cast(Tensor, out).view(x.shape)
+            return forward(*args, **kwargs)
+        found = _norm_call(widths, x, args, kwargs)
+        if found is None:
+            whole[0] = form
+            return forward(*args, **kwargs)
+        axis, dims, shape = found
+        key = (*kind, *shape)
+        original = cast(_Function, forward)
+        if key not in _LOCAL:
+            if _capturing():
+                return forward(*args, **kwargs)
+            began = time.perf_counter()
+            _LOCAL[key], held = _probe(original, args, kwargs, axis, dims)
+            name = f"{type(module).__module__}.{type(module).__qualname__}"
+            _probed(site, name, axis, _LOCAL[key] is not None, began, held)
+        local = _LOCAL[key]
+        if local is None:
+            whole[0] = form
+            return forward(*args, **kwargs)
+        assert isinstance(x, Tensor)
+        length, (out, made), size = int(x.shape[axis]), local, x.numel()
+        need = levelled(
+            length,
+            lambda n: sizing.peak(math.ceil(out * size), (math.ceil(made * size * n / length),)),
+        )
+        if catch.small(need):
+            whole[0] = form
+            return forward(*args, **kwargs)
+        run = functools.partial(_rowed, original, args, kwargs, axis, dims)
+        return catch.cut(site, levels(length), need, run)
 
-    return cut
-
-
-def _rows(forward: Forward, flat: Tensor, tokens: int, level: int) -> object:
-    if not level:
-        return forward(flat)
-    size, out = pieces(tokens, level), None
-    for at in range(0, tokens, size):
-        catch.checkpoint()
-        part = cast(Tensor, forward(flat[at : at + size]))
-        out = part.new_empty((tokens, *part.shape[1:])) if out is None else out
-        out[at : at + part.shape[0]].copy_(part)
-        del part
-    return out
+    return cast("Forward", cut)  # it takes the module's arguments as given
 
 
 def _rms_contract(module: nn.Module, kinds: Sequence[str]) -> tuple[bool, int, int] | None:
