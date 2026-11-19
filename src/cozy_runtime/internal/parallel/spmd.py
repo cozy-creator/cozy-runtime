@@ -611,6 +611,13 @@ def _serve_spread(ranks: Ranks, stages: Stages, told: Mapping[str, object]) -> N
             pass
 
 
+def local() -> bool:
+    """Whether this process's calls reach no other GPU of its group now: a stage running alone
+    whose `spread` calls stay here (`_alone(served=False)`), as one GPU's hosted sharded call."""
+    group = _group.CURRENT[0]
+    return isinstance(group, _Alone) and not group.served
+
+
 class _Alone:
     """The group as a stage running alone on one GPU sees it (`_group.CURRENT`): one GPU, but its
     `spread` calls go to the GPUs waiting for the stage's result."""

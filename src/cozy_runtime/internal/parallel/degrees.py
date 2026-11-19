@@ -9,8 +9,9 @@ to the next power of two, no seed or other value: `spmd._shape_class`), the card
 degree and the Runtime build: a new release measures again.
 
 One GPU is measured first: GPU 0 runs each sharded call and its output crosses (`spmd`), so it
-costs a request what one GPU does. It is measured again while its record is cold (a step read
-weights from disk or saw a kernel build), as that costs nothing. The group's degree is then tried
+costs a request what one GPU does. A cold record (a step read weights from disk or saw a kernel
+build) is measured once more, as that costs nothing, and kept after that: a measurement that stays
+cold must not hold the group's degree off. The group's degree is then tried
 once against it, and the trial moves the rest of its stage to one GPU after a slower second step
 (`spmd._Choice`); its record, cold or not, is never measured again. It is not tried at all where
 one GPU's last sharded call paged weights onto the card and the group crosses through host
@@ -112,7 +113,8 @@ def choose(key: Key, route: str) -> Decision:
     one = times.get(1)
     if one is None:
         return Decision(1, measure=True)
-    cold = bool(one.get("cold"))
+    # A first group request is cold; one more measurement shows whether it stays so.
+    cold = bool(one.get("cold")) and int(cast("int", one.get("measured", 1))) < 2
     if key.world not in times:
         if route == "host-staged" and int(cast("int", one.get("paged_bytes", 0))):
             why = "one GPU's last sharded call paged weights, and the exchange crosses host memory"
@@ -125,8 +127,8 @@ def choose(key: Key, route: str) -> Decision:
 
 def record(key: Key, degree: int, row: Mapping[str, object]) -> None:
     """`degree`'s steady step time and the kernels it served, for `key`. A degree already known
-    keeps its record (its choice must not move), except one GPU's cold record, which a later
-    measurement replaces."""
+    keeps its record (its choice must not move), except one GPU's cold record, which its next
+    measurement replaces once (`measured`)."""
     path = _path(key)
     if path is None:
         return
@@ -139,7 +141,8 @@ def record(key: Key, degree: int, row: Mapping[str, object]) -> None:
             held = degrees.get(str(degree))
             if held is not None and not (degree == 1 and held.get("cold")):
                 return
-            degrees[str(degree)] = dict(row)
+            measured = 1 + (int(held.get("measured", 1)) if held is not None else 0)
+            degrees[str(degree)] = {**row, "measured": measured}
             temporary = path.with_suffix(".tmp")
             temporary.write_text(json.dumps(document, sort_keys=True))
             temporary.replace(path)
