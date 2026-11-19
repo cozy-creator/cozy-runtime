@@ -18,7 +18,7 @@ dependencies = [
     # cozy-creator commit that merged the newest TensorFS API this Runtime calls. It holds where the RC builds TensorFS, Linux
     # x86_64, which is every machine an RC Runtime runs models on; elsewhere the released line stays admitted until the release
     # declares one range.
-    "tensorfs>=0.28.0.dev3490,<0.29; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tensorfs>=0.28.0.dev3528,<0.29; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "tensorfs>=0.27.0,<0.29; sys_platform != 'linux' or platform_machine != 'x86_64'",
     "msgspec>=0.19",
     "numpy>=1.26",
@@ -69,7 +69,7 @@ package = true
 # The open RC's TensorFS build its floor is met by (xs-216, docs/releases.md), on the one platform the RC builds it for. A release
 # drops this entry.
 [tool.uv.sources]
-tensorfs = { url = "https://github.com/cozy-creator/cozy-creator/releases/download/rc-0.28.0/tensorfs-0.28.0.dev3490+g88b4c22a-cp311-abi3-manylinux_2_28_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+tensorfs = { url = "https://github.com/cozy-creator/cozy-creator/releases/download/rc-0.28.0/tensorfs-0.28.0.dev3529+g021df0f9-cp311-abi3-manylinux_2_28_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
 
 [tool.basedpyright]
 # The editor's language server only; the required check is mypy (scripts/typecheck.sh).
@@ -153,7 +153,7 @@ media = [
 # Executors read and place weights through TensorFS (`tensorfs`, `tensorfs.varena`). Local
 # package environments select this capability; worker images provide the same range.
 model-execution = [
-    "tensorfs>=0.28.0.dev3490,<0.29; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tensorfs>=0.28.0.dev3528,<0.29; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "tensorfs>=0.27.0,<0.29; sys_platform != 'linux' or platform_machine != 'x86_64'",
 ]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
