@@ -171,6 +171,7 @@ from cozy_runtime.internal import (
     effect_interfaces,
     execution_evidence,
     fp8_linear,
+    fused_rows,
     int8_linear,
     kernel_cache,
     kernel_compile,
@@ -2833,9 +2834,12 @@ class Executor:
             # its whole stage on a fallback while it landed (Klein's on-demand upsampler; H3's
             # nvfp4 layers through step 1 on an RTX 5090, cr-241; on two 5060 Tis, cr-261). Each
             # first ask waits for it; a group's GPUs state theirs in their load's reply. So does
-            # counter noise's kernel, which a recorded step's draw needs before its capture.
+            # counter noise's kernel, which a recorded step's draw needs before its capture, and
+            # the fused rows' kernels, which each norm's and rotation's first call proves
+            # (`execution.fused`).
             leaves.prime(torch, torch.cuda.current_device())
             philox.prime(torch.cuda.current_device())
+            fused_rows.prime(torch.cuda.current_device())
             if self.world > 1:  # a group's int8 wire (`ulysses`)
                 from cozy_runtime.internal.parallel import turn
 

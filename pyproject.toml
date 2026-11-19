@@ -118,6 +118,7 @@ module = [
     "cozy_runtime.internal.attention_sol_fa4",
     "cozy_runtime.internal.decode_cores",
     "cozy_runtime.internal.decode_schemes",
+    "cozy_runtime.internal.fused_rows",
     "cozy_runtime.internal.kernel_sources",
     "cozy_runtime.internal.lora_bake",
     "cozy_runtime.internal.nvfp4_linear",

@@ -939,9 +939,15 @@ def rows(original: _Function) -> _Function:
     its input's sequence rows (`_call`), each with its tables' rows, at the level native selection
     takes under the current block, where its first call of that shape proved it row-local
     (`_probe`): PAN2's RoPE held 0.8 GiB of fp32 temporaries a call (cr-320). Whole outside a
-    named block, under autograd or compilation, and for any other call."""
+    named block, under autograd or compilation, and for any other call. A rotation its first call
+    of a shape proves the fused kernel's runs in one launch from then on (`fused.rotation`)."""
 
     def cut(*args: object, **kwargs: object) -> object:
+        from cozy_runtime.internal.execution import fused
+
+        return fused.rotation(original, eager, args, kwargs)
+
+    def eager(*args: object, **kwargs: object) -> object:
         x = args[0] if args else None
         if (
             not isinstance(x, Tensor)
