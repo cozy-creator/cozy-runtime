@@ -220,7 +220,8 @@ def _like(part: Tensor, shape: Sequence[int]) -> Tensor:
     """An empty tensor of `shape` laid out as `part` is (its dims in `part`'s stride order), so
     bands assemble into what the unbanded op returns: a channels-last conv's output stays
     channels-last, and its next op takes no copy to make it so."""
-    order = sorted(range(part.dim()), key=lambda d: -part.stride(d))
+    strides = part.stride()
+    order = sorted(range(part.dim()), key=lambda d: -strides[d])
     inner = part.new_empty([shape[d] for d in order])
     return inner.permute(*[order.index(d) for d in range(part.dim())])
 
