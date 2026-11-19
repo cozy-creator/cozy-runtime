@@ -463,7 +463,7 @@ def generate(
         row: WarningRow = recovered("decode ran through Transformers' loop", why=why)
         if row not in WARNINGS:
             WARNINGS.append(row)
-        with contract.owned():  # the Runtime's own use of Transformers' loop and caches
+        with contract.owned(), _given(inputs):  # the Runtime's own use of Transformers' loop
             said = (model, inputs, max_new_tokens, stops, filler, sampling, tell)
             return _transformers(*said, allowed, ngram)
     with _ENGINES_LOCK:
@@ -473,7 +473,7 @@ def generate(
     request = _Request(inputs, max_new_tokens, stops, filler, sampling, tell, allowed, ngram)
     token = BYPASS.set(True)  # the component's calls are this loop's, its graphs its own
     try:
-        with torch.inference_mode(), contract.owned():
+        with torch.inference_mode(), contract.owned(), _given(inputs):
             return engine.generate(request, draft)
     finally:
         BYPASS.reset(token)
@@ -1605,7 +1605,8 @@ def _prefill_level(
     """The decoder's call in 2^level pieces of its prompt, from an empty cache. Its tokens are
     embedded once, before the pieces (the table is read once, beside nothing of the prompt yet),
     and each piece's states are written where its embeddings were, which no later piece reads:
-    the prompt's states are held once."""
+    the prompt's states are held once. So are embeddings its model's wrapper made (a picture's
+    features merged in); only a caller's own get a buffer of their own (`_caller`)."""
     from cozy_runtime.internal.execution import sizing
 
     _emptied(cache)
@@ -1614,8 +1615,10 @@ def _prefill_level(
     embeds, ids = kwargs.get("inputs_embeds"), kwargs.get("input_ids")
     if embeds is None:
         states = embeds = cast("torch.nn.Module", decoder.get_input_embeddings())(ids)
-    else:  # the caller's own: it may read them again
+    elif _caller(embeds):  # the caller's own: it may read them again
         states = torch.empty_like(embeds)
+    else:  # the model's own, made for this call (its wrapper's merged embeddings)
+        states = embeds
     kwargs = {**kwargs, "input_ids": None, "inputs_embeds": embeds}
     piece = sizing.pieces(chunks, level) * PREFILL_ALIGN
     for at in range(0, length, piece):
@@ -1630,6 +1633,28 @@ def _prefill_level(
         states[:, at:end] = out[0]
     out["last_hidden_state"] = states
     return out
+
+
+#: The tensors of the `generate` call running now (`_given`): a prefill's pieces never write
+#: over them.
+_GIVEN: contextvars.ContextVar[tuple[torch.Tensor, ...]] = contextvars.ContextVar(
+    "cozy_lm_given", default=()
+)
+
+
+@contextmanager
+def _given(inputs: Mapping[str, object]) -> Iterator[None]:
+    token = _GIVEN.set(tuple(v for v in inputs.values() if isinstance(v, torch.Tensor)))
+    try:
+        yield
+    finally:
+        _GIVEN.reset(token)
+
+
+def _caller(tensor: torch.Tensor) -> bool:
+    """Whether `tensor` shares its storage with one of the running call's own inputs."""
+    at = tensor.untyped_storage().data_ptr()
+    return any(given.untyped_storage().data_ptr() == at for given in _GIVEN.get())
 
 
 def _prefill_need(
