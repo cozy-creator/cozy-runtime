@@ -34,7 +34,7 @@ RUST_FLOOR = re.compile(
     r'DRIVER_FLOOR: &str = if cfg!\(windows\) \{ "([\d.]+)" \} else \{ "([\d.]+)" \}'
 )
 #: A module on a machine without a GPU: one gemv and one INT4 attention return CUDA's error, a bad
-#: family is refused, FA3 and SageAttention3 refuse a head dim they have no kernel for.
+#: family is refused, FA3 and SageAttention3 refuse a head dim they have no kernel for, an engine launch raises.
 CALL = """
 import importlib.util, pathlib, sys
 def load(name):
@@ -68,6 +68,16 @@ assert _attn4.attention(0, *(0,) * 11, 1, 2, 2, 128, 128, 128, True, 1.0, *((0, 
 _ggml = load("_ggml")
 assert _ggml.kernel(0, 8, 4096, 4096, 1, 256) == 0, "a ggml kernel chosen with no GPU"
 assert _ggml.matmul(0, 8, 0, 0, 1, 0, 4096, 4096, 1, None, 0) != 0, "a ggml matmul without a GPU"
+import ctypes
+_engine = load("_engine")
+ring = ctypes.create_string_buffer(256)
+for call in (lambda: _engine.report(16, 4, 32, 8, 16, 8, 0), lambda: _engine.Segment(16, 16, 0)):
+    try:
+        call()
+        raise AssertionError("an engine launch without a GPU")
+    except RuntimeError:
+        pass
+assert _engine.Reader((ctypes.addressof(ring) + 15) & ~15, 4, 32).poll() == []
 _conv = load("_conv")
 assert _conv.conv(0, 0, 0, 0, False, 0, 1, 3, 8, 8, 8, 8, 3, 3, 3, 1, 6, 6, 1, 1, 1, -1, (0,) * 4, (0,) * 4, 0) != 0
 try:
