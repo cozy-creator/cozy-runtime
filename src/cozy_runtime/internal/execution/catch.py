@@ -371,11 +371,7 @@ def nested[T](
     use: what is unmapped, cached or held by idle weights, which varena reclaims for it. A pure op
     refused there runs again a level finer, the windows of the leaf around it kept (cr-305: H3's
     upscale ran its MLP whole inside a window and ran out). The last level's refusal stands."""
-    device = request.memory.device.index or 0
-    room = vt.room(device)
-    usable = int(room["capacity"]) - int(room["working_live"]) - int(room["pinned"])
-    fitting = next((at for at, (_, row) in enumerate(menu) if sum(row) <= usable), len(menu) - 1)
-    level = max(fitting, _NESTED.get(key, 0))
+    level = max(_fitting(request, menu), _NESTED.get(key, 0))
     while True:
         LEVELS[key] = level
         note(request, key, name, level)
@@ -391,6 +387,15 @@ def nested[T](
             file=sys.stderr,
         )
         level = _NESTED[key] = level + 1
+
+
+def _fitting(request: Request, menu: Sequence[tuple[str, Sequence[int]]]) -> int:
+    """The coarsest level of `menu` whose need the card's room holds now, else the finest: the card
+    less what is live and the weights in use (what is unmapped, cached or held by idle weights,
+    varena reclaims for it)."""
+    room = vt.room(request.memory.device.index or 0)
+    usable = int(room["capacity"]) - int(room["working_live"]) - int(room["pinned"])
+    return next((at for at, (_, row) in enumerate(menu) if sum(row) <= usable), len(menu) - 1)
 
 
 def retry(
@@ -488,7 +493,8 @@ def fixed(name: str, finest: int, need: sizing.Need) -> Fixed:
     """The level of a cut into 2^level pieces down to `finest` that a loop keeps throughout,
     chosen now by native selection, its room made, no coarser than one a piece was refused at;
     `DoesNotFit` where none can have it. Without native memory, or small, whole; inside a
-    capture or another site's leaf, the key's last."""
+    capture, the key's last; inside another site's leaf (a loop in a split's window), as a nested
+    cut chooses: the coarsest layout the card's room holds now, no coarser than one refused."""
     checkpoint()
     request = CURRENT.get()
     native = request is not None and request.memory.cuda
@@ -498,9 +504,13 @@ def fixed(name: str, finest: int, need: sizing.Need) -> Fixed:
         (str(level), row) for level, row in enumerate(useful([need(n) for n in range(finest + 1)]))
     )
     key = f"{name}:{hash(menu):x}"
-    if not native or not LEAF.acquire(blocking=False):
+    if not native or _capturing():
         return Fixed(LEVELS.get(key, 0))
     assert request is not None
+    if not LEAF.acquire(blocking=False):
+        level = LEVELS[key] = max(_fitting(request, menu), _REFUSED.get(key, 0))
+        note(request, key, name, level)
+        return Fixed(level, key, name, len(menu))
     try:
         device = request.memory.device.index or 0
         if not vt.split_context(device)["eligible"]:
