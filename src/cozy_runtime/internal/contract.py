@@ -370,22 +370,22 @@ def restore_flags(torch: ModuleType) -> list[str]:
 # ------------------------------------------------------------------------------- the scopes
 
 
-#: The executor's `() -> (varena's refused allocations on its GPU, the execution request)`, once
-#: its memory opens; None from a TensorFS that counts none.
-REFUSALS: list[Callable[[], tuple[int, Request | None] | None] | None] = [None]
+#: The executor's `() -> (varena's refused allocations on its GPU, those a cheaper step answered,
+#: the execution request)`, once its memory opens; None from a TensorFS that counts none.
+REFUSALS: list[Callable[[], tuple[int, int, Request | None] | None] | None] = [None]
 
 
-def _answered(request: object) -> int:
-    """The refusals `request`'s Runtime answered: by running again another way, or by a capture
-    recording again with room for them."""
-    return int(getattr(request, "retries", 0)) + int(getattr(request, "regrown", 0))
+def _regrown(request: object) -> int:
+    """The refusals `request`'s Runtime answered by a capture recording again with room for them."""
+    return int(getattr(request, "regrown", 0))
 
 
 class _Scopes:
     """Each local component scope (`author/_model.py`): at its exit the flags are put back and
     checked, and a refusal varena counted while it ran (`vt.ooms`) that the scope returned past,
-    and that no Runtime Retry answered (`retries`, `regrown`), is a swallowed OOM: a run warning
-    (`oom_swallowed`) and the request's `swallowed_ooms`. Scopes overlapping on two threads are
+    and that nothing answered (a cheaper step, `catch.refusals`, or a capture's `regrown`), is a
+    swallowed OOM: a run warning (`oom_swallowed`) and the request's `swallowed_ooms`. Those a
+    cheaper step answered are the request's `answered`, by scope. Scopes overlapping on two threads are
     not judged for it: varena's count is the device's. A scope that ran on a thread the package
     started is a run warning (`contract_thread`): a package's thread launches no device work."""
 
@@ -396,7 +396,7 @@ class _Scopes:
         self._shared = 0
         self._accounted: ContextVar[int] = ContextVar("cozy_contract_ooms", default=0)
 
-    def enter(self) -> tuple[int, int, int] | None:
+    def enter(self) -> tuple[int, int, int, int] | None:
         thread = threading.get_ident()
         with self._lock:
             if any(t != thread for t in self._open):
@@ -406,9 +406,9 @@ class _Scopes:
         read = REFUSALS[0]() if REFUSALS[0] is not None else None
         if read is None:
             return None
-        return read[0], _answered(read[1]), shared
+        return read[0], read[1], _regrown(read[2]), shared
 
-    def leave(self, entered: tuple[int, int, int] | None, method: str, ok: bool) -> None:
+    def leave(self, entered: tuple[int, int, int, int] | None, method: str, ok: bool) -> None:
         thread = threading.get_ident()
         with self._lock:
             depth = self._open.pop(thread, 1) - 1
@@ -416,7 +416,7 @@ class _Scopes:
                 self._open[thread] = depth
             alone = (
                 entered is not None
-                and self._shared == entered[2]
+                and self._shared == entered[3]
                 and not self._open.keys() - {thread}
             )
         moved = restore_flags(self.torch)
@@ -430,10 +430,13 @@ class _Scopes:
                 WARNINGS.append(row)
         if ok and alone and REFUSALS[0] is not None and (read := REFUSALS[0]()) is not None:
             assert entered is not None
-            ooms, request = read
+            ooms, answered, request = read
             since = max(entered[0], self._accounted.get())
-            swallowed = ooms - since - (_answered(request) - entered[1])
+            regrown = _regrown(request) - entered[2]
+            swallowed = ooms - since - (answered - entered[1]) - regrown
             self._accounted.set(ooms)
+            if answered > entered[1] and request is not None and hasattr(request, "answered"):
+                request.answered[method] = request.answered.get(method, 0) + answered - entered[1]
             if swallowed > 0:
                 if request is not None and hasattr(request, "swallowed_ooms"):
                     request.swallowed_ooms += swallowed

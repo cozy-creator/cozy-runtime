@@ -1248,9 +1248,14 @@ def split[T](
         hostable and request is not None and request.hosted.get(hsite, _ESTIMATED) != _ESTIMATED
     )
     if not on_host:
-        try:
+        try:  # refused before a window runs, its whole goes to host: a cheaper step stands behind
             return catch.cut(
-                site, deepest, need, lambda level: run(window(level), False), pure=pure
+                site,
+                deepest,
+                need,
+                lambda level: run(window(level), False),
+                pure=pure,
+                behind=hostable,
             )
         except catch.Unplaced as exc:  # refused before a window ran (or the op is pure)
             if not hostable or request is None:
@@ -1274,7 +1279,9 @@ def whole(part: Tensor, shape: Sequence[int], key: str, host: bool, zeros: bool 
     if host:
         return _pinned(shape, part.dtype, part.device, zeros)
     try:
-        return part.new_zeros(shape) if zeros else part.new_empty(shape)
+        # Refused, the whole goes to host here: cheaper than varena's last resort.
+        with catch.fallback(catch.CURRENT.get() is not None and not _capturing()):
+            return part.new_zeros(shape) if zeros else part.new_empty(shape)
     except BaseException as exc:
         request = catch.CURRENT.get()
         if request is None or not part.is_cuda or not is_capacity(exc) or _capturing():
@@ -1283,6 +1290,9 @@ def whole(part: Tensor, shape: Sequence[int], key: str, host: bool, zeros: bool 
         try:
             out = _pinned(shape, part.dtype, part.device, zeros)
         except Exception as failed:
+            if is_capacity(failed):  # the machine's host memory refused it too: its line says so
+                unwind(exc)
+                raise failed from None
             exc.add_note(f"its whole output in host memory failed too: {failed}")
             raise exc from None
         unwind(exc)
@@ -1313,9 +1323,10 @@ def ahead(key: str, host: bool, zeros: bool) -> Tensor | None:
     if host:
         return _pinned(shape, dtype, device, zeros)
     try:
-        if zeros:
-            return torch.zeros(shape, dtype=dtype, device=device)
-        return torch.empty(shape, dtype=dtype, device=device)
+        with catch.fallback(True):  # refused, the split takes the host rung
+            if zeros:
+                return torch.zeros(shape, dtype=dtype, device=device)
+            return torch.empty(shape, dtype=dtype, device=device)
     except BaseException as exc:
         if not is_capacity(exc):
             raise

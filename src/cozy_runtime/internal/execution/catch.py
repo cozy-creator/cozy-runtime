@@ -180,9 +180,15 @@ def _room_line() -> str:
         return f"a room that could not be read ({type(exc).__name__})"
     if refused is None:
         return f"{holders} now"
-    if refused["offered"]:
-        return f"{holders}, every evictable byte offered"
-    return f"{holders}, its graph pool short"
+    if not refused["offered"]:
+        return f"{holders}, its graph pool short"
+    if limit := refused.get("host_limit", 0):  # varena's last resort was refused host memory too
+        return (
+            f"{holders}, every evictable byte offered, and host memory too: "
+            f"{_gib(refused['host_free'])} free under its {_gib(limit)} limit for "
+            f"{_gib(refused['host_wanted'])} more"
+        )
+    return f"{holders}, every evictable byte offered"
 
 
 if not ROOM:
@@ -203,12 +209,48 @@ def refuse(device: int, name: str, level: str, need: int, exc: BaseException) ->
     )
 
 
-def select(
-    device: int, key: str, name: str, menu: Sequence[tuple[str, Sequence[int]]], stream: int
-) -> Selection:
-    """The level native selection takes, its room made; `DoesNotFit` where none can have it."""
+def fallback(on: bool) -> AbstractContextManager[object]:
+    """Allocations inside with a cheaper way out than varena's last resort, pinned host memory the
+    card reads over the link: a finer level of a pure op, a split's whole on host, a library's own
+    smaller choice, a graph that goes. A refusal then comes back here, the cheaper step runs, and
+    varena counts it answered. An enclosing one holds inside."""
+    scope = getattr(vt, "fallback", None)  # a TensorFS with the last resort
+    return scope(on) if scope is not None else nullcontext()
+
+
+def _attempt[T](run: Callable[[int], T], level: int, finer: bool, pure: bool) -> T:
+    """`run(level)`, its cheaper ways out first. Package code runs once. A pure op with a finer level
+    is refused for it (`retry`, `nested`). One at its last level first leaves a refusal to the
+    libraries it calls (cuDNN's next plan, cr-324), and runs again for varena's last resort only if
+    one escapes: their own choice costs less than a workspace over the link."""
+    if not pure:
+        return run(level)
+    if finer or getattr(vt, "fallback", None) is None:
+        with fallback(finer):
+            return run(level)
     try:
-        selection: Selection = vt.split_select(device, key, menu, stream=stream)
+        with fallback(True):
+            return run(level)
+    except BaseException as exc:
+        if not is_capacity(exc):
+            raise
+        _unwind(exc)
+    return run(level)
+
+
+def select(
+    device: int,
+    key: str,
+    name: str,
+    menu: Sequence[tuple[str, Sequence[int]]],
+    stream: int,
+    behind: bool = False,
+) -> Selection:
+    """The level native selection takes, its room made; `DoesNotFit` where none can have it and a
+    cheaper step stands `behind` the refusal, else the level nearest to fitting (varena's floor)."""
+    try:
+        with fallback(behind):
+            selection: Selection = vt.split_select(device, key, menu, stream=stream)
         return selection
     except varena.Exhausted as exc:  # a decision, not a failure: nothing has run
         raise refuse(device, name, "its finest split", sum(menu[-1][1]), exc) from exc
@@ -222,12 +264,15 @@ def begin(
     level: int,
     selection: Selection,
     stream: int,
+    behind: bool = False,
 ) -> int:
     """Open `level`'s native observation; `DoesNotFit` where its room is gone since selection
-    (another program took it, and the core's wait for it ran out)."""
+    (another program took it, and the core's wait for it ran out) and a cheaper step stands
+    `behind` the refusal, else it opens short (varena's floor)."""
     phase.choice()
     try:
-        return phase.begin_split(device, key, str(level), selection, stream=stream)
+        with fallback(behind):
+            return phase.begin_split(device, key, str(level), selection, stream=stream)
     except varena.Exhausted as exc:  # before the op runs
         raise refuse(device, name, f"split level {level}", sum(menu[level][1]), exc) from exc
 
@@ -252,12 +297,19 @@ def note(
 
 
 def cut[T](
-    name: str, finest: int, need: sizing.Need, run: Callable[[int], T], *, pure: bool = True
+    name: str,
+    finest: int,
+    need: sizing.Need,
+    run: Callable[[int], T],
+    *,
+    pure: bool = True,
+    behind: bool = False,
 ) -> T:
     """`run(level)` for a call that cuts itself into 2^level pieces down to `finest` (FFN tokens,
     attention pieces, a norm's or a conv's bands, a package's split). Without native memory, or
     small, it runs whole; inside a capture, at this key's last level; inside another site's leaf,
-    at the level the card's free room takes now (`nested`)."""
+    at the level the card's free room takes now (`nested`). `behind`: a cheaper step stands behind
+    a level refused before it runs (a split's whole on host), so selection refuses for it."""
     checkpoint()
     request = CURRENT.get()
     native = request is not None and request.memory.cuda
@@ -279,16 +331,16 @@ def cut[T](
             return run(LEVELS.get(key, 0))
         request.memory.remember_working_phase(key, owners(request))
         stream = int(torch.cuda.current_stream(device).cuda_stream)
-        selection = select(device, key, name, menu, stream)
+        selection = select(device, key, name, menu, stream, behind)
         while True:
             level = int(selection["choice_id"])
-            token = begin(device, key, name, menu, level, selection, stream)
+            token = begin(device, key, name, menu, level, selection, stream, behind)
             LEVELS[key] = level
             note(request, key, name, level, selection)
             try:
-                result = run(level)
+                result = _attempt(run, level, level + 1 < len(menu), pure)
             except BaseException as exc:
-                again = retry(device, key, name, menu, level, token, stream, exc, pure)
+                again = retry(device, key, name, menu, level, token, stream, exc, pure, behind)
                 if again is None:
                     if is_capacity(exc):  # the run record names it: a package's `holds` was short
                         request.working_splits[key]["refused"] = {"level": level, "pure": pure}
@@ -328,7 +380,7 @@ def nested[T](
         LEVELS[key] = level
         note(request, key, name, level)
         try:
-            return run(level)
+            return _attempt(run, level, level + 1 < len(menu), pure)
         except BaseException as exc:
             if not (pure and is_capacity(exc)) or level + 1 >= len(menu):
                 raise
@@ -351,6 +403,7 @@ def retry(
     stream: int,
     exc: BaseException,
     pure: bool,
+    behind: bool = False,
 ) -> Selection | None:
     """Close the failed leaf. For a pure op whose leaf varena refused memory, varena's answer: the
     finer level to run again at, its room made (`stats.retries`; a short estimate), or None,
@@ -360,7 +413,8 @@ def retry(
         return None
     _unwind(exc)
     try:
-        again: Selection | None = vt.split_refused(device, key, str(level), stream=stream)
+        with fallback(behind):
+            again: Selection | None = vt.split_refused(device, key, str(level), stream=stream)
     except varena.Exhausted as refused:
         raise refuse(device, name, "every finer split", sum(menu[-1][1]), refused) from exc
     if again is not None:
@@ -370,10 +424,19 @@ def retry(
     return again
 
 
-def refusals(device: int) -> Callable[[], tuple[int, Request | None]]:
-    """varena's count of allocations it refused on `device`, with the request whose Retries it
-    excludes, for the package contract's scopes."""
-    return lambda: (vt.ooms(device), CURRENT.get())
+def refusals(device: int) -> Callable[[], tuple[int, int, Request | None]]:
+    """varena's count of allocations it refused on `device`, of them those a cheaper step answered
+    (inside `fallback`: `vt.answered`; on a TensorFS without that count, the Runtime's retries), and
+    the request, for the package contract's scopes."""
+    answered = getattr(vt, "answered", None)  # a TensorFS that counts them
+
+    def read() -> tuple[int, int, Request | None]:
+        request = CURRENT.get()
+        if answered is not None:
+            return vt.ooms(device), answered(device), request
+        return vt.ooms(device), request.retries if request is not None else 0, request
+
+    return read
 
 
 def _unwind(exc: BaseException) -> None:

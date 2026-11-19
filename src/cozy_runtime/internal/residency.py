@@ -3091,6 +3091,8 @@ class RequestStats(TypedDict):
     first_blocks: list[FirstBlock]
     regrown: int
     swallowed_ooms: int
+    #: refusals a cheaper step answered, by the package scope they came in (`contract._Scopes`)
+    answered: dict[str, int]
     retained_bytes: int
     gathered: int
     streamed: int
@@ -3380,6 +3382,8 @@ class Request:
         self.first_blocks: list[FirstBlock] = []
         #: refusals a package scope returned past (`contract._Scopes`): zero in a conforming run
         self.swallowed_ooms = 0
+        #: refusals a cheaper step answered, by the package scope they came in (`contract._Scopes`)
+        self.answered: dict[str, int] = {}
         #: cross-step state its loops declared (`author.retained`)
         self.retained_bytes = 0
         #: Working allocation peak over the whole request, kept across cut-site resets. Weights
@@ -3531,6 +3535,7 @@ class Request:
             "first_blocks": list(self.first_blocks),
             "regrown": self.regrown,
             "swallowed_ooms": self.swallowed_ooms,
+            "answered": dict(self.answered),
             "retained_bytes": self.retained_bytes,
             "gathered": self.gathered,
             "streamed": self.streamed,
@@ -3584,12 +3589,16 @@ def _allocator(memory: Memory) -> dict[str, int]:
     """Cumulative native working-allocator counters; live/backing gauges are separate."""
     if not memory.cuda or memory.native is None:
         return {}
-    stats = vt.stats(memory.device.index or 0)
+    stats = cast("Mapping[str, int]", vt.stats(memory.device.index or 0))
     return {
-        key: int(stats[key])
+        key: int(stats.get(key, 0))  # a TensorFS before the last resort has none of its counters
         for key in (
             "allocations", "frees", "ooms", "driver_memory_calls",
             "event_queries", "event_records", "event_waits", "context_joins",
+            # refusals a cheaper step answered, and varena's last resort: host segments pinned,
+            # allocations served there and their bytes, and those host memory refused too
+            "answered_ooms", "host_working_allocs", "host_working_served",
+            "host_working_served_bytes", "host_working_refusals",
         )
     }
 

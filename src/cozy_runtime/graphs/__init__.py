@@ -1896,17 +1896,35 @@ class _OverCard(Exception):
     """A capture's pool can't sit beside its graph's weights (`_over_card`): it runs as written."""
 
 
-#: why a call that took a split's host rung records no graph (`_Seen.hosted`)
+#: why a call that took a split's host rung, or varena's last resort, records no graph
+#: (`_Seen.hosted`)
 _HOSTED = (
-    "a split in it kept its whole in host memory: a graph would need that whole on the card, "
-    "beside its weights, which had no room for it"
+    "it kept memory on the host the card had no room for (a split's whole, or what varena's last "
+    "resort held): a graph would need it on the card, beside its weights"
 )
 
 
 def _made() -> int:
+    """Host wholes made and allocations varena's last resort served, in this process."""
     from cozy_runtime.internal.execution import pinned  # with Torch: imported once a call runs
 
-    return pinned.made()
+    hosted = getattr(vt, "hosted", None)  # a TensorFS with the last resort
+    served = hosted(_current_device()) if hosted is not None else 0
+    return pinned.made() + served
+
+
+def _current_device() -> int:
+    import torch
+
+    return torch.cuda.current_device() if torch.cuda.is_initialized() else 0
+
+
+def _fallback() -> AbstractContextManager[object]:
+    """A graph is only speed: what its recording or check is refused, the call answers by running
+    as written (`_short`), never with varena's last resort (cr-333)."""
+    from cozy_runtime.internal.execution import catch  # it imports residency, which imports this
+
+    return catch.fallback(True)
 
 
 def _pool_key(module: Module, leaves: Sequence[object], device: int) -> str:
@@ -2297,6 +2315,7 @@ def _capture_verified(
             owner.using(),
             recorder.lock,
             request_path.known("cozy_runtime.graphs._record"),
+            _fallback(),
         ):
             if recorder.landed != LANDED[0] or (
                 recorder.binding is not None and not recorder.binding.valid()
@@ -3076,6 +3095,7 @@ def _record(
         with ExitStack() as entered:
             entered.enter_context(scope)
             entered.enter_context(lease)
+            entered.enter_context(_fallback())
             stage = "its warm-up"
             # Its weights are inputs, checked by identity and version: a copy of each held
             # beside them took the room a capped card's warm-up needed (SDXL at 6 GiB).

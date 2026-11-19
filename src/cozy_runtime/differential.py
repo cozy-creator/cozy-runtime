@@ -94,9 +94,11 @@ def arm(checks: Mapping[str, bool] | None = None, press: Press = "") -> None:
             _add(torch, vt, graphs._name(module), result)
         return result
 
-    def selected(device: int, key: str, name: str, menu: Menu, stream: int) -> SplitSelection:
+    def selected(
+        device: int, key: str, name: str, menu: Menu, stream: int, behind: bool = False
+    ) -> SplitSelection:
         try:
-            selection = select(device, key, name, menu, stream)
+            selection = select(device, key, name, menu, stream, behind)
         except DoesNotFit:
             _mark(key, len(menu) - 1, "refused")
             raise
