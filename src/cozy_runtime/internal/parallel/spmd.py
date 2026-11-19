@@ -653,10 +653,24 @@ def _layout(specs: Iterable[wire._Tensor]) -> dict[int, tuple[int, int]]:
     return found
 
 
+def _admit(nbytes: int) -> str:
+    """The machine's host admission for `nbytes` of plain host memory (TensorFS's, W5): empty
+    when admitted; else why not, in one line. Admitting reserves nothing: the bytes count from
+    the moment they are written, on the writing process's row, so they are written at once."""
+    try:
+        from tensorfs import _ext
+    except ImportError:
+        return ""
+    admit = getattr(_ext, "_varena_host_admit", None)  # absent before TensorFS carries W5
+    refused = admit(nbytes) if admit is not None else None
+    return str(refused or "")
+
+
 class _Shared:
-    """A crossing's host tensors in one shared mapping (`/dev/shm`): written once by the GPU that
-    holds them, mapped copy-on-write by each other GPU, which reads it in place. Its name goes once
-    every GPU has mapped it; its pages, once the last view of them does."""
+    """A crossing's host tensors in one shared mapping (`/dev/shm`): admitted by the machine's
+    host admission (`_admit`), written once by the GPU that holds them, mapped copy-on-write by
+    each other GPU, which reads it in place. Its name goes once every GPU has mapped it, and its
+    pages (counted once, on the writer's row) when the last view of them does."""
 
     def __init__(self, name: str, page: mmap.mmap) -> None:
         self.name, self.page = name, page
@@ -675,6 +689,8 @@ class _Shared:
         ]
         layout = _layout(specs)
         size = max(at + n for at, n in layout.values())
+        if _admit(size):
+            return None  # no room on the host now: every tensor broadcasts
         name = f"/dev/shm/cozy-cross-{os.getpid()}-{secrets.token_hex(8)}"
         try:
             fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
