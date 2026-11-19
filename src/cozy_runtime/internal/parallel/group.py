@@ -372,34 +372,41 @@ class Board:
         """Collective, once per process group: GPU 0 makes the page and names it in `store`, every
         GPU maps it, and its name goes once all have. None on every GPU alike where any could not
         (no shared memory): the group meets on its store."""
-        size, page = 2 * world * cls.SLOT, None
+        size, page, made = 2 * world * cls.SLOT, None, ""
         if rank == 0:
-            name = f"/dev/shm/cozy-board-{os.getpid()}-{secrets.token_hex(8)}"
+            made = f"/dev/shm/cozy-board-{os.getpid()}-{secrets.token_hex(8)}"
             try:
-                fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                fd = os.open(made, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            except OSError:
+                made = ""
+            else:
                 try:
-                    os.ftruncate(fd, size)
+                    os.posix_fallocate(fd, 0, size)  # a short /dev/shm refuses here, never a SIGBUS
                     page = mmap.mmap(fd, size)
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        os.unlink(made)
+                    made = ""
                 finally:
                     os.close(fd)
-            except OSError:
-                name = ""
-            store.set("board", name)
-        name = gather(store, ["board"], what)[0].decode()
-        if rank != 0 and name:
-            try:
-                fd = os.open(name, os.O_RDWR)
+            store.set("board", made)
+        try:
+            name = gather(store, ["board"], what)[0].decode()
+            if rank != 0 and name:
                 try:
-                    page = mmap.mmap(fd, size)
-                finally:
-                    os.close(fd)
-            except OSError:
-                page = None
-        store.set(f"board/{rank}", "1" if page is not None else "")
-        agreed = all(gather(store, [f"board/{r}" for r in range(world)], what))
-        if rank == 0 and name:
-            with contextlib.suppress(OSError):
-                os.unlink(name)
+                    fd = os.open(name, os.O_RDWR)
+                    try:
+                        page = mmap.mmap(fd, size)
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    page = None
+            store.set(f"board/{rank}", "1" if page is not None else "")
+            agreed = all(gather(store, [f"board/{r}" for r in range(world)], what))
+        finally:
+            if made:  # its name goes however the meeting ended; mapped pages stay until unmapped
+                with contextlib.suppress(OSError):
+                    os.unlink(made)
         if not agreed:
             if page is not None:
                 page.close()
