@@ -35,7 +35,7 @@ import cozy_runtime.internal.execution.sizing as sizing
 from cozy_runtime.author._errors import is_capacity, unwind
 from cozy_runtime.internal.encoding.leaves import NVFP4
 from cozy_runtime.internal.execution.sizing import levelled, levels, pieces
-from cozy_runtime.internal.residency import Request
+from cozy_runtime.internal.residency import Request, SplitProbe
 
 type Band = Callable[[int, int], Tensor]
 
@@ -843,13 +843,8 @@ def rows(original: _Function) -> _Function:
             began = time.perf_counter()
             local, held = _probe(original, args, kwargs, axis, dims)
             _LOCAL[key] = local
-            said = f"row-local along axis {axis}: cut" if local else "not row-local: whole"
-            print(
-                f"cozy-runtime: {original.__module__}.{getattr(original, '__qualname__', '')} "
-                f"{said} (its probe "
-                f"{(time.perf_counter() - began) * 1e3:.1f} ms, {held / (1 << 20):.2f} MiB)",
-                file=sys.stderr,
-            )
+            name = f"{original.__module__}.{getattr(original, '__qualname__', '')}"
+            _probed(site, name, axis, local is not None, began, held)
         local = _LOCAL[key]
         if local is None:
             return original(*args, **kwargs)
@@ -864,6 +859,22 @@ def rows(original: _Function) -> _Function:
     functools.update_wrapper(cut, original)
     vars(cut)[_ORIGINAL] = original
     return cut
+
+
+def _probed(site: str, function: str, axis: int, local: bool, began: float, held: int) -> None:
+    """A probe's verdict and cost, in one line and in the request's record beside its site."""
+    ms = (time.perf_counter() - began) * 1e3
+    said = f"row-local along axis {axis}: cut" if local else "not row-local: whole"
+    print(f"cozy-runtime: {function} {said} (its probe {ms:.1f} ms, {held} B)", file=sys.stderr)
+    request = catch.CURRENT.get()
+    if request is not None:
+        probe: SplitProbe = {"function": function, "local": local, "ms": ms, "bytes": held}
+        request.working_splits[f"{site}:probe"] = {
+            "site": site,
+            "levels": {},
+            "chosen": {},
+            "probe": probe,
+        }
 
 
 def _probe(
