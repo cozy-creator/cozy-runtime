@@ -107,6 +107,11 @@ Text = Annotated[str, msgspec.Meta(max_length=65536)]
 Effort = Literal["minimal", "low", "medium", "high", "xhigh"]
 
 
+#: Qwen's sampling for general tasks (Qwen3.5-9B's model card :833-836), (temperature, top_p) by
+#: whether it thinks; both with top_k 20, min_p 0 and presence penalty 1.5.
+CARD = {False: (0.7, 0.8), True: (1.0, 0.95)}
+
+
 class AskPrompt(msgspec.Struct):
     text: Annotated[str, msgspec.Meta(min_length=1, max_length=65536)]
     images: Images = []
@@ -127,13 +132,16 @@ class AskRequest(msgspec.Struct):
     #: template's own.
     reasoning_effort: Effort | None = None
     max_tokens: Annotated[int, msgspec.Meta(ge=1, le=16384)] = 1024
-    #: 0 answers greedily; above it, each token is drawn from the `top_p` nucleus at this
-    #: temperature, from `seed`: the same request and seed give the same answer.
-    temperature: Annotated[float, msgspec.Meta(ge=0, le=2)] = 0.0
-    top_p: Annotated[float, msgspec.Meta(gt=0, le=1)] = 1.0
-    seed: Annotated[int, msgspec.Meta(ge=0, le=(1 << 53) - 1)] = 0
+    #: `lm.generate`'s sampling, by default the Qwen model cards' (`CARD`): null temperature and
+    #: top_p are the card's for `thinking`. Temperature 0 answers greedily, which the cards advise
+    #: against (it can repeat endlessly). The same request and seed draw from the same
+    #: distribution (on a GPU not always the same words); unset, a new seed each render.
+    temperature: Annotated[float, msgspec.Meta(ge=0, le=2)] | None = None
+    top_p: Annotated[float, msgspec.Meta(gt=0, le=1)] | None = None
+    top_k: Annotated[int, msgspec.Meta(ge=0)] = 20
+    seed: Seed | None = None
     #: Subtracted from every token already generated (vLLM's).
-    presence_penalty: Annotated[float, msgspec.Meta(ge=-2, le=2)] = 0.0
+    presence_penalty: Annotated[float, msgspec.Meta(ge=-2, le=2)] = 1.5
     #: An answer ends before the first of these.
     stop: Annotated[
         list[Annotated[str, msgspec.Meta(min_length=1, max_length=256)]], msgspec.Meta(max_length=8)
@@ -167,10 +175,11 @@ class TextBox(msgspec.Struct, kw_only=True):
     system: Annotated[Text, Advanced()] = ""
     #: `lm.generate`'s `max_new_tokens`.
     max_tokens: Annotated[int, msgspec.Meta(ge=1, le=16384), Advanced()] = 1024
-    #: `lm.generate`'s sampling. The defaults are Qwen's for instruct VL tasks (its model cards);
-    #: 0 answers greedily.
-    temperature: Annotated[float, msgspec.Meta(ge=0, le=2), Advanced()] = 0.7
-    top_p: Annotated[float, msgspec.Meta(gt=0, le=1), Advanced()] = 0.8
+    #: `lm.generate`'s sampling, by default the Qwen model cards' (`CARD`): null temperature and
+    #: top_p are the card's for `thinking`; 0 answers greedily.
+    temperature: Annotated[Annotated[float, msgspec.Meta(ge=0, le=2)] | None, Advanced()] = None
+    top_p: Annotated[Annotated[float, msgspec.Meta(gt=0, le=1)] | None, Advanced()] = None
+    top_k: Annotated[int, msgspec.Meta(ge=0), Advanced()] = 20
     presence_penalty: Annotated[float, msgspec.Meta(ge=-2, le=2), Advanced()] = 1.5
     #: `lm.generate`'s draw; unset, a new one each render.
     seed: Annotated[Seed | None, Advanced()] = None
@@ -261,8 +270,9 @@ def write(ctx: Context, payload: TextBox, model: VisionLM, tel: Telemetry) -> Te
         max_tokens=payload.max_tokens,
         temperature=payload.temperature,
         top_p=payload.top_p,
+        top_k=payload.top_k,
         presence_penalty=payload.presence_penalty,
-        seed=secrets.randbits(53) if payload.seed is None else payload.seed,
+        seed=payload.seed,
     )
     (text,) = _answers([_parts(payload.instructions)], asked, model, tel, output="text")
     return TextResult(text)
@@ -325,6 +335,7 @@ def _answers(
         if sink is not None:
             sink(output, row + 1 if listed else 0, delta)
 
+    card_temperature, card_top_p = CARD[payload.thinking]
     with tel.stage(stage[0]):
         return model.ask(
             read_questions,
@@ -334,9 +345,10 @@ def _answers(
             stop=list(payload.stop),
             max_new_tokens=payload.max_tokens,
             presence_penalty=payload.presence_penalty,
-            temperature=payload.temperature,
-            top_p=payload.top_p,
-            seed=payload.seed,
+            temperature=card_temperature if payload.temperature is None else payload.temperature,
+            top_p=card_top_p if payload.top_p is None else payload.top_p,
+            top_k=payload.top_k,
+            seed=secrets.randbits(53) if payload.seed is None else payload.seed,
             progress=lambda tokens: tel._tokens(tokens, payload.max_tokens, stage=stage[0]),
             words=words,
         )
@@ -506,7 +518,8 @@ class Pipeline:
 @dataclass(frozen=True, slots=True)
 class Params:
     """How to answer: the system turn and the chat template's thinking (`reasoning_effort` where
-    it reads one), where an answer stops, and the decoding (`lm.generate`'s)."""
+    it reads one), where an answer stops, and the decoding (`lm.generate`'s, each setting as
+    vLLM's `SamplingParams` defines it; the defaults change nothing)."""
 
     system: str
     thinking: bool
@@ -519,6 +532,9 @@ class Params:
     seed: int
     no_repeat_ngram: int | None = None
     top_k: int = 0
+    min_p: float = 0.0
+    frequency_penalty: float = 0.0
+    repetition_penalty: float = 1.0
 
 
 class Engine(Protocol):
@@ -578,6 +594,9 @@ class VisionLM(Model[Pipeline]):
         top_p: float,
         seed: int,
         top_k: int = 0,
+        min_p: float = 0.0,
+        frequency_penalty: float = 0.0,
+        repetition_penalty: float = 1.0,
         progress: Callable[[int], None] | None = None,
         no_repeat_ngram: int | None = None,
         reasoning_effort: str | None = None,
@@ -600,6 +619,9 @@ class VisionLM(Model[Pipeline]):
             seed=seed,
             no_repeat_ngram=no_repeat_ngram,
             top_k=top_k,
+            min_p=min_p,
+            frequency_penalty=frequency_penalty,
+            repetition_penalty=repetition_penalty,
         )
         shown = [_Words(stop) for _ in questions]
 
@@ -674,6 +696,9 @@ class TransformersEngine:
             "temperature": params.temperature,
             "top_p": params.top_p,
             "top_k": params.top_k,
+            "min_p": params.min_p,
+            "frequency_penalty": params.frequency_penalty,
+            "repetition_penalty": params.repetition_penalty,
             "seed": params.seed,
             "progress": progress,
             "no_repeat_ngram": params.no_repeat_ngram,
@@ -844,6 +869,9 @@ class _Decoding(TypedDict):
     temperature: float
     top_p: float
     top_k: int
+    min_p: float
+    frequency_penalty: float
+    repetition_penalty: float
     seed: int
     progress: Callable[[int], None] | None
     no_repeat_ngram: int | None
