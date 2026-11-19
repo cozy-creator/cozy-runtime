@@ -37,6 +37,7 @@ forward or function as it was, under the cut it had.
 from __future__ import annotations
 
 import sys
+import time
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -91,6 +92,53 @@ def _launch(device: torch.device) -> Launch | None:
         if launch is not None:
             _LAUNCHES[index] = launch
     return launch
+
+
+@dataclass(slots=True)
+class Check:
+    """One law's first-call checks (`taken`): the sites the kernel serves after theirs, those left
+    as written and the first reason, the worst difference seen as a share of rounding's allowance,
+    the values compared and the checks' time on the call's path."""
+
+    served: int = 0
+    left: int = 0
+    why: str = ""
+    worst: float = 0.0
+    values: int = 0
+    ms: float = 0.0
+
+
+#: each (kind, law)'s checks since the executor last took them for a run's record
+_CHECKS: dict[tuple[str, str], Check] = {}
+
+
+def _checked(kind: str, law: str, began: float, off: float, values: int, why: str = "") -> None:
+    check = _CHECKS.setdefault((kind, law), Check())
+    if why:
+        check.left += 1
+        check.why = check.why or why
+    else:
+        check.served += 1
+        check.worst = max(check.worst, off)
+    check.values += values
+    check.ms += (time.perf_counter() - began) * 1e3
+
+
+def taken() -> list[tuple[str, str, Check]]:
+    """The first-call checks since the last take, for the attempt's record (the executor's
+    `kernel.fused_rows`): a check is said in the run whose call ran it."""
+    rows = [(kind, law, check) for (kind, law), check in sorted(_CHECKS.items())]
+    _CHECKS.clear()
+    return rows
+
+
+def _piece(rows: int, width: int, itemsize: int) -> int:
+    """How many of a call's `rows` a first-call check compares, so all it holds stays under what
+    runs unasked (`catch._SMALL`): a value's kernel and eager rows (`itemsize` each), up to two
+    tables' entries with their int64 index, and the allowance's float32 temporaries (the value,
+    what it carried, a factor and the terms of their sums: seven at most)."""
+    held = 2 * itemsize + 2 * (itemsize + 8) + 7 * 4
+    return min(rows, max(1, catch._SMALL // (held * width)))
 
 
 def _failed(exc: Exception) -> str:
@@ -242,7 +290,8 @@ class _Site:
         weight = self.weight()
         if not fused_rows.fits(x) or weight is None:
             return fused_rows.fits(x)
-        return weight.shape == x.shape[-1:] and weight.dtype == x.dtype and weight.device == x.device
+        same = weight.shape == x.shape[-1:] and weight.dtype == x.dtype
+        return same and weight.device == x.device
 
     def takes(self, x: Tensor) -> bool:
         """Whether this call's rows are the kernel's now."""
@@ -269,23 +318,26 @@ class _Site:
         if self.proven:
             return _rows(_Pending(self, launch, x))
         if self.asked is not None and self.asked() is None:
-            self.leave("its rows were read where they cannot wait")
+            self.left_checked(time.perf_counter(), "its rows were read where they cannot wait")
             return self.inner(x)
         if torch.cuda.is_current_stream_capturing():
             return self.inner(x)  # a capture cannot hold the proof's comparison
         counted = _Made()  # type: ignore[no-untyped-call]  # TorchDispatchMode's __init__
         with counted:
             whole = self.inner(x)
+        began = time.perf_counter()
         if not (
             type(whole) is Tensor
             and whole.shape == x.shape
             and whole.dtype == x.dtype
             and whole.device == x.device
         ):
-            self.leave("its result is not its input's rows")
+            self.left_checked(began, "its result is not its input's rows")
             return whole
         if counted.made < 2 * whole.numel() * whole.element_size():
-            self.leave()  # one kernel already: no temporary the size of its output
+            # one kernel already: no temporary the size of its output (said once, in the record)
+            self.leave()
+            _checked("norm", _name(self.module), began, 0.0, 0, "one kernel already")
             return whole
         made = _rows(_Pending(self, launch, x, eager=whole))
         self.asked = weakref.ref(made)
@@ -314,12 +366,13 @@ class _Site:
         """Prove the kernel on this call: its rows of the middle of `pending.x`, a piece small
         enough to run unasked, within rounding's allowance of `want`'s. `want` came from the
         input as it was when the norm was called, so an input changed since fails here too."""
+        began = time.perf_counter()
         x, width = pending.x, int(pending.x.shape[-1])
         if want.shape != x.shape or want.dtype != x.dtype:
-            self.leave("its block's scale or shift changes its rows' shape or dtype")
+            self.left_checked(began, "its block's scale or shift changes its rows' shape or dtype")
             return
         rows = x.numel() // width
-        count = min(rows, max(1, catch._SMALL // (16 * width)))
+        count = _piece(rows, width, x.element_size())
         at = (rows - count) // 2
         try:
             piece = x.view(rows, width)[at : at + count]
@@ -329,13 +382,20 @@ class _Site:
             allowed = fused_rows.bound(piece, self.eps, self.weight(), scale, shift)
             off = fused_rows.within(got, want.reshape(rows, width)[at : at + count], allowed)
         except Exception as exc:
-            self.leave(_failed(exc))
+            self.left_checked(began, _failed(exc))
             return
         if not off <= 1:
-            self.leave(f"its rows lie {off:.3g} times rounding's allowance from the kernel's")
+            why = f"its rows lie {off:.3g} times rounding's allowance from the kernel's"
+            self.left_checked(began, why, count * width)
             return
         self.proven = True
+        _checked("norm", _name(self.module), began, off, count * width)
         _say(f"{_name(self.module)}: one kernel a call, each proven on its first call")
+
+    def left_checked(self, began: float, why: str, values: int = 0) -> None:
+        """Its check refused it: left as written, said in the record and once in a line."""
+        self.leave(why)
+        _checked("norm", _name(self.module), began, 0.0, values, why)
 
     def leave(self, why: str = "") -> None:
         """This module runs as written from here on: its forward goes back where it is still this
@@ -433,22 +493,29 @@ def rotation(
             return eager(*args, **kwargs)
     if torch.cuda.is_current_stream_capturing():
         return eager(*args, **kwargs)  # a capture cannot hold the proof's comparison
-    want = eager(*args, **kwargs)
+    want, law = eager(*args, **kwargs), _function(original)
+    began = time.perf_counter()
     if type(want) is not Tensor or want.shape != x.shape or want.dtype != x.dtype:
         _TURNS[key] = None
+        _checked("rotation", law, began, 0.0, 0, "its result is not its input's shape and dtype")
         return want
     try:
-        proven = _turned(launch, x, cos, sin, want)
+        proven, off, values = _turned(launch, x, cos, sin, want)
     except Exception as exc:
         _TURNS[key] = None
-        _say(f"{_function(original)}: left as written ({_failed(exc)})")
+        why = _failed(exc)
+        _checked("rotation", law, began, 0.0, 0, why)
+        _say(f"{law}: left as written ({why})")
         return want
     if proven is not False:
         _TURNS[key] = proven
         if proven is None:
-            _say(f"{_function(original)}: left as written (no layout of its tables matches)")
+            why = "no layout of its tables matches"
+            _checked("rotation", law, began, 0.0, values, why)
+            _say(f"{law}: left as written ({why})")
         else:
-            _say(f"{_function(original)}: one kernel a call, proven on each shape's first call")
+            _checked("rotation", law, began, off, values)
+            _say(f"{law}: one kernel a call, proven on each shape's first call")
     return want
 
 
@@ -487,25 +554,27 @@ def _turning(
 
 def _turned(
     launch: Launch, x: Tensor, cos: Tensor, sin: Tensor, want: Tensor
-) -> fused_rows.Turn | Literal[False] | None:
+) -> tuple[fused_rows.Turn | Literal[False] | None, float, int]:
     """The first layout (`fused_rows.turns`) whose rotation of the middle of `x`, a piece small
-    enough to run unasked, is within rounding's allowance of `want`'s; None for none; False where
+    enough to run unasked (`_piece`), is within rounding's allowance of `want`'s, with its
+    difference as a share of that allowance and the values compared; None for none; False where
     the call left that piece as it was (no layout can be told from another there)."""
-    info = torch.finfo(x.dtype)
+    info, compared = torch.finfo(x.dtype), 0
     for turn in fused_rows.turns(x, cos):
         rows = x.numel() // turn.head
-        count = min(rows, max(1, catch._SMALL // (16 * turn.head)))
+        count = _piece(rows, turn.head, x.element_size())
         at = (rows - count) // 2
         piece = x.reshape(rows, turn.head)[at : at + count]
         expected = want.reshape(rows, turn.head)[at : at + count]
         unturned = expected.float().abs() * info.eps + info.tiny * info.eps
         if fused_rows.within(piece, expected, unturned) <= 1:
-            return False
+            return False, 0.0, 0
         got = fused_rows.turned(launch, piece, cos, sin, turn, at)
         allowed = fused_rows.turn_bound(piece, cos, sin, turn, expected, at)
-        if fused_rows.within(got, expected, allowed) <= 1:
-            return turn
-    return None
+        off, compared = fused_rows.within(got, expected, allowed), compared + count * turn.head
+        if off <= 1:
+            return turn, off, compared
+    return None, 0.0, compared
 
 
 def _function(original: _Call) -> str:

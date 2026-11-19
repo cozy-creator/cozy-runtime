@@ -357,13 +357,14 @@ def bound(
     by twice that. The mean's sum, in either order over `width` positive squares, is within
     `width` fp32 epsilons of the other's (rsqrt halves it), and that carries to the end too."""
     info, single = torch.finfo(x.dtype), torch.finfo(torch.float32).eps
-    wide = x.float()
-    value = wide * torch.rsqrt(wide.pow(2).mean(-1, keepdim=True) + eps)
+    value = x.float()
+    value = value * torch.rsqrt(value.pow(2).mean(-1, keepdim=True) + eps)
     carried, rounded = value.abs(), 1
     for factor in (weight, scale):
         if factor is not None:
-            value = value * factor.float()
-            carried = carried * factor.float().abs() + value.abs()
+            wide = factor.float()
+            value = value * wide
+            carried = carried * wide.abs() + value.abs()
             rounded += 1
     drift = value.abs() * (single * int(x.shape[-1]))
     if shift is not None:
