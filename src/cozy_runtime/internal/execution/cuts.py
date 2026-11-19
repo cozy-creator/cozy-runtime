@@ -806,8 +806,9 @@ def _call(
     length its tables are indexed by, each table's axis of that length (None: it has none and is
     passed whole), and a key for its shape of call. None where the axis isn't one (no table has it,
     a table has it twice, or two axes could be it), where an argument is neither a table nor a
-    scalar, or where a second tensor is an activation like `x`, its shape and dtype (the call mixes
-    two: attention's keys and values)."""
+    scalar, or where the call mixes activations: a second tensor like `x` (its shape and dtype), or
+    two of `x`'s rank and dtype that share one shape (attention's keys and values, whatever their
+    length). Attention is `attend`'s: a processor's dispatch reaches it there."""
     tables: list[Tensor] = []
     form: list[object] = []
     for value in (*args[1:], *kwargs.values()):
@@ -823,6 +824,9 @@ def _call(
                 form.append(item)
             else:
                 return None
+    activations = [(t.shape, t.dtype) for t in tables if t.dim() == x.dim() and t.dtype == x.dtype]
+    if len(set(activations)) < len(activations):
+        return None
     found = None
     for axis in range(1, x.dim() - 1):
         length = int(x.shape[axis])
