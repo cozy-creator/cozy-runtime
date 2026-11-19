@@ -144,6 +144,48 @@ def matmul(
     return shaped
 
 
+def products(torch: ModuleType, x: Tensor, weights: list[tuple[Tensor, str, int]]) -> list[Tensor] | None:
+    """Each weight's f32 product `x[..., K] @ W.T` of one 16-bit `x`, from one q8_1 quantize of it,
+    where ggml's rule takes MMVQ for every one of them on this card (a few rows): the quantize
+    sibling linears of one input would each launch, once. `weights` are (blocks, scheme, n). None
+    where they can't share it (another kernel, another dtype, a module without it), for the caller
+    to call each linear."""
+    if not x.is_cuda:
+        return None
+    index = x.get_device()
+    ops = native(torch, index)
+    name = str(x.dtype).removeprefix("torch.")
+    if ops is None or not hasattr(ops, "quantize") or name not in ("bfloat16", "float16"):
+        return None
+    k = int(x.shape[-1])
+    rows = x.reshape(-1, k).contiguous()
+    m = int(rows.shape[0])
+    for blocks, scheme, n in weights:
+        if unserved(blocks, k) or kernel(torch, index, scheme, k, n, m, blocks) != "mmvq":
+            return None
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+    q8_1: Tensor = torch.empty(int(ops.quantized_bytes(k, m)), dtype=torch.uint8, device=x.device)
+    code = ops.quantize(index, rows.data_ptr(), ops.ACTIVATIONS.index(name), q8_1.data_ptr(), k, m, stream)
+    if code != 0:
+        raise RuntimeError(f"ggml quantize ({k} columns, {m} rows): {ops.error_name(code)}")
+
+    def allocate(nbytes: int) -> Tensor:
+        held: Tensor = torch.empty(nbytes, dtype=torch.uint8, device=x.device)
+        return held
+
+    made: list[Tensor] = []
+    for blocks, scheme, n in weights:
+        out: Tensor = torch.empty(m, n, dtype=torch.float32, device=x.device)
+        code = ops.matmul_quantized(
+            index, TYPES[scheme], blocks.data_ptr(), q8_1.data_ptr(), out.data_ptr(), k, n, m, allocate, stream
+        )
+        if code != 0:
+            said = ops.error() if code == ops.UNKNOWN else ops.error_name(code)
+            raise RuntimeError(f"ggml matmul of a shared q8_1 ({scheme}, {k}x{n}, {m} rows): {said}")
+        made.append(out.view(*x.shape[:-1], n))
+    return made
+
+
 def linear(
     torch: ModuleType,
     x: Tensor,
