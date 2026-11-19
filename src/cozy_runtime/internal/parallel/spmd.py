@@ -665,8 +665,8 @@ def _layout(specs: Iterable[wire._Tensor]) -> dict[int, tuple[int, int]]:
 
 def _admit(nbytes: int) -> str:
     """The machine's host admission for `nbytes` of plain host memory (TensorFS's, W5): empty
-    when admitted; else why not, in one line. Admitting reserves nothing: the bytes count from
-    the moment they are written, on the writing process's row, so they are written at once."""
+    when admitted; else why not, in one line. Admitting reserves nothing: the pages count by the
+    kernel's charge from `posix_fallocate`, which follows at once, until their last view goes."""
     try:
         from tensorfs import _ext
     except ImportError:
@@ -680,7 +680,7 @@ class _Shared:
     """A crossing's host tensors in one shared mapping (`/dev/shm`): admitted by the machine's
     host admission (`_admit`), written once by the GPU that holds them, mapped copy-on-write by
     each other GPU, which reads it in place. Its name goes once every GPU has mapped it, and its
-    pages (counted once, on the writer's row) when the last view of them does."""
+    pages (counted by the kernel's charge from `posix_fallocate`) when their last view does."""
 
     def __init__(self, name: str, page: mmap.mmap) -> None:
         self.name, self.page = name, page
