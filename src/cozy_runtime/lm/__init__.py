@@ -913,12 +913,14 @@ def _paged_layout(shapes: list[_Shape], dtype: torch.dtype) -> str:
     """Why the engine's K/V (`engine.kv`: one block layout across every attention layer, 16-bit,
     a power-of-two head width up to 256) can't hold these layers, "" where it can."""
     keys = {(shape[1], shape[2], shape[3]) for shape in shapes if shape[0] == "keys"}
+    if not keys:
+        return "it has no attention layer: the engine's K/V blocks are attention's"
     if len(keys) > 1:
         return f"its attention layers' K/V differ ({sorted(keys)}): one block layout holds all"
     for heads, width, values in keys:
         if width != values or width > 256 or width & (width - 1):
             return f"K/V heads {width} and {values} wide: paged attention takes one power of 2 to 256"
-    if keys and dtype not in (torch.bfloat16, torch.float16):
+    if dtype not in (torch.bfloat16, torch.float16):
         return f"its K/V would be {dtype}: the paged attention reads 16-bit K/V"
     return ""
 
