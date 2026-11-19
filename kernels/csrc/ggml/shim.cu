@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // What llama.cpp's ggml-cuda matmul sources (`ggml/`, b12466, MIT, unmodified) take from the rest of ggml, for
-// `_kernels._ggml`: the device table, one context per device whose stream is the caller's and whose pool is the
-// caller's allocator, ggml's tensor arithmetic for the types `_ggml` runs, and failures as C++ exceptions. No ggml
+// `_kernels._ggml`: the device table, one context per device and thread whose stream is the caller's and whose pool is
+// the caller's allocator, ggml's tensor arithmetic for the types `_ggml` runs, and failures as C++ exceptions. No ggml
 // graph, allocator or backend: ggml-cuda.cu and ggml.c are not built.
 #include "shim.h"
 
@@ -242,14 +242,12 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(g
 namespace cozy_ggml {
 
 Call::Call(int device, cudaStream_t stream, Allocate* allocate) {
-    static std::mutex lock;
-    static ggml_backend_cuda_context* contexts[GGML_CUDA_MAX_DEVICES] = {};
+    // A context per thread and device, freed at the thread's exit: a call's `allocate` runs Python, where the interpreter
+    // can switch threads, and another thread's call on a shared context would overwrite or null this call's stream.
+    thread_local std::unique_ptr<ggml_backend_cuda_context> contexts[GGML_CUDA_MAX_DEVICES];
     if (device < 0 || device >= ggml_cuda_info().device_count) throw std::runtime_error("ggml: no such device");
-    {
-        const std::lock_guard<std::mutex> held(lock);
-        if (contexts[device] == nullptr) contexts[device] = new ggml_backend_cuda_context(device);
-    }
-    ctx_ = contexts[device];
+    if (contexts[device] == nullptr) contexts[device] = std::make_unique<ggml_backend_cuda_context>(device);
+    ctx_ = contexts[device].get();
     ctx_->curr_stream_no = 0;
     ctx_->streams[device][0] = stream;
     current = allocate;

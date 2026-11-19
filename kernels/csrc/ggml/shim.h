@@ -12,7 +12,7 @@ struct Allocate {
     void* context;
 };
 
-// While it lives, `device`'s ggml context runs on `stream` and takes temporaries from `allocate`.
+// While it lives, this thread's ggml context for `device` runs on `stream` and takes temporaries from `allocate`.
 class Call {
   public:
     Call(int device, cudaStream_t stream, Allocate* allocate);

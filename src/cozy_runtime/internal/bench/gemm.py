@@ -14,6 +14,8 @@ from __future__ import annotations
 import math
 import random
 import statistics
+import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -369,6 +371,8 @@ def _ggml(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
         rules[f"ordered:{name}"] = _ordered(matmul)
         # The leaf's production path: bf16 rows, quantized to q8_1 as they are (`matmul`'s other branches).
         rules[f"ordered-linear:{name}"] = _ordered(partial(ggml_linear.matmul, ops, torch, x, blocks, scheme, s.n))
+        if (threaded := _threads(ops, scheme, s.n, s.k)) is not None:
+            rules[f"ordered-threads:{name}"] = threaded
         calls[f"ggml-matmul{GGML_GRAPHED}:{name}"] = _graphed(matmul)
         calls[f"ggml-linear{GGML_GRAPHED}:{name}"] = _graphed(partial(_ggml_linear, ops, x, blocks, scheme, s.n))
         rules[f"kernel:{name}"] = ggml_linear.kernel(torch, 0, scheme, s.k, s.n, s.m, blocks)
@@ -441,6 +445,73 @@ def _ordered(call: Call) -> str:
             if not same:
                 return "false"
     return "true"
+
+
+#: The two-thread cell: rounds of calls a thread, at most, and the bytes it holds, at most (both threads' inputs and
+#: outputs, wanted and got), within a quarter of the card's free memory.
+_THREAD_ROUNDS = 32
+_THREAD_BYTES = 512 << 20
+
+
+def _threads(ops: ModuleType, scheme: str, n: int, k: int) -> str | None:
+    """Whether two threads' ggml matmuls on one GPU, each thread on its own stream and both at once, give every output
+    bit for bit as the same calls made one after another on one thread do (xs-213: `Call` kept one context per device,
+    and a call's `allocate` runs Python, where the interpreter switches threads, so the other thread's call could
+    overwrite or null this call's stream). Every call takes temporaries from `allocate`: bf16 rows where ggml's rule
+    takes few-row MMQ (their widened copy, after which ggml reads the context's stream) and f32 rows through MMQ (their
+    q8_1 copy), in turns, with no sync until a thread's last. Real blocks (one encoded 64-row tile, repeated), so an
+    output read early or made from another call's rows differs. None where neither kernel serves this weight here, or
+    where the card can't hold two rounds beside the bench's operands (44602394914: a 3080's 9B head, out of memory)."""
+    g = torch.Generator(device="cuda:0").manual_seed(213)
+    tile = ggml_linear.encode(torch, scheme, _rand(g, 64, k, scale=0.1, add=-0.05).cpu())
+    blocks = tile.to("cuda:0").repeat(-(-n // 64), 1, 1)[:n].contiguous()
+    paths: list[tuple[int, torch.dtype]] = []
+    for kind, dtype, ms in (("mmq_few", BF16, (16, 8)), ("mmq", torch.float32, (64, 32))):
+        m = next((m for m in ms if ggml_linear.kernel(torch, 0, scheme, k, n, m, blocks) == kind), 0)
+        if m:
+            paths.append((m, dtype))
+    if not paths:
+        return None
+    held = 2 * sum(2 * 4 * m * n + m * k * (2 if dtype == BF16 else 4) for m, dtype in paths)  # a round, both threads
+    rounds = min(_THREAD_ROUNDS, min(_THREAD_BYTES, torch.cuda.mem_get_info(0)[0] // 4) // held)
+    if rounds < 2:
+        return None
+    inputs = [[_rand(g, m, k, scale=2.0, add=-1.0).to(dtype) for _ in range(rounds) for m, dtype in paths] for _ in range(2)]
+
+    def run(xs: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [ggml_linear.matmul(ops, torch, x, blocks, scheme, n) for x in xs]
+
+    want = [run(xs) for xs in inputs]
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    start = threading.Barrier(2, timeout=60)
+    same = [False, False]
+    failed: list[str] = []
+
+    def thread(t: int) -> None:
+        try:
+            with torch.cuda.stream(streams[t]):
+                start.wait()
+                got = run(inputs[t])
+                streams[t].synchronize()
+                same[t] = all(torch.equal(a.view(torch.int32), b.view(torch.int32)) for a, b in zip(got, want[t], strict=True))
+        except Exception as exc:  # the cell's finding
+            failed.append(_said(exc))
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # the interpreter hands the GIL over as often as it can
+    try:
+        workers = [threading.Thread(target=thread, args=(t,)) for t in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+    finally:
+        sys.setswitchinterval(interval)
+    torch.cuda.synchronize()
+    if failed:
+        return f"false: {failed[0]}"
+    return "true" if all(same) else "false"
 
 
 def _ggml_linear(ops: ModuleType, x: torch.Tensor, blocks: torch.Tensor, scheme: str, n: int) -> torch.Tensor:
