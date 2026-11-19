@@ -51,6 +51,13 @@ CURRENT: ContextVar[Request | None] = ContextVar("cozy_execution_request", defau
 #: Below this a whole op runs unasked: the allocator's reclaim makes its room, and three native
 #: calls cost more than a cut could save (an SDXL UNet's hundred small convs, in every eager step).
 _SMALL = 64 << 20
+
+
+def small(need: sizing.Need) -> bool:
+    """A whole op this small runs unasked, whatever the room (`_SMALL`)."""
+    return sum(need(0)) < _SMALL
+
+
 #: Native leaves do not nest and this process has one device: a site that finds this held, in
 #: another site's leaf on any thread, runs inside that leaf's observation.
 LEAF = threading.Lock()
@@ -254,7 +261,7 @@ def cut[T](
     checkpoint()
     request = CURRENT.get()
     native = request is not None and request.memory.cuda
-    if not (native or _capturing()) or sum(need(0)) < _SMALL:
+    if not (native or _capturing()) or small(need):
         return run(0)
     menu = tuple(
         (str(level), row) for level, row in enumerate(useful([need(n) for n in range(finest + 1)]))
@@ -422,7 +429,7 @@ def fixed(name: str, finest: int, need: sizing.Need) -> Fixed:
     checkpoint()
     request = CURRENT.get()
     native = request is not None and request.memory.cuda
-    if not (native or _capturing()) or sum(need(0)) < _SMALL:
+    if not (native or _capturing()) or small(need):
         return Fixed(0)
     menu = tuple(
         (str(level), row) for level, row in enumerate(useful([need(n) for n in range(finest + 1)]))
