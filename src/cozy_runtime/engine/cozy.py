@@ -1,20 +1,24 @@
-"""`CozyEngine` (xs-213 phase 2): `vlm.Engine` on the engine's own decoder where it serves the
-call, Transformers' engine where it doesn't, with the reason in the call's timings note.
+"""`CozyEngine` (xs-213 phase 2): `vlm.Engine` on the engine's own decoder for the calls it can
+hold, Transformers' engine for every other. Which serves is decided in one place: `_why` (the
+platform, the model, the call), then the decoder's `Short` (its weights or K/V refused room at the
+call's start, before anything is told). Once a token is told nothing falls back. Each call says
+which engine served it, and why not this one, in the run record's `<model>.engine` note.
 
-It serves a CUDA Qwen3.5 text call: text-only questions, no repeat-n-gram cut, at most the
-decoder's rows. The questions are read as Transformers' engine reads them (its chat template and
-tokenizer), each row's text is handed on as it comes (at most every `STREAM_S`), and stops are
-cut as `VisionLM.ask` cuts them.
+It serves a CUDA Qwen3.5 text call: text-only questions, at most `ROWS` rows, no repeat-n-gram cut,
+on a dense model whose step linears are all of `LANES`. The questions are read as Transformers'
+engine reads them (its chat template and tokenizer), each row's text is handed on as it comes (at
+most every `STREAM_S`), and stops are cut as `VisionLM.ask` cuts them.
 """
 
 from __future__ import annotations
 
+import sys
 import time
 from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 
-from cozy_runtime.engine.decoder import Decoder, Request
+from cozy_runtime.engine.decoder import Decoder, Request, Short, answered, short_of_room
 from cozy_runtime.engine.qwen35 import text_of
 
 if TYPE_CHECKING:
@@ -26,6 +30,12 @@ if TYPE_CHECKING:
 
 #: Text handed on at most this often, a row at a time.
 STREAM_S = 0.1
+#: The most rows a call decodes at once (the decoder's).
+ROWS = 16
+#: The encodings of the step's linears the engine's GPU cells have passed; a lane joins when its
+#: cell passes (int8.convrot, q4_k_m's `ggml.q4_k` and `ggml.q6_k` next).
+LANES = frozenset({"bf16", "ggml.q8_0"})
+_DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
 
 
 class _Tokenizer(Protocol):
@@ -38,8 +48,12 @@ class _Tokenizer(Protocol):
 
 def serves(model: torch.nn.Module) -> str:
     """Why the engine can't decode `model`, or "" where it can."""
+    from cozy_runtime.engine._kernels import TRITON_ABSENT
+
     if not torch.cuda.is_available():
         return "the engine decodes on CUDA"
+    if TRITON_ABSENT:
+        return f"the engine's kernels need Triton: {TRITON_ABSENT}"
     try:
         text = text_of(model)
     except (AttributeError, KeyError, TypeError) as exc:
@@ -48,6 +62,25 @@ def serves(model: torch.nn.Module) -> str:
         return "the engine decodes Qwen3.5's hybrid layers"
     if (text.heads // text.kv_heads) * text.kv_heads != text.heads:
         return "its query heads are not a multiple of its K/V heads"
+    root = model.get_decoder()  # type: ignore[operator]  # a Transformers model's
+    head = getattr(model, "mtp", None)
+    layers = [*root.layers, *(head.layers if head is not None else [])]
+    if not all(hasattr(layer.mlp, part) for layer in layers for part in ("gate_proj", "up_proj", "down_proj")):
+        return "its MLPs are experts: the engine's step has none"
+    reads = (root, model.get_output_embeddings(), head)  # type: ignore[operator]  # as above
+    lanes = {_lane(m) for read in reads if read is not None for m in read.modules()} - {""}
+    if unproven := sorted(lanes - LANES):
+        return f"its linears are {', '.join(unproven)}, which the engine's cells have not passed"
+    return ""
+
+
+def _lane(module: torch.nn.Module) -> str:
+    """A linear's encoding (an encoded leaf's), or its dtype's name (a plain one's); "" otherwise."""
+    encoding = getattr(module, "encoding", None)
+    if isinstance(encoding, str):
+        return encoding
+    if isinstance(module, torch.nn.Linear):
+        return _DTYPES.get(module.weight.dtype, str(module.weight.dtype))
     return ""
 
 
@@ -61,15 +94,21 @@ class CozyEngine:
         self.fallback = TransformersEngine(pipe, processor)
         self.model = pipe.components[COMPONENT]
         self.decoder: Decoder | None = None
+        #: why the engine can't decode the model ("" where it can), judged at the first call
+        self.unserved: str | None = None
 
     def _why(self, questions: list[Question], params: Params) -> str:
+        if self.unserved is None:
+            self.unserved = serves(self.model)
+        if self.unserved:
+            return self.unserved
         if any(not isinstance(p, str) for q in questions for p in q.read()):
-            return "the engine's prefill reads text only (xs-213 phase 2)"
+            return "the engine's prefill reads text only"
+        if len(questions) > ROWS:
+            return f"the engine decodes at most {ROWS} rows at once"
         if params.no_repeat_ngram:
             return "the engine has no repeat-n-gram cut"
-        if len(questions) > 16:
-            return "the engine decodes at most 16 rows at once"
-        return serves(self.model)
+        return ""
 
     def generate(
         self,
@@ -79,12 +118,27 @@ class CozyEngine:
         on_delta: Callable[[Delta], None],
         progress: Callable[[int], None] | None = None,
     ) -> Final:
+        why = self._why(questions, params)
+        if not why:
+            try:
+                return self._served(questions, params, on_delta, progress)
+            except Short as short:
+                from cozy_runtime.internal.execution import catch
+
+                why = str(short)
+                catch._unwind(short)
+        self._note(f"Transformers' engine: {why}")
+        return self.fallback.generate(questions, params, on_delta=on_delta, progress=progress)
+
+    def _served(
+        self,
+        questions: list[Question],
+        params: Params,
+        on_delta: Callable[[Delta], None],
+        progress: Callable[[int], None] | None,
+    ) -> Final:
         from cozy_runtime.vlm import Final, Usage, _Told
 
-        if self._why(questions, params):
-            served = self.fallback.generate(questions, params, on_delta=on_delta, progress=progress)
-            served.timings["engine_transformers"] = 1.0
-            return served
         tokenizer = cast("_Tokenizer", self.processor.tokenizer)
         texts = [self.fallback._chat(q, params.system, params.thinking, params.reasoning_effort) for q in questions]
         prompts = [tokenizer.encode(t, add_special_tokens=False) for t in texts]
@@ -93,7 +147,13 @@ class CozyEngine:
         single = [ids[0] for ids in (tokenizer.encode(s, add_special_tokens=False) for s in stop) if len(ids) == 1]
         stops = [t for t in dict.fromkeys([*(configured if isinstance(configured, list) else [configured]), tokenizer.eos_token_id, *single]) if t is not None]
         if self.decoder is None:
-            self.decoder = Decoder(self.model)
+            try:
+                self.decoder = Decoder(self.model, max_rows=ROWS)
+            except Exception as exc:
+                if not short_of_room(exc):
+                    raise
+                answered(exc)
+                raise Short(f"the engine's tables don't fit ({str(exc)[:200]})") from exc
         rows = len(prompts)
         made: list[list[int]] = [[] for _ in range(rows)]
         told = [_Told(params.thinking) for _ in range(rows)]
@@ -128,10 +188,25 @@ class CozyEngine:
             made[row] = ids if end is None else ids[: end + 1]
             reasons.append("length" if end is None else "stop")
             tell(row, ended=True)
+        kept = [k for row in out.kept for k in row]
+        made_tokens = sum(len(m) for m in made)
+        self._note(
+            f"{made_tokens} tokens after {sum(len(p) for p in prompts)} by the engine: prefill {out.prefill_s:.3f} s, "
+            f"then {1000 * out.decode_s / max(out.steps, 1):.2f} ms a step over {out.steps} steps "
+            f"({sum(kept) / max(len(kept), 1):.2f} tokens a step a row, {'captured' if out.captured else 'eager'})"
+        )
         return Final(
             texts=[t.answer for t in told],
             thoughts=[t.thought for t in told],
             finish_reasons=reasons,
-            usage=Usage(sum(len(p) for p in prompts), sum(len(m) for m in made)),
+            usage=Usage(sum(len(p) for p in prompts), made_tokens),
             timings={"prefill": out.prefill_s, "decode": out.decode_s, "steps": float(out.steps), "captured": float(out.captured)},
         )
+
+    def _note(self, text: str) -> None:
+        """The call's engine in the run record, beside lm's `<model>.lm`, and the executor's log."""
+        from cozy_runtime.author._model import PLACED
+
+        print(f"[engine] {text}", file=sys.stderr)
+        if (placed := PLACED.get(self.model)) is not None:
+            placed[0].note(f"{placed[1]}.engine", text)

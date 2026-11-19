@@ -6,6 +6,10 @@ The step's graph runs as the body of the launcher's WHILE node (`_kernels._engin
 launch runs steps until the step itself says stop (every row done, or a row's next step would
 write past the K/V its host committed), each step reporting what it made into a host ring the
 host reads `POLLS` times a second. Bring-up: a row's prompt is prefilled alone, text only.
+
+A call takes the step's weights (`_leased`) and every row's K/V at its start and holds them to its
+end. Refused room there, before anything ran, it raises `Short`: its caller serves the call
+another way.
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ import contextlib
 import functools
 import time
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, cast
 
@@ -119,6 +123,11 @@ STOPS = 8
 #: 64-token chunks, so each piece computes as in a whole-prompt call; fixed, so a capped and an
 #: uncapped call cut a prompt alike.
 PREFILL_CHUNK = 2048
+
+
+class Short(Exception):
+    """A call refused room at its start, before anything ran: the step's weights or its rows' K/V
+    don't fit beside what the card holds now. Nothing was told and nothing is held."""
 
 
 @dataclass(frozen=True)
@@ -226,26 +235,42 @@ class Decoder:
         sampling = self._sampling(request, size)
         drafted = self.drafting
         made = Made(tokens=[[] for _ in range(rows)], kept=[[] for _ in range(rows)])
-        with torch.cuda.stream(self.stream), torch.inference_mode():
-            began = time.perf_counter()
-            for row, prompt in enumerate(request.prompts):
-                made.tokens[row].append(self._prefill(row, prompt, request, sampling, drafted))
-            self.stream.synchronize()
-            made.prefill_s = time.perf_counter() - began
-            if told is not None:
-                for row in range(rows):
-                    told(row, made.tokens[row][-1:])
+        admitted: list[int] = []
+        with torch.cuda.stream(self.stream), torch.inference_mode(), ExitStack() as call:
             began = time.perf_counter()
             try:
+                try:
+                    call.enter_context(self._leased())
+                    for row, prompt in enumerate(request.prompts):
+                        self._admit(row, len(prompt), request, drafted)
+                        admitted.append(row)
+                except Exception as exc:
+                    if not short_of_room(exc):
+                        raise
+                    answered(exc)
+                    raise Short(f"its weights and K/V don't fit at the call's start ({str(exc)[:200]})") from exc
+                for row, prompt in enumerate(request.prompts):
+                    made.tokens[row].append(self._prefill(row, prompt, request, sampling, drafted))
+                self.stream.synchronize()
+                made.prefill_s = time.perf_counter() - began
+                if told is not None:
+                    for row in range(rows):
+                        told(row, made.tokens[row][-1:])
+                began = time.perf_counter()
                 self._decode(size, rows, drafted, sampling, request, made, told)
             finally:
-                for row in range(rows):
+                for row in admitted:
                     self.kv.free(row)
-                r = self.rows
-                r.done.fill_(True)
+                self.rows.done.fill_(True)
                 self.stream.synchronize()
             made.decode_s = time.perf_counter() - began
         return made
+
+    def _admit(self, row: int, length: int, request: Request, drafted: bool) -> None:
+        """`row`'s blocks for its prompt, its state slot and the first steps' K/V, committed."""
+        kv = self.kv
+        kv.admit(row, length, drafted=drafted, host_tokens=self._host_tokens(length, request))
+        kv.reserve_ahead(row, (SEGMENT + 1) * (kv.layout.span + 1))  # the head's position P, and the first steps
 
     def _sampling(self, request: Request, size: int) -> Sampling:
         sampled = request.temperature > 0
@@ -263,18 +288,16 @@ class Decoder:
     # ------------------------------------------------------------------ prefill
 
     def _prefill(self, row: int, prompt: Sequence[int], request: Request, sampling: Sampling, drafted: bool) -> int:
-        """`row`'s prompt through the model's own forward, `prefill_chunk` tokens at a time: each
-        attention layer's K/V into the row's blocks as it is made (`_PagedLayer`), the gated-delta
-        layers' states carried by Transformers' cache from chunk to chunk and into the row's slot
-        at the end; the head's K/V for positions 1 to P chunk by chunk, and its state for the first
-        draft. Returns the first token."""
+        """`row`'s prompt (admitted) through the model's own forward, `prefill_chunk` tokens at a
+        time: each attention layer's K/V into the row's blocks as it is made (`_PagedLayer`), the
+        gated-delta layers' states carried by Transformers' cache from chunk to chunk and into the
+        row's slot at the end; the head's K/V for positions 1 to P chunk by chunk, and its state for
+        the first draft. Returns the first token."""
         from transformers import DynamicCache
 
         hf, kv, qwen, r = self.hf, self.kv, self.qwen, self.rows
         ids = torch.tensor([list(prompt)], dtype=torch.long, device=self.device)
         length = ids.shape[1]
-        kv.admit(row, length, drafted=drafted, host_tokens=self._host_tokens(length, request))
-        kv.reserve_ahead(row, (SEGMENT + 1) * (kv.layout.span + 1))  # the head's position P, and the first steps
         cache = DynamicCache(config=hf.config.get_text_config(decoder=True))  # type: ignore[arg-type]  # its own config type
         for layer, index in qwen.slot_of.items():
             cache.layers[layer] = cast("CacheLayerMixin", _paged_layer(kv, row, index))
@@ -364,9 +387,9 @@ class Decoder:
     @contextmanager
     def _leased(self) -> Iterator[None]:
         """The weights a step reads (the language model, its head and, drafting, the draft head)
-        held where they are while a graph records or replays: varena moves no Region a graph
-        holds the address of. A model with no placement (a bench's plain tensors) holds nothing.
-        Where the binding's identity changed since the graphs were recorded, they are dropped."""
+        held where they are for a call: varena moves no Region a graph holds the address of. A
+        model with no placement (a bench's plain tensors) holds nothing. Where the binding's
+        identity changed since the graphs were recorded, they are dropped."""
         from cozy_runtime.author._model import PLACED
 
         placed = PLACED.get(self.model)
@@ -418,20 +441,17 @@ class Decoder:
                     kv.settle(row, int(kv.lengths[row]))
                     kv.reserve_ahead(row, (SEGMENT + 1) * reach)
                     r.budget[row] = kv.committed(row)
-            with self._leased():
-                if key not in self.steps and graph is not None:
-                    graph = None  # recorded against weights that have since moved
-                for k in range(SEGMENT):
-                    if graph is not None:
-                        graph.replay()
-                    elif made.steps and key not in self.steps:  # the second step is recorded, then run
-                        graph = self._capture(step, made)
-                        self.steps[key] = (step, graph)
-                        graph.replay() if graph is not None else step()
-                    else:
-                        step()
-                    ring[k].copy_(r.report[:size])
-                    made.steps += 1
+            for k in range(SEGMENT):
+                if graph is not None:
+                    graph.replay()
+                elif made.steps and key not in self.steps:  # the second step is recorded, then run
+                    graph = self._capture(step, made)
+                    self.steps[key] = (step, graph)
+                    graph.replay() if graph is not None else step()
+                else:
+                    step()
+                ring[k].copy_(r.report[:size])
+                made.steps += 1
             self.stream.synchronize()
             for k, report in enumerate(ring.cpu().tolist()):
                 for row in range(rows):
@@ -489,28 +509,25 @@ class Decoder:
                     ahead = min(LAUNCH_STEPS, max(request.max_new - len(made.tokens[row]), 0)) + reach
                     kv.reserve_ahead(row, ahead)
                     r.budget[row] = min(kv.committed(row), length + ahead)
-            with self._leased():
-                if key not in self.steps and graph is not None:
-                    graph = None  # recorded against weights that have since moved
-                if graph is None and made.steps and key not in self.steps:  # the second step is recorded
-                    graph = self._capture(step, made, keep_graph=True)
-                    self.steps[key] = (step, graph)
-                    if graph is not None:
-                        self.segments[key] = _engine.Segment(graph.raw_cuda_graph(), r.go.data_ptr(), self.device.index or 0)
-                if graph is None:  # a new key's first step, or a step that can't be captured: eagerly
-                    step()
-                    self.stream.synchronize()
-                else:
-                    segment = cast("_engine.Segment", self.segments[key])
-                    with _held(graph, self.stream):
-                        segment.launch(self.stream.cuda_stream)
-                        done = torch.cuda.Event(blocking=True)
-                        done.record(self.stream)
-                        if told is not None:
-                            while not done.query():
-                                time.sleep(1 / POLLS)
-                                take()
-                        done.synchronize()
+            if graph is None and made.steps and key not in self.steps:  # the second step is recorded
+                graph = self._capture(step, made, keep_graph=True)
+                self.steps[key] = (step, graph)
+                if graph is not None:
+                    self.segments[key] = _engine.Segment(graph.raw_cuda_graph(), r.go.data_ptr(), self.device.index or 0)
+            if graph is None:  # a new key's first step, or a step that can't be captured: eagerly
+                step()
+                self.stream.synchronize()
+            else:
+                segment = cast("_engine.Segment", self.segments[key])
+                with _held(graph, self.stream):
+                    segment.launch(self.stream.cuda_stream)
+                    done = torch.cuda.Event(blocking=True)
+                    done.record(self.stream)
+                    if told is not None:
+                        while not done.query():
+                            time.sleep(1 / POLLS)
+                            take()
+                    done.synchronize()
             take()
             live = [not d for d in r.done[:rows].tolist()]
 
@@ -595,6 +612,32 @@ def _host_tier(model: torch.nn.Module, index: int) -> varena.Pages:
 
 #: the host tier of a GPU no placement opened one for, made once
 _OWN_PAGES: dict[int, varena.Pages] = {}
+
+
+def short_of_room(exc: BaseException) -> bool:
+    """Whether `exc` refuses a call room (lm's test): an allocation refused, varena's `Exhausted`
+    (`is_capacity`), a native refusal before anything ran (`DoesNotFit`), or weights whose storage
+    a held binding can't serve (`StaleBinding`)."""
+    from cozy_runtime.author._errors import DoesNotFit, is_capacity
+    from cozy_runtime.internal.accel import StaleBinding
+
+    return is_capacity(exc) or isinstance(exc, (DoesNotFit, StaleBinding))
+
+
+def answered(exc: BaseException) -> None:
+    """A refusal varena counted (`vt.ooms`) that the Runtime answers by running another way, so the
+    package's scope is not judged to have swallowed it (as lm's)."""
+    from tensorfs.varena import Exhausted
+
+    from cozy_runtime.author._errors import DoesNotFit
+    from cozy_runtime.internal.accel import StaleBinding
+    from cozy_runtime.internal.execution.catch import CURRENT
+
+    counted = exc.__cause__ if isinstance(exc, DoesNotFit) else exc
+    if counted is None or isinstance(counted, (Exhausted, StaleBinding)):
+        return
+    if (serving := CURRENT.get()) is not None:
+        serving.retries += 1
 
 
 class _Paged(Protocol):
