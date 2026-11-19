@@ -54,9 +54,12 @@ class Run:
             if not why:
                 self.launch(kernel, grid, *cast("tuple[KernelArgument, ...]", args))
                 return
-            if key not in self.said:
+            if key not in self.said:  # said once, in the log and the run's record
+                from cozy_runtime.author._model import WARNINGS
+
                 self.said.add(key)
                 print(f"[engine] {key} through Triton's JIT: {why}", file=sys.stderr)
+                WARNINGS.append((f"the engine's {key} went through Triton's JIT: {why}", {"kernel": key, "why": why}))
         cast("_Jit", kernel)[grid](*args, num_warps=num_warps)
 
 

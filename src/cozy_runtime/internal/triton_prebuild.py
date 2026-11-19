@@ -3,7 +3,8 @@
 OUT being `cozy_runtime/_triton`, or `... OUT --package NAME`, OUT being `<NAME>/_triton`.
 
 The Runtime's: every set a card row runs (`machine_kernels.triton_sets`, the LoRA bake set, LM
-decode, MoE experts, tcgen05's Sol merge). A package's: every set its import declares (its fused
+decode, MoE experts, tcgen05's Sol merge, the engine's sets for the Qwen3.5 checkpoints it ships them
+for: `engine.kernels.PREBUILT`). A package's: every set its import declares (its fused
 plans included), for every row of `arch.ROWS`. Each compiles as the machine's builder compiles it
 (`spec`, `compile_entries`), into a scratch Triton cache; a set that does not compile for a row is
 left out and named, and machines compile it as before. Each kernel's metadata and cubin go to
@@ -34,6 +35,7 @@ from triton.runtime.cache import get_cache_manager
 from cozy_runtime import lm
 from cozy_runtime.accel import moe
 from cozy_runtime.accel.kernels import _SETS, TritonKernels
+from cozy_runtime.engine import kernels as engine_kernels
 from cozy_runtime.internal import (
     arch,
     attention_sol_fa4,
@@ -59,6 +61,8 @@ def sets(package: str = "") -> list[tuple[TritonKernels, int]]:
             row = replace(named, half_accumulate=half)  # each hardware class of the cc
             extra = [attention_sol_fa4.KERNELS] if row.family == arch.TCGEN05 else []
             sets = (*machine_kernels.triton_sets(row), lora_bake.KERNELS, lm.KERNELS, moe.KERNELS)
+            if row.family:  # bf16: Ampere on, as the engine decodes
+                sets = (*sets, *engine_kernels.prebuilt())
             for kernels in (*sets, *extra):
                 if kernels.entries:
                     found[(kernels.name, sm)] = kernels

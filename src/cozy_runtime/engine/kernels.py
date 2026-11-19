@@ -260,3 +260,36 @@ def entries(shapes: Shapes) -> list[TritonEntry]:
 def kernels_for(shapes: Shapes) -> TritonKernels:
     """The set a model of `shapes` launches, named by its shapes: one per model kind on a machine."""
     return TritonKernels(f"cozy-engine-{shapes.digest}", entries(shapes), origin=__name__)
+
+
+_ROLES = ("a", "b", "down", "gate", "k", "o", "out", "q", "qkv", "residual", "up", "v", "z")
+#: The canonical layout's parameters, every Qwen3.5 lane alike (44599741328's sets).
+_WEIGHTS = (("a_log", "fp32"), ("conv", "bf16"), ("dt_bias", "bf16"), ("gated_norm", "fp32"), ("norm", "bf16"),
+            ("qk_norm", "bf16"))  # fmt: skip
+
+
+def _checkpoint(hidden: int, heads: int, full: int, v_heads: int, product: str) -> Shapes:
+    """A Qwen3.5 checkpoint's shapes: its head dim 256 at a quarter rotary, 4 K/V heads, `full` attention layers and
+    the drafting head's, 16 key heads of 128 and value heads of 128, a conv of 4; every product `product` (f32 on the
+    ggml lanes, bf16 on bf16 and int8)."""
+    return Shapes(
+        act="bf16", kv="bf16", states=("bf16", "fp32"), hidden=hidden, heads=heads, kv_heads=4, head_dim=256,
+        rotary=64, attn_layers=full + 1, block_tokens=16, k_heads=16, v_heads=v_heads, dk=128, dv=128, conv=4,
+        products=tuple((role, product) for role in _ROLES), weights=_WEIGHTS,
+    )  # fmt: skip
+
+
+#: The checkpoints whose sets the wheel ships (`triton_prebuild`), so a fresh machine copies them as the model loads:
+#: Qwen3.5-9B (q8_0 `cozy-engine-f26a776376f92032`; int8 and bf16 `cozy-engine-32a91780a70ae938`, as 44599741328
+#: built them) and qwen3's default 27B (llmfan46's Qwen3.8-27B), each on the ggml lanes and on bf16 and int8. A
+#: checkpoint whose shapes differ builds its own set on the machine, as before.
+PREBUILT: tuple[Shapes, ...] = tuple(
+    _checkpoint(*dims, product)
+    for dims in ((4096, 16, 8, 32), (5120, 24, 16, 48))
+    for product in ("fp32", "bf16")
+)
+
+
+def prebuilt() -> list[TritonKernels]:
+    """The sets of `PREBUILT`."""
+    return [kernels_for(shapes) for shapes in PREBUILT]
