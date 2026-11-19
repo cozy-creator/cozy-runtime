@@ -210,6 +210,8 @@ class Tables:
 
 #: The widest row the fused norm takes in one program.
 NORM_WIDEST = 8192
+#: An MLP's intermediate columns a SiLU-and-multiply program takes.
+MLP_BLOCK = 1024
 
 
 def _norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
@@ -248,9 +250,32 @@ def _gated(x: Tensor, gate: Tensor, weight: Tensor, eps: float) -> Tensor:
     return (y * F.silu(gate.float())).to(dtype)
 
 
-def _rotate(x: Tensor) -> Tensor:
-    half = x.shape[-1] // 2
-    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+def _add_norm(x: Tensor, h: Tensor, weight: Tensor, eps: float) -> tuple[Tensor, Tensor]:
+    """The residual stream `x + h` and its `Qwen3_5RMSNorm`: one launch for every row on CUDA
+    (`_kernels.add_norm_kernel`), else torch's add and `_norm`."""
+    width = int(x.shape[-1])
+    if x.is_cuda and not _kernels.TRITON_ABSENT and width <= NORM_WIDEST:
+        rows = x.reshape(-1, width).contiguous()
+        total, out = torch.empty_like(rows), torch.empty_like(rows)
+        block = 1 << max(width - 1, 0).bit_length()
+        _kernels.add_norm_kernel[(int(rows.shape[0]),)](
+            rows, h.reshape(-1, width).contiguous(), weight, total, out, width, eps,
+            BLOCK=block, num_warps=8 if block >= 2048 else 4,
+        )  # fmt: skip
+        return total.view(x.shape), out.view(x.shape)
+    total = x + h
+    return total, _norm(total, weight, eps)
+
+
+def _silu_mul(gate: Tensor, up: Tensor) -> Tensor:
+    """SiLU(gate) * up in one launch (`_kernels.silu_mul_kernel`)."""
+    width = int(gate.shape[-1])
+    out = torch.empty_like(gate)
+    rows = gate.numel() // width
+    _kernels.silu_mul_kernel[(rows, -(-width // MLP_BLOCK))](
+        gate.contiguous(), up.contiguous(), out, width, BLOCK=MLP_BLOCK, num_warps=4
+    )
+    return out
 
 
 class Qwen35:
@@ -272,43 +297,45 @@ class Qwen35:
         #: an attention layer's index among the K/V's layers; the head's own is last
         self.slot_of = {layer: i for i, layer in enumerate(text.attention)}
         self.delta_of = {layer: i for i, layer in enumerate(text.delta)}
+        mlps = [layer.mlp for layer in self.layers] + ([layer.mlp for layer in self.mtp.layers] if self.mtp else [])
+        #: every MLP's activation is SiLU, so SiLU(gate) * up is one launch
+        self.silu = all(type(m.act_fn).__name__ in ("SiLU", "SiLUActivation") for m in mlps)
 
     # ------------------------------------------------------------------ pieces
-
-    def _rope(self, positions: Tensor, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        """cos and sin `[rows, S, rotary]` at text positions `[rows, S]`: Qwen3.5's M-RoPE, whose
-        three sections are one position for text."""
-        freqs = positions[..., None].float() * self.inv_freq
-        both = torch.cat((freqs, freqs), dim=-1)
-        return both.cos().to(dtype), both.sin().to(dtype)
 
     def _attention(
         self,
         block: _Attention,
         x: Tensor,
-        rope: tuple[Tensor, Tensor],
+        positions: Tensor,
         kv_layer: int,
         tables: Tables,
         eps: float,
     ) -> Tensor:
+        """Qwen3.5's gated attention at text `positions` (`[rows, S]`, contiguous): q's and k's
+        norms and RoPE in one launch, the step's attention, its output gate in the join."""
         rows, span, _ = x.shape
         text, dim = self.text, self.text.head_dim
-        q, gate = torch.chunk(block.q_proj(x).view(rows, span, -1, dim * 2), 2, dim=-1)
-        gate = gate.reshape(rows, span, -1)
-        q = _norm(q, block.q_norm.weight, eps)
-        k = _norm(block.k_proj(x).view(rows, span, -1, dim), block.k_norm.weight, eps)
+        projected = block.q_proj(x).view(rows, span, -1, dim * 2)
+        heads = int(projected.shape[2])
+        k = block.k_proj(x).contiguous()
         v = block.v_proj(x).view(rows, span, -1, dim)
-        cos, sin = (t[:, :, None, :] for t in rope)
-        r = text.rotary
-        q = torch.cat((q[..., :r] * cos + _rotate(q[..., :r]) * sin, q[..., r:]), dim=-1)
-        k = torch.cat((k[..., :r] * cos + _rotate(k[..., :r]) * sin, k[..., r:]), dim=-1)
+        q_out = torch.empty((rows, span, heads, dim), dtype=projected.dtype, device=x.device)
+        k_out = torch.empty((rows, span, text.kv_heads, dim), dtype=k.dtype, device=x.device)
+        _kernels.qk_norm_rope_kernel[(rows * span, heads + text.kv_heads)](
+            projected.contiguous(), k, block.q_norm.weight, block.k_norm.weight, positions, self.inv_freq,
+            q_out, k_out, eps, heads, text.kv_heads, 2 * dim, D=dim, R=text.rotary, num_warps=2,
+        )  # fmt: skip
         kv = self.kv
         out = paged_step(
-            q, k, v, kv.blocks, self.host, kv.block_table[:rows], tables.lengths, tables.slots,
-            kv.layout, kv_layer, PARTS, dim**-0.5, tables.first_seen,
+            q_out, k_out, v, kv.blocks, self.host, kv.block_table[:rows], tables.lengths, tables.slots,
+            kv.layout, kv_layer, PARTS, dim**-0.5, tables.first_seen, gate=projected[..., dim:],
         )  # fmt: skip
-        out = out.reshape(rows, span, -1) * torch.sigmoid(gate)
-        return block.o_proj(out)
+        return block.o_proj(out.reshape(rows, span, -1))
+
+    def _mlp(self, m: _Mlp, h: Tensor) -> Tensor:
+        gate, up = m.gate_proj(h), m.up_proj(h)
+        return m.down_proj(_silu_mul(gate, up) if self.silu and h.is_cuda else m.act_fn(gate) * up)
 
     def _delta(self, block: _Delta, x: Tensor, index: int) -> Tensor:
         rows, span, _ = x.shape
@@ -347,19 +374,6 @@ class Qwen35:
         )
         return block.out_proj(normed.reshape(rows, span, -1))
 
-    def _layer(self, i: int, x: Tensor, rope: tuple[Tensor, Tensor], tables: Tables) -> Tensor:
-        layer = self.layers[i]
-        eps = self.text.eps
-        h = _norm(x, layer.input_layernorm.weight, eps)
-        if i in self.slot_of:
-            h = self._attention(layer.self_attn, h, rope, self.slot_of[i], tables, eps)
-        else:
-            h = self._delta(layer.linear_attn, h, self.delta_of[i])
-        x = x + h
-        m = layer.mlp
-        h = _norm(x, layer.post_attention_layernorm.weight, eps)
-        h = m.down_proj(m.act_fn(m.gate_proj(h)) * m.up_proj(h))
-        return x + h
 
     # ------------------------------------------------------------------ what a step calls
 
@@ -368,10 +382,18 @@ class Qwen35:
         at text `positions` `[rows, S]`; their K/V written at `tables`' slots and their states
         into the slots (one token) or the scratch (a span)."""
         x = self.embed(ids)
-        rope = self._rope(positions, x.dtype)
-        for i in range(len(self.layers)):
-            x = self._layer(i, x, rope, tables)
-        return _norm(x, self.final.weight, self.text.eps)
+        eps, layers = self.text.eps, self.layers
+        positions = positions.contiguous()
+        h = _norm(x, layers[0].input_layernorm.weight, eps)
+        for i, layer in enumerate(layers):
+            if i in self.slot_of:
+                mixed = self._attention(layer.self_attn, h, positions, self.slot_of[i], tables, eps)
+            else:
+                mixed = self._delta(layer.linear_attn, h, self.delta_of[i])
+            x, h = _add_norm(x, mixed, layer.post_attention_layernorm.weight, eps)
+            after = layers[i + 1].input_layernorm.weight if i + 1 < len(layers) else self.final.weight
+            x, h = _add_norm(x, self._mlp(layer.mlp, h), after, eps)
+        return h
 
     def draft(self, ids: Tensor, hidden: Tensor, positions: Tensor, tables: Tables) -> Tensor:
         """The head's state `[rows, S, hidden]` for tokens `ids` at `positions`, each from the
@@ -384,13 +406,11 @@ class Qwen35:
         h = _norm(hidden, mtp.pre_fc_norm_hidden.weight, eps)
         x = mtp.fc(torch.cat([e, h], -1))
         layer = mtp.layers[0]
-        rope = self._rope(positions, x.dtype)
         a = _norm(x, layer.input_layernorm.weight, eps)
-        x = x + self._attention(layer.self_attn, a, rope, self.kv.layout.attn_layers - 1, tables, eps)
-        m = layer.mlp
-        a = _norm(x, layer.post_attention_layernorm.weight, eps)
-        x = x + m.down_proj(m.act_fn(m.gate_proj(a)) * m.up_proj(a))
-        return _norm(x, mtp.norm.weight, eps)
+        mixed = self._attention(layer.self_attn, a, positions.contiguous(), self.kv.layout.attn_layers - 1, tables, eps)
+        x, a = _add_norm(x, mixed, layer.post_attention_layernorm.weight, eps)
+        _, out = _add_norm(x, self._mlp(layer.mlp, a), mtp.norm.weight, eps)
+        return out
 
     def logits(self, hidden: Tensor) -> Tensor:
         return self.head(hidden).float()
