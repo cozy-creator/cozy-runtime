@@ -266,8 +266,20 @@ def _add_norm(x: Tensor, h: Tensor, weight: Tensor, eps: float, fused: bool = Tr
             BLOCK=block, num_warps=8 if block >= 2048 else 4,
         )  # fmt: skip
         return total.view(x.shape), out.view(x.shape)
-    total = x + h
+    total = x + h.to(x.dtype)
     return total, _norm(total, weight, eps, fused)
+
+
+def _product(linear: _Linear, x: Tensor) -> Tensor:
+    """A linear's product as its kernel writes it (f32 for a ggml leaf, `product`), else the
+    module's own output: for the fused ops, each of which rounds what it reads to the model's
+    dtype, where Transformers rounds the linear's output, so no cast a call."""
+    product = getattr(linear, "product", None)
+    return product(x) if product is not None else linear(x)
+
+
+def _called(linear: _Linear, x: Tensor) -> Tensor:
+    return linear(x)
 
 
 def _rotate(x: Tensor) -> Tensor:
@@ -275,10 +287,10 @@ def _rotate(x: Tensor) -> Tensor:
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
 
-def _silu_mul(gate: Tensor, up: Tensor) -> Tensor:
-    """SiLU(gate) * up in one launch (`_kernels.silu_mul_kernel`)."""
+def _silu_mul(gate: Tensor, up: Tensor, dtype: torch.dtype) -> Tensor:
+    """SiLU(gate) * up in `dtype`, one launch (`_kernels.silu_mul_kernel`)."""
     width = int(gate.shape[-1])
-    out = torch.empty_like(gate)
+    out = torch.empty(gate.shape, dtype=dtype, device=gate.device)
     rows = gate.numel() // width
     _kernels.silu_mul_kernel[(rows, -(-width // MLP_BLOCK))](
         gate.contiguous(), up.contiguous(), out, width, BLOCK=MLP_BLOCK, num_warps=4
@@ -328,12 +340,12 @@ class Qwen35:
         text, dim = self.text, self.text.head_dim
         if not self.fused:
             return self._attention_unfused(block, x, positions, kv_layer, tables, eps)
-        projected = block.q_proj(x).view(rows, span, -1, dim * 2)
+        projected = _product(block.q_proj, x).view(rows, span, -1, dim * 2)
         heads = int(projected.shape[2])
-        k = block.k_proj(x).contiguous()
-        v = block.v_proj(x).view(rows, span, -1, dim)
-        q_out = torch.empty((rows, span, heads, dim), dtype=projected.dtype, device=x.device)
-        k_out = torch.empty((rows, span, text.kv_heads, dim), dtype=k.dtype, device=x.device)
+        k = _product(block.k_proj, x).contiguous()
+        v = _product(block.v_proj, x).view(rows, span, -1, dim)
+        q_out = torch.empty((rows, span, heads, dim), dtype=x.dtype, device=x.device)
+        k_out = torch.empty((rows, span, text.kv_heads, dim), dtype=x.dtype, device=x.device)
         _kernels.qk_norm_rope_kernel[(rows * span, heads + text.kv_heads)](
             projected.contiguous(), k, read(block.q_norm.weight), read(block.k_norm.weight), positions, self.inv_freq,
             q_out, k_out, eps, heads, text.kv_heads, 2 * dim, D=dim, R=text.rotary, num_warps=2,
@@ -343,7 +355,7 @@ class Qwen35:
             q_out, k_out, v, kv.blocks, self.host, kv.block_table[:rows], tables.lengths, tables.slots,
             kv.layout, kv_layer, PARTS, dim**-0.5, tables.first_seen, gate=projected[..., dim:],
         )  # fmt: skip
-        return block.o_proj(out.reshape(rows, span, -1))
+        return _product(block.o_proj, out.reshape(rows, span, -1))
 
     def _attention_unfused(
         self, block: _Attention, x: Tensor, positions: Tensor, kv_layer: int, tables: Tables, eps: float
@@ -370,19 +382,22 @@ class Qwen35:
         return block.o_proj(out.reshape(rows, span, -1) * torch.sigmoid(gate))
 
     def _mlp(self, m: _Mlp, h: Tensor) -> Tensor:
-        gate, up = m.gate_proj(h), m.up_proj(h)
-        fused = self.fused and self.silu and h.is_cuda
-        return m.down_proj(_silu_mul(gate, up) if fused else m.act_fn(gate) * up)
+        if self.fused and self.silu and h.is_cuda:
+            act = _silu_mul(_product(m.gate_proj, h), _product(m.up_proj, h), h.dtype)
+            return _product(m.down_proj, act)
+        return m.down_proj(m.act_fn(m.gate_proj(h)) * m.up_proj(h))
 
     def _delta(self, block: _Delta, x: Tensor, index: int) -> Tensor:
         rows, span, _ = x.shape
         text, kv = self.text, self.kv
-        mixed = block.in_proj_qkv(x).contiguous()
-        z = block.in_proj_z(x).reshape(rows, span, text.v_heads, text.dv)
-        b = block.in_proj_b(x)
-        a = block.in_proj_a(x)
+        # Fused, the kernels round each product to the model's dtype as they read it.
+        linear = _product if self.fused else _called
+        mixed = linear(block.in_proj_qkv, x).contiguous()
+        z = linear(block.in_proj_z, x).reshape(rows, span, text.v_heads, text.dv)
+        b = linear(block.in_proj_b, x)
+        a = linear(block.in_proj_a, x)
         channels = text.conv_channels
-        conv = torch.empty_like(mixed)
+        conv = torch.empty(mixed.shape, dtype=x.dtype, device=x.device)
         # Every pointer a kernel is given must lie on a mapped page (Triton's launcher asks the
         # driver of each): one token writes no scratch, so it is given the state again.
         windows, kept_windows = kv.state(0), kv.state_scratch[0]
@@ -414,7 +429,7 @@ class Qwen35:
         normed = _gated(
             out.reshape(-1, text.dv), z.reshape(-1, text.dv), block.norm.weight, block.norm.variance_epsilon, self.fused
         )
-        return block.out_proj(normed.reshape(rows, span, -1))
+        return linear(block.out_proj, normed.reshape(rows, span, -1))
 
     # ------------------------------------------------------------------ what a step calls
 
