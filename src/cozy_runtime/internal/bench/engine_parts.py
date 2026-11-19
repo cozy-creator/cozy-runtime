@@ -6,7 +6,8 @@ each arm held against Transformers' teacher-forced forward at its clear position
 - `attn-ref`: the step with its paged attention (write and read) done by torch's ops on the same blocks;
 - `delta-ref`: the step with each gated-delta layer done by Transformers' own torch functions
   (`causal_conv1d_update`, `torch_recurrent_gated_delta_rule`) on the same state slots;
-- `both-ref`: both.
+- `both-ref`: both;
+- `engine-alone`, `both-ref-alone`: each row decoded alone (a bucket of one).
 The reference arms run eagerly (no graph). Each row reports its first clear position an arm misses, the lead
 there, the two tokens, and where it first differs from `hf-decode`. It judges nothing: it reports."""
 
@@ -170,6 +171,12 @@ def measure() -> dict[str, JSON]:
                 runs[name] = decoder(Request(prompts=prompts, max_new=NEW, stops=[])).tokens
             except Exception as exc:
                 errors[name] = f"{type(exc).__name__}: {exc}"[:600]
+    # Each row alone, a bucket of one: a fault in how rows share a step shows as a bucket's rows wrong and these right.
+    alone = Decoder(model, max_rows=4, max_tokens=1024)
+    runs["engine-alone"] = [alone(Request(prompts=[p], max_new=NEW, stops=[])).tokens[0] for p in prompts]
+    with _swapped(True, True):
+        refs = Decoder(model, max_rows=4, max_tokens=1024)
+        runs["both-ref-alone"] = [refs(Request(prompts=[p], max_new=NEW, stops=[])).tokens[0] for p in prompts]
     rows: dict[str, JSON] = {}
     for i, prompt in enumerate(prompts):
         made = runs["hf-decode"][i]
