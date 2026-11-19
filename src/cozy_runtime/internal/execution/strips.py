@@ -27,7 +27,8 @@ from typing import Protocol, cast
 import torch
 from torch import Tensor, nn
 
-from cozy_runtime.internal.execution import catch, sizing
+from cozy_runtime.author._errors import is_capacity, unwind
+from cozy_runtime.internal.execution import catch, pinned, sizing
 
 #: a strip's working set over its input rows: a causal conv's input, its norm, the activation, the
 #: cache clone, the cache `cat` and the pad, each the strip's rows (an estimate: a measured peak
@@ -135,6 +136,8 @@ class _Rows:
             g = _factor(int(entry.shape[-1]), self.width)
             a, b = self.columns
             entry = entry.narrow(-1, a * g, (b - a) * g)
+        if pinned.held(entry):
+            return pinned.read(entry)
         return entry if entry.device == self.device else entry.to(self.device)
 
     def __setitem__(self, index: int, value: object) -> None:
@@ -188,9 +191,11 @@ def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) 
         out_row = row * block.scale * block.scale
 
         def need(level: int) -> tuple[int, ...]:
-            n = sizing.pieces(height, level)
-            span = min(height, n + 2 * block.rows) if level else height
-            return sizing.peak(height * out_row, (span * row * _HOLDS * block.scale**2,))
+            if not level:
+                return sizing.peak(height * out_row, (height * row * _HOLDS * block.scale**2,))
+            # a cut level's whole output goes to host where the card refuses it (`_whole`)
+            span = min(height, sizing.pieces(height, level) + 2 * block.rows)
+            return (span * row * _HOLDS * block.scale**2,)
 
         def run(level: int) -> object:
             if level and key not in _VERDICTS and not catch._capturing():
@@ -245,7 +250,8 @@ class _Call:
 
         def sliced(t: Tensor) -> Tensor:
             t = t.narrow(-2, lo, hi - lo)
-            return t if columns is None else t.narrow(-1, columns[0], columns[1] - columns[0])
+            t = t if columns is None else t.narrow(-1, columns[0], columns[1] - columns[0])
+            return pinned.read(t)  # a window of a host whole comes to the device
 
         arguments: dict[str, object] = {}
         for name, value in self.bound.items():
@@ -296,11 +302,8 @@ class _Call:
                 out = y
             else:
                 if out is None:
-                    shape = (*y.shape[:-2], height * scale, y.shape[-1])
-                    out = torch.empty(
-                        shape, dtype=y.dtype, device=y.device, memory_format=_format(y)
-                    )
-                out.narrow(-2, a * scale, (b - a) * scale).copy_(kept)
+                    out = _whole(y, (*y.shape[:-2], height * scale, y.shape[-1]))
+                pinned.write(out.narrow(-2, a * scale, (b - a) * scale), kept)
             del y, kept
             if rows is not None:
                 for index, value in rows.written.items():
@@ -413,15 +416,26 @@ def _assemble(
     f = _factor(int(value.shape[-2]), hi - lo)
     if not isinstance(whole, Tensor):
         shape = (*value.shape[:-2], height * f, value.shape[-1])
-        pinned = host and torch.cuda.is_available()
-        whole = torch.empty(
-            shape,
-            dtype=value.dtype,
-            device="cpu" if host else value.device,
-            pin_memory=pinned,
+        whole = (
+            pinned.empty(shape, value.dtype, value.device)
+            if host and value.is_cuda
+            else torch.empty(shape, dtype=value.dtype, device=value.device)
         )
-    whole.narrow(-2, a * f, (b - a) * f).copy_(value.narrow(-2, (a - lo) * f, (b - a) * f))
+    pinned.write(whole.narrow(-2, a * f, (b - a) * f), value.narrow(-2, (a - lo) * f, (b - a) * f))
     return whole
+
+
+def _whole(part: Tensor, shape: tuple[int, ...]) -> Tensor:
+    """A cut block's whole output: on the card in `part`'s layout, else in pinned host memory the
+    card addresses, where the card refuses it beside the strips (the next block reads its rows
+    back a strip at a time)."""
+    try:
+        return torch.empty(shape, dtype=part.dtype, device=part.device, memory_format=_format(part))
+    except BaseException as exc:
+        if not part.is_cuda or not is_capacity(exc) or catch._capturing():
+            raise
+        unwind(exc)
+    return pinned.empty(shape, part.dtype, part.device)
 
 
 def _format(t: Tensor) -> torch.memory_format:
