@@ -571,6 +571,11 @@ class Engine(Protocol):
     ) -> Final: ...
 
 
+#: `VisionLM`'s engine is CozyEngine (xs-213: the calls it can hold, Transformers' engine the rest,
+#: `engine.cozy`), else Transformers' engine for every call; off until its GPU done bar passes.
+COZY_ENGINE = False
+
+
 class VisionLM(Model[Pipeline]):
     """A Qwen-VL model answering questions about text, images and videos, greedily or sampled
     from a seed. Runtime may serve encoded lanes' linears natively. Its `engine` answers them."""
@@ -589,7 +594,12 @@ class VisionLM(Model[Pipeline]):
             model.generation_config = GenerationConfig(  # type: ignore[no-untyped-call]  # unannotated in Transformers
                 **json.loads(loader.assets.read("generation_config.json"))
             )
-        self.engine = TransformersEngine(self.pipe, self.processor)
+        if COZY_ENGINE:
+            from cozy_runtime.engine.cozy import CozyEngine
+
+            self.engine = CozyEngine(self.pipe, self.processor)
+        else:
+            self.engine = TransformersEngine(self.pipe, self.processor)
 
     def execution_plan(self, plan: Plan) -> str:
         model = self.pipe.components[COMPONENT]
