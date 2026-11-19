@@ -278,6 +278,15 @@ def _product(linear: _Linear, x: Tensor) -> Tensor:
     return product(x) if product is not None else linear(x)
 
 
+def _products(linears: Sequence[_Linear], x: Tensor) -> list[Tensor]:
+    """Sibling linears' products of one input (`_product` each): where they are ggml leaves MMVQ
+    serves, from one q8_1 quantize of it (the leaf's `siblings`), so one launch, not one each."""
+    first, *others = linears
+    siblings = getattr(first, "siblings", None)
+    made = siblings(list(others), x) if siblings is not None else None
+    return list(made) if made is not None else [_product(m, x) for m in linears]
+
+
 def _called(linear: _Linear, x: Tensor) -> Tensor:
     return linear(x)
 
@@ -340,10 +349,11 @@ class Qwen35:
         text, dim = self.text, self.text.head_dim
         if not self.fused:
             return self._attention_unfused(block, x, positions, kv_layer, tables, eps)
-        projected = _product(block.q_proj, x).view(rows, span, -1, dim * 2)
+        q_made, k, v = _products((block.q_proj, block.k_proj, block.v_proj), x)
+        projected = q_made.view(rows, span, -1, dim * 2)
         heads = int(projected.shape[2])
-        k = _product(block.k_proj, x).contiguous()
-        v = _product(block.v_proj, x).view(rows, span, -1, dim)
+        k = k.contiguous()
+        v = v.view(rows, span, -1, dim)
         q_out = torch.empty((rows, span, heads, dim), dtype=x.dtype, device=x.device)
         k_out = torch.empty((rows, span, text.kv_heads, dim), dtype=x.dtype, device=x.device)
         _kernels.qk_norm_rope_kernel[(rows * span, heads + text.kv_heads)](
@@ -383,7 +393,8 @@ class Qwen35:
 
     def _mlp(self, m: _Mlp, h: Tensor) -> Tensor:
         if self.fused and self.silu and h.is_cuda:
-            act = _silu_mul(_product(m.gate_proj, h), _product(m.up_proj, h), h.dtype)
+            gate, up = _products((m.gate_proj, m.up_proj), h)
+            act = _silu_mul(gate, up, h.dtype)
             return _product(m.down_proj, act)
         return m.down_proj(m.act_fn(m.gate_proj(h)) * m.up_proj(h))
 
@@ -392,10 +403,9 @@ class Qwen35:
         text, kv = self.text, self.kv
         # Fused, the kernels round each product to the model's dtype as they read it.
         linear = _product if self.fused else _called
-        mixed = linear(block.in_proj_qkv, x).contiguous()
-        z = linear(block.in_proj_z, x).reshape(rows, span, text.v_heads, text.dv)
-        b = linear(block.in_proj_b, x)
-        a = linear(block.in_proj_a, x)
+        projections = (block.in_proj_qkv, block.in_proj_z, block.in_proj_b, block.in_proj_a)
+        made = _products(projections, x) if self.fused else [m(x) for m in projections]
+        mixed, z, b, a = made[0].contiguous(), made[1].reshape(rows, span, text.v_heads, text.dv), made[2], made[3]
         channels = text.conv_channels
         conv = torch.empty(mixed.shape, dtype=x.dtype, device=x.device)
         # Every pointer a kernel is given must lie on a mapped page (Triton's launcher asks the
