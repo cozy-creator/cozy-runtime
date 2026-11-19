@@ -228,18 +228,33 @@ class Watched:
 
 
 @dataclass(frozen=True)
+class Turn:
+    """An earlier turn of a conversation (`Question.turns`): the user's, its text, pictures and
+    videos in the order the model reads them, or the assistant's, its words."""
+
+    role: Literal["user", "assistant"]
+    parts: Sequence[str | Image | Watched]
+
+
+@dataclass(frozen=True)
 class Question:
-    """One single-turn question: its text after its images and videos, or `parts`, its text,
-    pictures and videos in the order the model reads them."""
+    """One question: its text after its images and videos, or `parts`, its text, pictures and
+    videos in the order the model reads them; after `turns`, the conversation before it."""
 
     text: str = ""
     images: list[Image] = field(default_factory=list)
     videos: list[Watched] = field(default_factory=list)
     parts: Sequence[str | Image | Watched] = ()
+    turns: Sequence[Turn] = ()
 
     def read(self) -> Sequence[str | Image | Watched]:
-        """What the model reads, in order."""
+        """What the model reads of the question itself, in order."""
         return self.parts or [*self.images, *self.videos, self.text]
+
+    def everything(self) -> list[str | Image | Watched]:
+        """What the model reads of the whole conversation, in order: each picture and video where
+        the processor meets it."""
+        return [*(p for turn in self.turns for p in turn.parts), *self.read()]
 
 
 def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> AskResult:
@@ -535,6 +550,9 @@ class Params:
     min_p: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    #: what each answer may say (`lm.generate`'s `allowed`); while it thinks, its thought is free
+    #: and the constraint starts after the thought (`lm.After`)
+    allowed: lm.Constraint | None = None
 
 
 class Engine(Protocol):
@@ -597,6 +615,7 @@ class VisionLM(Model[Pipeline]):
         min_p: float = 0.0,
         frequency_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
+        allowed: lm.Constraint | None = None,
         progress: Callable[[int], None] | None = None,
         no_repeat_ngram: int | None = None,
         reasoning_effort: str | None = None,
@@ -622,6 +641,7 @@ class VisionLM(Model[Pipeline]):
             min_p=min_p,
             frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
+            allowed=allowed,
         )
         shown = [_Words(stop) for _ in questions]
 
@@ -672,7 +692,7 @@ class TransformersEngine:
             self._chat(question, params.system, params.thinking, params.reasoning_effort)
             for question in questions
         ]
-        parts = [part for question in questions for part in question.read()]
+        parts = [part for question in questions for part in question.everything()]
         images = [part for part in parts if isinstance(part, Image)]
         videos = [part for part in parts if isinstance(part, Watched)]
         kwargs: dict[str, object] = {"images": images} if images else {}
@@ -699,6 +719,7 @@ class TransformersEngine:
             "min_p": params.min_p,
             "frequency_penalty": params.frequency_penalty,
             "repetition_penalty": params.repetition_penalty,
+            "allowed": self._allowed(params),
             "seed": params.seed,
             "progress": progress,
             "no_repeat_ngram": params.no_repeat_ngram,
@@ -709,20 +730,41 @@ class TransformersEngine:
             self._inputs(text=texts, **kwargs), stop, decoding, params.thinking, on_delta
         )
 
+    def _allowed(self, params: Params) -> lm.Constraint | None:
+        """`params.allowed`, starting after the thought where the model thinks: the template opens
+        the thought in the answer's own tokens, so the constraint starts after `THOUGHT_END`."""
+        if params.allowed is None or not params.thinking:
+            return params.allowed
+        end = int(self.processor.tokenizer.convert_tokens_to_ids(THOUGHT_END))
+        return lm.After(end, params.allowed)
+
     def _chat(
         self, question: Question, system: str, thinking: bool, effort: str | None = None
     ) -> str:
-        content = [
-            {"type": "text", "text": part}
-            if isinstance(part, str)
-            else {"type": "video" if isinstance(part, Watched) else "image"}
-            for part in question.read()
-        ]
-        messages = [{"role": "system", "content": system}] if system else []
+        def content(parts: Sequence[str | Image | Watched]) -> list[dict[str, str]]:
+            # each picture or video as the processor meets it, in reading order
+            return [
+                {"type": "text", "text": part}
+                if isinstance(part, str)
+                else {"type": "video" if isinstance(part, Watched) else "image"}
+                for part in parts
+            ]
+
+        messages: list[dict[str, object]] = (
+            [{"role": "system", "content": system}] if system else []
+        )
+        for turn in question.turns:
+            said = "".join(p for p in turn.parts if isinstance(p, str))
+            messages.append(
+                {
+                    "role": turn.role,
+                    "content": said if turn.role == "assistant" else content(turn.parts),
+                }
+            )
         chat = functools.partial(
             self.processor.apply_chat_template,
             # Transformers types a turn's content as text; a multimodal turn's is a list
-            [*messages, {"role": "user", "content": content}],  # type: ignore[arg-type]  # see above
+            [*messages, {"role": "user", "content": content(question.read())}],  # type: ignore[arg-type]  # see above
             add_generation_prompt=True,
             tokenize=False,
             enable_thinking=thinking,
@@ -872,6 +914,7 @@ class _Decoding(TypedDict):
     min_p: float
     frequency_penalty: float
     repetition_penalty: float
+    allowed: lm.Constraint | None
     seed: int
     progress: Callable[[int], None] | None
     no_repeat_ngram: int | None
