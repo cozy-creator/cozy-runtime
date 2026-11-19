@@ -318,7 +318,9 @@ class Attempt:
             # The ring checks `kind` against its `Kind`s and refuses another.
             observation = self.ring.emit(cast("Kind", kind), name, value, **fields)
             if self.sink is not None:
-                self.sink(observation)
+                for row in (observation, *self.ring.notes):
+                    self.sink(row)
+            self.ring.notes.clear()
         return observation
 
     def signal(self, frame: ProgressFrame) -> None:

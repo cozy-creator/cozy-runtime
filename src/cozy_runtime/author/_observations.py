@@ -34,9 +34,10 @@ be able to fail the attempt that produced it. It did — a contract attestation 
 attempt `EXECUTOR_INVALIDATED`, rebuilt and retried the same 30-step generation forever. So
 values and field values clip to `TEXT_CAP` with a marker and bump `truncated`; a lost tail
 is a fact on `caps()`, exactly like a shed row. An over-cap NAME or KEY keeps a digest of its
-tail, so two records never alias; fields past `FIELDS_CAP` go; a numpy or torch scalar
-unwraps; a number JSON cannot carry exactly (NaN, beyond 2^53) and any other object become
-text. Each is counted, and none raises.
+tail, so two records never alias; fields past `FIELDS_CAP` go, and the first such row of a
+name says which in a `warn` log row; a numpy or torch scalar unwraps; a number JSON cannot
+carry exactly (NaN, beyond 2^53) and any other object become text. Each is counted, and none
+raises.
 
 This module is in the AUTHOR package on purpose — the caps must bite where the author code
 emits, and the worker imports the same implementation rather than a second one.
@@ -69,6 +70,9 @@ MAX_RING_BYTES = 128 * 1024
 NAME_CAP = 200
 TEXT_CAP = 400
 FIELDS_CAP = 8
+#: Names whose rows past `FIELDS_CAP` an attempt says (`EventRing.emit`); past them such rows are
+#: only counted (`truncated`), so a message that varies per step cannot flood the ring.
+CAP_WARNINGS = 8
 KEY_CAP = 48
 #: Distinct attribution names. A handler that names a fresh stage per step folds into
 #: `other` rather than growing a dict for the life of the attempt.
@@ -169,6 +173,11 @@ class EventRing:
     refused: int = 0
     redactions: int = 0
     truncated: int = 0
+    #: Names whose rows came with more than `FIELDS_CAP` fields: each said once (`emit`), the first
+    #: `CAP_WARNINGS` of them.
+    over_cap: set[str] = field(default_factory=set)
+    #: Rows `emit` admitted beside the one it returns (that warning), for the caller's lane.
+    notes: list[Observation] = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.events)
@@ -177,13 +186,24 @@ class EventRing:
         return iter(self.events)
 
     def emit(self, kind: Kind, name: str, value: Scalar = None, /, **fields: Scalar) -> Observation:
-        """Validate, bound, stamp and admit ONE record. Refusals are counted and raised."""
+        """Validate, bound, stamp and admit ONE record. Refusals are counted and raised. A row
+        past `FIELDS_CAP` keeps its first fields and says, once per name, which it dropped."""
         try:
             observation = self._build(kind, name, value, fields)
         except ObservationRefusal:
             self.refused += 1
             raise
-        return self.admit(observation)
+        admitted = self.admit(observation)
+        if (
+            len(fields) > FIELDS_CAP
+            and observation.name not in self.over_cap
+            and len(self.over_cap) < CAP_WARNINGS
+        ):
+            self.over_cap.add(observation.name)
+            said = f"{observation.name}: {len(fields)} fields, past the {FIELDS_CAP} a row keeps"
+            dropped = ",".join(list(fields)[FIELDS_CAP:])
+            self.notes.append(self.admit(self._build("log", said, "warn", {"dropped": dropped})))
+        return admitted
 
     def _build(
         self, kind: Kind, name: str, value: Scalar, fields: Mapping[str, Scalar]
