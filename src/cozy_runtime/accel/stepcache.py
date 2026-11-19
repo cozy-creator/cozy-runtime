@@ -36,7 +36,13 @@ bytes. `run.document()` counts its forwards, computed and skipped.
 
 Its state lives in device buffers updated in place; each forward reads its verdict on the host
 once, so component calls under `running` run eagerly, never from a CUDA graph. Each step's `plans`
-line names its verdict.
+line names its verdict. Its wholes (EasyCache four buffers, FirstBlockCache two and r0, each the
+size of the carried states, and the inputs and block 0's output it keeps through a forward) are made
+only where the card's room holds them beside what a block of the stack measured it needs; else that
+loop computes every forward and holds nothing, and the run's notes say "step cache off: not enough
+memory". FirstBlockCache decides after its first block 0; EasyCache at its first forward, or, with
+no block measured at that shape yet, at its second (its first computes either way: with `retain` 3
+or more its verdicts are the same).
 """
 
 from __future__ import annotations
@@ -224,6 +230,11 @@ class _State:
     rate: Tensor | None = None
     acc: Tensor | None = None
     like: BlockOutput | None = None
+    #: Whether its buffers were made, or the room had none for them (every forward computes and
+    #: holds nothing); None until decided (`_decide`).
+    kept: bool | None = None
+    #: The forwards it has seen: EasyCache decides by its second where its first had no measure.
+    seen: int = 0
 
 
 def _sum(tensors: Sequence[Tensor]) -> Tensor:
@@ -243,6 +254,32 @@ def _diff(a: Sequence[Tensor], b: Sequence[Tensor], mean: bool = False) -> Tenso
 def _like(tensors: Sequence[Tensor]) -> tuple[Tensor, ...]:
     """Unset buffers: an allocation alone, which a recording does not replay."""
     return tuple(torch.empty_like(t) for t in tensors)
+
+
+def _decide(copies: int, tensors: Sequence[Tensor], first: bool) -> bool | None:
+    """Whether the card holds `copies` more wholes like `tensors` through the loop beside what a block of the stack
+    needs: the room a cut's selection reads (`execution.catch.nested`) less the largest peak above its entry this process
+    measured for a block at this pass shape (`Memory.block_need`). None, not yet, on a loop's `first` forward with no
+    block measured at this shape (its own measures one). Without native memory, it does. Said once in the run's notes
+    when not."""
+    import tensorfs.varena.torch as vt
+
+    from cozy_runtime.internal.residency import _REQUEST, PASS_SHAPE
+
+    request = _REQUEST.get()
+    if request is None or not request.memory.cuda or not torch.cuda.is_initialized():
+        return True
+    block = request.memory.block_need(PASS_SHAPE.get())
+    if not block and first:
+        return None
+    room = vt.room(request.memory.device.index or 0)
+    usable = int(room["capacity"]) - int(room["working_live"]) - int(room["pinned"])
+    if copies * sum(t.numel() * t.element_size() for t in tensors) + block <= usable:
+        return True
+    row: WarningRow = recovered("step cache off: not enough memory")
+    if row not in WARNINGS:
+        WARNINGS.append(row)
+    return False
 
 
 #: The forwards a step's stacks hold state for (`Run.flags`): every slot's row is the run's.
@@ -329,21 +366,42 @@ class _Gate:
         run, installed = self.run, self.installed
         if run.current is None:
             raise ValueError("a step-cached loop calls `run.step(i)` before each step's forwards")
-        self.inputs = xs = installed.inputs(args, kwargs)
+        xs = installed.inputs(args, kwargs)
         self.state = state = run.claim(self.blocks)
         out: BlockOutput | None = None
         if isinstance(run.policy, FirstBlockCache):
             out = first = cast("BlockOutput", self.first(*args, **kwargs))  # a block of the Stack
-            self.head = installed.outputs(first)
-            self.r0 = tuple(h - x for h, x in zip(self.head, xs, strict=True))
-            if not state.ref:
-                state.ref, state.residual = _like(self.r0), _like(self.head)
-            computed = (state.has[0] == 0) | (
-                _diff(self.r0, state.ref) > run.policy.threshold * _sum(state.ref).clamp_min(1e-8)
-            )
+            head = installed.outputs(first)
+            if state.kept is None:
+                # Block 0 just ran, so its need is measured: its ref, residual and r0 beside x and head, or none.
+                state.kept = bool(_decide(3, head, first=False))
+                if state.kept:
+                    state.ref, state.residual = _like(head), _like(head)
+            if state.kept:
+                self.inputs, self.head = xs, head
+                self.r0 = tuple(h - x for h, x in zip(head, xs, strict=True))
+                computed = (state.has[0] == 0) | (
+                    _diff(self.r0, state.ref) > run.policy.threshold * _sum(state.ref).clamp_min(1e-8)
+                )
+            else:
+                computed = torch.ones((), dtype=torch.bool)
         else:
-            # `run.step(i)` set the index with the current step checked above.
-            computed = self._easy(run.policy, state, xs, cast("Tensor", run.index))
+            if state.kept is None:
+                # Its four buffers beside x, or none; a loop's first forward computes either way (no rate yet), so with
+                # no block measured at this shape it decides at the next, from this one's measure.
+                state.kept = _decide(4, xs, first=not state.seen)
+                if state.kept:
+                    state.previous, state.inputs_c, state.outputs_c, state.residual = (
+                        _like(xs), _like(xs), _like(xs), _like(xs)
+                    )
+                    state.rate, state.acc = (torch.empty(1, device=xs[0].device) for _ in range(2))
+            state.seen += 1
+            if state.kept:
+                self.inputs = xs
+                # `run.step(i)` set the index with the current step checked above.
+                computed = self._easy(run.policy, state, xs, cast("Tensor", run.index))
+            else:
+                computed = torch.ones((), dtype=torch.bool)  # holds nothing: the plain stack's forward
         self.computed = bool(computed.item())
         run.verdicts.append((run.current, self.computed))
         if not self.computed:
@@ -359,11 +417,6 @@ class _Gate:
     def _easy(
         self, policy: EasyCache, state: _State, xs: tuple[Tensor, ...], relative: Tensor
     ) -> Tensor:
-        if not state.previous:
-            state.previous, state.inputs_c, state.outputs_c, state.residual = (
-                _like(xs), _like(xs), _like(xs), _like(xs)
-            )
-            state.rate, state.acc = (torch.empty(1, device=xs[0].device) for _ in range(2))
         rate, acc = cast("Tensor", state.rate), cast("Tensor", state.acc)  # made just above
         last = self.run.steps - 1
         forced = (
@@ -412,6 +465,8 @@ class _Last:
     def __call__(self, *args: object, **kwargs: object) -> BlockOutput:
         out: BlockOutput = self.last(*args, **kwargs)
         ys, state, gate = self.installed.outputs(out), self.state, self.gate
+        if not state.kept:  # no buffers (yet, or for this loop): nothing to keep
+            return out
         if isinstance(self.run.policy, FirstBlockCache):
             for ref, r0 in zip(state.ref, gate.r0, strict=True):
                 ref.copy_(r0)

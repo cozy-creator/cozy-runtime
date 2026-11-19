@@ -62,9 +62,12 @@ from cozy_runtime.accel.kernels import (
     Plan,
     PreQuantized,
     TritonEntry,
+    Readers,
     TritonKernels,
     int8_rows,
     quantize_once,
+    release,
+    shared_scope,
 )
 from cozy_runtime.internal import kernel_ready, prebuilt
 
@@ -339,6 +342,7 @@ if TYPE_CHECKING:
         weight: Tensor | None
         eps: float
         _cozy_rope: _RopeCall | None
+        _cozy_shared: Tensor | None
         _cozy_eager: Callable[[Tensor], Tensor]
 
         def __call__(self, x: Tensor, /) -> Tensor: ...
@@ -623,12 +627,20 @@ def _call_attention(
         entry = cast("TritonEntry", layout.entries.rope)  # a layout with a rope has its entry
         for norm in site.qk:
             norm._cozy_rope = (launch, entry, tables, layout)
+    # The attention's projections read the normed rows: their operand goes once the last has (the layout's reader
+    # count, learned from its blocks' calls), or at its q/k norm, which follows them; never after the kernel.
+    for norm in site.qk:
+        norm._cozy_shared = normed
     try:
-        with quantize_once(normed), _selected(site.attention):
+        with shared_scope((normed,), _READERS.setdefault(id(layout), Readers())), _selected(site.attention):
             return site.attention(normed, **call)
     finally:
         for norm in site.qk:
-            norm._cozy_rope = None
+            norm._cozy_rope = norm._cozy_shared = None
+
+
+#: Each block layout's count of leaves that read its normed rows in the attention module (`kernels.Readers`).
+_READERS: dict[int, Readers] = {}
 
 
 @contextmanager
@@ -778,14 +790,29 @@ type _Rotary = Tensor | tuple[Tensor, Tensor]
 
 
 def _head_norm_forward(self: _HeadNorm, hidden_states: Tensor) -> Tensor:
+    if self._cozy_shared is not None:  # the projections it follows have run: their shared operand goes
+        release(self._cozy_shared)
     rope = self._cozy_rope
     # fp16 rows: the fp16 projection, or a processor's fp32 upcast of it.
     if rope is None or hidden_states.dim() != 4 or not _fusable(rope[3], hidden_states):
-        return self._cozy_eager(hidden_states)
+        return _head_norm_eager(self, hidden_states)
     launch, entry, tables, layout = rope
     return _kernels.head_norm_rope(
         launch, entry, hidden_states, self.weight, self.eps, tables, layout.dtype
     )
+
+
+def _head_norm_eager(norm: _HeadNorm, hidden: Tensor) -> Tensor:
+    """The replaced norm's own forward (a block still building its kernels, a call with no RoPE), cut as
+    `execution.cuts` cuts a per-row norm: in pieces of whole rows where the room is short. A head norm reduces each
+    row of its last axis alone (what `head_norm_rope` computes), so a piece is the whole's arithmetic."""
+    from cozy_runtime.internal.execution import catch, cuts
+
+    def eager(x: object, *args: object, **kwargs: object) -> object:
+        return norm._cozy_eager(cast("Tensor", x))
+
+    cut = cuts._norm(catch.site("head-norm") or "head-norm", norm, eager)
+    return cast("Tensor", cut(hidden))
 
 
 _FUSED: dict[tuple[type[nn.Module], str], type] = {}
@@ -825,7 +852,7 @@ def _fused[M: nn.Module](cls: type[M], kind: str) -> type[M]:
         elif kind == "int8-temporal":
             body["forward"] = _int8_temporal_forward
         else:
-            body |= {"forward": _head_norm_forward, "_cozy_rope": None}
+            body |= {"forward": _head_norm_forward, "_cozy_rope": None, "_cozy_shared": None}
         _FUSED[(cls, kind)] = type(f"Fused{cls.__name__}", (cls,), body)
     return cast("type[M]", _FUSED[(cls, kind)])  # a subclass of `cls`
 
