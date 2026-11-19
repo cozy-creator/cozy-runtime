@@ -3398,8 +3398,9 @@ class _Engine:
         saved and replayed (`_Before`), and of the key buffers the positions it reaches. Before
         its capture (`writes` None) every key buffer it may write, and no other tensor."""
         state = self._token_state(drafted)
+        others: list[torch.Tensor] = []
         if writes is None:
-            keyed, others = self._keyed(), []
+            keyed = self._keyed()
         else:
             keyed, others = _beyond(writes, state, self._keyed())
         whole = sum(t.nbytes for t in state)
