@@ -87,6 +87,7 @@ from tensorfs.executor import (
     Load,
     Malformed,
     Map,
+    ModelNeed,
     PrepareRequest,
     Request,
     Start,
@@ -95,27 +96,6 @@ from tensorfs.executor import (
     decode_answer,
 )
 from tensorfs.varena import _runtime as varena
-
-
-class _ModelNeed(Protocol):
-    """TensorFS's request for a model read now (cl-966)."""
-
-    def __call__(self, *, manifest: str, components: list[str]) -> Request: ...
-
-
-#: None in a TensorFS before it.
-_MODEL_NEED: _ModelNeed | None = getattr(tensorfs.executor, "ModelNeed", None)
-
-
-class _Vigil(Protocol):
-    """TensorFS's native vigil (cl-977): a thread outside the GIL that answers TensorD's hang
-    watch on `fd` with this process's own threads, which TensorD may not be allowed to read."""
-
-    def __call__(self, fd: int) -> None: ...
-
-
-#: None in a TensorFS before it.
-_VIGIL: _Vigil | None = getattr(tensorfs.executor, "vigil", None)
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
@@ -468,14 +448,12 @@ _TOLD: set[str] = set()
 
 def _scratch(command: Invoke) -> Path | None:
     """The call's own folder in its project (`call_scope`); none: the executor's."""
-    value = getattr(command, "scratch", None)  # a TensorFS before cl-984 has none
-    return Path(value) if value else None
+    return Path(command.scratch) if command.scratch else None
 
 
 def _call_store(command: Invoke) -> Path | None:
     """The TensorFS store this call writes its weights outputs into; none: the executor's."""
-    value = getattr(command, "store", None)
-    return Path(value) if value else None
+    return Path(command.store) if command.store else None
 
 
 class _CommandTeller:
@@ -1013,9 +991,8 @@ def _construction_record(prepare: Mapping[str, object]) -> Reply:
 
 
 def _unbound(command: Invoke) -> dict[str, tuple[str, str]]:
-    """The on-demand slots TensorD bound no checkpoint, each with why (xs-186). A TensorFS
-    before it sends none."""
-    return dict(getattr(command, "unbound", None) or {})
+    """The on-demand slots TensorD bound no checkpoint, each with why (xs-186)."""
+    return dict(command.unbound)
 
 
 class _OnDemand:
@@ -1197,8 +1174,6 @@ class Executor:
         self.imported = False
         #: children forked from this import-only process and not reaped yet (`fork/1`)
         self.forked: set[int] = set()
-        #: the vigil's line for TensorD, until it follows the device Start's reply (cl-977)
-        self.vigil_line: socket.socket | None = None
         self.package_warmed = False
         #: rank 0 only: each follower's own start ledger, in rank order
         self.follower_stages: list[list[object]] = []
@@ -1374,8 +1349,6 @@ class Executor:
             "previews": 1,
             # TensorD may send `release` (idle constructions go): `release_constructions`.
             "releases": 1,
-            # A device Start that asks for it hands TensorD its vigil's line (cl-977).
-            "vigil": int(_VIGIL is not None),
         }
 
     # ------------------------------------------------------------- the group (cr-068)
@@ -1558,7 +1531,7 @@ class Executor:
     def _follow_display(self, command: Invoke) -> None:
         """A display GPU's limit as its display uses it now: the machine reads it for each request
         (an older one never sends it, and the limit stays Start's)."""
-        limits = tuple(getattr(command, "display_limit", ()) or ())
+        limits = tuple(command.display_limit)
         memory = self.host.memory
         if limits and memory is not None and memory.cuda:
             self.host.display_limit = limits
@@ -2090,15 +2063,7 @@ class Executor:
 
     def start(self, command: Start) -> Reply:
         with self._device_work():
-            reply = self._start(command)
-        # The vigil starts with the device (an import-only parent stays single-threaded to fork),
-        # its line following this reply (`_answer`).
-        vigil = _VIGIL if getattr(command, "vigil", False) and self.rank == 0 else None
-        if vigil is not None and reply.get("ok") and self.started and self.vigil_line is None:
-            ours, self.vigil_line = socket.socketpair()
-            vigil(ours.detach())
-            reply["descriptor"] = True
-        return reply
+            return self._start(command)
 
     def _start(self, command: Start) -> Reply:
         """Bring EVERY rank up before any construction: seal, group, torch, package, warmup.
@@ -2121,8 +2086,7 @@ class Executor:
         degree = command.sequence_parallel_degree or 1
         self.host.shared = command.shared
         self.host.gpu_memory_limit = command.gpu_memory_limit
-        # An older machine's Start names none.
-        self.host.display_limit = tuple(getattr(command, "display_limit", ()) or ())
+        self.host.display_limit = tuple(command.display_limit)
         # A dev machine (`dev = true` in its config.toml) audits its CUDA graphs' replays.
         graphs.AUDIT = bool(getattr(command, "dev", False))
         if pacing.configure(pace := command.display_pace) and pace is not None:
@@ -3580,10 +3544,10 @@ class Executor:
         them itself as before. For call `request_id`, else the one running here."""
         context = CURRENT.get()
         request_id = request_id or (context.request_id if context is not None else None)
-        if request_id is None or _MODEL_NEED is None:
+        if request_id is None:
             return
         for binding in load.models:
-            self._ask(_MODEL_NEED(manifest=binding.snapshot, components=list(binding.components)), request_id)
+            self._ask(ModelNeed(manifest=binding.snapshot, components=list(binding.components)), request_id)
 
     def _need_now(self, request_id: str, parameter: str) -> None:
         """`ctx.need`: a model this call builds at its first read, asked of TensorD now on a thread of its own, so what of
@@ -3865,8 +3829,8 @@ class Executor:
                 prepared = target.prepared.pop(command.request_id, None)
             if prepared is None:  # trimmed by a prepare meanwhile
                 return target._unadmitted(command) or {}
-            # Dev-only (`cozy run --attention-capture`): TensorFS carries it from 0.25.
-            capture = str(getattr(command, "attention_capture", "") or "")
+            # Dev-only (`cozy run --attention-capture`).
+            capture = command.attention_capture
             sites: Sequence[tuple[str, str, object, int]] = ()
             if capture:
                 try:
@@ -5831,7 +5795,7 @@ def serve(executor: Executor, channel: Channel) -> int:
             reply = _reply(executor, frame)
         if reply is None:
             return _shut(executor, channel)
-        _answer(executor, channel, reply)
+        _send_reply(channel, reply)
 
 
 def _call_thread() -> None:
@@ -5839,16 +5803,6 @@ def _call_thread() -> None:
     own threads from the rest by it (cl-977)."""
     _watchers.native_name(threading.current_thread().name)
     crash.arm()
-
-
-def _answer(executor: Executor, channel: Channel, reply: Reply) -> None:
-    """A reply, and the vigil's line after the device Start's that says it follows (cl-977)."""
-    with channel.sending:
-        _send_reply(channel, reply)
-        if reply.get("descriptor") is True and (line := executor.vigil_line) is not None:
-            executor.vigil_line = None
-            channel.send_descriptor(line)
-            line.close()
 
 
 def _shut(executor: Executor, channel: Channel) -> int:
@@ -5877,7 +5831,7 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
                 os._exit(code)
             if frame.get("cmd") in {"invoke", "map"} and call:
                 executor.mux.forget(call)
-            _answer(executor, executor.channel, {**reply, "request_id": call} if call else reply)
+            _send_reply(executor.channel, {**reply, "request_id": call} if call else reply)
     except BaseException as exc:
         if call in _TOLD:  # its traceback is in its own log (`Executor._call`)
             print(f"call {call} ended this executor: {type(exc).__name__}", file=sys.stderr)
