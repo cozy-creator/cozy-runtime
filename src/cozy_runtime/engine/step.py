@@ -120,6 +120,8 @@ class Step:
         """Logits after the rows' penalties, counting their output so far and `ahead`: the
         drafts before each position, `[rows, vocab]` for one position or `[rows, span, vocab]`."""
         r, s = self.rows, self.size
+        if not self.sampling.penalized:
+            return logits
         counts, prompt = r.counts[:s], r.prompt[:s]
         if logits.dim() == 3:
             counts, prompt = counts[:, None], prompt[:, None]
@@ -175,7 +177,10 @@ class Step:
         for i in range(1, depth):
             at = (length + i + delta)[:, None]
             state = m.draft(drafts[-1][:, None], state, at, Tables(self.mtp_lengths, self.mtp_slots, 1))
-            before = torch.zeros_like(r.counts[:s]).scatter_add_(1, torch.stack(drafts, 1), torch.ones_like(torch.stack(drafts, 1), dtype=torch.float32))
+            before = None  # the drafts before this one, for the penalties
+            if self.sampling.penalized:
+                made = torch.stack(drafts, 1)
+                before = torch.zeros_like(r.counts[:s]).scatter_add_(1, made, torch.ones_like(made, dtype=torch.float32))
             drafts.append(self.sampling.pick(self._scores(m.logits(state[:, 0]), before), s, n + i))
             if i + 1 < depth:
                 self.mtp_lengths.copy_(torch.where(live, length + i + 1, -1))
@@ -186,8 +191,10 @@ class Step:
         ids = torch.cat([r.ids[:s, None], drafted], 1)
         y = m.body(ids, (length + delta)[:, None] + steps, Tables(self.live_lengths, kv.slot_mapping[:s]))
         logits = m.logits(y)
-        ahead = torch.zeros_like(logits).scatter_(2, drafted[..., None], 1.0).cumsum(1)
-        ahead = torch.cat([torch.zeros_like(ahead[:, :1]), ahead[:, :-1]], 1)
+        ahead = None  # each position's drafts before it, for the penalties
+        if self.sampling.penalized:
+            ahead = torch.zeros_like(logits).scatter_(2, drafted[..., None], 1.0).cumsum(1)
+            ahead = torch.cat([torch.zeros_like(ahead[:, :1]), ahead[:, :-1]], 1)
         best = self.sampling.pick(self._scores(logits, ahead), s, n[:, None] + steps)
         agreed = (best[:, :depth] == drafted).long().cumprod(-1).sum(-1)
         valid = (steps[None] <= agreed[:, None]) & live[:, None]
