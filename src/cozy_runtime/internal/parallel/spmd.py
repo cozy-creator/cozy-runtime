@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import inspect
 import itertools
 import json
 import mmap
@@ -303,7 +304,7 @@ def _checked_call(module: torch.nn.Module, *args: object, **kwargs: object) -> o
     name = str(module._cozy_spmd_check)
     choice = getattr(_CHOICE, "stage", None)
     if choice is not None:
-        choice.called(name, args, kwargs)
+        choice.called(module, name, args, kwargs)
     if not getattr(_ALONE, "unsharded", False):  # a stage at degree 1 runs on its own
         ranks = current()
         if ranks is None:
@@ -883,17 +884,40 @@ class _Shared:
             self.page.close()
 
 
-def _shape(value: object) -> str:
-    """A sharded call's shape class: its tensors' types and shapes, in its arguments' places. No
-    other value is any class of its own: a seed, a step's timestep, a scale."""
+def _shape_class(
+    module: torch.nn.Module, args: tuple[object, ...], kwargs: dict[str, object]
+) -> str:
+    """A sharded call's shape class: the state it computes on (its forward's first argument: a
+    DiT's latent rows, the video) by its exact shape, and every other tensor with each dimension
+    raised to the next power of two: the conditioning, whose length a prompt sets (H3 packs its
+    text rows into the sequence the DiT attends over), so a video's shape chooses and a prompt's
+    length within a power of two does not. No other value is any class of its own: a seed, a
+    step's timestep, a scale."""
+    try:
+        bound = dict(
+            inspect.signature(type(module).forward).bind(module, *args, **kwargs).arguments
+        )
+    except (TypeError, ValueError):
+        bound = {"self": module, **{str(i): a for i, a in enumerate(args)}, **kwargs}
+    names = list(bound)[1:]
+    return ",".join(f"{n}={_shape(bound[n], exact=i == 0)}" for i, n in enumerate(names))
+
+
+def _shape(value: object, *, exact: bool) -> str:
     import torch
 
     if isinstance(value, torch.Tensor):
-        return f"{str(value.dtype).removeprefix('torch.')}{list(value.shape)}"
+        dims = (
+            list(value.shape)
+            if exact
+            else [1 << (n - 1).bit_length() if n else 0 for n in value.shape]
+        )
+        return f"{str(value.dtype).removeprefix('torch.')}{dims}"
     if isinstance(value, (list, tuple)):
-        return "[" + ",".join(_shape(item) for item in value) + "]"
+        return "[" + ",".join(_shape(item, exact=exact) for item in value) + "]"
     if isinstance(value, dict):
-        return "{" + ",".join(f"{k}:{_shape(v)}" for k, v in sorted(value.items())) + "}"
+        items = sorted(value.items())
+        return "{" + ",".join(f"{k}:{_shape(v, exact=exact)}" for k, v in items) + "}"
     return type(value).__name__
 
 
@@ -936,10 +960,11 @@ def _degree(ranks: Ranks, stages: Stages, stage: str, run: Callable[[], object])
 class _Choice:
     """A sharded stage's degree: its group's, or one GPU, whichever was measured faster for its
     key (`degrees.choose`, GPU 0's word for every GPU), chosen at the stage's first sharded call,
-    where every GPU meets anyway. The key's shape class is that call's (`_shape`): a request's
-    length and size choose, and its seed or words do not. One GPU only where the unsharded stage
-    fits on every GPU (`_fits`), else the group's; there every GPU runs the rest of the stage
-    unsharded on its own, the same inputs and the same program, nothing crossing.
+    where every GPU meets anyway. The key's shape class is that call's (`_shape_class`): a
+    request's video chooses, and its seed, its words or its prompt's length within a power of two
+    do not. One GPU only where the unsharded stage fits on every GPU (`_fits`), else the group's;
+    there every GPU runs the rest of the stage unsharded on its own, the same inputs and the same
+    program, nothing crossing.
 
     A degree its key has no time for is measured: GPU 0's steady step (steps 2 on), recorded only
     where no GPU read weights from disk or saw a kernel build or land over those steps (`_cold`);
@@ -958,15 +983,24 @@ class _Choice:
         #: this GPU's `_cold` at the steady steps' start and at the stage's end
         self.cold: list[tuple[int, int, bool]] = []
 
-    def called(self, name: str, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
+    def called(
+        self,
+        module: torch.nn.Module,
+        name: str,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> None:
         self.calls += 1
         if self.calls == 1:
-            self._choose(name, args, kwargs)
+            # GPU 0's key is every GPU's (`_choose`)
+            self._choose(
+                f"{name}({_shape_class(module, args, kwargs)})" if self.ranks.rank == 0 else ""
+            )
         elif self.calls == 2 and self.measure:
             self.cold.append(_cold())
         self._mark()
 
-    def _choose(self, name: str, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
+    def _choose(self, shape: str) -> None:
         import torch
 
         from cozy_runtime.internal.parallel import cp, degrees
@@ -975,7 +1009,6 @@ class _Choice:
         told: dict[str, Json] = {}
         if ranks.rank == 0:
             card = torch.cuda.get_device_name(ranks.device) if torch.cuda.is_available() else "cpu"
-            shape = f"{name}{_shape((args, kwargs))}"
             key = degrees.Key(*ranks.call, self.stage, shape, card, ranks.world, _runtime())
             chosen = degrees.choose(key)
             measure = torch.cuda.is_available() and chosen not in degrees.known(key)

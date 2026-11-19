@@ -3,12 +3,13 @@ whichever was measured faster for its key, never estimated. Ulysses halves a ste
 not its host work, so no figure taken at one degree predicts the other where the host bounds the
 step (LTX-2.5's base stage: 1.67 s a step on two GPUs, 0.925 s on one).
 
-A key is the package and its build, the function, the stage, its shape class (the tensor shapes
-of the stage's first sharded call, where the degree is chosen: no seed or other value), the card,
-the group's degree and the Runtime build: a new release measures again. A key with no steady step
-time at a degree runs there and records it (steps 2 on: step 1 carries fills and compiles; and
-only steps no GPU read weights from disk or saw a kernel build in, else the next request measures
-again); once both are known, the faster is the key's for good, so a request's bytes stop changing
+A key is the package and its build, the function, the stage, its shape class (the stage's first
+sharded call, where the degree is chosen: its video's exact shape, its other tensors' dimensions
+to the next power of two, no seed or other value: `spmd._shape_class`), the card, the group's
+degree and the Runtime build: a new release measures again. A key with no steady step time at a
+degree runs there and records it (steps 2 on: step 1 carries fills and compiles; and only steps no
+GPU read weights from disk or saw a kernel build in, else the next request measures again); once
+both are known, the faster is the key's for good, so a request's bytes stop changing
 with its runs. The record keeps the attention kernels each degree served, so a reviewer can tell a
 degree's head-group numerics from a bug. Records live in the machine's kernel cache, beside its
 link measurements.
