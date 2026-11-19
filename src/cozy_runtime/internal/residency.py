@@ -36,7 +36,7 @@ from torch.utils.hooks import RemovableHandle
 from cozy_runtime import graphs
 from cozy_runtime.author import _phases, _retained
 from cozy_runtime.author._errors import CapabilityError, DoesNotFit, Fault, fault, is_capacity
-from cozy_runtime.author._model import WARNINGS, WarningRow, recovered
+from cozy_runtime.author._model import TRANSPARENT, WARNINGS, WarningRow, recovered
 from cozy_runtime.internal import cache_owners, pacing, proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
@@ -293,6 +293,28 @@ def _readable(value: object) -> object:
     return value._varena_read() if isinstance(value, Placeholder) else value
 
 
+def _host(nbytes: int, *, pinned: bool) -> Tensor:
+    """`nbytes` of host memory, page-locked when `pinned` and the host can lock it."""
+    if pinned:
+        try:
+            return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        except RuntimeError:  # no lockable host memory now: pageable copies are slower, not wrong
+            pass
+    return torch.empty(nbytes, dtype=torch.uint8)
+
+
+def _bound(model: Model, site: _Site) -> Tensor:
+    """`site`'s value while its block is entered."""
+    held = site.table[site.name]
+    if isinstance(held, Placeholder):
+        raise ResidencyError(
+            f"{model.name}: {site.name} has no value: no stored tensor binds it. A buffer no "
+            "checkpoint stores keeps its constructed value only when construction computed one "
+            "(from config or a constant), not from a weightless parameter"
+        )
+    return cast(Tensor, held)  # a site is a slot that held a tensor
+
+
 def blocks_of(module: nn.Module) -> list[str]:
     return paging(module)[1]
 
@@ -507,6 +529,9 @@ class _Block:
     prefilled: varena.Use | None = None
     #: the birth site its entry replaced, back at its exit: what runs after it is not its
     born_before: int | None = None
+    #: a block that is one linear layer: refused room, it stays on the host and its forward
+    #: runs in windows of output rows copied in (`Memory._streamed`)
+    leaf: nn.Module | None = None
 
     def paged(self) -> bool:
         """Whether a page a fill wrote may still serve: bound data or a native region."""
@@ -2357,6 +2382,20 @@ class Memory:
                 request.read(block, read_ns, read_bytes, bake=bake)
         return data
 
+    def _placed_after_reads(self, block: _Block, overlay: Hashable) -> bool:
+        """`block` placed after the commons bound only for reads outside their forwards, of
+        components not running, went (`_let_go_reads`): False when none was bound, or it still
+        has no room. LTX-2.5's denoise held its VAE's, connectors' and audio VAE's beside its
+        transformer's first block, 1.3 GiB of a 6 GiB cap (var-030 §12)."""
+        if not self._let_go_reads():
+            return False
+        try:
+            self._ensure(block, True, overlay)
+        except Exhausted:
+            return False
+        block.gathered = None
+        return True
+
     def _placed_after_shed(self, block: _Block, overlay: Hashable) -> bool:
         """`block` placed after what holds weights only for speed let them go (`sheds`): False
         when nothing did, or it still has no room. A refused block beside them is the refusal
@@ -2372,17 +2411,20 @@ class Memory:
         block.gathered = None
         return True
 
+    @torch.inference_mode(False)
     def _gather(self, block: _Block, overlay: Hashable) -> None:
         """An embedding table that does not fit the room stays on the host: its forward looks up
         there and moves only the rows it read (`_gathering`), so a room below the table never
         fails the call (Qwen-Image's 1.2 GB text-encoder table beside a 5 GB game on 8 GB). The
         copy is the host tier's page when it keeps one, else read once and held while the table
-        gathers; each entry tries the device first."""
+        gathers; each entry tries the device first. A linear layer refused so (`_Block.leaf`)
+        stays there the same way, in pinned memory; its windows' rows are copied in
+        (`_streamed`)."""
         self._retire_phase_plan("host_gathered_representation", model=block.model)
         if block.gathered is None or block.gathered[0] != overlay:
             block.gathered = None
             model = block.model
-            raw = torch.empty(block.storage_bytes, dtype=torch.uint8)
+            raw = _host(block.storage_bytes, pinned=not block.table)
             began = time.perf_counter_ns()
             self._source(block, final=False).read_host(raw.numpy(), stored=model.fill is not None)
             if (request := _REQUEST.get()) is not None:
@@ -2406,8 +2448,70 @@ class Memory:
             block.gathered = overlay, data, finals
         with self.lock:
             block.data, block.final_data, block.ready = block.gathered[1], block.gathered[2], None
-        if (request := _REQUEST.get()) is not None:
+        if (request := _REQUEST.get()) is not None and block.table:
             request.gathered += 1
+
+    def _streams(self, block: _Block) -> bool:
+        """Whether `block`, refused room, can run from the host: one linear layer whose output
+        rows compute alone (`rows.streamed`), outside a capture and a graph's binding (whose
+        refusal tells it to run eagerly)."""
+        if block.leaf is None or not self.cuda or self.capturing() or block.retained:
+            return False
+        from cozy_runtime.accel import rows
+
+        return rows.streamed(block.leaf, rows._slice, rows._same) is not None
+
+    def _streamed(self, block: _Block, x: Tensor) -> Tensor:
+        """`block`'s layer over `x` from its host copy (`_gather`): in windows of its output rows,
+        each window's rows copied in on this stream and computed as `rows` computes them, the
+        windows as many as the card's room takes (`catch.cut`, which goes finer on a refusal).
+        One window is the whole layer's own call. Each byte crosses the bus once a forward."""
+        from cozy_runtime.accel import rows
+        from cozy_runtime.internal.execution import catch, sizing
+
+        leaf = cast(nn.Module, block.leaf)
+        if torch.cuda.is_current_stream_capturing():
+            raise Exhausted(f"{block.model.component}/{block.path} is on the host: no capture")
+        device = self.device
+
+        def take(tensor: Tensor, start: int, stop: int) -> Tensor:
+            return tensor[start:stop].to(device, non_blocking=True)
+
+        def whole(tensor: Tensor) -> Tensor:
+            return tensor.to(device, non_blocking=True)
+
+        compute = rows.streamed(leaf, take, whole)
+        if compute is None:  # its hooks changed since its entry
+            raise Exhausted(f"{block.model.component}/{block.path} has no room and does not cut")
+        width = cast(int, leaf.out_features)
+        tile = rows.tile(leaf)
+        units = -(-width // tile)
+        per_row = block.storage_bytes // width
+        tokens = x.numel() // max(x.shape[-1], 1)
+        out_bytes = tokens * width * x.element_size()
+
+        def need(level: int) -> tuple[int, ...]:
+            n = min(width, sizing.pieces(units, level) * tile)
+            return out_bytes, n * per_row, out_bytes * n // width
+
+        def run(level: int) -> Tensor:
+            n = min(width, sizing.pieces(units, level) * tile)
+            if n >= width:
+                return compute(x, 0, width)
+            out: Tensor | None = None
+            for start in range(0, width, n):
+                stop = min(width, start + n)
+                found = compute(x, start, stop)
+                if out is None:
+                    out = found.new_empty((*found.shape[:-1], width))
+                out[..., start:stop].copy_(found)
+                del found
+            return cast(Tensor, out)
+
+        if (request := _REQUEST.get()) is not None:
+            request.streamed += 1
+        name = f"{block.model.component}.{block.path}:rows"
+        return catch.cut(name, sizing.levels(units), need, run)
 
     def _read_into(
         self, tensors: tensorfs.Tensors, key: str, raw: Tensor, role: str | None
@@ -2469,8 +2573,11 @@ class Memory:
                 except Exhausted:  # varena refused its region before its forward ran
                     if not (reclaim and self.cuda and not capturing):
                         raise
-                    if not self._placed_after_shed(block, overlay):
-                        if not block.table:
+                    if not (
+                        self._placed_after_reads(block, overlay)
+                        or self._placed_after_shed(block, overlay)
+                    ):
+                        if not (block.table or self._streams(block)):
                             raise
                         gathered = block.gathered is not None and block.gathered[0] == overlay
                         with nullcontext() if gathered else self._read_told(block):
@@ -2595,6 +2702,14 @@ class Memory:
         try:
             if not getattr(model.local, "depth", 0):
                 self._declare(model)
+            elif block is model.common and self._scoped(model) and not self.capturing():
+                # Read outside its forwards in a call that declared it (an overlay's factors,
+                # a VAE's latent statistics): bound until the next outermost forward begins, the
+                # scope ends or a refused block takes it back (`_let_go_reads`), so an overlay
+                # read in every layer binds once a forward, never once an op (cr-207).
+                self._enter(block)
+                model.local.held = True
+                return _bound(model, site)
             if (
                 raw_view is not None
                 and model.fill is None
@@ -2624,31 +2739,55 @@ class Memory:
                         return nn.Parameter(value, requires_grad=False) if site.parameter else value
             self._enter(block)
             try:
-                held = site.table[site.name]
-                if isinstance(held, Placeholder):
-                    raise ResidencyError(
-                        f"{model.name}: {site.name} has no value: no stored tensor binds it. A "
-                        "buffer no checkpoint stores keeps its constructed value only when "
-                        "construction computed one (from config or a constant), not from a "
-                        "weightless parameter"
-                    )
-                return cast(Tensor, held)  # a site is a slot that held a tensor
+                return _bound(model, site)
             finally:
                 self._exit(block)
         finally:
             model._release()
 
+    def _scoped(self, model: Model) -> bool:
+        """Whether `model`'s common block waits for its own use on this thread: varena pages it, a
+        call's scope declared it and none of its forwards runs, so nothing holds it yet."""
+        return (
+            self.native is not None
+            and getattr(model.local, "depth", 0) > 0
+            and not getattr(model.local, "running", 0)
+            and not getattr(model.local, "held", False)
+        )
+
+    def _let_go_reads(self) -> bool:
+        """The common blocks this thread's scopes bound for reads outside their forwards, given
+        back where their component is not running: a refused block comes before a read's speed.
+        A later read binds them again. Whether any went."""
+        went = False
+        for model in list(self.models.values()):
+            local = model.local
+            if getattr(local, "held", False) and not getattr(local, "running", 0):
+                local.held = False
+                if model.common is not None:
+                    self._exit(model.common)
+                    went = True
+        return went
+
     def _open(self, model: Model, key: str, *, executing: bool = False) -> None:
+        """A scope of `model` (a call that declared it) or one of its forwards begins. Under varena
+        its common block is held while it runs, not while a scope only names it: LTX-2.5's
+        denoise held four components' commons through the connectors, whose 1.44 GiB projection
+        then had no room at a 6 GiB cap (var-030 §12). A read outside its forwards binds it then
+        (`_read`). Elsewhere (CPU, MPS) the scope holds it, as their bytes are not paged."""
         model._claim()
         depth = getattr(model.local, "depth", 0)
+        running = getattr(model.local, "running", 0)
         model.local.depth = depth + 1
         request = _REQUEST.get()
         outer_forward = False
         if executing:
+            model.local.running = running + 1
             with self.lock:
                 outer_forward = self._forward_depth == 0
                 self._forward_depth += 1
                 self._executing[model] = self._executing.get(model, 0) + 1
+        held = (executing and not running) if self.native is not None else not depth
         try:
             if not depth:
                 self._declare(model)
@@ -2657,17 +2796,21 @@ class Memory:
                     request.forwards.add(model)
                     self._pass(model, request, hash(key) & _U64 or 1)
             if outer_forward:
+                if self.native is not None and not self.capturing():
+                    # What reads bound for the last forward's sake stays bound no longer: the
+                    # VAE statistics a refine read held 832 MiB through its whole loop.
+                    self._let_go_reads()
                 self._activate_phase(model)
-            if depth:
-                return
-            model.local.request = request
-            if request is not None:
-                request.current.add(model.name)
-            if model.common is not None:
+            if not depth:
+                model.local.request = request
+                if request is not None:
+                    request.current.add(model.name)
+            if held and model.common is not None:
                 self._enter(model.common)
         except BaseException:
             model.local.depth = depth
             if executing:
+                model.local.running = running
                 with self.lock:
                     self._forward_depth -= 1
                     self._leave(model)
@@ -2679,17 +2822,27 @@ class Memory:
     def _close(self, model: Model, *, executing: bool = False) -> None:
         try:
             model.local.depth -= 1
-            if model.local.depth == 0:
-                if model.escape_site:
-                    self._born(0)
-                try:
-                    if model.common is not None:
-                        self._exit(model.common)
-                finally:
-                    request = getattr(model.local, "request", None)
-                    if request is not None:
-                        request.current.discard(model.name)
-                        request.sample()
+            if executing:
+                model.local.running -= 1
+            depth, running = model.local.depth, getattr(model.local, "running", 0)
+            try:
+                held = (executing and not running) if self.native is not None else not depth
+                if held and model.common is not None:
+                    self._exit(model.common)
+            finally:
+                if not depth:
+                    if model.escape_site:
+                        self._born(0)
+                    try:
+                        if getattr(model.local, "held", False):
+                            model.local.held = False
+                            if model.common is not None:
+                                self._exit(model.common)
+                    finally:
+                        request = getattr(model.local, "request", None)
+                        if request is not None:
+                            request.current.discard(model.name)
+                            request.sample()
         finally:
             if executing:
                 with self.lock:
@@ -2743,9 +2896,18 @@ class Memory:
         if request.idle or self.capturing():
             return
         if model.escape_floor is None:
+            # A block the card need not hold whole sets no floor: an embedding table gathers its
+            # rows on the host (`_gather`), and one linear layer streams its rows (`_streamed`).
+            # Counted, Qwen3.8-27B's 2.37 GiB bf16 table and head refused every decode pass at a
+            # 6 GiB cap ("needs 5.4 GiB ... 2.6 GiB of weights", cr-344).
             common = model.common.allocation_bytes if model.common is not None else 0
             model.escape_floor = common + max(
-                (block.allocation_bytes for block in model.blocks.values()), default=0
+                (
+                    b.allocation_bytes
+                    for b in model.blocks.values()
+                    if not (b.table or b.leaf is not None)
+                ),
+                default=0,
             )
         floor = model.escape_floor
         if any(b.retained for b in model.groups()):
@@ -2753,7 +2915,11 @@ class Memory:
             # (a decode keeping what fits, `keep`); an embedding table gathers on the host.
             shared = model.common
             floor = (shared.allocation_bytes if shared and not shared.retained else 0) + max(
-                (b.allocation_bytes for b in model.blocks.values() if not (b.retained or b.table)),
+                (
+                    b.allocation_bytes
+                    for b in model.blocks.values()
+                    if not (b.retained or b.table or b.leaf is not None)
+                ),
                 default=0,
             )
         device = self.device.index or 0
@@ -2921,6 +3087,7 @@ class RequestStats(TypedDict):
     swallowed_ooms: int
     retained_bytes: int
     gathered: int
+    streamed: int
     host: None
     allocated: NotRequired[int]
     reserved: NotRequired[int]
@@ -3222,6 +3389,8 @@ class Request:
         self.final_fills = self.final_hits = 0
         #: table lookups served on the host (`Memory._gather`)
         self.gathered = 0
+        #: forwards of a layer refused room, run from its host copy in windows (`Memory._streamed`)
+        self.streamed = 0
         self.prefetch_completed = 0
         self.ahead = _ahead(memory)
         self.allocator = _allocator(memory)
@@ -3358,6 +3527,7 @@ class Request:
             "swallowed_ooms": self.swallowed_ooms,
             "retained_bytes": self.retained_bytes,
             "gathered": self.gathered,
+            "streamed": self.streamed,
             "host": None,
         }
         if self.memory.cuda and torch.cuda.is_initialized():
@@ -3753,7 +3923,12 @@ def _widened(
     )
 
 
+@torch.inference_mode(False)
 def _assign(block: _Block) -> list[tuple[_Site, Tensor]]:
+    """`block`'s values for its sites, made outside inference mode whatever its caller's (a
+    forward's hook, a read in a package's `inference_mode`): a CPU's widened copy made inside it
+    was an inference tensor, and its Parameter failed `Cannot set version_counter for inference
+    tensor` once a CPU model's blocks entered per forward (CPU e2e 44407890827)."""
     model = block.model
     if block.data is None:
         raise ResidencyError("weight assignment before a complete fill")
@@ -3892,6 +4067,31 @@ def _hooks(model: Model) -> None:
         model.handles.extend(_paired(sub, entered, exited, model))
         if block.table:
             model.handles.extend(_gathering(sub, memory))
+        elif memory.cuda and _linear(sub):
+            block.leaf = sub
+            _streaming(sub, block, memory)
+
+
+def _linear(module: nn.Module) -> bool:
+    """A layer with no children whose kind may compute by output rows (`rows.streamed`)."""
+    if next(module.children(), None) is not None:
+        return False
+    return type(module) is nn.Linear or getattr(module, "provider", None) is not None
+
+
+def _streaming(module: nn.Module, block: _Block, memory: Memory) -> None:
+    """`module`'s forward, from its host copy while it has no room on the card (`_streamed`)."""
+    previous = vars(module).get("forward") or (
+        lambda *args, **kwargs: type(module).forward(module, *args, **kwargs)
+    )
+
+    def forward(x: Tensor, *args: object, **kwargs: object) -> object:
+        if block.gathered is None or args or kwargs or not isinstance(x, Tensor):
+            return previous(x, *args, **kwargs)
+        return memory._streamed(block, x)
+
+    vars(forward)[TRANSPARENT] = True
+    module.forward = forward
 
 
 def _gathering(module: nn.Module, memory: Memory) -> list[RemovableHandle]:
@@ -3935,6 +4135,8 @@ def _paired(
     leave: Callable[[], None],
     owner: Model,
 ) -> list[RemovableHandle]:
+    from cozy_runtime.accel import rows
+
     owed = threading.local()
 
     def pre(_: nn.Module, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
@@ -3945,6 +4147,9 @@ def _paired(
         if getattr(owed, "count", 0):
             owed.count -= 1
             leave()
+
+    # The block's entry, not its arithmetic: a layer's row cut looks past them (`rows.streamed`).
+    vars(pre)[rows.OWN] = vars(post)[rows.OWN] = True
 
     return [
         module.register_forward_pre_hook(pre, with_kwargs=True),
