@@ -162,6 +162,18 @@ class CozyEngine:
                     raise
                 answered(exc)
                 raise Short(f"the engine's tables don't fit ({str(exc)[:200]})") from exc
+        ceiling, longest = self.decoder.kv.ceiling, max(len(p) for p in prompts)
+        if longest >= ceiling:
+            raise Short(f"its prompt of {longest} tokens fills the {ceiling} a row holds (the model's context)")
+        new = min(params.max_new_tokens, ceiling - longest)
+        if new < params.max_new_tokens:
+            from cozy_runtime.author._model import WARNINGS
+
+            WARNINGS.append((
+                f"max_tokens {params.max_new_tokens} runs past the model's context after a {longest}-token "
+                f"prompt: clamped to {new}",
+                {"max_tokens": params.max_new_tokens, "clamped": new, "context": ceiling},
+            ))  # fmt: skip
         rows = len(prompts)
         made: list[list[int]] = [[] for _ in range(rows)]
         told = [_Told(params.thinking) for _ in range(rows)]
@@ -185,7 +197,7 @@ class CozyEngine:
                     progress(count[0])
 
         request = Request(
-            prompts=prompts, max_new=params.max_new_tokens, stops=stops, temperature=params.temperature,
+            prompts=prompts, max_new=new, stops=stops, temperature=params.temperature,
             top_p=params.top_p, top_k=params.top_k, min_p=params.min_p, presence=params.presence_penalty,
             frequency=params.frequency_penalty, repetition=params.repetition_penalty, seed=params.seed,
         )  # fmt: skip
