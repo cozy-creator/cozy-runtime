@@ -887,7 +887,7 @@ def _inject(
         elif param.role == "preflight":
             kwargs[param.name] = facts
         elif param.role in ("model", "weights"):
-            model = _model(param, inv, param.name in surface.deferred)
+            model = _model(param, inv, surface)
             keyword = surface.parameters is not None
             artifact = getattr(overlay.payload, param.name, None) if keyword else None
             if artifact is not None and (
@@ -921,19 +921,29 @@ def _need(surface: Surface, inv: Invocation, slot: str) -> None:
         inv.need(slot)
 
 
-def _model(param: Param, inv: Invocation, on_demand: bool) -> object:
+def _model(param: Param, inv: Invocation, surface: Surface) -> object:
     model = (inv.sources if param.role == "weights" else inv.models).get(param.name)
-    if model is None and on_demand:
-        # A request may leave it unused: refused only when read.
-        return _Unbound(param.name, inv.unbound.get(param.name))
-    if model is None:
-        raise InvalidRequest(
-            f"this function needs a model for {param.name!r} and has no default: name one with "
-            f"`model.{param.name}=<org/model>`",
-            code="unbound_model",
-            fields=[param.name],
+    if model is not None:
+        return model
+    refusal = inv.unbound.get(param.name)
+    rule = surface.model_needs.get(param.name)
+    if rule is not None and refusal is None and param.name in surface.model_defaults:
+        # A slot its needs rule rules out for this request has no source, a Model or a raw
+        # Weights alike (cl-1281): its machine bound it none, and reading it refuses.
+        refusal = (
+            "model_ruled_out",
+            f"{param.name!r} is not this request's: its needs rule ({rule}) is false for it, so "
+            "its machine bound no model, and the function read it",
         )
-    return model
+    if rule is not None or param.name in surface.deferred:
+        # A request may leave it unused: refused only when read.
+        return _Unbound(param.name, refusal)
+    raise InvalidRequest(
+        f"this function needs a model for {param.name!r} and has no default: name one with "
+        f"`model.{param.name}=<org/model>`",
+        code="unbound_model",
+        fields=[param.name],
+    )
 
 
 class _Unbound:

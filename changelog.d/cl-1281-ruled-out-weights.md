@@ -1,0 +1,1 @@
+A `Weights` argument whose `needs` rule is false for a request is left unbound, as a ruled-out Model argument is, so the request runs instead of failing `unbound_model` at bind (H3 Edit's five edit LoRAs). Reading one refuses `model_ruled_out`.
