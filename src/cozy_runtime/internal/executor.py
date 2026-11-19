@@ -1655,6 +1655,7 @@ class Executor:
                 copy_engine.install(exchange, self.pg)
         except Exception as exc:
             return self._unformed(exc, "form")
+        spmd.formed()
         if self.comms is not None:
             self.comms.pg = self.pg
         return reply
@@ -1746,6 +1747,7 @@ class Executor:
             exchange=exchange,
             formed=self.host._formed if exchange else None,
         )
+        spmd.formed()
         if self.host.comms is not None:
             self.host.comms.pg = self.host.pg
 
@@ -2291,6 +2293,7 @@ class Executor:
                 if not command.import_only and cpu_group:
                     with _phases.phase("joining the group's GPUs"):
                         self.pg = self.group.form(cast("ModuleType", self.torch), _SEALED)
+                        spmd.formed()
                     stage("group_form")
                 elif not command.import_only:
                     with _phases.phase("measuring the links between GPUs"):
@@ -2312,6 +2315,7 @@ class Executor:
                             exchange=exchange,
                             formed=self._formed if exchange else None,
                         )
+                        spmd.formed()
                     stage("group_form")
         except GroupRefusal as exc:
             return self._group_refusal(exc)

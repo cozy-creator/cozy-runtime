@@ -53,6 +53,16 @@ class UngatedShardedForward(GroupRefusal):
     default_code = "ungated_sharded_forward"
 
 
+#: A crossing's payload as its owner sends it: its structure, its tensors, its shared mapping.
+type _Made = tuple[Json, list[torch.Tensor], _Shared | None]
+
+
+def _made(value: object, what: str) -> _Made:
+    tensors: list[torch.Tensor] = []
+    structure = wire.marshal(value, tensors)
+    return structure, tensors, _Shared.make(tensors, what)
+
+
 class Ranks:
     """This GPU's part of one group attempt: who it is among the group, and the meetings and
     crossings that keep every GPU on one program."""
@@ -138,26 +148,32 @@ class Ranks:
             raise GroupRefusal(f"{what}: GPU 0 told no value", code="group_diverged")
         return told
 
-    def cross(self, value: object, owner: int, what: str) -> object:
+    def cross(self, value: object, owner: int, what: str, made: _Made | None = None) -> object:
         """`value` as GPU `owner` holds it, on every GPU: its structure through the store, each
         device tensor by one broadcast from `owner` onto this GPU, and its host tensors (and
-        arrays) through one shared mapping every other GPU reads in place (`_Shared`)."""
+        arrays) through one shared mapping every other GPU reads in place (`_Shared`; `made`:
+        the owner's, made already). The mapping's name and pages go however the crossing ends."""
         tensors: list[torch.Tensor] = []
-        structure = wire.marshal(value, tensors) if self.rank == owner else None
-        shared = _Shared.make(tensors, what) if self.rank == owner else None
-        name = shared.name if shared is not None else ""
-        rows = self.meet({"structure": structure, "shared": name}, what)
-        structure, name = rows[owner]["structure"], str(rows[owner].get("shared") or "")
-        specs = wire.specs(structure)
-        views = _Shared.views(name, specs, what) if name and self.rank != owner else {}
-        received = [
-            (tensors[spec.v] if self.rank == owner else views[spec.v])
-            if name and spec.host
-            else self._broadcast(tensors[spec.v] if self.rank == owner else None, spec, owner)
-            for spec in specs
-        ]
-        if name:
-            self.meet({}, f"{what}: mapped")  # every GPU holds the mapping: its name goes
+        shared: _Shared | None = None
+        if self.rank == owner:
+            structure, tensors, shared = made or _made(value, what)
+        else:
+            structure = None
+        try:
+            name = shared.name if shared is not None else ""
+            rows = self.meet({"structure": structure, "shared": name}, what)
+            structure, name = rows[owner]["structure"], str(rows[owner].get("shared") or "")
+            specs = wire.specs(structure)
+            views = _Shared.views(name, specs, what) if name and self.rank != owner else {}
+            received = [
+                (tensors[spec.v] if self.rank == owner else views[spec.v])
+                if name and spec.host
+                else self._broadcast(tensors[spec.v] if self.rank == owner else None, spec, owner)
+                for spec in specs
+            ]
+            if name:
+                self.meet({}, f"{what}: mapped")  # every GPU holds the mapping: its name goes
+        finally:
             if shared is not None:
                 shared.done()
         return wire.unmarshal(structure, received)
@@ -204,6 +220,32 @@ class Ranks:
         if tensor is not None:
             return tensor
         return buffer.cpu() if spec.host else buffer.to(self.device)
+
+
+def formed() -> None:
+    """A group formed on this GPU: what an earlier group decided per process goes, so a GPU
+    that came back meets one that kept nothing either (`_WRITES`), and files of processes that
+    ended are swept from /dev/shm (a crossing's mapping, a board)."""
+    _WRITES.clear()
+    sweep()
+
+
+def sweep() -> None:
+    """Remove `cozy-cross-<pid>-*` and `cozy-board-<pid>-*` files whose process has ended."""
+    import glob
+
+    for path in glob.glob("/dev/shm/cozy-cross-*") + glob.glob("/dev/shm/cozy-board-*"):
+        try:
+            pid = int(os.path.basename(path).split("-")[2])
+        except (IndexError, ValueError):
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+        except PermissionError:  # alive, another user's
+            pass
 
 
 def current() -> Ranks | None:
@@ -395,7 +437,9 @@ def place(
         return run()
     what = f"stage {method}"
     if ranks.rank == home:
-        return _run_alone(ranks, stages, home, what, run, given, (model, key, components))
+        return _run_alone(
+            ranks, stages, home, what, run, given, (model, key, components), (args, kwargs)
+        )
     return _receive(ranks, stages, home, what, run, given, key)
 
 
@@ -432,16 +476,20 @@ def _run_alone(
     run: Callable[[], object],
     given: list[torch.Tensor],
     stage: tuple[object, str, tuple[str, ...]],
+    arguments: tuple[tuple[object, ...], dict[str, object]],
 ) -> object:
     """The stage here, alone; then its result, the streams' state, and every argument tensor it
     may have written in place to the others: its version moved, or it keeps none (an inference
     tensor), so the others never read a stale argument. A stage that left other state behind
-    (`_left`) is run by the others too, and by every GPU from then on."""
+    (`_left`: in the model, its components or its arguments' structure) is run by the others
+    too, and by every GPU from then on; so is one whose result cannot cross. One whose host
+    tensors find no shared mapping now runs on the others too, this once."""
     import torch
 
     model, key, components = stage
     versions = [None if tensor.is_inference() else tensor._version for tensor in given]
     before = _state(torch, model, stages, components)
+    before["arguments"] = _arguments(arguments)
     try:
         with _alone(ranks, stages, home, what):
             result = run()
@@ -450,26 +498,45 @@ def _run_alone(
             ranks.cross({"op": "failed", "why": f"{type(exc).__name__}: {exc}"[:600]}, home, what)
         raise
     states = _streams(torch)
-    left = _left(before, _state(torch, model, stages, components))
+    after = _state(torch, model, stages, components)
+    after["arguments"] = _arguments(arguments)
+    left = _left(before, after)
     if left:
         # The others run it as this GPU did, from the streams' same state, and so does every GPU
         # next time.
         _WRITES.add(key)
         _EVERYWHERE[what] = left
-        ranks.cross({"op": "everywhere", "left": left}, home, what)
+        ranks.cross({"op": "everywhere", "left": left, "keep": True}, home, what)
         return result
     tensors: list[torch.Tensor] = []
     if not _crossable(result, tensors):
+        _WRITES.add(key)
         _EVERYWHERE[what] = ""
-        ranks.cross({"op": "everywhere", "left": ""}, home, what)
+        ranks.cross({"op": "everywhere", "left": "", "keep": True}, home, what)
         return result
     written = {
         str(i): t
         for i, (t, v) in enumerate(zip(given, versions, strict=True))
         if v is None or t._version != v
     }
-    ranks.cross({"op": "done", "result": result, "streams": states, "written": written}, home, what)
+    payload = {"op": "done", "result": result, "streams": states, "written": written}
+    made = _made(payload, what)
+    bulky = any(t.device.type == "cpu" and t.numel() for t in (*tensors, *written.values()))
+    if bulky and made[2] is None:
+        # No room for a shared mapping now: host tensors would broadcast through every card.
+        _EVERYWHERE[what] = "no shared mapping for its host tensors"
+        ranks.cross({"op": "everywhere", "left": "", "keep": False}, home, what)
+        return result
+    ranks.cross(payload, home, what, made)
     return result
+
+
+def _arguments(arguments: tuple[tuple[object, ...], dict[str, object]]) -> object:
+    """A stage's arguments as they cross, their tensors by identity: an entry a stage adds to
+    a dict, list or struct argument, or a tensor it puts in one, shows."""
+    tensors: list[torch.Tensor] = []
+    structure = wire.marshal(arguments, tensors)
+    return (json.dumps(structure, sort_keys=True), tuple(map(id, tensors)))
 
 
 def _receive(
@@ -498,7 +565,7 @@ def _receive(
                     given[int(index)].copy_(tensor)
             return told["result"]
         if op == "everywhere":
-            if told.get("left"):
+            if told.get("keep"):  # as GPU 0 keeps it
                 _WRITES.add(key)
             with _alone(ranks, stages, home, what, served=False):
                 return run()
@@ -535,10 +602,15 @@ class _Alone:
     ) -> Iterator[R]:
         name = self.stages.name(getattr(method, "__self__", None))
         calls = list(arguments)
-        if name is None or not self.served:  # here, one after another
+        # Here, one after another: no GPU waits for it, or its arguments cannot cross to them.
+        if name is None or not self.served or not _crossable(calls, []):
             return (method(*call) for call in calls)
-        told = {"op": "spread", "component": name, "method": getattr(method, "__name__", ""),
-                "arguments": [list(call) for call in calls]}
+        told = {
+            "op": "spread",
+            "component": name,
+            "method": getattr(method, "__name__", ""),
+            "arguments": [list(call) for call in calls],
+        }
         self.ranks.cross(told, self.home, self.what)
         return self.ranks.spread(method, calls)
 
@@ -574,9 +646,11 @@ def _set_streams(torch: ModuleType, states: Mapping[str, object]) -> None:
 _PLAIN = (str, bytes, int, float, bool, type(None))
 
 
-def _shallow(value: object) -> object:
+def _shallow(torch: ModuleType, value: object) -> object:
     """A value as `_state` compares it: plain values and their tuples by value, a container by
-    its items' identities (an entry added to a cache dict shows), anything else by identity."""
+    its items' identities (an entry added to a cache dict shows), a tensor by identity and
+    version (an inference tensor, which keeps none, by its storage), a generator by its state,
+    anything else by identity."""
     if isinstance(value, _PLAIN):
         return (type(value), value)
     if isinstance(value, tuple) and all(isinstance(item, _PLAIN) for item in value):
@@ -585,27 +659,51 @@ def _shallow(value: object) -> object:
         return ("dict", id(value), tuple((repr(k), id(v)) for k, v in value.items()))
     if isinstance(value, (list, set)):
         return (type(value).__name__, id(value), tuple(sorted(map(id, value))))
+    if isinstance(value, torch.Tensor):
+        mark = value.data_ptr() if value.is_inference() else value._version
+        return ("tensor", id(value), mark)
+    if isinstance(value, torch.Generator):
+        return ("generator", id(value), bytes(value.get_state().numpy()))
     return ("id", id(value))
 
 
 def _state(
     torch: ModuleType, model: object, stages: Stages, components: tuple[str, ...]
 ) -> dict[str, object]:
-    """What a stage could leave behind beside its result: the model's own attributes, one level
-    into each that is not a module (a tokenizer's `padding_side`), its components' attributes,
-    and their buffers' versions. Runtime state (`_cozy…`) aside."""
+    """What a stage could leave behind beside its result: the model's own attributes, every
+    object they reach that is not a module (a tokenizer's `padding_side`, a cache inside a
+    helper, each once), its components' attributes, and their buffers' versions. Runtime state
+    (`_cozy…`) aside."""
     found: dict[str, object] = {}
+    seen: set[int] = {id(model)}
+    #: objects still to read, each with its path (a stack: no recursion limit on deep state)
+    todo: list[tuple[str, object]] = []
 
     def attributes(prefix: str, owner: object, skip: tuple[str, ...] = ()) -> None:
         for name, value in list(getattr(owner, "__dict__", {}).items()):
             if not name.startswith("_cozy") and name not in skip:
-                found[prefix + name] = _shallow(value)
+                found[prefix + name] = _shallow(torch, value)
+                todo.append((f"{prefix}{name}.", value))
 
     attributes("", model)
-    for name, value in list(getattr(model, "__dict__", {}).items()):
-        if name.startswith("_cozy") or isinstance(value, (torch.nn.Module, *_PLAIN)):
+    while todo:
+        prefix, value = todo.pop()
+        if isinstance(value, (torch.nn.Module, torch.Tensor, torch.Generator, type, *_PLAIN)):
             continue
-        attributes(f"{name}.", value)
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        items: Iterable[tuple[str, object]] = ()
+        if isinstance(value, dict):
+            items = ((f"[{k!r}]", v) for k, v in list(value.items()))
+        elif isinstance(value, (list, tuple)):
+            items = ((f"[{i}]", v) for i, v in enumerate(value))
+        elif hasattr(value, "__dict__"):
+            attributes(prefix, value)
+        for at, item in items:  # a container's plain items are its own entry's
+            if not isinstance(item, _PLAIN):
+                found[prefix + at] = _shallow(torch, item)
+                todo.append((f"{prefix}{at}.", item))
     for name in components:
         root = stages.roots.get(name)
         if isinstance(root, torch.nn.Module):
