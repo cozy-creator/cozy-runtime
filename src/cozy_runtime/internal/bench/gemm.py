@@ -447,9 +447,10 @@ def _ordered(call: Call) -> str:
     return "true"
 
 
-#: The two-thread cell: rounds of calls a thread, at most, and the output bytes a thread holds, at most.
+#: The two-thread cell: rounds of calls a thread, at most, and the bytes it holds, at most (both threads' inputs and
+#: outputs, wanted and got), within a quarter of the card's free memory.
 _THREAD_ROUNDS = 32
-_THREAD_BYTES = 256 << 20
+_THREAD_BYTES = 512 << 20
 
 
 def _threads(ops: ModuleType, scheme: str, n: int, k: int) -> str | None:
@@ -459,7 +460,8 @@ def _threads(ops: ModuleType, scheme: str, n: int, k: int) -> str | None:
     overwrite or null this call's stream). Every call takes temporaries from `allocate`: bf16 rows where ggml's rule
     takes few-row MMQ (their widened copy, after which ggml reads the context's stream) and f32 rows through MMQ (their
     q8_1 copy), in turns, with no sync until a thread's last. Real blocks (one encoded 64-row tile, repeated), so an
-    output read early or made from another call's rows differs. None where neither kernel serves this weight here."""
+    output read early or made from another call's rows differs. None where neither kernel serves this weight here, or
+    where the card can't hold two rounds beside the bench's operands (44602394914: a 3080's 9B head, out of memory)."""
     g = torch.Generator(device="cuda:0").manual_seed(213)
     tile = ggml_linear.encode(torch, scheme, _rand(g, 64, k, scale=0.1, add=-0.05).cpu())
     blocks = tile.to("cuda:0").repeat(-(-n // 64), 1, 1)[:n].contiguous()
@@ -470,7 +472,10 @@ def _threads(ops: ModuleType, scheme: str, n: int, k: int) -> str | None:
             paths.append((m, dtype))
     if not paths:
         return None
-    rounds = max(4, min(_THREAD_ROUNDS, _THREAD_BYTES // sum(4 * m * n for m, _ in paths)))
+    held = 2 * sum(2 * 4 * m * n + m * k * (2 if dtype == BF16 else 4) for m, dtype in paths)  # a round, both threads
+    rounds = min(_THREAD_ROUNDS, min(_THREAD_BYTES, torch.cuda.mem_get_info(0)[0] // 4) // held)
+    if rounds < 2:
+        return None
     inputs = [[_rand(g, m, k, scale=2.0, add=-1.0).to(dtype) for _ in range(rounds) for m, dtype in paths] for _ in range(2)]
 
     def run(xs: list[torch.Tensor]) -> list[torch.Tensor]:
