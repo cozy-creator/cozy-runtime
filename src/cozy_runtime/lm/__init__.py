@@ -1727,7 +1727,7 @@ class _StaticCache(Cache):
         self.size[0] = size
 
 
-class _Paged(CacheLayerMixin):  # type: ignore[misc]  # Transformers' layer base is untyped
+class _Paged(CacheLayerMixin):  # type: ignore[no-untyped-call]  # Transformers' __init_subclass__
     """A full-attention layer of the engine's step, over the rows' K/V blocks (`engine.kv`): it
     gives the step's own K and V back as they came, naming its K/V layer to the attention that
     follows (`_Attending`), which writes them into each row's blocks and reads the rest there."""
@@ -1736,7 +1736,7 @@ class _Paged(CacheLayerMixin):  # type: ignore[misc]  # Transformers' layer base
     is_sliding = False
 
     def __init__(self, attending: _Attending, layer: int, head: bool = False) -> None:
-        super().__init__()
+        super().__init__()  # type: ignore[no-untyped-call]  # Transformers is partly annotated
         self.attending, self.layer, self.head = attending, layer, head
         self.is_initialized = True
 
@@ -2888,7 +2888,8 @@ class _Engine:
         for slot in range(rows):
             self._empty(slot)
         self.cache_device, self.width, self.views = device, stops, {}
-        modules = [*_lm(self.model).get_decoder().modules()]
+        decoder = cast("torch.nn.Module", _lm(self.model).get_decoder())  # cast: a decoder module
+        modules = [*decoder.modules()]
         if self.draft is not None:
             modules += [*self.draft.modules()]
         found = {id(c): c for m in modules if (c := getattr(m, "config", None)) is not None}
