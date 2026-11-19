@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra import libdevice
 except ImportError as _absent:  # pragma: no cover - a CPU-only or non-Linux environment
     if TYPE_CHECKING:
         raise
@@ -274,8 +275,10 @@ if not TRITON_ABSENT:
         q_ptr,
         k_ptr,
         v_ptr,
-        g_ptr,
-        beta_ptr,
+        a_ptr,
+        b_ptr,
+        a_log_ptr,
+        dt_bias_ptr,
         slots_ptr,
         state_ptr,
         scratch_ptr,
@@ -296,11 +299,13 @@ if not TRITON_ABSENT:
         """The gated delta rule for a row's `S` tokens in turn, of one value head and `BV` value
         columns, from the state in the row's slot (`[heads, DK, DV]` f32, a slot every
         `slot_stride`; -1: a row that isn't decoding). q and k are `[rows, S, k_heads, DK]` rows
-        `qk_stride` apart (a value head reads key head `h // group`), v `[rows, S, heads, DV]`, g
-        and beta `[rows, S, heads]`; q and k L2-normalised (q then divided by `scale`), the state
-        decayed by exp(g), corrected toward v by beta, then read by q, as `lm`'s kernel computes
-        it. One token: the state goes back to the slot. A span: the state after each token goes
-        to the row's scratch for the step to keep one."""
+        `qk_stride` apart (a value head reads key head `h // group`), v `[rows, S, heads, DV]`, a
+        and b `[rows, S, heads]` (the layer's `in_proj_a` and `in_proj_b`); q and k L2-normalised
+        (q then divided by `scale`), the state decayed by exp(g), corrected toward v by beta, then
+        read by q, as `lm`'s kernel computes it. g and beta are Transformers' own, computed here:
+        beta = sigmoid(b) rounded to b's dtype, g = -exp(A_log) * softplus(a + dt_bias) in f32.
+        One token: the state goes back to the slot. A span: the state after each token goes to
+        the row's scratch for the step to keep one."""
         bh = tl.program_id(0)
         row = bh // heads
         h = bh % heads
@@ -312,6 +317,8 @@ if not TRITON_ABSENT:
         if slot >= 0:
             home = state_ptr + slot.to(tl.int64) * slot_stride
             state = tl.load(home + where)
+            decay = -tl.exp(tl.load(a_log_ptr + h).to(tl.float32))
+            bias = tl.load(dt_bias_ptr + h).to(tl.float32)
             for t in tl.static_range(S):
                 at = row * S + t
                 q = tl.load(q_ptr + at * qk_stride + kh * DK + rk).to(tl.float32)
@@ -319,8 +326,10 @@ if not TRITON_ABSENT:
                 q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1e-6) / scale
                 k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1e-6)
                 v = tl.load(v_ptr + at * v_stride + h * DV + rv).to(tl.float32)
-                g = tl.load(g_ptr + at * heads + h)
-                beta = tl.load(beta_ptr + at * heads + h).to(tl.float32)
+                raw = tl.load(b_ptr + at * heads + h)
+                beta = tl.sigmoid(raw.to(tl.float32)).to(raw.dtype).to(tl.float32)
+                a = tl.load(a_ptr + at * heads + h).to(tl.float32) + bias
+                g = decay * tl.where(a > 20.0, a, libdevice.log1p(tl.exp(a)))  # softplus, torch's threshold
                 state = state * tl.exp(g)
                 delta = (v - tl.sum(state * k[:, None], axis=0)) * beta
                 state = state + k[:, None] * delta[None, :]
@@ -355,6 +364,30 @@ if not TRITON_ABSENT:
             words_out = state_ptr.to(tl.pointer_type(tl.int32))
             src = words_in + row * scratch_stride + kept.to(tl.int64) * scratch_step
             tl.store(words_out + slot.to(tl.int64) * slot_stride + w, tl.load(src + w, mask=ok), mask=ok)
+
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
+    def gated_norm_kernel(  # type: ignore[no-untyped-def]
+        x_ptr,
+        gate_ptr,
+        w_ptr,
+        out_ptr,
+        eps,
+        D: tl.constexpr,
+        WEIGHT_ROUNDS: tl.constexpr,
+    ):
+        """`Qwen3_5RMSNormGated` for one row of `D`, one launch for every row: the norm in f32,
+        rounded to x's dtype; times the weight (rounded again where the weight is x's dtype,
+        `WEIGHT_ROUNDS`); times SiLU of the gate in f32; rounded once to the output's dtype."""
+        row = tl.program_id(0).to(tl.int64)
+        c = tl.arange(0, D)
+        raw = tl.load(x_ptr + row * D + c)
+        x = raw.to(tl.float32)
+        y = (x * tl.rsqrt(tl.sum(x * x, axis=0) / D + eps)).to(raw.dtype).to(tl.float32)
+        y = tl.load(w_ptr + c).to(tl.float32) * y
+        if WEIGHT_ROUNDS:
+            y = y.to(raw.dtype).to(tl.float32)
+        z = tl.load(gate_ptr + row * D + c).to(tl.float32)
+        tl.store(out_ptr + row * D + c, (y * (z * tl.sigmoid(z))).to(out_ptr.dtype.element_ty))
 
     @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
     def rms_norm_kernel(  # type: ignore[no-untyped-def]
