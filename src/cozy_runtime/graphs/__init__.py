@@ -1222,6 +1222,12 @@ def capture_device(torch: ModuleType, memory: Memory) -> domain.Domain:
 _ZERO: _Counts = (0, 0, 0.0, 0.0, 0.0)
 
 
+def capture_attempts(root: Module) -> int:
+    """How many times `root`'s calls have tried to record a graph in this process."""
+    recorder = _RECORDERS.get(root)
+    return 0 if recorder is None else recorder.capture_attempts
+
+
 def describe(root: Module) -> dict[str, object]:
     """One final-reply snapshot of `root`'s region, never an aggregate scan on the replay hot
     path. Counts are this attempt's, since the Placement opened it (`mark`); an unplaced

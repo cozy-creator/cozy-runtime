@@ -1013,7 +1013,7 @@ class _Choice:
         self.filled: list[int] = []
         self.calls = 0
         #: this GPU's `_cold` at the steady steps' start and at the stage's end
-        self.cold: list[tuple[int, int, bool]] = []
+        self.cold: list[tuple[int, int, bool, int]] = []
 
     def called(
         self,
@@ -1029,7 +1029,7 @@ class _Choice:
                 f"{name}({_shape_class(module, args, kwargs)})" if self.ranks.rank == 0 else ""
             )
         elif self.calls == 2 and self.measure:
-            self.cold.append(_cold())
+            self.cold.append(_cold(self.stages))
         elif self.calls == 3 and self.measure and self.against_ms is not None:
             self._trial()
         self._mark()
@@ -1173,7 +1173,7 @@ class _Choice:
             self.events[2].synchronize()
             step = round(self.events[1].elapsed_time(self.events[2]), 2)
             self.events.pop()  # `called` marks this call's start
-        now = _cold()
+        now = _cold(self.stages)
         warm = len(self.cold) == 1 and self.cold[0] == now and not now[2]
         rows = self.ranks.meet({"peak": _peak(), "warm": warm, "step": step}, f"trial {self.stage}")
         second = float(cast("float", rows[0]["step"]))
@@ -1207,7 +1207,7 @@ class _Choice:
         """The stage's end, inside it."""
         if self.measure:
             self._mark()
-            self.cold.append(_cold())
+            self.cold.append(_cold(self.stages))
 
     def _steady_ms(self) -> float | None:
         """Mean ms of steps 2 on (step 1 carries fills and compiles); None under two steps."""
@@ -1267,11 +1267,12 @@ def _unsharded() -> Iterator[None]:
         _ALONE.unsharded = False
 
 
-def _cold() -> tuple[int, int, bool]:
+def _cold(stages: Stages) -> tuple[int, int, bool, int]:
     """What makes a step not steady on this GPU, so far in its request: the weight bytes read
     from disk (the store, a derived page; a page kept in host memory is a tight card's steady
-    paging), the kernels' changes (`LANDED`), and whether a kernel is still building or landed
-    and not serving yet."""
+    paging), the kernels' changes (`LANDED`), whether a kernel is still building or landed and
+    not serving yet, and the graphs its sharded components tried to record."""
+    from cozy_runtime import graphs
     from cozy_runtime.author._model import LANDED
     from cozy_runtime.internal import kernel_ready
     from cozy_runtime.internal.execution import catch
@@ -1282,7 +1283,9 @@ def _cold() -> tuple[int, int, bool]:
         request.record_fills()
         disk = sum(request.moved.get(origin, (0,))[0] for origin in ("store", "derived"))
     building = any(at in ("opening", "landed") for at in kernel_ready.pending().values())
-    return disk, LANDED[0], building
+    roots = (stages.roots[name] for name in sorted(stages.sharded))
+    captured = sum(graphs.capture_attempts(cast("torch.nn.Module", root)) for root in roots)
+    return disk, LANDED[0], building, captured
 
 
 def _filled() -> int:
