@@ -110,6 +110,10 @@ def measure() -> dict[str, JSON]:
         # The prompts prefilled 64 tokens a forward (two of them span chunks), against Transformers too.
         chunked = Decoder(model, max_rows=4, max_tokens=1024, prefill_chunk=64)
         runs[f"{name}-chunked"] = chunked(Request(prompts=prompts, max_new=NEW, stops=[])).tokens
+        # The card holding 32 tokens of each row's K/V: every older whole block on the host tier,
+        # prefilled there and read there each step. The same tokens as all on the card.
+        hosted = Decoder(model, max_rows=4, max_tokens=1024, kv_card_bytes=4 * 32 * decoder.kv.layout.token_bytes)
+        runs[f"{name}-hosted"] = hosted(Request(prompts=prompts, max_new=NEW, stops=[])).tokens
         row[name]["launcher"] = decoder.launcher  # type: ignore[index]  # the dict just made
     checks: dict[str, JSON] = {}
     wrong: list[str] = []
@@ -156,6 +160,9 @@ def measure() -> dict[str, JSON]:
         checks[f"{name}_replayed_equal"] = runs[f"{name}-replayed"] == runs[name]
         if runs[f"{name}-replayed"] != runs[name]:
             wrong.append(f"{name}: the launcher's tokens are not the host's replays' for the same step")
+        checks[f"{name}_hosted_equal"] = runs[f"{name}-hosted"] == runs[name]
+        if runs[f"{name}-hosted"] != runs[name]:
+            wrong.append(f"{name}: with K/V on the host tier, other tokens than with it all on the card")
     row["checks"] = checks
     assert not wrong, wrong
     return row
