@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 
+from cozy_runtime.engine import _kernels
 from cozy_runtime.engine.qwen35 import Tables
 
 if TYPE_CHECKING:
@@ -99,15 +100,21 @@ class Step:
 
     # ------------------------------------------------------------------ pieces
 
-    def _slots(self, start: Tensor, count: int, live: Tensor) -> Tensor:
-        """Each row's token slot at positions `start + [0, count)` (block entry * T + offset),
-        -1 where the row isn't live."""
+    def _slots(self, out: Tensor, start: Tensor, offset: int, count: int, live: Tensor) -> None:
+        """Each row's token slot at positions `start + offset + [0, count)` (block entry * T +
+        offset in the block), -1 where the row isn't live, into `out`'s first `count` columns."""
         kv = self.model.kv
-        tokens = kv.layout.block_tokens
-        at = start.long()[:, None] + self.steps[:count]
-        index = (at // tokens).clamp(0, kv.max_blocks - 1)
-        entry = kv.block_table[: self.size].gather(1, index).long()
-        return torch.where(live[:, None] & (entry >= 0), entry * tokens + at % tokens, -1)
+        if not self.model.fused:
+            tokens = kv.layout.block_tokens
+            at = start.long()[:, None] + offset + self.steps[:count]
+            index = (at // tokens).clamp(0, kv.max_blocks - 1)
+            entry = kv.block_table[: self.size].gather(1, index).long()
+            out[:, :count].copy_(torch.where(live[:, None] & (entry >= 0), entry * tokens + at % tokens, -1))
+            return
+        _kernels.slots_kernel[(self.size,)](
+            start, live, kv.block_table, out, offset, kv.max_blocks, int(out.stride(0)),
+            T=kv.layout.block_tokens, COUNT=count, WIDTH=1 << max(count - 1, 0).bit_length(), num_warps=1,
+        )  # fmt: skip
 
     def _scores(self, logits: Tensor, ahead: Tensor | None = None) -> Tensor:
         """Logits after the rows' penalties, counting their output so far and `ahead`: the
@@ -135,7 +142,7 @@ class Step:
         length = kv.lengths[:s]
         live = (length >= 0) & ~r.done[:s]
         self.live_lengths.copy_(torch.where(live, length, -1))
-        kv.slot_mapping[:s, :1].copy_(self._slots(length, 1, live))
+        self._slots(kv.slot_mapping[:s], length, 0, 1, live)
         positions = (length + r.delta[:s])[:, None]
         y = m.body(r.ids[:s, None], positions, Tables(self.live_lengths, kv.slot_mapping[:s]))
         scores = self._scores(m.logits(y[:, 0]))
@@ -163,7 +170,7 @@ class Step:
         self.mtp_lengths.copy_(torch.where(live, length + 1, -1))
         # Draft 0 from the head's state the last step left; draft 1 from the head at position L + 1.
         drafts = [self.sampling.pick(self._scores(m.logits(hidden)), s, n)]
-        self.mtp_slots[:, :1].copy_(self._slots(length + 1, 1, live))
+        self._slots(self.mtp_slots, length, 1, 1, live)
         state = hidden[:, None]
         for i in range(1, depth):
             at = (length + i + delta)[:, None]
@@ -172,10 +179,10 @@ class Step:
             drafts.append(self.sampling.pick(self._scores(m.logits(state[:, 0]), before), s, n + i))
             if i + 1 < depth:
                 self.mtp_lengths.copy_(torch.where(live, length + i + 1, -1))
-                self.mtp_slots[:, :1].copy_(self._slots(length + i + 1, 1, live))
+                self._slots(self.mtp_slots, length, i + 1, 1, live)
         drafted = torch.stack(drafts, 1)
         # Verify the row's token and its drafts in one pass.
-        kv.slot_mapping[:s, :span].copy_(self._slots(length, span, live))
+        self._slots(kv.slot_mapping[:s], length, 0, span, live)
         ids = torch.cat([r.ids[:s, None], drafted], 1)
         y = m.body(ids, (length + delta)[:, None] + steps, Tables(self.live_lengths, kv.slot_mapping[:s]))
         logits = m.logits(y)
@@ -198,7 +205,7 @@ class Step:
         # The head's K/V for the kept tokens, from the model's state before each, and its state
         # after them: the next step's first draft.
         self.mtp_lengths.copy_(torch.where(live, length + 1, -1))
-        self.mtp_slots[:, :span].copy_(self._slots(length + 1, span, live))
+        self._slots(self.mtp_slots, length, 1, span, live)
         tokens = torch.where(keep, best, r.ids[:s, None])
         states = m.draft(tokens, y, (length + 1 + delta)[:, None] + steps, Tables(self.mtp_lengths, self.mtp_slots, 1))
         kept_state = states.gather(1, last[:, None, None].expand(-1, 1, states.shape[-1]))[:, 0]
