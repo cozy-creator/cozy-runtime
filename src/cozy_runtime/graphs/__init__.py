@@ -495,8 +495,10 @@ class _Recording:
         self.levels = _levels()
         #: its region's attempt count at its last replay: the least recent goes first (`_admit`)
         self.used = 0
-        #: the module attributes its capture read (`_reading`): (module, name, value, plain)
-        self.reads: tuple[tuple[Module, str, object, bool], ...] = ()
+        #: the module attributes its capture read (`_reading`): (module, name, value, plain), each
+        #: module held weakly: a copy its call made (`rows`' window of a leaf) holds bound weight
+        #: views, whose pins would otherwise last as long as the graph (var-030 §9)
+        self.reads: tuple[tuple[weakref.ref[Module], str, object, bool], ...] = ()
         #: the region generation its read guards last held at
         self.guarded = -1
         #: its replays in a row that found weights gone and refilled them (`_REFILLS`)
@@ -2587,10 +2589,13 @@ def _reader(torch: ModuleType) -> Callable[[Module, str], object]:
 
 def _holds(recorder: _Recorder, entry: _Recording) -> bool:
     """Whether every module attribute `entry`'s capture read still has its value: checked again
-    only when an attribute was set on the region's modules since it last held."""
+    only when an attribute was set on the region's modules since it last held. A module that has
+    died (a copy its call made) holds: nothing can set an attribute on it."""
     if entry.guarded == recorder.generation:
         return True
-    for module, name, value, plain in entry.reads:
+    for ref, name, value, plain in entry.reads:
+        if (module := ref()) is None:
+            continue
         now = module.__dict__.get(name, _MISSING)
         if now is value or (plain and type(now) is type(value) and now == value):
             continue
@@ -3317,7 +3322,10 @@ def _build(
         return None
     entry = _Recording(torch, graph, pool, statics, outputs[0], key, served, owner, seen)
     entry.overlays = overlays
-    entry.reads = tuple(reads)
+    entry.reads = tuple(
+        (weakref.ref(module), name, value, plain) for module, name, value, plain in reads
+    )
+    reads.clear()
     return entry
 
 
