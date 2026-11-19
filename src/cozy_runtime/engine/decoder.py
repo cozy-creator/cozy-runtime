@@ -153,14 +153,15 @@ class Made:
 
 
 class Decoder:
-    """`model`'s engine on its GPU, for at most `max_rows` rows of at most `max_tokens` tokens."""
+    """`model`'s engine on its GPU, for at most `max_rows` rows of at most `max_tokens` tokens (by
+    default the model's context length: the K/V reservations are address space, mapped as rows grow)."""
 
     def __init__(
         self,
         model: torch.nn.Module,
         *,
         max_rows: int = 16,
-        max_tokens: int = 32768,
+        max_tokens: int | None = None,
         launcher: bool = True,
         fused: bool = True,
         prefill_chunk: int = PREFILL_CHUNK,
@@ -179,6 +180,9 @@ class Decoder:
         self.stream = torch.cuda.Stream(device)
         layout = layout_of(self.text, depth=2, drafting=self.drafting)
         self.max_rows = max_rows
+        if max_tokens is None:
+            text_config = cast("_Model", model).config.get_text_config(decoder=True)
+            max_tokens = int(getattr(text_config, "max_position_embeddings", 0) or 32768)
         #: the card's share of a call's K/V, in bytes; the rest goes to the host tier (None: all on the card)
         self.kv_card_bytes = kv_card_bytes
         host = _host_tier(model, device.index or 0) if kv_card_bytes is not None else None
