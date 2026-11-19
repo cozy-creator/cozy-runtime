@@ -230,7 +230,17 @@ def _norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
 
 
 def _gated(x: Tensor, gate: Tensor, weight: Tensor, eps: float) -> Tensor:
-    """`Qwen3_5RMSNormGated`: the norm before the gate, SiLU of the gate in f32."""
+    """`Qwen3_5RMSNormGated`: the norm before the gate, SiLU of the gate in f32: one launch for
+    every row on CUDA (`_kernels.gated_norm_kernel`), else torch's ops."""
+    width = int(x.shape[-1])
+    if x.is_cuda and not _kernels.TRITON_ABSENT and width & (width - 1) == 0 and width <= NORM_WIDEST:
+        rows = x.reshape(-1, width).contiguous()
+        out = torch.empty_like(rows)
+        _kernels.gated_norm_kernel[(int(rows.shape[0]),)](
+            rows, gate.reshape(-1, width).contiguous(), weight, out, eps,
+            D=width, WEIGHT_ROUNDS=weight.dtype == x.dtype, num_warps=1 if width <= 256 else 4,
+        )  # fmt: skip
+        return out.view(x.shape)
     dtype = x.dtype
     y = x.float()
     y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + eps)
@@ -321,13 +331,12 @@ class Qwen35:
         )  # fmt: skip
         keys = text.k_heads * text.dk
         q, k, v = conv[..., :keys], conv[..., keys : 2 * keys], conv[..., 2 * keys :]
-        beta = b.sigmoid().contiguous()
-        g = (-block.A_log.float().exp() * F.softplus(a.float() + block.dt_bias)).contiguous()
         out = torch.empty((rows, span, text.v_heads, text.dv), dtype=x.dtype, device=x.device)
         states, kept_states = kv.state(1), kv.state_scratch[1]
         state_scratch = kept_states[:, :, index] if span > 1 else states[:, index]
         _kernels.delta_span_kernel[(rows * text.v_heads, text.dv // VALUE_BLOCK)](
-            q, k, v, g, beta, kv.state_slot[:rows], states[:, index], state_scratch,
+            q, k, v, a.contiguous(), b.contiguous(), block.A_log, block.dt_bias, kv.state_slot[:rows],
+            states[:, index], state_scratch,
             out, text.v_heads, text.v_heads // text.k_heads, int(conv.stride(1)),
             int(conv.stride(1)), int(states.stride(0)), int(kept_states.stride(0)),
             int(kept_states.stride(1)), float(text.dk) ** 0.5,
