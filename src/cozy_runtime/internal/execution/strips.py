@@ -7,36 +7,35 @@ forward wraps its conv (a causal pad). Its halo and scale come from its module t
 reach along a row (`dilation * (kernel - 1) // 2`, summed: a bound for convs in sequence), each
 upsampler's factor. A conv with a stride, or a norm whose statistics span rows, is no block.
 
-The first call of a shape that would cut runs a probe: the block on a small crop of its input,
-whole and in two strips, must give the same rows. A block that reads across rows (an attention)
-fails it and runs whole from then on. A strip reads its rows of each cache entry and writes its
-own rows of the entry's next value; the entries go to host memory once a block cuts (they are
-saved inputs, read back a strip at a time). Nothing is committed until every strip is done, so a
-refused strip runs again finer. A block that keeps tensors on itself between calls (a causal conv
-holding its last frames as an attribute) runs whole: strips see only the caches handed to them.
-PAN2's 5 s decode at a 6 GiB cap ran out in a causal pad
-(`up_blocks.3.resnets.0.conv1`, 1.36 GB beside 3.2 GiB, pod-session 44426689158).
+The first call of a shape measures the block's peak on two whole crops of its input (`_Call.fit`):
+each level's need, whole or a strip, comes from that, so a block whose whole fits runs whole. A
+level that cuts first probes the shape: on a crop, whole and in two strips must give the same rows.
+A block that reads across rows (an attention) fails it and runs whole from then on. A strip reads
+its rows of each cache entry and writes its own rows of the entry's next value; the entries go to
+host memory once a block cuts (they are saved inputs, read back a strip at a time). Nothing is
+committed until every strip is done, so a refused strip runs again finer. A block that keeps
+tensors on itself between calls (a causal conv holding its last frames as an attribute) runs
+whole: strips see only the caches handed to them. PAN2's 5 s decode at a 6 GiB cap ran out in a
+causal pad (`up_blocks.3.resnets.0.conv1`, 1.36 GB beside 3.2 GiB, pod-session 44426689158).
 """
 
 from __future__ import annotations
 
+import functools
 import inspect
 import sys
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Protocol, cast
 
+import tensorfs.varena.torch as vt
 import torch
 from torch import Tensor, nn
 
 from cozy_runtime.author._errors import is_capacity, unwind
 from cozy_runtime.internal.execution import catch, pinned, sizing
 
-#: a strip's working set over its input rows: a causal conv's input, its norm, the activation, the
-#: cache clone, the cache `cat` and the pad, each the strip's rows (an estimate: a measured peak
-#: replaces it)
-_HOLDS = 6
 _ROW_NORMS = (nn.GroupNorm, nn.BatchNorm2d, nn.BatchNorm3d, nn.InstanceNorm2d, nn.InstanceNorm3d)
 
 
@@ -160,8 +159,26 @@ def _factor(size: int, height: int) -> int:
     return size // height
 
 
-#: a block's probe verdict by (site, shape without its rows)
-_VERDICTS: dict[tuple[str, tuple[int, ...], torch.dtype], bool] = {}
+#: a block's call by (site, shape without its rows)
+type _Key = tuple[str, tuple[int, ...], torch.dtype]
+#: a block's probe verdict
+_VERDICTS: dict[_Key, bool] = {}
+#: a block's peak over its call, measured on crops (`_Call.fit`); None where it could not be
+_FITS: dict[_Key, _Fit | None] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class _Fit:
+    """A block's peak over a call: fixed bytes (a conv's workspace), and bytes per cell of its
+    rows and columns, each with its halo either side."""
+
+    fixed: int
+    cell: float
+    rows: int
+    columns: int
+
+    def of(self, rows: int, width: int) -> int:
+        return self.fixed + int(self.cell * (rows + 2 * self.rows) * (width + 2 * self.columns))
 #: sites whose module keeps tensors on itself between calls: they run whole
 _STATEFUL: set[str] = set()
 
@@ -179,6 +196,28 @@ def _keeps(site: str, names: Iterable[str]) -> str:
     return f"it keeps {', '.join(sorted(names))} on itself between calls"
 
 
+def _records(module: nn.Module, values: Iterable[object]) -> bool:
+    """Whether autograd records this call: grad mode on, and an input or a parameter needs grad."""
+    return torch.is_grad_enabled() and (
+        any(isinstance(v, Tensor) and v.requires_grad for v in values)
+        or any(p.requires_grad for p in module.parameters())
+    )
+
+
+def _peak[T](run: Callable[[], T], device: torch.device) -> tuple[T, int | None]:
+    """`run()`, and the working bytes it held at its peak above what was live as it began. varena's
+    peak resets here, as residency's first-block probe resets it; the request keeps its peak."""
+    request = catch.CURRENT.get()
+    if request is None or not request.memory.cuda or device.type != "cuda":
+        return run(), None
+    index = device.index or 0
+    request.sample()
+    before = int(vt.stats(index)["allocated_bytes"])
+    vt.reset_peak(index)
+    out = run()
+    return out, max(int(vt.stats(index)["allocated_peak"]) - before, 0)
+
+
 def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) -> catch.Forward:
     def cut(*args: object, **kwargs: object) -> object:
         try:
@@ -192,7 +231,7 @@ def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) 
             not isinstance(x, Tensor)
             or (cached and not isinstance(bound.arguments.get("feat_idx"), list))
             or x.dim() < 4
-            or torch.is_grad_enabled()
+            or _records(module, bound.arguments.values())
             or module.training
             or getattr(type(module), "_cozy_fused", None)
             or site in _STATEFUL
@@ -209,15 +248,22 @@ def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) 
         if _VERDICTS.get(key) is False:
             return forward(*args, **kwargs)
         call = _Call(site, module, forward, block, bound, names[1])
-        row = x.narrow(-2, 0, 1).numel() * x.element_size()
-        out_row = row * block.scale * block.scale
+        width = int(x.shape[-1])
+        if key not in _FITS and not catch._capturing():
+            try:
+                _FITS[key] = call.fit()
+            except _Mismatch as exc:
+                _VERDICTS[key] = False
+                print(f"cozy-runtime: {site} runs whole: {exc}", file=sys.stderr)
+                return forward(*args, **kwargs)
+        fit = _FITS.get(key)
 
         def need(level: int) -> tuple[int, ...]:
-            if not level:
-                return sizing.peak(height * out_row, (height * row * _HOLDS * block.scale**2,))
+            if fit is None:
+                return (0,)  # not measured (no native memory, or inside a capture): whole
             # a cut level's whole output goes to host where the card refuses it (`_whole`)
-            span = min(height, sizing.pieces(height, level) + 2 * block.rows)
-            return (span * row * _HOLDS * block.scale**2,)
+            rows = min(height, sizing.pieces(height, level) + 2 * block.rows) if level else height
+            return (fit.of(rows, width),)
 
         def run(level: int) -> object:
             if level and key not in _VERDICTS and not catch._capturing():
@@ -350,20 +396,17 @@ class _Call:
             self.index[0] = end
         return out
 
-    def probe(self) -> bool:
-        """Whether the block's rows are its strips': on a crop of its input, whole and in two
-        strips, the same output and the same cache writes. Kernels may round a different shape
-        differently, so a difference within a few units of the output's last place passes."""
-        x, block, site = self.x, self.block, self.site
+    def _crop(self, tall: int, wide: int) -> tuple[_Call, _Rows | None]:
+        """The block's call on a centred crop of `tall` rows and `wide` columns of its input, and
+        the crop's view of its cache."""
+        x = self.x
         height, width = int(x.shape[-2]), int(x.shape[-1])
-        tall = min(height, 4 * block.rows + 4)
-        wide = min(width, 4 * block.columns + 4)
         top, left = (height - tall) // 2, (width - wide) // 2
         crop = _Call(
-            site,
+            self.site,
             self.module,
             self.forward,
-            block,
+            self.block,
             self.signature.bind_partial(**self.bound),
             self.first,
         )
@@ -380,6 +423,48 @@ class _Call:
             if self.cache is None
             else _Rows(self.cache, height, top, top + tall, x.device, width, (left, left + wide))
         )
+        return crop, cache
+
+    def _crop_size(self) -> tuple[int, int]:
+        """The probe's crop: rows and columns, four halos and four more each."""
+        x, block = self.x, self.block
+        tall = min(int(x.shape[-2]), 4 * block.rows + 4)
+        return tall, min(int(x.shape[-1]), 4 * block.columns + 4)
+
+    def fit(self) -> _Fit | None:
+        """The block's peak over its call, from whole crops at two widths: fixed bytes and bytes a
+        cell. None where it cannot be measured, or the card refused a crop."""
+        block, width = self.block, int(self.x.shape[-1])
+        tall, wide = self._crop_size()
+        broad = min(width, 2 * wide + 2 * block.columns)
+        peaks: list[tuple[int, int]] = []
+        for w in dict.fromkeys((wide, broad)):
+            crop, cache = self._crop(tall, w)
+            try:
+                _, peak = _peak(functools.partial(crop._run, 0, tall, cache=cache), self.x.device)
+            except BaseException as exc:
+                if not is_capacity(exc):
+                    raise
+                unwind(exc)
+                return None
+            if peak is None:
+                return None
+            peaks.append(((tall + 2 * block.rows) * (w + 2 * block.columns), peak))
+        (c1, p1), (c2, p2) = peaks[0], peaks[-1]
+        if c2 > c1 and p2 > p1:
+            cell = (p2 - p1) / (c2 - c1)
+            fixed = max(int(p1 - cell * c1), 0)
+        else:
+            cell, fixed = p1 / c1, 0
+        return _Fit(fixed, cell, block.rows, block.columns)
+
+    def probe(self) -> bool:
+        """Whether the block's rows are its strips': on a crop of its input, whole and in two
+        strips, the same output and the same cache writes. Kernels may round a different shape
+        differently, so a difference within a few units of the output's last place passes."""
+        x, block, site = self.x, self.block, self.site
+        tall, wide = self._crop_size()
+        crop, cache = self._crop(tall, wide)
         try:
             whole, whole_rows, _ = crop._run(0, tall, cache=cache)
             half = tall // 2
