@@ -19,7 +19,7 @@ dependencies = [
     # x86_64, which is every machine an RC Runtime runs models on; elsewhere the released line stays admitted until the release
     # declares one range.
     "tensorfs>=0.28.0.dev3490,<0.29; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "tensorfs>=0.26.0,<0.29; sys_platform != 'linux' or platform_machine != 'x86_64'",
+    "tensorfs>=0.27.0,<0.29; sys_platform != 'linux' or platform_machine != 'x86_64'",
     "msgspec>=0.19",
     "numpy>=1.26",
     "packaging>=24",
@@ -154,7 +154,7 @@ media = [
 # package environments select this capability; worker images provide the same range.
 model-execution = [
     "tensorfs>=0.28.0.dev3490,<0.29; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "tensorfs>=0.26.0,<0.29; sys_platform != 'linux' or platform_machine != 'x86_64'",
+    "tensorfs>=0.27.0,<0.29; sys_platform != 'linux' or platform_machine != 'x86_64'",
 ]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.
