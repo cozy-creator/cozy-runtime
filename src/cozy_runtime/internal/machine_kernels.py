@@ -35,6 +35,7 @@ from cozy_runtime.internal import (
     attention,
     attention_sol,
     config,
+    decode_kernels,
     fused_rows,
     kernel_cache,
     kernel_compile,
@@ -78,11 +79,12 @@ def triton_sets(row: arch.Row) -> list[TritonKernels]:
     as `attention` opens them: Sage3's fixed means, Sage2's fixed K mean, the E4M3 quantizers),
     the encoded linears' (nvfp4 on every row, SVDQuant on FP4 rows), counter noise's (`philox`),
     Ulysses' int8 wire's (`parallel.turn`) and the fused rows' (`fused_rows`: norms and
-    rotations). None without Triton."""
+    rotations) and the decode cores' (`decode_kernels`). None without Triton."""
     if triton_kernels.TRITON_ABSENT:
         return []
     found = [import_module(c.kernels).KERNELS for c in boot(row) if c.kernels]
     found += [nvfp4_linear.KERNELS, *([svdq_linear.KERNELS] if row.fp4 else []), philox.KERNELS]
+    found += [decode_kernels.kernels()]
     found += [turn.KERNELS, fused_rows.KERNELS] if row.family else []  # bf16: Ampere on
     return list({kernels.name: kernels for kernels in found if kernels.entries}.values())
 

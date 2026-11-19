@@ -241,15 +241,21 @@ def _random(
 
 
 def sample(
-    torch: ModuleType, a: Adapter, shape: Sequence[int], generator: Generator
+    torch: ModuleType,
+    a: Adapter,
+    shape: Sequence[int],
+    generator: Generator,
+    params: Mapping[str, object] | None = None,
+    optional: Sequence[str] = (),
 ) -> dict[str, Tensor]:
-    """Random stored parts of a tensor of `shape` at the row's probe params, then the row's `fix`
-    for the parts whose values the decode checks or that hold floats in their bytes."""
-    params = a.probe_params
+    """Random stored parts of a tensor of `shape` at `params` (the row's probe params), its
+    required parts and the `optional` ones, then the row's `fix` for the parts whose values the
+    decode checks or that hold floats in their bytes."""
+    params = a.probe_params if params is None else params
     view = View(stored_shape(params, shape), params, {}, a.flat)
     out: dict[str, Tensor] = {}
     for p in a.parts:
-        if not p.required:
+        if not p.required and p.role not in optional:
             continue
         dtype = p.dtypes[0]
         _, want = p.shape(view)
@@ -821,24 +827,60 @@ if HAS_TRITON:
         q = (dc.u8_at(base, 2 + el // 4, mask) >> (2 * (el % 4))) & 3
         return (q - 1).to(tl.float32) * dc.f16_at(base, 0, mask)
 
-    GGML_KERNELS: dict[str, object] = {
-        "q4_0": _q4_0,
-        "q4_1": _q4_1,
-        "q5_0": _q5_0,
-        "q5_1": _q5_1,
-        "q8_0": _q8_0,
-        "q2_k": _q2_k,
-        "q3_k": _q3_k,
-        "q4_k": _q4_k,
-        "q5_k": _q5_k,
-        "q6_k": _q6_k,
-        "mxfp4": _mxfp4_struct,
-        "nvfp4": _nvfp4_struct,
-        "q1_0": _q1_0,
-        "q2_0": _q2_0,
-    }
-else:
-    GGML_KERNELS = {}
+    @triton.jit  # type: ignore[untyped-decorator]
+    def _blocks_kernel(  # type: ignore[no-untyped-def]
+        out,
+        data,
+        total,
+        post,
+        POST: tl.constexpr,
+        FORM: tl.constexpr,
+        N: tl.constexpr,
+        S: tl.constexpr,
+        OUT: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """`Cores.blocks`' struct kernel: element e of `FORMS[FORM]` (N elements in S bytes)."""
+        e = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        valid = e < total
+        base = data + (e // N) * S
+        el = e % N
+        if FORM == 0:
+            v = _q4_0(base, el, valid)
+        elif FORM == 1:
+            v = _q4_1(base, el, valid)
+        elif FORM == 2:
+            v = _q5_0(base, el, valid)
+        elif FORM == 3:
+            v = _q5_1(base, el, valid)
+        elif FORM == 4:
+            v = _q8_0(base, el, valid)
+        elif FORM == 5:
+            v = _q2_k(base, el, valid)
+        elif FORM == 6:
+            v = _q3_k(base, el, valid)
+        elif FORM == 7:
+            v = _q4_k(base, el, valid)
+        elif FORM == 8:
+            v = _q5_k(base, el, valid)
+        elif FORM == 9:
+            v = _q6_k(base, el, valid)
+        elif FORM == 10:
+            v = _mxfp4_struct(base, el, valid)
+        elif FORM == 11:
+            v = _nvfp4_struct(base, el, valid)
+        elif FORM == 12:
+            v = _q1_0(base, el, valid)
+        else:
+            v = _q2_0(base, el, valid)
+        v = dc._by_post(post, e, v, valid, POST)
+        dc._store(out, e, v, valid, OUT)
+
+
+#: `_blocks_kernel`'s structs by `FORM`.
+FORMS = ("q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "mxfp4",
+         "nvfp4", "q1_0", "q2_0")  # fmt: skip
+assert set(FORMS) == set(GGML), "every ggml struct is a form of _blocks_kernel"
 
 
 def _ggml_eager(name: str) -> Callable[[ModuleType, Tensor], Tensor]:
@@ -995,7 +1037,8 @@ def _ggml(name: str) -> Adapter:
             n,
             size,
             out,
-            kernel_fn=GGML_KERNELS.get(name),
+            kernel=_blocks_kernel if HAS_TRITON else None,
+            form=FORMS.index(name),
             eager_fn=_ggml_eager(name),
             post=parts.get("scale"),
         )
@@ -1113,6 +1156,8 @@ def _bnb(table: tuple[float, ...]) -> Decode:
 def _bnb_fix(table: tuple[float, ...]) -> Callable[[ModuleType, View, dict[str, Tensor]], None]:
     def fix(torch: ModuleType, v: View, parts: dict[str, Tensor]) -> None:
         parts["quant_map"] = torch.tensor(table, dtype=torch.float32)
+        if v.params["double_quant"] is True:  # absmax as codes into the nested map
+            parts["absmax"] = parts["absmax"].view(torch.int32).to(torch.uint8)
 
     return fix
 
@@ -1359,6 +1404,9 @@ def _ct(bits: int) -> Adapter:
 
     def fix(torch: ModuleType, v: View, parts: dict[str, Tensor]) -> None:
         parts["weight_shape"] = torch.tensor(v.shape, dtype=torch.int32)
+        if "weight_g_idx" in parts:  # each group its g columns
+            columns = torch.arange(v.cols) // _intp(v.params, "group_size")
+            parts["weight_g_idx"] = columns.to(torch.int32)
 
     return Adapter(
         f"ct.int{bits}",
