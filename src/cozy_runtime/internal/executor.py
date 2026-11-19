@@ -1791,6 +1791,7 @@ class Executor:
             device=self._rank_device(self.torch),
             tag=tag,
             gpu=_gpu,
+            call=(self.construction or "", asked.entrypoint),
         )
         held = attention.observed(self._attention_roots())
         hold = self.host._producer_hold
@@ -1942,6 +1943,7 @@ class Executor:
             gpu=_gpu,
             # its long meeting waits are the run's stage; a follower's attempt tells nothing
             stage=request_path.told,
+            call=(self.construction or "", asked.entrypoint),
         )
         group.broadcast(
             {
