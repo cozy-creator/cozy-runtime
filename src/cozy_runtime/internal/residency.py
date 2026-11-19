@@ -330,7 +330,6 @@ def paging(module: nn.Module) -> tuple[str, list[str]]:
     return ("repeated", best) if best else ("none", [])
 
 
-#: Left free under a software cap: s8-h3 on an RTX 5090 peaked 57 MiB over 8 GiB with none.
 #: A paging unit larger than this is a warning: a quarter of an 8 GB card.
 _LARGEST_UNIT = 2 << 30
 #: A paging unit holding more than this splits (`split`), the same on every card.
