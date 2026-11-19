@@ -4,7 +4,9 @@ blocks and state slots of `engine.kv`.
 
 It reads the weights of the model as loaded (its modules, whatever lane serves them: a linear is
 called as the module it is) and computes each op as Transformers' Qwen3.5 does, rounding where it
-rounds, so a greedy decode keeps its tokens. Attention is `engine.attention.paged_step` and the
+rounds, so a greedy decode keeps its tokens. A weight a kernel reads by pointer goes through
+`accel.kernels.read` first: outside a forward of its module, varena may hold it as a placeholder
+whose pointer is 0 (cr-208), which a Triton launch would read as address 0. Attention is `engine.attention.paged_step` and the
 gated-delta layers are `engine._kernels`' span kernels: every length, slot and table entry is read
 on the device, so a step's graph holds only addresses. Nothing here allocates outside the step's
 own working memory, and nothing imports `cozy_runtime.lm`.
@@ -18,6 +20,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 import torch
 import torch.nn.functional as F
 
+from cozy_runtime.accel.kernels import read
 from cozy_runtime.engine import _kernels
 from cozy_runtime.engine.attention import HostTier, paged_step
 from cozy_runtime.engine.kv import KvLayout, StateSpec
@@ -223,7 +226,7 @@ def _norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
         out = torch.empty_like(rows)
         block = 1 << max(width - 1, 0).bit_length()
         _kernels.rms_norm_kernel[(int(rows.shape[0]),)](
-            rows, weight, out, width, eps, BLOCK=block, num_warps=8 if block >= 2048 else 4
+            rows, read(weight), out, width, eps, BLOCK=block, num_warps=8 if block >= 2048 else 4
         )
         return out.view(x.shape)
     y = x.float()
@@ -239,7 +242,7 @@ def _gated(x: Tensor, gate: Tensor, weight: Tensor, eps: float) -> Tensor:
         rows = x.reshape(-1, width).contiguous()
         out = torch.empty_like(rows)
         _kernels.gated_norm_kernel[(int(rows.shape[0]),)](
-            rows, gate.reshape(-1, width).contiguous(), weight, out, eps,
+            rows, gate.reshape(-1, width).contiguous(), read(weight), out, eps,
             D=width, WEIGHT_ROUNDS=weight.dtype == x.dtype, num_warps=1 if width <= 256 else 4,
         )  # fmt: skip
         return out.view(x.shape)
@@ -259,7 +262,7 @@ def _add_norm(x: Tensor, h: Tensor, weight: Tensor, eps: float) -> tuple[Tensor,
         total, out = torch.empty_like(rows), torch.empty_like(rows)
         block = 1 << max(width - 1, 0).bit_length()
         _kernels.add_norm_kernel[(int(rows.shape[0]),)](
-            rows, h.reshape(-1, width).contiguous(), weight, total, out, width, eps,
+            rows, h.reshape(-1, width).contiguous(), read(weight), total, out, width, eps,
             BLOCK=block, num_warps=8 if block >= 2048 else 4,
         )  # fmt: skip
         return total.view(x.shape), out.view(x.shape)
@@ -323,7 +326,7 @@ class Qwen35:
         q_out = torch.empty((rows, span, heads, dim), dtype=projected.dtype, device=x.device)
         k_out = torch.empty((rows, span, text.kv_heads, dim), dtype=k.dtype, device=x.device)
         _kernels.qk_norm_rope_kernel[(rows * span, heads + text.kv_heads)](
-            projected.contiguous(), k, block.q_norm.weight, block.k_norm.weight, positions, self.inv_freq,
+            projected.contiguous(), k, read(block.q_norm.weight), read(block.k_norm.weight), positions, self.inv_freq,
             q_out, k_out, eps, heads, text.kv_heads, 2 * dim, D=dim, R=text.rotary, num_warps=2,
         )  # fmt: skip
         kv = self.kv
@@ -351,7 +354,7 @@ class Qwen35:
         windows, kept_windows = kv.state(0), kv.state_scratch[0]
         window_scratch = kept_windows[:, :, index] if span > 1 else windows[:, index]
         _kernels.conv_span_kernel[(rows, -(-channels // CONV_BLOCK))](
-            mixed, block.conv1d.weight, kv.state_slot[:rows], windows[:, index],
+            mixed, read(block.conv1d.weight), kv.state_slot[:rows], windows[:, index],
             window_scratch, conv, channels, int(windows.stride(0)),
             int(kept_windows.stride(0)), int(kept_windows.stride(1)),
             S=span, W=text.conv - 1, BLOCK=CONV_BLOCK, num_warps=4,
@@ -362,7 +365,7 @@ class Qwen35:
         states, kept_states = kv.state(1), kv.state_scratch[1]
         state_scratch = kept_states[:, :, index] if span > 1 else states[:, index]
         _kernels.delta_span_kernel[(rows * text.v_heads, text.dv // VALUE_BLOCK)](
-            q, k, v, a.contiguous(), b.contiguous(), block.A_log, block.dt_bias, kv.state_slot[:rows],
+            q, k, v, a.contiguous(), b.contiguous(), read(block.A_log), read(block.dt_bias), kv.state_slot[:rows],
             states[:, index], state_scratch,
             out, text.v_heads, text.v_heads // text.k_heads, int(conv.stride(1)),
             int(conv.stride(1)), int(states.stride(0)), int(kept_states.stride(0)),
