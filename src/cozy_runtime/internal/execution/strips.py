@@ -368,9 +368,16 @@ class _Call:
                     file=sys.stderr,
                 )
                 return False
-            pairs += [
-                (v, writes[i]) for i, v in whole_rows.written.items() if isinstance(v, Tensor)
-            ]
+            for i, v in whole_rows.written.items():
+                w = writes[i]
+                if isinstance(v, Tensor) and isinstance(w, Tensor):
+                    pairs.append((v, w))
+                elif isinstance(v, Tensor) or isinstance(w, Tensor) or v != w:
+                    print(
+                        f"cozy-runtime: {site} runs whole: strips write another entry",
+                        file=sys.stderr,
+                    )
+                    return False
         worst = 0.0
         for expected, got in pairs:
             if expected.shape != got.shape:
