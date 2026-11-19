@@ -42,7 +42,6 @@ from cozy_runtime.internal.accel import (
     ResidencyError,
     StaleBinding,
     allocation,
-    host_memory,
     release_cached,
 )
 
@@ -86,16 +85,6 @@ def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
 #: Other overlays' pages a block keeps parked: base and a LoRA alternate with one.
 _PARKED = 2
 _HOST_STAGING = 64 << 20
-#: Host RAM that host-resident weights leave free: the host tier's pages, a CPU's held blocks.
-_HOST_HEADROOM = 8 << 30
-
-
-@functools.cache
-def _headroom() -> int:
-    """`_HOST_HEADROOM`, or a quarter of a smaller host's RAM: 8 GiB was half a 16 GB laptop's or
-    CI runner's, whose free RAM was most often less, so every CPU binding was refused (cl-885)."""
-    total = host_memory().total_bytes
-    return min(_HOST_HEADROOM, total // 4) if total > 0 else _HOST_HEADROOM
 
 
 #: Stored float dtypes a CPU executor serves widened to float32 (`weights._float32`).
@@ -138,6 +127,8 @@ _NOTED = 256 << 20
 _INDEX = re.compile(r"(?<![^.])\d+(?![^.])")
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
 _OPENING = threading.Lock()
+#: the CPU steps measuring on this thread (`Memory.growth`)
+_GROWTH = threading.local()
 # A failed graph completion must retain the actual storage owners until executor exit.
 _UNPROVEN: list[Binding] = []
 
@@ -650,6 +641,9 @@ class Model:
         #: loops streaming it (`gathering`): an embedding table of it that left the device gathers
         #: its rows on the host instead of filling whole again
         self.gathers = 0
+        #: what one CPU step of it grew by above what it held as the step began, the most measured
+        #: (`Memory.growth`); None until a step has run
+        self.cpu_working: int | None = None
 
     def sites_in(self, groups: Iterable[_Block]) -> list[_Site]:
         """The weight sites `groups` hold, mapped once: a LoRA bake binds one source block per
@@ -1020,7 +1014,7 @@ class Binding:
                     # Bound whole, its blocks cannot stream: past the host's room it refuses as
                     # an allocation would, and a decode streams them per forward instead.
                     missing = sum(b.allocation_bytes for b in self.groups if b.data is None)
-                    if missing and missing > memory._free() - _headroom():
+                    if missing and missing > memory._free() - (self.model.cpu_working or 0):
                         raise torch.OutOfMemoryError(
                             f"{self.model.component}: {missing / (1 << 30):.1f} GiB of float32 "
                             "weights to bind, more than the host can give"
@@ -1366,14 +1360,13 @@ class Memory:
         return max(card - live, 0), said
 
     def _free(self) -> int:
-        """Free bytes where no native owner answers (MPS, CPU). A CPU's is what the host can still
-        give this process: on Linux its tightest cgroup's, page cache counted as room (a pod's
-        `memory.max` is a fraction of the host's MemAvailable)."""
+        """Free bytes where no native owner answers (MPS, CPU). A CPU's is what the host's number
+        leaves this process (`varena.host_room`): host room has that one owner, which keeps the
+        computer's reserve for programs outside cozy and its own headroom. The Runtime kept 8 GiB
+        free besides, or a quarter of a small host (cl-885), tuned until one runner passed."""
         if self.device.type != "mps":
-            if sys.platform == "linux":
-                return max(proctree.available_host_bytes(), 0)
-            else:
-                return host_memory().free_bytes
+            # The type check pins an older TensorFS stub, which has no `host_room` (var-027).
+            return max(int(varena.host_room()), 0)  # type: ignore[attr-defined]
         figures = allocation(torch, "mps")
         free = int(figures["driver_free_bytes"])
         if self.budget_bytes is not None:
@@ -1382,15 +1375,19 @@ class Memory:
 
     def _fitting(self, model: Model, groups: list[_Block]) -> list[_Block]:
         """A CPU step's hold, decided once: the longest prefix of `groups` whose bytes as served
-        fit what the host can still give less its headroom (`_headroom`), once other models' holds
-        outside the step have gone. The rest stream, read and widened per forward (`_idle`)."""
+        fit what the host's number still leaves (`_free`) beside what its step grows by
+        (`Model.cpu_working`), once other models' holds outside the step have gone. The rest
+        stream, read and widened per forward (`_idle`). Before a step has measured that, it holds
+        nothing: held weights beside a forward that outgrows the number are killed by the kernel."""
+        if model.cpu_working is None:
+            return []
         request = _REQUEST.get()
         step = request.phase(model.name) if request is not None else frozenset({model.name})
         for other in list(self.models.values()):
             if other.name not in step and not other.users:
                 for hold in [h for h in other.holds if h.reclaimable]:
                     hold.shed()
-        room = self._free() - _headroom()
+        room = self._free() - model.cpu_working
         held: list[_Block] = []
         for block in groups:
             room -= 0 if block.data is not None else block.allocation_bytes
@@ -1398,6 +1395,31 @@ class Memory:
                 break
             held.append(block)
         return held
+
+    @contextmanager
+    def growth(self, models: Collection[Model]) -> Iterator[None]:
+        """What a CPU step of `models` grows by above what this process holds as it begins: its
+        resident high-water mark over the step less its resident bytes at the start, each model's
+        most kept (`Model.cpu_working`). A step inside another sets the outer one's mark aside and
+        restarts it, and the outer one's is the greater. Where the kernel keeps the mark for the
+        process's life it is an upper bound. Linux; elsewhere nothing is measured."""
+        if self.device.type != "cpu" or sys.platform != "linux":
+            yield
+            return
+        frames: list[list[int]] = vars(_GROWTH).setdefault("frames", [])
+        resident, peak = proctree.own_memory()
+        if frames:
+            frames[-1][1] = max(frames[-1][1], peak)
+        proctree.reset_own_peak()
+        frames.append([resident, 0])
+        try:
+            yield
+        finally:
+            start, before = frames.pop()
+            peak = max(before, proctree.own_memory()[1])
+            if start >= 0 and peak >= start:
+                for model in models:
+                    model.cpu_working = max(model.cpu_working or 0, peak - start)
 
     def load(self, module: nn.Module, level: Level | str = Level.GPU) -> Model:
         level = Level(level) if isinstance(level, str) else level
