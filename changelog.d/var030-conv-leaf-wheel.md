@@ -1,0 +1,1 @@
+An int8-convrot conv leaf meets the leaf provider contract again (`wheel_refuses`): a model with int8-convrot conv filters, H3's latent upscaler among them, constructs instead of failing an assertion.

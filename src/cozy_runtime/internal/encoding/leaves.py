@@ -954,6 +954,9 @@ class Int8ConvRotConvLeaf:
     def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
         return 8.0 * self.resident_bytes(parts) / max(numel, 1)
 
+    def wheel_refuses(self, sm: int) -> str:
+        return ""
+
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
         return 0
 
