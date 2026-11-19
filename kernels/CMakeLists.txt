@@ -265,6 +265,19 @@ target_compile_options(conv8_units PRIVATE -O3 --use_fast_math --expt-relaxed-co
                        $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus>)
 kernel_module(_conv conv.cpp conv_units conv8_units)
 
+# llama.cpp's quantized matmuls for the ggml.* lanes (xs-213), vendored unmodified at b12466 under `csrc/ggml/ggml`
+# (MIT, `csrc/ggml/UPSTREAM.md`). The vendored files are upstream's byte for byte: each one's digest as UPSTREAM.md
+# lists it, or no build.
+set(GGML "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ggml")
+file(STRINGS "${GGML}/UPSTREAM.md" ggml_manifest REGEX "^\\| `[^`]+` \\| `[0-9a-f]+` \\|$")
+foreach(row ${ggml_manifest})
+    string(REGEX MATCH "^\\| `([^`]+)` \\| `([0-9a-f]+)`" _ "${row}")
+    file(SHA256 "${GGML}/${CMAKE_MATCH_1}" ggml_digest)
+    if(NOT ggml_digest STREQUAL CMAKE_MATCH_2)
+        message(FATAL_ERROR "${CMAKE_MATCH_1} is not llama.cpp's (UPSTREAM.md): never edit a vendored file")
+    endif()
+endforeach()
+
 # The executor's record of a fatal signal (`csrc/crash.c`, cr-275): plain C on the stable ABI, Linux only.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     enable_language(C)
