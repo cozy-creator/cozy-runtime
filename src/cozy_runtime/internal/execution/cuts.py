@@ -18,11 +18,15 @@ import functools
 import inspect
 import math
 import sys
+import threading
+import weakref
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
+from dataclasses import dataclass, field
 from typing import Protocol, cast
 
 import torch
+from tensorfs import varena
 from torch import Tensor, nn
 
 import cozy_runtime.internal.execution.catch as catch
@@ -31,7 +35,7 @@ import cozy_runtime.internal.execution.sizing as sizing
 from cozy_runtime.author._errors import is_capacity, unwind
 from cozy_runtime.internal.encoding.leaves import NVFP4
 from cozy_runtime.internal.execution.sizing import levelled, levels, pieces
-from cozy_runtime.internal.residency import Request
+from cozy_runtime.internal.residency import BLOCK, Request
 
 type Band = Callable[[int, int], Tensor]
 
@@ -968,19 +972,31 @@ def split[T](
     on_host = (
         hostable and request is not None and request.hosted.get(hsite, _ESTIMATED) != _ESTIMATED
     )
+    block = _block(request, exact) if hostable and out_bytes else None
+    seen = block.saw(exact, sum(windows_only(deepest))) if block is not None else None
+    placed = block.placed(exact) if block is not None else None
+    if placed is not None:  # its block's plan places it (var-030)
+        on_host = placed
+        if placed and request is not None and request.hosted.get(hsite) != _PLANNED:
+            _hosted(request, hsite, name, _PLANNED)
+    result: T
     if not on_host:
         try:
-            return catch.cut(
+            result = catch.cut(
                 site, deepest, need, lambda level: run(window(level), False), pure=pure
             )
+            return _made(seen, result, exact)
         except catch.Unplaced as exc:  # refused before a window ran (or the op is pure)
             if not hostable or request is None:
                 raise
             unwind(exc)
+            if placed is False and block is not None:
+                block.refused(exact)
             _hosted(request, hsite, name, _ESTIMATED if measured is None else _MEASURED)
-    return catch.cut(
+    result = catch.cut(
         f"{site}:host", deepest, windows_only, lambda level: run(window(level), True), pure=pure
     )
+    return _made(seen, result, exact)
 
 
 def whole(part: Tensor, shape: Sequence[int], key: str, host: bool, zeros: bool = False) -> Tensor:
@@ -1008,6 +1024,9 @@ def whole(part: Tensor, shape: Sequence[int], key: str, host: bool, zeros: bool 
             raise exc from None
         unwind(exc)
         request.retries += 1
+        block = _block(request, key, open_new=False)
+        if block is not None and block.placed(key) is False:
+            block.refused(key)
         _hosted(request, f"split:{key}", key, room)
         return out
 
@@ -1084,8 +1103,163 @@ def read[X](window: X) -> X:
 #: each split call shape's whole output, its shape, dtype and device, as its allocation measured it
 _WHOLES: dict[str, tuple[tuple[int, ...], torch.dtype, torch.device]] = {}
 #: `Request.hosted`'s reason for a whole sent to host without a refusal in the run: selection
-#: judged the package's estimate (for that call only) or the measured whole (for the request)
-_ESTIMATED, _MEASURED = "estimated", "measured"
+#: judged the package's estimate (for that call only) or the measured whole (for the request), or
+#: its block's plan placed it there (`_Pass`)
+_ESTIMATED, _MEASURED, _PLANNED = "estimated", "measured", "planned"
+
+
+@dataclass
+class _Seen:
+    """A hostable whole one pass of a block made, as `_Pass.plan` reads it: the room its split
+    began with (`catch.usable`), its finest windows, which earlier wholes of the pass were live
+    then, its measured bytes, and where the pass kept it. `made` is the tensor it returned; a
+    whole kept alive only through another tensor's view of it counts as gone."""
+
+    key: str
+    room: int
+    windows: int
+    live: tuple[int, ...]
+    nbytes: int = 0
+    host: bool = False
+    made: weakref.ref[Tensor] | None = None
+
+
+@dataclass
+class _Pass:
+    """One pass of a paged block (`residency.BLOCK`) through its hostable splits (var-030).
+
+    A block whose request has no plan for it yet records each whole it makes (`_Seen`). At its
+    next pass that record becomes the plan for every later pass of a block with the same stack
+    and first whole: the wholes to keep in host memory, chosen so the rest fit the card wherever
+    they are live together, with the fewest bytes crossing the link. A whole still live when the
+    next pass begins (the block's output) goes to host only where no other choice fits, since
+    every later reader of it would then read it over the link. A pass that sent nothing to host
+    leaves no plan, so a card with room runs as before. Where a whole the plan put on the card
+    is refused there, the plan is dropped for the request and its passes run as before."""
+
+    request: Request
+    block: tuple[str, int]
+    first: str
+    plan: tuple[frozenset[str], frozenset[str]] | None
+    seen: list[_Seen] = field(default_factory=list)
+    learning: bool = True
+
+    def saw(self, key: str, windows: int) -> _Seen | None:
+        if self.plan is not None or not self.learning:
+            return None
+        try:
+            room = catch.usable(self.request)
+        except varena.Error:  # the card's room can't be read now: this pass teaches nothing
+            self.learning = False
+            return None
+        live = tuple(
+            i for i, s in enumerate(self.seen) if s.made is not None and s.made() is not None
+        )
+        seen = _Seen(key, room, windows, live)
+        self.seen.append(seen)
+        return seen
+
+    def placed(self, key: str) -> bool | None:
+        """True: the plan keeps `key` on host; False: on the card; None: no plan for it."""
+        if self.plan is None or key not in self.plan[1]:
+            return None
+        return key in self.plan[0]
+
+    def refused(self, key: str) -> None:
+        if self.plan is not None:  # what it put on host goes back to choosing as before
+            for other in self.plan[0]:
+                if self.request.hosted.get(f"split:{other}") == _PLANNED:
+                    del self.request.hosted[f"split:{other}"]
+        self.request.host_plans[(self.block[0], self.first)] = None
+        self.plan = None
+        self.learning = False
+        print(
+            f"cozy-runtime: {key}: refused on the card its block's plan put it on; the block's "
+            "wholes are placed as before",
+            file=sys.stderr,
+        )
+
+    def close(self) -> None:
+        """Learn this pass's plan, where it taught one (see the class)."""
+        signature = (self.block[0], self.first)
+        seen = self.seen
+        if (
+            self.plan is not None
+            or not self.learning
+            or signature in self.request.host_plans
+            or len(seen) < 2
+            or not any(s.host for s in seen)
+            or not all(s.nbytes for s in seen)
+        ):
+            return
+        output = [s.made is not None and s.made() is not None for s in seen]
+        best: tuple[tuple[int, int], list[bool]] | None = None
+        for mask in range(1 << len(seen)):
+            host = [bool(mask >> i & 1) for i in range(len(seen))]
+            if not _fits(seen, host):
+                continue
+            cost = (
+                sum(o and h for o, h in zip(output, host, strict=True)),
+                sum(s.nbytes for s, h in zip(seen, host, strict=True) if h),
+            )
+            if best is None or cost < best[0]:
+                best = (cost, host)
+        if best is not None:
+            hosted = frozenset(s.key for s, h in zip(seen, best[1], strict=True) if h)
+            self.request.host_plans[signature] = (hosted, frozenset(s.key for s in seen))
+
+
+def _fits(seen: Sequence[_Seen], host: Sequence[bool]) -> bool:
+    """Whether the wholes `host` leaves on the card fit beside each split's finest windows, from
+    the room each split began with in the pass that measured them."""
+    for j, s in enumerate(seen):
+        room = s.room
+        for i in s.live:
+            if host[i] and not seen[i].host:
+                room += seen[i].nbytes
+            elif seen[i].host and not host[i]:
+                room -= seen[i].nbytes
+        if s.windows + (0 if host[j] else s.nbytes) > room:
+            return False
+    return True
+
+
+#: each thread's pass of the block it runs in now
+_PASSES = threading.local()
+
+
+def _block(request: Request | None, key: str, open_new: bool = True) -> _Pass | None:
+    """The pass of the paged block running now that `key`'s split belongs to; a new block entry
+    closes the last pass and opens one keyed by its first whole. None outside a block."""
+    entry = BLOCK.get()
+    if request is None or entry is None:
+        return None
+    now: _Pass | None = getattr(_PASSES, "now", None)
+    if now is not None and now.request is request and now.block == entry:
+        return now
+    if not open_new:
+        return None
+    if now is not None and now.request is request:
+        now.close()
+    plan = request.host_plans.get((entry[0], key))
+    if (entry[0], key) in request.host_plans and plan is None:  # its plan was refused: as before
+        now = _Pass(request, entry, key, None, learning=False)
+    else:
+        now = _Pass(request, entry, key, plan)
+    _PASSES.now = now
+    return now
+
+
+def _made[T](seen: _Seen | None, result: T, key: str) -> T:
+    """`result` of a split whose pass records it: its measured bytes and where it is."""
+    if seen is not None and isinstance(result, Tensor):
+        known = _WHOLES.get(key)
+        seen.nbytes = (
+            _nbytes(known[0], known[1]) if known else result.numel() * result.element_size()
+        )
+        seen.host = pinned.held(result)
+        seen.made = weakref.ref(result)
+    return result
 
 
 def _nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:

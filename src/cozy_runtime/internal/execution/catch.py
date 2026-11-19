@@ -294,6 +294,13 @@ def cut[T](
         LEAF.release()
 
 
+def usable(request: Request) -> int:
+    """The room no eviction makes larger on `request`'s card: the card or its cap, less live
+    tensors and the weights in use."""
+    now = vt.room(request.memory.device.index or 0)
+    return int(now["capacity"]) - int(now["working_live"]) - int(now["pinned"])
+
+
 #: A nested site's level a refusal moved it to, by key: its next call starts no coarser.
 _NESTED: dict[str, int] = {}
 
@@ -312,10 +319,8 @@ def nested[T](
     use: what is unmapped, cached or held by idle weights, which varena reclaims for it. A pure op
     refused there runs again a level finer, the windows of the leaf around it kept (cr-305: H3's
     upscale ran its MLP whole inside a window and ran out). The last level's refusal stands."""
-    device = request.memory.device.index or 0
-    room = vt.room(device)
-    usable = int(room["capacity"]) - int(room["working_live"]) - int(room["pinned"])
-    fitting = next((at for at, (_, row) in enumerate(menu) if sum(row) <= usable), len(menu) - 1)
+    room = usable(request)
+    fitting = next((at for at, (_, row) in enumerate(menu) if sum(row) <= room), len(menu) - 1)
     level = max(fitting, _NESTED.get(key, 0))
     while True:
         LEVELS[key] = level

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import itertools
 import math
 import re
 import sys
@@ -126,6 +127,13 @@ _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", defa
 #: The shape key of the component forward running now (`execution.catch.passing`), its passes'
 #: shape where its blocks mark them (`_entered`): 0 where none runs.
 PASS_SHAPE: ContextVar[int] = ContextVar("cozy_pass_shape", default=0)
+#: The paged block running now, as its stack (index starred) and the serial of this entry: each
+#: entry is one pass of the block, whose hostable wholes `execution.cuts` plans (var-030). None
+#: outside a block.
+BLOCK: ContextVar[tuple[str, int] | None] = ContextVar("cozy_block", default=None)
+_BLOCK_ENTRIES = itertools.count(1)
+#: each thread's open block entries, newest last, to reset `BLOCK` as each leaves
+_BLOCK_TOKENS = threading.local()
 #: TensorFS tallies working memory by the pass and site it was born in (`vt.pass_mark`); an older
 #: one has no tally, and nothing is marked.
 _ESCAPES = hasattr(vt, "pass_mark")
@@ -3189,6 +3197,11 @@ class Request:
         #: the card's room when its allocation was refused there, else whether selection judged
         #: the package's estimate of it or its measure (`execution.cuts._hosted`)
         self.hosted: dict[str, str] = {}
+        #: per block stack and the key of its first hostable whole: the keys of the wholes its
+        #: passes keep in host memory (`execution.cuts`), chosen from one pass's measured wholes;
+        #: None where a planned card whole was refused, so its passes run as before. It dies with
+        #: the request.
+        self.host_plans: dict[tuple[str, str], frozenset[str] | None] = {}
         #: refusals a CUDA graph capture answered by recording again with room for them
         #: (`graphs.capture`): what runs is the same
         self.regrown = 0
@@ -3863,7 +3876,9 @@ def _hooks(model: Model) -> None:
         if tally:  # its index starred: one site per stack
             block.escape_site = vt.site_id(f"{model.component}.{_INDEX.sub('*', block.path)}")
 
-        def entered(*_: object, b: _Block = block) -> None:
+        stack = f"{model.component}.{_INDEX.sub('*', block.path)}"
+
+        def entered(*_: object, b: _Block = block, s: str = stack) -> None:
             pacing.tick()
             model._claim()
             try:
@@ -3871,8 +3886,18 @@ def _hooks(model: Model) -> None:
             except BaseException:
                 model._release()
                 raise
+            tokens = getattr(_BLOCK_TOKENS, "open", None)
+            if tokens is None:
+                tokens = _BLOCK_TOKENS.open = []
+            tokens.append(BLOCK.set((s, next(_BLOCK_ENTRIES))))
 
         def exited(b: _Block = block) -> None:
+            tokens = getattr(_BLOCK_TOKENS, "open", None)
+            if tokens:
+                try:
+                    BLOCK.reset(tokens.pop())
+                except ValueError:  # set in another context: it ends with that context
+                    pass
             try:
                 memory._exit(b)
             finally:
