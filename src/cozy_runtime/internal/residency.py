@@ -2896,9 +2896,12 @@ class Memory:
         if request.idle or self.capturing():
             return
         if model.escape_floor is None:
+            # A block that is one linear layer streams when it has no room (`_streamed`): no forward
+            # needs it whole, so it sets no floor (Qwen3.8-27B's 2.37 GiB bf16 head refused every
+            # decode pass at 6 GiB, cr-344).
             common = model.common.allocation_bytes if model.common is not None else 0
             model.escape_floor = common + max(
-                (block.allocation_bytes for block in model.blocks.values()), default=0
+                (b.allocation_bytes for b in model.blocks.values() if b.leaf is None), default=0
             )
         floor = model.escape_floor
         if any(b.retained for b in model.groups()):
@@ -2906,7 +2909,11 @@ class Memory:
             # (a decode keeping what fits, `keep`); an embedding table gathers on the host.
             shared = model.common
             floor = (shared.allocation_bytes if shared and not shared.retained else 0) + max(
-                (b.allocation_bytes for b in model.blocks.values() if not (b.retained or b.table)),
+                (
+                    b.allocation_bytes
+                    for b in model.blocks.values()
+                    if not (b.retained or b.table or b.leaf is not None)
+                ),
                 default=0,
             )
         device = self.device.index or 0
