@@ -6,7 +6,9 @@ attention layer, a multi-token-prediction head), against Transformers' own forwa
   those tokens in one pass (teacher-forced), at every position where its choice is clear.
 - Drafted: the decoder's drafted greedy tokens against its plain ones (a draft only changes how
   many tokens a step keeps, never which).
-- Rows: four prompts of different lengths in one bucket, each row against itself alone.
+- Rows: four prompts of different lengths in one bucket, each row against itself alone; three of
+  them in the bucket of four (a row the call doesn't fill), against Transformers and drafted against
+  plain.
 - Sampled (temperature 0.7, top-k 20, top-p 0.95, a seed): drafted against plain and plain against
   itself, reported (each draw's noise is hashed from the seed and the token's index; a near tie in the
   scores can still turn a draw, so equality is told, not required of the real model).
@@ -110,6 +112,8 @@ def measure() -> dict[str, JSON]:
         runs[name] = call.tokens
         alone = decoder(Request(prompts=prompts[:1], max_new=NEW, stops=[]))
         runs[f"{name}-alone"] = alone.tokens
+        # Three rows in the bucket of four: a row the call doesn't fill stays idle in every step.
+        runs[f"{name}-three"] = decoder(Request(prompts=prompts[:3], max_new=NEW, stops=[])).tokens
         drawn = decoder(sampled)
         runs[f"{name}-sampled"] = drawn.tokens
         kept = [k for row in drawn.kept for k in row]
@@ -175,6 +179,13 @@ def measure() -> dict[str, JSON]:
         if first_wrong is not None:
             wrong.append(f"row {i}: plain token {first_wrong} is not Transformers' clear choice "
                          f"(unfused: first wrong {unfused_wrong})")
+        if i < 3:
+            _, three_agreed, three_wrong = forced(prompt, runs["plain-three"][i])
+            checks[f"row{i}"]["three_agreed"] = three_agreed  # type: ignore[index]  # the dict just made
+            if three_wrong is not None:
+                wrong.append(f"row {i}: three rows in a bucket of four, plain token {three_wrong} is not Transformers' clear choice")
+            if runs["drafted-three"][i] != runs["plain-three"][i]:
+                wrong.append(f"row {i}: three rows in a bucket of four, drafted tokens are not the plain ones")
         if chunked_wrong is not None:
             wrong.append(f"row {i}: prefilled 64 tokens a forward, plain token {chunked_wrong} is not Transformers' clear choice")
     checks["sampled_drafted_equal"] = runs["drafted-sampled"] == runs["plain-sampled"]
