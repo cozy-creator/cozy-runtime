@@ -572,8 +572,8 @@ class Engine(Protocol):
 
 
 #: `VisionLM`'s engine is CozyEngine (xs-213: the calls it can hold, Transformers' engine the rest,
-#: `engine.cozy`), else Transformers' engine for every call; off until its GPU done bar passes.
-COZY_ENGINE = False
+#: `engine.cozy`), else Transformers' engine for every call; on since its GPU bar passed (xs-213).
+COZY_ENGINE = True
 
 
 class VisionLM(Model[Pipeline]):

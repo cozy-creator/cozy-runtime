@@ -519,8 +519,12 @@ class Decoder:
                 step()
                 self.stream.synchronize()
             else:
+                import tensorfs.varena.torch as vt
+
                 segment = cast("_engine.Segment", self.segments[key])
-                with _held(graph, self.stream):
+                # The graph's pool mapped and retained through every launch on the stream,
+                # the segment's parent graph holding its clone among them (var-032).
+                with vt.launching(graph, stream=self.stream):
                     segment.launch(self.stream.cuda_stream)
                     done = torch.cuda.Event(blocking=True)
                     done.record(self.stream)
@@ -575,24 +579,6 @@ class _Ring:
             self.host.data_ptr(), self.slots, self.slot_bytes, self.counter.data_ptr(), src.data_ptr(),
             src.nbytes, torch.cuda.current_stream().cuda_stream,
         )  # fmt: skip
-
-
-@contextmanager
-def _held(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> Iterator[None]:
-    """What `vt.replay` holds around a replay, around a launch of an executable holding `graph`'s
-    clone: its varena pool mapped, and retained until `stream` passes it. Through TensorFS's private
-    calls until var-032's public `vt.launching` is in the TensorFS this runs on."""
-    import tensorfs.varena.torch as vt
-    from tensorfs import _ext
-
-    _, device, pool = cast("tuple[int, int, tuple[int, int]]", graph._varena_owner)  # type: ignore[attr-defined]  # vt.graph marks it
-    vt.prepare_pool(pool, 0, device)
-    _ext._varena_working_pool_retain(device, pool)
-    try:
-        yield
-    finally:
-        _ext._varena_working_pool_record_stream(device, pool, stream.cuda_stream, False)
-        _ext._varena_working_pool_release(device, pool)
 
 
 def _host_tier(model: torch.nn.Module, index: int) -> varena.Pages:
