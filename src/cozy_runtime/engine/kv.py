@@ -301,6 +301,7 @@ class KvManager:
         self._window_pages: _Pages | None = None
         self._window_extent = 0
         self._window_taken: list[tuple[int, int]] = []
+        self.window_blocks = 0
         if host is not None:
             layer_bytes = layout.block_bytes // layout.attn_layers
             self.host_blocks = max_rows * max_blocks
@@ -308,10 +309,12 @@ class KvManager:
             self._host_pages = _HostPages(self._host)
             self._host_pages.take([(0, layer_bytes)])
             self._host_free = list(range(self.host_blocks))
-            # Two slots of one layer's host blocks on the card, each indexed by host block id.
-            self._window = gpu.cache(2 * self.host_blocks * layer_bytes)
+            # Two slots of one layer's host blocks on the card, each indexed by host block id: address
+            # space for as many as the card could hold (`window_blocks`), mapped as the extent grows.
+            self.window_blocks = min(self.host_blocks, card // (2 * layer_bytes))
+            self._window = gpu.cache(2 * self.window_blocks * layer_bytes)
             self._window_pages = _Pages(self._window, self.device)
-            self._window_taken = [(0, layer_bytes), (self.host_blocks * layer_bytes, layer_bytes)]
+            self._window_taken = [(0, layer_bytes), (self.window_blocks * layer_bytes, layer_bytes)]
             self._window_pages.take(self._window_taken)
         #: [attn_layers, host_blocks, 2, block_tokens, kv_heads, head_dim] as the device addresses it
         #: (a view over the whole host reservation; only mapped windows are touched), or a 1-block
@@ -328,7 +331,9 @@ class KvManager:
         )
         #: [2, host_blocks, 2, block_tokens, kv_heads, head_dim]: the copy-ahead windows on the card
         self.windows: Tensor | None = (
-            self._window.tensor(layout.dtype, (2, *self.host_view.shape[1:])) if self._window is not None else None
+            self._window.tensor(layout.dtype, (2, self.window_blocks, *self.host_view.shape[2:]))
+            if self._window is not None
+            else None
         )
 
     # ------------------------------------------------------------------ what a call needs
@@ -579,8 +584,10 @@ class KvManager:
         """Both copy-ahead windows mapped for host block ids below `extent`."""
         if extent <= self._window_extent or self._window_pages is None:
             return
+        if extent > self.window_blocks:
+            raise RuntimeError(f"{extent} host blocks a layer to copy ahead; the card's windows hold {self.window_blocks}")
         piece = self.layout.block_bytes // self.layout.attn_layers
-        ranges = [(slot * self.host_blocks * piece, extent * piece) for slot in (0, 1)]
+        ranges = [(slot * self.window_blocks * piece, extent * piece) for slot in (0, 1)]
         self._window_pages.take(ranges)
         self._window_taken += ranges
         self._window_extent = extent
