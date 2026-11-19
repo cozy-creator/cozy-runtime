@@ -3400,7 +3400,10 @@ class _Engine:
                 self._verify(key, graph, size, ops, launch, writes)
             finally:
                 writes.clear()  # its check is over, however it ended
-            self.rung = "graph, captured and checked"
+            if key in self.graphs:
+                self.rung = "graph, captured and checked"
+            elif key in self.unrecorded:
+                self.rung = f"eager ({self.unrecorded[key]})"
             return None
         if judged:
             self._eager_key(key, why, judge.short)
@@ -3499,19 +3502,37 @@ class _Engine:
         values, which a replay writes ahead of the eager step, made Klein's check fail a sound
         graph (cr-283). Of a key buffer that is the slots a step reaches, never the buffer
         (`_Before`), and all of it goes as the check ends. What it holds beside the pool was judged
-        before its capture (`_Judge`, `_check_bytes`). A difference discards the graph and
-        explains itself (`_explain`)."""
+        before its capture (`_Judge`, `_check_bytes`). As a component graph's check (graphs'
+        rule, cr-333), it is refused rather than given varena's last resort: refused, the graph
+        goes and the token decodes eagerly from the state before it, the key judged again once the
+        card has more room. A difference discards the graph and explains itself (`_explain`)."""
         domain = _set(self.domain)
         state, stream = self._token_state(key[2]), torch.cuda.current_stream(domain.device)
         start: _Before | None = None
         replayed: list[torch.Tensor] = []
         try:
-            at = self.length[:size].clone()
-            start = self._before(state, writes, at)
-            vt.replay(graph, stream=stream)  # its pool is held since its capture
-            replayed = [*(value.clone() for value in state), *self._written(size, at)]
-            start.restore()
-            self._advance(size)
+            try:
+                with _fallback():
+                    at = self.length[:size].clone()
+                    start = self._before(state, writes, at)
+                    vt.replay(graph, stream=stream)  # its pool is held since its capture
+                    replayed = [*(value.clone() for value in state), *self._written(size, at)]
+                    start.restore()
+                    self._advance(size)
+            except Exception as exc:
+                if not _short_of_room(exc):
+                    raise
+                if start is not None:
+                    start.restore()
+                    start.release()
+                replayed.clear()
+                self._discard(key, graph, stream)
+                why = no_room(domain.device, "its graph's check", 0, exc)
+                _unwind(exc)
+                _answered(exc)
+                self._eager_key(key, f"{why}: it decodes eagerly")
+                self._eager(size, why)
+                return
             self.eager += 1
             why = vt.replay_differs([*state, *self._written(size, at)], replayed)
             if why:
@@ -3597,12 +3618,26 @@ class _Engine:
             return f"no room to run the step again: {_gib(need)} beside {_gib(room)} left"
         here = [*(value.clone() for value in state), *self._written(size, at)]
         mode, written = observe.trace(torch)
-        start.restore()
-        vt.replay(graph, stream=torch.cuda.current_stream())
-        twice = [*(value.clone() for value in state), *self._written(size, at)]
-        again = run(False, mode)
-        on_stream = run(True)
-        run(False)
+        served = False
+        try:
+            with _fallback():  # refused, the explanation stops short
+                start.restore()
+                vt.replay(graph, stream=torch.cuda.current_stream())
+                twice = [*(value.clone() for value in state), *self._written(size, at)]
+                again = run(False, mode)
+                on_stream = run(True)
+                run(False)
+                served = True
+        except Exception as exc:
+            if not _short_of_room(exc):
+                raise
+            _unwind(exc)
+            _answered(exc)
+            return "no room to run the step again"
+        finally:
+            if not served:
+                start.restore()
+                self._advance(size)
         if noise := vt.replay_differs(here, again):
             return f"the step as written differs run to run ({noise}): a nondeterministic kernel"
         replays = vt.replay_differs(replayed, twice)
