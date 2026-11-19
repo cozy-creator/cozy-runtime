@@ -2268,9 +2268,12 @@ class _Engine:
                 self.undrafted = self.undrafted and not key[1]
 
     def _room(self) -> int:
-        """What the card leaves a graph beside what is pinned and live now (`vt.room`)."""
-        room = vt.room(_set(self.domain).device)
-        return room["capacity"] - room["pinned"] - room["working_live"]
+        """What the card leaves a graph beside what is pinned, live and in caches (the K/V's)
+        now (`vt.room`, `vt.stats`)."""
+        device = _set(self.domain).device
+        room = vt.room(device)
+        caches = int(vt.stats(device).get("cache_mapped_bytes", 0))
+        return room["capacity"] - room["pinned"] - room["working_live"] - caches
 
     def _lease(self, drafted: bool) -> str:
         """The weights a graph of the step reads (`_read`) and the graphs' pool, held for its
@@ -3980,10 +3983,14 @@ class _Judge:
     the next process judges by it."""
 
     def __init__(self, engine: _Engine, before: Room, step: int, check: int, pool_key: str) -> None:
-        pinned = vt.room(_set(engine.domain).device)["pinned"]
+        device = _set(engine.domain).device
+        pinned = vt.room(device)["pinned"]
         #: what the step's lease pinned: the weights its graph reads, as the card holds them
         self.weights = max(pinned - before["pinned"], 0)
-        self.card = before["capacity"] - before["pinned"]
+        # The rows' K/V and state pages (`engine.kv`'s Caches) are neither working memory nor
+        # weights, and stay while rows decode.
+        caches = int(vt.stats(device).get("cache_mapped_bytes", 0))
+        self.card = before["capacity"] - before["pinned"] - caches
         self.live, self.step, self.check, self.key = before["working_live"], step, check, pool_key
         #: by how much the last pool judged didn't fit
         self.short = 0
