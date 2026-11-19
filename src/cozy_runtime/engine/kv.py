@@ -329,6 +329,17 @@ class KvManager:
         at = range(start, start + count)
         return self._ints([held[p // tokens] * tokens + p % tokens for p in at], torch.int64)
 
+    def gather(self, layer: int, row: int, start: int, count: int) -> tuple[Tensor, Tensor]:
+        """`row`'s K and V of `layer` at positions `start + [0, count)`, each contiguous
+        `[count, kv_heads, head_dim]`: what a prefill's attention reads (its blocks mapped)."""
+        tokens, held = self.layout.block_tokens, self._held[row]
+        first, last = start // tokens, (start + count - 1) // tokens
+        blocks = self._ints(held[first : last + 1], torch.int64)
+        at = start - first * tokens
+        keys, values = self.kv(layer)
+        return (keys.index_select(0, blocks).flatten(0, 1)[at : at + count],
+                values.index_select(0, blocks).flatten(0, 1)[at : at + count])  # fmt: skip
+
     def settle(self, row: int, length: int) -> None:
         """The host read `row`'s length back: `reserve_ahead` counts from it."""
         self._known[row] = length

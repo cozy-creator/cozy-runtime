@@ -11,11 +11,12 @@ host reads `POLLS` times a second. Bring-up: a row's prompt is prefilled alone, 
 from __future__ import annotations
 
 import contextlib
+import functools
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 
@@ -24,6 +25,9 @@ from cozy_runtime.engine.kv import KvManager
 from cozy_runtime.engine.qwen35 import Qwen35, layout_of, text_of
 from cozy_runtime.engine.sampling import Sampling
 from cozy_runtime.engine.step import Rows, Step, rows_for
+
+if TYPE_CHECKING:
+    from transformers.cache_utils import CacheLayerMixin
 
 class _TextConfig(Protocol):
     vocab_size: int
@@ -111,6 +115,10 @@ POLLS = 10
 BUCKETS = (1, 2, 4, 8, 16)
 #: Stop tokens a row holds.
 STOPS = 8
+#: A prompt's tokens a forward of the prefill takes at a time: a multiple of the gated-delta rule's
+#: 64-token chunks, so each piece computes as in a whole-prompt call; fixed, so a capped and an
+#: uncapped call cut a prompt alike.
+PREFILL_CHUNK = 2048
 
 
 @dataclass(frozen=True)
@@ -155,6 +163,7 @@ class Decoder:
         max_tokens: int = 32768,
         launcher: bool = True,
         fused: bool = True,
+        prefill_chunk: int = PREFILL_CHUNK,
     ) -> None:
         from tensorfs.varena import _runtime as varena
 
@@ -173,6 +182,10 @@ class Decoder:
         nothing = torch.zeros((1, 1, 2, layout.block_tokens, layout.kv_heads, layout.head_dim),
                               dtype=layout.dtype, device=device)  # fmt: skip
         self.qwen = Qwen35(model, self.kv, HostTier(nothing, 0), fused=fused)
+        if prefill_chunk <= 0 or prefill_chunk % 64:
+            raise ValueError(f"a prefill chunk of {prefill_chunk} tokens: a multiple of the gated-delta rule's 64")
+        #: a prompt's tokens a prefill forward takes at a time
+        self.prefill_chunk = prefill_chunk
         self.hf = cast("_Model", model)
         vocab = int(self.hf.config.get_text_config(decoder=True).vocab_size)
         self.rows: Rows = rows_for(max_rows, layout.span, self.text.hidden, vocab, STOPS, device)
@@ -242,36 +255,48 @@ class Decoder:
     # ------------------------------------------------------------------ prefill
 
     def _prefill(self, row: int, prompt: Sequence[int], request: Request, sampling: Sampling, drafted: bool) -> int:
-        """`row`'s prompt through the model's own forward: its K/V into its blocks, its states
-        into its slot, the head's K/V for positions 1 to P and its state for the first draft;
-        returns the first token."""
+        """`row`'s prompt through the model's own forward, `prefill_chunk` tokens at a time: each
+        attention layer's K/V into the row's blocks as it is made (`_PagedLayer`), the gated-delta
+        layers' states carried by Transformers' cache from chunk to chunk and into the row's slot
+        at the end; the head's K/V for positions 1 to P chunk by chunk, and its state for the first
+        draft. Returns the first token."""
         from transformers import DynamicCache
 
         hf, kv, qwen, r = self.hf, self.kv, self.qwen, self.rows
         ids = torch.tensor([list(prompt)], dtype=torch.long, device=self.device)
         length = ids.shape[1]
+        kv.admit(row, length, drafted=drafted)
+        kv.reserve_ahead(row, (SEGMENT + 1) * (kv.layout.span + 1))  # the head's position P, and the first steps
         cache = DynamicCache(config=hf.config.get_text_config(decoder=True))  # type: ignore[arg-type]  # its own config type
-        out = hf.get_decoder()(input_ids=ids, past_key_values=cache, use_cache=True)
-        y = out.last_hidden_state[0]  # [P, hidden], final-normed
+        for layer, index in qwen.slot_of.items():
+            cache.layers[layer] = cast("CacheLayerMixin", _paged_layer(kv, row, index))
+        head = _paged_layer(kv, row, kv.layout.attn_layers - 1, start=1) if drafted else None
         r.counts[row].zero_()
         r.prompt[row].zero_()
         r.prompt[row, ids[0]] = True
-        logits = qwen.logits(y[-1:])
-        scores = sampling.penalties(logits, 1, r.counts[row : row + 1], r.prompt[row : row + 1])
-        first = int(sampling.pick(scores, 1, torch.zeros(1, dtype=torch.long, device=self.device))[0])
-        slots = kv.admit(row, length, drafted=drafted)
-        for layer, index in qwen.slot_of.items():
-            keys = cast("_Keys", cache.layers[layer])
-            kv.write(index, keys.keys[0].transpose(0, 1), keys.values[0].transpose(0, 1), slots)
+        first = -1
+        hidden: torch.Tensor | None = None
+        for c0 in range(0, length, self.prefill_chunk):
+            chunk = ids[:, c0 : c0 + self.prefill_chunk]
+            y = hf.get_decoder()(input_ids=chunk, past_key_values=cache, use_cache=True).last_hidden_state[0]
+            last = c0 + chunk.shape[1] >= length
+            if last:  # [n, hidden], final-normed: the prompt's last position gives the first token
+                logits = qwen.logits(y[-1:])
+                scores = sampling.penalties(logits, 1, r.counts[row : row + 1], r.prompt[row : row + 1])
+                first = int(sampling.pick(scores, 1, torch.zeros(1, dtype=torch.long, device=self.device))[0])
+            if head is not None:  # position p's head input is token p with the model's state at p - 1
+                after = ids[0, c0 + 1 : c0 + chunk.shape[1] + 1]
+                if last:
+                    after = torch.cat([after, torch.tensor([first], dtype=torch.long, device=self.device)])
+                hidden = self._draft_prompt(after, y, c0 + 1, head)
+            del y
         slot = kv.slot(row)
         for layer, index in qwen.delta_of.items():
             states = cast("_States", cache.layers[layer])
             kv.state(0)[slot, index].copy_(states.conv_states[0][0, :, 1:])
             kv.state(1)[slot, index].copy_(states.recurrent_states[0][0])
-        reach = kv.layout.span + 1
-        kv.reserve_ahead(row, (SEGMENT + 1) * reach)
-        if drafted:
-            hidden = self._draft_prompt(row, ids[0], first, y)
+        del cache
+        if hidden is not None:
             r.hidden[row].copy_(hidden)
         r.ids[row] = first
         r.made[row] = 1
@@ -286,29 +311,34 @@ class Decoder:
         r.budget[row] = kv.committed(row)
         return first
 
-    def _draft_prompt(self, row: int, ids: torch.Tensor, first: int, y: torch.Tensor) -> torch.Tensor:
-        """The head's K/V for positions 1 to P (token p from the model's state at p - 1) and its
-        state at P, from which the first step drafts: `lm`'s `_drafted_prompt`, one row."""
+    def _draft_prompt(self, tokens: torch.Tensor, y: torch.Tensor, at: int, head: _Paged) -> torch.Tensor:
+        """The head's K/V for positions `at` to `at + n - 1` (token p with the model's state at
+        p - 1: `tokens` and `y`, `[n]` and `[n, hidden]`) into its layer's blocks, attending to its
+        K/V so far; returns its state at the last of them: `lm`'s `_drafted_prompt`, one row."""
         from transformers import DynamicCache
 
-        hf, kv, qwen, text = self.hf, self.kv, self.qwen, self.text
+        hf, qwen, text = self.hf, self.qwen, self.text
         mtp = hf.mtp
-        length = int(ids.shape[0])
-        tokens = torch.cat([ids[1:], torch.tensor([first], dtype=torch.long, device=self.device)])
+        n = int(tokens.shape[0])
         eps = text.eps
         from cozy_runtime.engine.qwen35 import _norm
 
         e = _norm(qwen.embed(tokens[None]), mtp.pre_fc_norm_embedding.weight, eps, qwen.fused)
         h = _norm(y[None], mtp.pre_fc_norm_hidden.weight, eps, qwen.fused)
         x = mtp.fc(torch.cat([e, h], -1))
-        positions = torch.arange(1, length + 1, device=self.device)
+        positions = torch.arange(at, at + n, device=self.device)
         rope = hf.get_decoder().rotary_emb(x, positions.view(1, 1, -1).expand(3, 1, -1))
+        seen = head.get_seq_length()
+        # Causal over the head's K/V so far and this chunk: query i sees keys up to seen + i.
+        mask = None if not seen else (
+            torch.arange(seen + n, device=self.device)[None, :] <= (seen + torch.arange(n, device=self.device))[:, None]
+        )[None, None]
+        layer = mtp.layers[0]
+        # The head's layer updates the cache at its own index, whatever that is: every slot up to it is `head`.
+        index = int(getattr(getattr(layer, "self_attn", None), "layer_idx", 0) or 0)
         cache = DynamicCache()
-        x = mtp.layers[0](x, position_embeddings=rope, attention_mask=None, past_key_values=cache)
-        held = cast("_Keys", cache.layers[0])
-        slots = kv.token_slots(row, 1, length)
-        mine = kv.layout.attn_layers - 1
-        kv.write(mine, held.keys[0].transpose(0, 1), held.values[0].transpose(0, 1), slots)
+        cache.layers.extend([cast("CacheLayerMixin", head)] * (index + 1))
+        x = layer(x, position_embeddings=rope, attention_mask=mask, past_key_values=cache)
         return mtp.norm(x)[0, -1]
 
     # ------------------------------------------------------------------ weights
@@ -525,3 +555,44 @@ def _held(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> Iterator[No
     finally:
         _ext._varena_working_pool_record_stream(device, pool, stream.cuda_stream, False)
         _ext._varena_working_pool_release(device, pool)
+
+
+class _Paged(Protocol):
+    """An attention layer's prefill cache over the engine's blocks (`_paged_layer`)."""
+
+    def get_seq_length(self) -> int: ...
+
+
+def _paged_layer(kv: KvManager, row: int, index: int, start: int = 0) -> _Paged:
+    made: _Paged = _paged_layer_class()(kv, row, index, start)
+    return made
+
+
+@functools.cache
+def _paged_layer_class() -> type:
+    from transformers.cache_utils import DynamicLayer
+
+    class PagedLayer(DynamicLayer):  # type: ignore[no-untyped-call]  # Transformers' __init_subclass__
+        """Transformers' cache of one attention layer for one row's prefill, over the engine's K/V
+        blocks: each chunk's K and V go into the row's blocks at their token slots (from `start`), and
+        the layer attends to the row's K/V so far, read back from them (`KvManager.gather`)."""
+
+        def __init__(self, kv: KvManager, row: int, index: int, start: int = 0) -> None:
+            super().__init__()  # type: ignore[no-untyped-call]  # Transformers is partly annotated
+            self.kv, self.row, self.index, self.start, self.length = kv, row, index, start, 0
+
+        def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args: object, **kwargs: object
+                   ) -> tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
+            if not self.is_initialized:
+                self.lazy_initialization(key_states, value_states)
+            n = int(key_states.shape[-2])
+            slots = self.kv.token_slots(self.row, self.start + self.length, n)
+            self.kv.write(self.index, key_states[0].transpose(0, 1), value_states[0].transpose(0, 1), slots)
+            self.length += n
+            keys, values = self.kv.gather(self.index, self.row, self.start, self.length)
+            return keys.transpose(0, 1)[None], values.transpose(0, 1)[None]
+
+        def get_seq_length(self) -> int:
+            return int(self.length)
+
+    return PagedLayer
