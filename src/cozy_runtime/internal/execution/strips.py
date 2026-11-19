@@ -22,7 +22,7 @@ import inspect
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Protocol, cast
 
 import torch
 from torch import Tensor, nn
@@ -39,8 +39,8 @@ _ROW_NORMS = (nn.GroupNorm, nn.BatchNorm2d, nn.BatchNorm3d, nn.InstanceNorm2d, n
 class _Cache(Protocol):
     """Diffusers' causal cache as a block reads it: entries by index, set in place."""
 
-    def __getitem__(self, index: int, /) -> Any: ...
-    def __setitem__(self, index: int, value: Any, /) -> None: ...
+    def __getitem__(self, index: int, /) -> object: ...
+    def __setitem__(self, index: int, value: object, /) -> None: ...
     def __len__(self) -> int: ...
 
 
@@ -123,9 +123,9 @@ class _Rows:
     ) -> None:
         self.parent, self.height, self.lo, self.hi, self.device = parent, height, lo, hi, device
         self.width, self.columns = width, columns
-        self.written: dict[int, Any] = {}
+        self.written: dict[int, object] = {}
 
-    def __getitem__(self, index: int) -> Any:
+    def __getitem__(self, index: int) -> object:
         entry = self.parent[index]
         if not isinstance(entry, Tensor):
             return entry
@@ -137,7 +137,7 @@ class _Rows:
             entry = entry.narrow(-1, a * g, (b - a) * g)
         return entry if entry.device == self.device else entry.to(self.device)
 
-    def __setitem__(self, index: int, value: Any) -> None:
+    def __setitem__(self, index: int, value: object) -> None:
         self.written[index] = value
 
     def __len__(self) -> int:
@@ -223,13 +223,13 @@ class _Call:
         first: str,
     ) -> None:
         self.module, self.forward, self.block, self.first = module, forward, block, first
-        self.bound = dict(bound.arguments)
+        self.bound: dict[str, object] = dict(bound.arguments)
         self.signature = bound.signature
-        self.x: Tensor = self.bound[first]
+        self.x = cast("Tensor", self.bound[first])
         cache = self.bound.get("feat_cache")
-        self.cache: _Cache | None = cache if cache is not None else None
+        self.cache = cast("_Cache", cache) if cache is not None else None
         index = self.bound.get("feat_idx")
-        self.index: list[int] | None = index if self.cache is not None else None
+        self.index = cast("list[int]", index) if self.cache is not None else None
 
     def _run(
         self,
@@ -247,7 +247,7 @@ class _Call:
             t = t.narrow(-2, lo, hi - lo)
             return t if columns is None else t.narrow(-1, columns[0], columns[1] - columns[0])
 
-        arguments: dict[str, Any] = {}
+        arguments: dict[str, object] = {}
         for name, value in self.bound.items():
             if (
                 isinstance(value, Tensor)
@@ -282,7 +282,7 @@ class _Call:
         x, scale, reach = self.x, self.block.scale, self.block.rows
         height = int(x.shape[-2])
         out: Tensor | None = None
-        made: dict[int, Any] = {}
+        made: dict[int, object] = {}
         end: int | None = None
         for a, b in spans:
             catch.checkpoint()
@@ -333,7 +333,7 @@ class _Call:
                 and value.shape[-2:] == x.shape[-2:]
             ):
                 crop.bound[name] = value.narrow(-2, top, tall).narrow(-1, left, wide)
-        crop.x = crop.bound[self.first]
+        crop.x = cast("Tensor", crop.bound[self.first])
         cache = (
             None
             if self.cache is None
@@ -343,7 +343,7 @@ class _Call:
             whole, whole_rows, _ = crop._run(0, tall, cache=cache)
             half = tall // 2
             parts: list[Tensor] = []
-            writes: dict[int, Any] = {}
+            writes: dict[int, object] = {}
             for a, b in ((0, half), (half, tall)):
                 lo, hi = max(0, a - block.rows), min(tall, b + block.rows)
                 y, rows, _ = crop._run(lo, hi, cache=cache)
@@ -395,8 +395,8 @@ class _Call:
 
 
 def _assemble(
-    whole: Any,
-    value: Any,
+    whole: object,
+    value: object,
     height: int,
     a: int,
     b: int,
@@ -404,14 +404,14 @@ def _assemble(
     hi: int,
     host: bool,
     count: int,
-) -> Any:
+) -> object:
     """A cache entry's next value with a strip's own rows [a, b) of `value` (rows [lo, hi))."""
     if not isinstance(value, Tensor):
         return value
     if count == 1:
         return value
     f = _factor(int(value.shape[-2]), hi - lo)
-    if whole is None:
+    if not isinstance(whole, Tensor):
         shape = (*value.shape[:-2], height * f, value.shape[-1])
         pinned = host and torch.cuda.is_available()
         whole = torch.empty(
