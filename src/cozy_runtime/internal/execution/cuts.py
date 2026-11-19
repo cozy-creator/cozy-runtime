@@ -742,11 +742,13 @@ _LOCAL: dict[tuple[object, ...], tuple[float, float] | None] = {}
 
 
 def _ropes(module: nn.Module) -> int:
-    """Cut what the library attention processors under `module` call on their queries and keys
-    before dispatch (their RoPE, whatever its name): every Diffusers function a processor's
-    `__call__` names, and those its own module's functions it calls name in turn, rebound where the
-    processor finds it to its cut (`rows`). A call is cut only where its shape proves row-local
-    (`_probe`); every other runs as written. Returns how many functions it cut now."""
+    """Cut what the attention processors under `module` call on their queries and keys before
+    dispatch (their RoPE, whatever its name), whoever wrote the processor: every Diffusers
+    function its `__call__` reaches, by a name it imported (aliased or not) or as an attribute of a
+    Diffusers module it holds, and those its own module's functions reach in turn. Each is rebound
+    to its cut (`rows`) where the processor finds it and where Diffusers defines it, so every way
+    to it reaches the one cut. A call is cut only where its shape proves row-local (`_probe`);
+    every other runs as written. Package code is followed, never cut. Returns how many it cut."""
     count, called = 0, set()
     for sub in module.modules():
         processor = getattr(sub, "processor", None)
@@ -754,27 +756,47 @@ def _ropes(module: nn.Module) -> int:
         if not isinstance(call, types.FunctionType) or id(call) in called:
             continue
         called.add(id(call))
-        home = call.__module__
-        if not home.startswith("diffusers."):
-            continue
-        names, stack, walked = call.__globals__, [call.__code__], {id(call)}
+        home, names = call.__module__, call.__globals__
+        stack, walked = [call.__code__], {id(call)}
         while stack:
             code = stack.pop()
             stack.extend(c for c in code.co_consts if inspect.iscode(c))
             for name in code.co_names:
                 found = names.get(name)
+                if isinstance(found, types.ModuleType) and found.__name__.startswith("diffusers."):
+                    # `module.function(...)`: its functions this code names, rebound there
+                    for attribute in code.co_names:
+                        held = vars(found).get(attribute)
+                        if isinstance(held, types.FunctionType):
+                            count += _rebind(vars(found), attribute, held)
+                    continue
                 if not isinstance(found, types.FunctionType):
                     continue
                 original = vars(found).get(_ORIGINAL, found)
-                if not original.__module__.startswith("diffusers."):
-                    continue
                 if original.__module__ == home and id(original) not in walked:
                     walked.add(id(original))
                     stack.append(original.__code__)
-                if original is found:
-                    names[name] = rows(original)
-                    count += 1
+                count += _rebind(names, name, found)
     return count
+
+
+#: each Diffusers function's cut, by its original's id: one cut wherever it is bound
+_CUTS: dict[int, _Function] = {}
+
+
+def _rebind(names: dict[str, object], name: str, found: types.FunctionType) -> int:
+    """`names[name]`, a Diffusers function, bound to its cut there and in the module that defines
+    it; 1 where it was cut now."""
+    original = vars(found).get(_ORIGINAL, found)
+    if not original.__module__.startswith("diffusers."):
+        return 0
+    made = id(original) not in _CUTS
+    cut = _CUTS[id(original)] if not made else _CUTS.setdefault(id(original), rows(original))
+    names[name] = cut
+    defined = sys.modules.get(original.__module__)
+    if defined is not None and vars(defined).get(original.__name__) is original:
+        vars(defined)[original.__name__] = cut
+    return int(made)
 
 
 def _call(
