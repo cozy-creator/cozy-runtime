@@ -79,6 +79,68 @@ std::vector<cudaGraphNode_t> nodes(cudaGraph_t graph) {
 // The first node the step graph holds that a WHILE body's child graph may not: a body holds kernel,
 // empty, memcpy, memset, child graph and conditional nodes (programming guide, conditional node body
 // graph requirements), and a child graph no conditional (`cudaChildGraphNodeParams`).
+// A memcpy node's direction, from its kind or, where it is cudaMemcpyDefault, its pointers.
+const char* direction(cudaGraphNode_t node) {
+    cudaMemcpy3DParms p = {};
+    if (cudaGraphMemcpyNodeGetParams(node, &p) != cudaSuccess) return "memcpy";
+    cudaMemcpyKind kind = p.kind;
+    if (kind == cudaMemcpyDefault) {
+        auto on_card = [](const void* ptr) {
+            cudaPointerAttributes at = {};
+            if (cudaPointerGetAttributes(&at, ptr) != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+            return at.type == cudaMemoryTypeDevice || at.type == cudaMemoryTypeManaged;
+        };
+        const void* src = p.srcArray ? nullptr : static_cast<const char*>(p.srcPtr.ptr) + p.srcPos.x;
+        const void* dst = p.dstArray ? nullptr : static_cast<const char*>(p.dstPtr.ptr) + p.dstPos.x;
+        const bool from = p.srcArray || on_card(src), to = p.dstArray || on_card(dst);
+        kind = from ? (to ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost)
+                    : (to ? cudaMemcpyHostToDevice : cudaMemcpyHostToHost);
+    }
+    switch (kind) {
+        case cudaMemcpyHostToDevice: return "memcpy host-to-device";
+        case cudaMemcpyDeviceToDevice: return "memcpy device-to-device";
+        case cudaMemcpyDeviceToHost: return "memcpy device-to-host";
+        case cudaMemcpyHostToHost: return "memcpy host-to-host";
+        default: return "memcpy";
+    }
+}
+
+// Every node kind of `graph`, a child graph's as its own nodes', a memcpy by its direction.
+void kinds_of(cudaGraph_t graph, std::vector<std::string>& found) {
+    for (cudaGraphNode_t node : nodes(graph)) {
+        cudaGraphNodeType type;
+        check("cudaGraphNodeGetType", cudaGraphNodeGetType(node, &type));
+        if (type == cudaGraphNodeTypeGraph) {
+            cudaGraph_t child;
+            check("cudaGraphChildGraphNodeGetGraph", cudaGraphChildGraphNodeGetGraph(node, &child));
+            kinds_of(child, found);
+            continue;
+        }
+        const std::string name = type == cudaGraphNodeTypeMemcpy ? direction(node) : kind(type);
+        bool seen = false;
+        for (const std::string& had : found) seen = seen || had == name;
+        if (!seen) found.push_back(name);
+    }
+}
+
+nb::list kinds(uintptr_t graph) {
+    if (!graph) throw std::invalid_argument("kinds: no graph");
+    std::vector<std::string> found;
+    kinds_of(reinterpret_cast<cudaGraph_t>(graph), found);
+    nb::list out;
+    for (const std::string& name : found) out.append(name);
+    return out;
+}
+
+void memset_async(uintptr_t ptr, int value, size_t nbytes, uintptr_t stream) {
+    if (!ptr) throw std::invalid_argument("memset: no pointer");
+    check("cudaMemsetAsync", cudaMemsetAsync(reinterpret_cast<void*>(ptr), value, nbytes,
+                                             reinterpret_cast<cudaStream_t>(stream)));
+}
+
 const char* refused(cudaGraph_t graph) {
     for (cudaGraphNode_t node : nodes(graph)) {
         cudaGraphNodeType type;
@@ -341,6 +403,8 @@ NB_MODULE(_engine, m) {
         .def("set_copy", &Segment::set_copy, "index"_a, "dst"_a, "src"_a, "nbytes"_a)
         .def("enable_copy", &Segment::enable_copy, "index"_a, "on"_a);
     m.def("report", &report, "ring"_a, "slots"_a, "slot_bytes"_a, "counter"_a, "src"_a, "nbytes"_a, "stream"_a);
+    m.def("kinds", &kinds, "graph"_a);
+    m.def("memset", &memset_async, "ptr"_a, "value"_a, "nbytes"_a, "stream"_a);
     nb::class_<Reader>(m, "Reader")
         .def(nb::init<uintptr_t, int64_t, int64_t>(), "ring"_a, "slots"_a, "slot_bytes"_a)
         .def("poll", &Reader::poll)

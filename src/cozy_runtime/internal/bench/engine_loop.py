@@ -370,30 +370,47 @@ def _ggml(wrong: list[str]) -> dict[str, JSON]:
 
 
 def _copies(wrong: list[str]) -> dict[str, JSON]:
-    """A step whose first op copies pinned host bytes to the card: that copy, as the body holds it,
-    moved to another source, resized, disabled and enabled through the Segment between launches."""
+    """A step holding every node kind a decode step does (`launcher.COVERED`): kernels, a copy of pinned
+    host bytes to the card, a copy on the card and a memset; it fails where its body lacks one. The host
+    copy, as the body holds it, is then moved to another source, resized, disabled and enabled through
+    the Segment between launches."""
+    from cozy_runtime._kernels import _engine
+    from cozy_runtime.engine.launcher import COVERED
+
     nbytes = 4096
     sources = [torch.full((nbytes,), value, dtype=torch.uint8).pin_memory() for value in (1, 2, 3)]
     window = torch.zeros(nbytes, dtype=torch.uint8, device="cuda")
+    mirror = torch.zeros_like(window)
+    blank = torch.zeros_like(window)
     counted = _Counted(1)
     ring = _Ring(8, nbytes)
 
     def step() -> None:
         counted.tick()
         window.copy_(sources[0], non_blocking=True)
-        ring.report(window)
+        mirror.copy_(window)  # a copy on the card
+        _engine.memset(blank.data_ptr(), 9, nbytes, torch.cuda.current_stream().cuda_stream)
+        ring.report(mirror)
 
     step()
     ring.drain()
     graph = _capture(step)
+    held = sorted(_engine.kinds(graph.raw_cuda_graph()))
+    missing = sorted(COVERED - {"empty"} - set(held))
+    if missing:
+        wrong.append(f"copies: its step holds no {', '.join(missing)} node, which a decode step may")
     segment = _segment(graph, counted)
-    row: dict[str, JSON] = {"body_copies": [list(copy) for copy in segment.copies]}
+    row: dict[str, JSON] = {"kinds": held, "body_copies": [list(copy) for copy in segment.copies]}
 
     def once(before: int) -> bytes:
         counted.n.zero_()
         window.fill_(before)
+        mirror.zero_()
+        blank.zero_()
         _run(segment, graph)
         [record] = ring.reader.poll()
+        if not bool((blank == 9).all()):
+            wrong.append("copies: the body's memset did not take effect")
         return record
 
     def tried(name: str, change: Callable[[], None], before: int, want: bytes) -> None:

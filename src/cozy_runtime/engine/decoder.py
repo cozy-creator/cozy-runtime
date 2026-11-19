@@ -26,7 +26,7 @@ import torch
 
 from cozy_runtime.engine.kv import KvManager
 from cozy_runtime.engine.launch import JIT, Run
-from cozy_runtime.engine.launcher import first
+from cozy_runtime.engine.launcher import COVERED, first
 from cozy_runtime.engine.qwen35 import Qwen35, layout_of, text_of
 from cozy_runtime.engine.sampling import Sampling
 from cozy_runtime.engine.step import Rows, Step, rows_for
@@ -224,6 +224,8 @@ class Decoder:
         self.recorded: object | None = None
         #: steps run by the launcher's WHILE node, else replayed by the host `SEGMENT` at a time
         self.launcher = launcher and not NO_ENGINE
+        #: why a decoder built to launch replays its steps instead ("" while it launches)
+        self.unlaunched = ""
         self.ring = _Ring(LAUNCH_STEPS + 2 * SEGMENT, self.rows.report.nbytes) if self.launcher else None
         #: a bucket's launcher over its step's graph, by the key of `steps`
         self.segments: dict[tuple[int, bool, bool, int], object] = {}
@@ -520,6 +522,13 @@ class Decoder:
                 graph = self._capture(step, made, keep_graph=True)
                 self.steps[key] = (step, graph)
                 if graph is not None:
+                    unchecked = sorted(set(_engine.kinds(graph.raw_cuda_graph())) - COVERED)
+                    if unchecked:  # the launcher check never ran them: this call and the next replay it
+                        self.launcher = False
+                        self.unlaunched = f"the step holds {', '.join(unchecked)} nodes, which the launcher check does not run"
+                        made.notes.append(self.unlaunched)
+                        self._decode(size, rows, drafted, sampling, request, made, told)
+                        return
                     with first(index, launch=False):  # a driver the launcher crashes refuses it next process
                         self.segments[key] = _engine.Segment(graph.raw_cuda_graph(), r.go.data_ptr(), index)
             if graph is None:  # a new key's first step, or a step that can't be captured: eagerly

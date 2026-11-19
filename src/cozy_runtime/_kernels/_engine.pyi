@@ -28,6 +28,14 @@ def report(
     slot `*counter % slots` of a zeroed ring in pinned, device-mapped host memory, its sequence number
     `*counter + 1` written last, then `*counter += 1` (an int64 on the device)."""
 
+def kinds(graph: int) -> list[str]:
+    """The node kinds of a captured graph (`raw_cuda_graph()`), each once, a child graph's as its own
+    nodes': kernel, memset, empty, ..., a memcpy by its direction (`memcpy host-to-device`,
+    `memcpy device-to-device`, `memcpy device-to-host`, `memcpy host-to-host`)."""
+
+def memset(ptr: int, value: int, nbytes: int, stream: int) -> None:
+    """`cudaMemsetAsync` of `nbytes` at device `ptr` on `stream` (capturable: a graph's memset node)."""
+
 class Reader:
     """One consumer of the records `report` writes to a ring (its host address)."""
 

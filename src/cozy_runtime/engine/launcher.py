@@ -32,6 +32,10 @@ LAUNCHER = "cozy-engine-launcher"
 #: Each path's engine-loop sections, in the order a check runs them: a crash it cannot place (one
 #: before any section, as a check's process starting) is the first path's.
 SECTIONS = {"launcher": ("loop", "polled", "copies"), "replayed": ("replayed",)}
+#: The step-graph node kinds (`_engine.kinds`) the check's launcher sections hold, so a driver that
+#: faults on one fails the check, not a call: every kind a decode step holds. A step holding another
+#: is never launched (`Decoder`): the check must grow with the step. An empty node does no work.
+COVERED = frozenset({"kernel", "memcpy host-to-device", "memcpy device-to-device", "memset", "empty"})
 #: Each path as `verify` keys its crash marker.
 KEYS = {"launcher": LAUNCHER, "replayed": f"{LAUNCHER}-replayed"}
 #: The child's longest run.
