@@ -313,8 +313,8 @@ class Qwen35:
     small ops as the fused kernels above; False runs each as torch's ops (the same arithmetic,
     more launches), the reference a fused kernel is held against."""
 
-    def __init__(self, model: torch.nn.Module, kv: KvManager, host: HostTier, *, fused: bool = True) -> None:
-        self.model, self.kv, self.host, self.fused = model, kv, host, fused
+    def __init__(self, model: torch.nn.Module, kv: KvManager, *, fused: bool = True) -> None:
+        self.model, self.kv, self.fused = model, kv, fused
         self.text = text_of(model)
         root = model.get_decoder()  # type: ignore[operator]  # a Transformers model's
         self.layers = [cast("_Layer", layer) for layer in root.layers]
@@ -362,7 +362,7 @@ class Qwen35:
         )  # fmt: skip
         kv = self.kv
         out = paged_step(
-            q_out, k_out, v, kv.blocks, self.host, kv.block_table[:rows], tables.lengths, tables.slots,
+            q_out, k_out, v, kv.blocks, HostTier(kv.host_view, kv_layer), kv.block_table[:rows], tables.lengths, tables.slots,
             kv.layout, kv_layer, PARTS, dim**-0.5, tables.first_seen, gate=projected[..., dim:],
         )  # fmt: skip
         return _product(block.o_proj, out.reshape(rows, span, -1))
@@ -386,7 +386,7 @@ class Qwen35:
         k = torch.cat((k[..., :r] * cos + _rotate(k[..., :r]) * sin, k[..., r:]), dim=-1)
         kv = self.kv
         out = paged_step(
-            q, k, v, kv.blocks, self.host, kv.block_table[:rows], tables.lengths, tables.slots,
+            q, k, v, kv.blocks, HostTier(kv.host_view, kv_layer), kv.block_table[:rows], tables.lengths, tables.slots,
             kv.layout, kv_layer, PARTS, dim**-0.5, tables.first_seen, fused=False,
         )  # fmt: skip
         return block.o_proj(out.reshape(rows, span, -1) * torch.sigmoid(gate))
