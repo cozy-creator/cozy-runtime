@@ -40,15 +40,13 @@ def consume() -> dict[str, object]:
             artifact = outputs.adopt(output)
             checkpoint = output.commit()
             model_id = weights_store.derived_model_id(output.transaction)
-            # The published SDK exposes this model identity as repo_id.
-            assert checkpoint.repo_id == model_id
+            assert checkpoint.model_id == model_id
             values = array("f", checkpoint.components["model"].tensors.read("weight", decode=True).tobytes()).tolist()
             assert values == [2.0, 4.0]
             assert artifact.checkpoint == checkpoint.id
             assert checkpoint.tree is not None
-            expected = json.loads(CheckpointItem(output="weights", repo_id=model_id, revision=checkpoint.tree).json())
+            expected = json.loads(CheckpointItem(output="weights", model_id=model_id, revision=checkpoint.tree).json())
             assert frames == [expected]
-            assert frames[0]["repo_id"] == model_id and "model_id" not in frames[0]
             checkpoint_id = checkpoint.id
             checkpoint.close()
         with outputs.open("weights", derivation) as replay:

@@ -586,8 +586,7 @@ def _replay_code(command: Invoke, request: str) -> str:
 
 def _show_checkpoint(exchange: Exchange, slot: str, model_id: str, revision: str) -> None:
     """A weights output's checkpoint as the run's checkpoint item (`CheckpointItem`)."""
-    # The published TensorFS executor record retains this historical wire spelling.
-    answer = exchange(CheckpointItem(output=slot, repo_id=model_id, revision=revision))
+    answer = exchange(CheckpointItem(output=slot, model_id=model_id, revision=revision))
     if not answer.ok:
         raise RuntimeFailure(
             answer.detail or "the machine refused the checkpoint item",

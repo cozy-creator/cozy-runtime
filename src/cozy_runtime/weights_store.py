@@ -262,8 +262,7 @@ class Output:
             if self.done is not None
             else tensorfs.Writer(
                 base=derivation.base,
-                # Published TensorFS 0.24 names its model-identity keyword repo_id.
-                repo_id=derived_model_id(transaction),
+                model_id=derived_model_id(transaction),
                 lane=slot,
                 resume=transaction.removeprefix("sha256:"),
                 cache_dir=store,
