@@ -802,17 +802,17 @@ def _head_norm_forward(self: _HeadNorm, hidden_states: Tensor) -> Tensor:
     )
 
 
-def _head_norm_eager(norm: _HeadNorm, x: Tensor) -> Tensor:
+def _head_norm_eager(norm: _HeadNorm, hidden: Tensor) -> Tensor:
     """The replaced norm's own forward (a block still building its kernels, a call with no RoPE), cut as
     `execution.cuts` cuts a per-row norm: in pieces of whole rows where the room is short. A head norm reduces each
     row of its last axis alone (what `head_norm_rope` computes), so a piece is the whole's arithmetic."""
     from cozy_runtime.internal.execution import catch, cuts
 
-    def eager(rows: object, *args: object, **kwargs: object) -> object:
-        return norm._cozy_eager(cast("Tensor", rows))
+    def eager(x: object, *args: object, **kwargs: object) -> object:
+        return norm._cozy_eager(cast("Tensor", x))
 
     cut = cuts._norm(catch.site("head-norm") or "head-norm", norm, eager)
-    return cast("Tensor", cut(x))
+    return cast("Tensor", cut(hidden))
 
 
 _FUSED: dict[tuple[type[nn.Module], str], type] = {}
