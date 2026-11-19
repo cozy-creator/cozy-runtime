@@ -65,7 +65,7 @@ import threading
 import time
 import weakref
 from collections import OrderedDict, deque
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
@@ -1219,7 +1219,7 @@ def _transformers(
     processors.append(_Pick(inputs, picking))
     own: dict[str, float] = {} if picking.repetition == 1 else {"repetition_penalty": 1.0}
     context = CURRENT.get()
-    _pieced(_lm(model).get_decoder())
+    _pieced(cast("torch.nn.Module", _lm(model).get_decoder()))
     rows, device = int(inputs["input_ids"].shape[0]), inputs["input_ids"].device
     paged = _paged(model, device, rows, prompt + max_new_tokens)
     cache = {"past_key_values": DynamicCache(config=model.config, offloading=True)} if paged else {}
@@ -1249,7 +1249,7 @@ def _paged(model: PreTrainedModel, device: torch.device, rows: int, tokens: int)
     shapes, why = _shapes(model)
     if device.type != "cuda" or why:
         return False
-    itemsize = cast("torch.dtype", model.dtype).itemsize
+    itemsize = model.dtype.itemsize
     each = sum(s[1] * (s[2] + s[3]) * itemsize for s in shapes if s[0] == "keys")
     room = vt.room(device.index or 0)
     left = int(room["capacity"]) - int(room["working_live"]) - int(room["pinned"])
@@ -1565,7 +1565,7 @@ def _pieced(decoder: torch.nn.Module) -> None:
     forward = decoder.forward
     site = f"{type(decoder).__name__}:prefill"
 
-    def cut(*args: Any, **kwargs: Any) -> Any:  # the decoder's own signature
+    def cut(*args: Any, **kwargs: Any) -> Any:  # type: ignore[explicit-any]  # its own signature
         tokens = kwargs.get("inputs_embeds")
         tokens = kwargs.get("input_ids") if tokens is None else tokens
         cache = kwargs.get("past_key_values")
@@ -1594,7 +1594,7 @@ def _pieced(decoder: torch.nn.Module) -> None:
     vars(decoder)["forward"], vars(decoder)["_cozy_pieced"] = cut, True
 
 
-def _prefill_level(
+def _prefill_level(  # type: ignore[explicit-any]  # the decoder's own call
     decoder: torch.nn.Module,
     forward: Callable[..., Any],
     kwargs: dict[str, Any],
@@ -1615,13 +1615,15 @@ def _prefill_level(
         return forward(**kwargs)
     embeds, ids = kwargs.get("inputs_embeds"), kwargs.get("input_ids")
     if embeds is None:
-        states = embeds = cast("torch.nn.Module", decoder.get_input_embeddings())(ids)
+        table = cast("Callable[[], torch.nn.Module]", decoder.get_input_embeddings)()
+        states = embeds = table(ids)
     elif _caller(embeds):  # the caller's own: it may read them again
         states = torch.empty_like(embeds)
     else:  # the model's own, made for this call (its wrapper's merged embeddings)
         states = embeds
     kwargs = {**kwargs, "input_ids": None, "inputs_embeds": embeds}
     piece = sizing.pieces(chunks, level) * PREFILL_ALIGN
+    last: object = None
     for at in range(0, length, piece):
         end = min(at + piece, length)
         call = dict(kwargs)
@@ -1632,8 +1634,10 @@ def _prefill_level(
                 call[name] = value[:, cut] if seq is None else seq
         out = forward(**call)
         states[:, at:end] = out[0]
-    out["last_hidden_state"] = states
-    return out
+        last = out
+    result = cast("MutableMapping[str, object]", last)  # the last piece's outputs, as a call's
+    result["last_hidden_state"] = states
+    return result
 
 
 #: The tensors of the Runtime `generate` call running now (`_given`), none outside one: a
@@ -1720,14 +1724,15 @@ def _emptied(cache: Cache) -> None:
             for index in states:
                 states[index] = False
         counted = getattr(layer, "cumulative_length", None)
+        keys = getattr(layer, "keys", None)
         if isinstance(counted, torch.Tensor):
             counted.zero_()
-        elif getattr(layer, "is_initialized", False) and isinstance(
-            getattr(layer, "keys", None), torch.Tensor
-        ):
-            layer.keys, layer.values = layer.keys[..., :0, :], layer.values[..., :0, :]
+        elif getattr(layer, "is_initialized", False) and isinstance(keys, torch.Tensor):
+            full = cast("CacheLayerMixin", layer)
+            full.keys = keys[..., :0, :]
+            full.values = cast("torch.Tensor", full.values)[..., :0, :]
             if isinstance(counted, int):
-                layer.cumulative_length = 0
+                vars(full)["cumulative_length"] = 0
 
 
 def _cuttable(kwargs: Mapping[str, object], shape: tuple[int, int], config: object) -> bool:
@@ -2887,7 +2892,7 @@ class _Engine:
         first token, from what `first` (the constraint's ids for no tokens) allows."""
         started = time.perf_counter()
         model, ids = self.model, request.inputs["input_ids"]
-        _pieced(_lm(model).get_decoder())
+        _pieced(cast("torch.nn.Module", _lm(model).get_decoder()))
         fresh = _StaticCache(self.text, request.prompt, request.prompt)
         prepared = _lm(model).prepare_inputs_for_generation(
             ids, past_key_values=fresh, use_cache=True, is_first_iteration=True, **kwargs
