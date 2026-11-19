@@ -367,8 +367,8 @@ class Decoder:
         eps = text.eps
         from cozy_runtime.engine.qwen35 import _norm
 
-        e = _norm(qwen.embed(tokens[None]), mtp.pre_fc_norm_embedding.weight, eps, qwen.fused)
-        h = _norm(y[None], mtp.pre_fc_norm_hidden.weight, eps, qwen.fused)
+        e = _norm(qwen.embed(tokens[None]), mtp.pre_fc_norm_embedding.weight, eps, qwen.fused, qwen.run)
+        h = _norm(y[None], mtp.pre_fc_norm_hidden.weight, eps, qwen.fused, qwen.run)
         x = mtp.fc(torch.cat([e, h], -1))
         positions = torch.arange(at, at + n, device=self.device)
         rope = hf.get_decoder().rotary_emb(x, positions.view(1, 1, -1).expand(3, 1, -1))

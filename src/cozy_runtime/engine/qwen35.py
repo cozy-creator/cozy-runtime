@@ -218,7 +218,7 @@ NORM_WIDEST = 8192
 MLP_BLOCK = 1024
 
 
-def _norm(x: Tensor, weight: Tensor, eps: float, fused: bool = True, run: Run = JIT) -> Tensor:
+def _norm(x: Tensor, weight: Tensor, eps: float, fused: bool, run: Run) -> Tensor:
     """`Qwen3_5RMSNorm`: in f32, times 1 + weight, back to x's dtype: one launch for every row on CUDA
     (`_kernels.rms_norm_kernel`) where `fused`, else torch's seven ops."""
     width = int(x.shape[-1])
@@ -234,7 +234,7 @@ def _norm(x: Tensor, weight: Tensor, eps: float, fused: bool = True, run: Run = 
     return (y * (1.0 + weight.float())).type_as(x)
 
 
-def _gated(x: Tensor, gate: Tensor, weight: Tensor, eps: float, fused: bool = True, run: Run = JIT) -> Tensor:
+def _gated(x: Tensor, gate: Tensor, weight: Tensor, eps: float, fused: bool, run: Run) -> Tensor:
     """`Qwen3_5RMSNormGated`: the norm before the gate, SiLU of the gate in f32: one launch for
     every row on CUDA (`_kernels.gated_norm_kernel`) where `fused`, else torch's ops."""
     width = int(x.shape[-1])
@@ -253,9 +253,7 @@ def _gated(x: Tensor, gate: Tensor, weight: Tensor, eps: float, fused: bool = Tr
     return (y * F.silu(gate.float())).to(dtype)
 
 
-def _add_norm(
-    x: Tensor, h: Tensor, weight: Tensor, eps: float, fused: bool = True, run: Run = JIT
-) -> tuple[Tensor, Tensor]:
+def _add_norm(x: Tensor, h: Tensor, weight: Tensor, eps: float, fused: bool, run: Run) -> tuple[Tensor, Tensor]:
     """The residual stream `x + h` and its `Qwen3_5RMSNorm`: one launch for every row on CUDA
     (`_kernels.add_norm_kernel`) where `fused`, else torch's add and `_norm`."""
     width = int(x.shape[-1])
@@ -298,7 +296,7 @@ def _rotate(x: Tensor) -> Tensor:
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
 
-def _silu_mul(gate: Tensor, up: Tensor, dtype: torch.dtype, run: Run = JIT) -> Tensor:
+def _silu_mul(gate: Tensor, up: Tensor, dtype: torch.dtype, run: Run) -> Tensor:
     """SiLU(gate) * up in `dtype`, one launch (`_kernels.silu_mul_kernel`)."""
     width = int(gate.shape[-1])
     out = torch.empty(gate.shape, dtype=dtype, device=gate.device)
@@ -385,8 +383,8 @@ class Qwen35:
         text, dim = self.text, self.text.head_dim
         q, gate = torch.chunk(block.q_proj(x).view(rows, span, -1, dim * 2), 2, dim=-1)
         gate = gate.reshape(rows, span, -1)
-        q = _norm(q, block.q_norm.weight, eps, False)
-        k = _norm(block.k_proj(x).view(rows, span, -1, dim), block.k_norm.weight, eps, False)
+        q = _norm(q, block.q_norm.weight, eps, False, self.run)
+        k = _norm(block.k_proj(x).view(rows, span, -1, dim), block.k_norm.weight, eps, False, self.run)
         v = block.v_proj(x).view(rows, span, -1, dim)
         freqs = positions[..., None].float() * self.inv_freq
         both = torch.cat((freqs, freqs), dim=-1)
