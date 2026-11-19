@@ -33,9 +33,10 @@ if TYPE_CHECKING:
 STREAM_S = 0.1
 #: The most rows a call decodes at once (the decoder's).
 ROWS = 16
-#: The encodings of the step's linears the engine's GPU cells have passed; a lane joins when its
-#: cell passes (int8.convrot, q4_k_m's `ggml.q4_k` and `ggml.q6_k` next).
-LANES = frozenset({"bf16", "ggml.q8_0"})
+#: The encodings of the step's linears the engine's GPU cells have passed (the real 9B's teacher-
+#: forced check and today's path on the same pod, sm86 and sm89); a lane joins when its cell
+#: passes (q4_k_m's `ggml.q4_k` and `ggml.q6_k` next).
+LANES = frozenset({"bf16", "ggml.q8_0", "int8.convrot"})
 _DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
 
 
