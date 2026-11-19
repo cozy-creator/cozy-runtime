@@ -9,7 +9,7 @@ import tensorfs
 import torch
 from torch import nn
 
-from cozy_runtime.internal.execution import catch, cuts, fused
+from cozy_runtime.internal.execution import catch, cuts, fused, strips
 from cozy_runtime.internal.execution.catch import checkpoint as piece
 from cozy_runtime.internal.execution.catch import refusals, serving
 from cozy_runtime.internal.execution.cuts import (
@@ -46,11 +46,12 @@ __all__ = [
 
 
 def install(module: nn.Module) -> None:
-    """Install known pure cuts and name their enclosing blocks, without replay wrappers. A norm's
-    rows then serve from one kernel where its first call proves them (`fused`), over its cut, as
-    a rotation's do through its cut (`cuts.rows`)."""
+    """Install known pure cuts and row strips, and name their enclosing blocks, without replay
+    wrappers. A norm's rows then serve from one kernel where its first call proves them (`fused`),
+    over its cut, as a rotation's do through its cut (`cuts.rows`)."""
     cuts.install(module)
     fused.install(module)
+    strips.install(module)
     blocks = blocks_of(module)
     for path in blocks:
         catch.wrap(module.get_submodule(path), path)

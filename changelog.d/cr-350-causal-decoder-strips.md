@@ -1,0 +1,1 @@
+A conv network's blocks (a causal video VAE's residual blocks, resamples and up blocks, a causal conv) run in row strips where the card is short, each with a halo from its own module tree, its causal cache sliced by the same rows and kept on host once it cuts. PAN2's 5 s decode at 6 GiB ran out in a causal pad (cr-350).
