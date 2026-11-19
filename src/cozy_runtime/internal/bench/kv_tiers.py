@@ -195,15 +195,20 @@ def measure() -> dict[str, JSON]:
 
     matrix_bytes = STANDIN_ROWS * STANDIN_COLS * 2
     per_layer = standin_bytes // layers
+    # What the steps below read, held here rather than closed over, so the views can be let go
+    # (cleared) before the caches close: a closure over a deleted name is ruff's F821.
+    views: dict[str, torch.Tensor] = {"card": card, "window": window, "matrix": matrix}
+    if host_dev is not None and host_cpu is not None:
+        views |= {"host_dev": host_dev, "host_cpu": host_cpu}
 
     def weights() -> None:
         """One layer's share of the stand-in's bytes, read on the current stream."""
         left = per_layer
         while left >= matrix_bytes:
-            torch.mv(matrix, vector)
+            torch.mv(views["matrix"], vector)
             left -= matrix_bytes
         if rows := left // (STANDIN_COLS * 2):
-            torch.mv(matrix[:rows], vector)
+            torch.mv(views["matrix"][:rows], vector)
 
     def table(off_card: int) -> torch.Tensor:
         """The row's blocks, its oldest `off_card` on the host tier."""
@@ -212,12 +217,11 @@ def measure() -> dict[str, JSON]:
         return entries[None].contiguous()
 
     def copy(layer: int, slot: int, off_card: int) -> None:
-        assert host_cpu is not None
         for a, b in _windows(layer * blocks * layer_bytes, layer_bytes, off_card, unit):
-            window[slot, a:b].copy_(host_cpu[layer, a:b], non_blocking=True)
+            views["window"][slot, a:b].copy_(views["host_cpu"][layer, a:b], non_blocking=True)
 
     def attend(host: HostTier, layer: int, entries: torch.Tensor) -> torch.Tensor:
-        return paged_attention(q, card, host, entries, lengths, layout, layer, PARTS, scale)
+        return paged_attention(q, views["card"], host, entries, lengths, layout, layer, PARTS, scale)
 
     def serial(mode: str, off_card: int, entries: torch.Tensor, work: bool) -> Callable[[], list[torch.Tensor]]:
         """A step served one layer after another on `stream`: card, in place, or a window."""
@@ -229,11 +233,11 @@ def measure() -> dict[str, JSON]:
                     weights()
                 if mode == "window":
                     copy(layer, 0, off_card)
-                    host = HostTier(window[:1], 0)
-                elif mode == "in-place" and host_dev is not None:
-                    host = HostTier(host_dev, layer)
+                    host = HostTier(views["window"][:1], 0)
+                elif mode == "in-place" and "host_dev" in views:
+                    host = HostTier(views["host_dev"], layer)
                 else:
-                    host = HostTier(window[:1], 0)  # no block is off the card: never read
+                    host = HostTier(views["window"][:1], 0)  # no block is off the card: never read
                 outs.append(attend(host, layer, entries))
             return outs
 
@@ -265,7 +269,7 @@ def measure() -> dict[str, JSON]:
                 if work:
                     weights()
                 stream.wait_event(copied[slot])
-                outs.append(attend(HostTier(window[slot : slot + 1], 0), layer, entries))
+                outs.append(attend(HostTier(views["window"][slot : slot + 1], 0), layer, entries))
                 done = torch.cuda.Event()
                 done.record(stream)
                 read[slot] = done
@@ -328,6 +332,7 @@ def measure() -> dict[str, JSON]:
             spent = time.perf_counter() - began
         row["h2d_gb_s"] = layers * blocks * layer_bytes / spent / 1e9
 
+    views.clear()
     del card, host_dev, host_cpu, window, matrix
     try:  # tidy; the measurement above stands whether or not it succeeds (the V2 cells judge this)
         card_cache.release(0, card_cache.reserved_bytes, stream.cuda_stream)

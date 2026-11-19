@@ -14,8 +14,10 @@ differs from itself is not a shape's doing. It reports; it judges nothing.
 
 from __future__ import annotations
 
+import functools
 import time
 from collections.abc import Callable, Mapping, Sequence
+from types import ModuleType
 
 import torch
 
@@ -30,6 +32,14 @@ SCHEMES = ("ggml.q8_0", "ggml.q4_k")
 DECODE = (1, 2, 4, 8, 13, 16)
 #: Prefill chunks' rows, each held against the same rows in the largest.
 PREFILL = (640, 1500, 4096)
+
+
+def _leaf(r: torch.Tensor, *, blocks: torch.Tensor, scheme: str, n: int) -> torch.Tensor:
+    return ggml_linear.linear(torch, r, blocks, scheme, n, None, torch.float32)
+
+
+def _launch(r: torch.Tensor, *, ops: ModuleType, blocks: torch.Tensor, scheme: str, n: int) -> torch.Tensor:
+    return ggml_linear.matmul(ops, torch, r, blocks, scheme, n)
 
 
 def measure() -> dict[str, JSON]:
@@ -57,9 +67,10 @@ def measure() -> dict[str, JSON]:
             weight = torch.randn((n, k), generator=made).mul_(0.02)
             blocks = ggml_linear.encode(torch, scheme, weight).to("cuda")
             x = torch.randn((max(PREFILL), k), generator=made).to("cuda", torch.bfloat16)
+            # Bound by value (`partial`), so the `del` below leaves no closure reading a deleted name.
             paths: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
-                "leaf": lambda r: ggml_linear.linear(torch, r, blocks, scheme, n, None, torch.float32),
-                "launch": lambda r: ggml_linear.matmul(ops, torch, r, blocks, scheme, n),
+                "leaf": functools.partial(_leaf, blocks=blocks, scheme=scheme, n=n),
+                "launch": functools.partial(_launch, ops=ops, blocks=blocks, scheme=scheme, n=n),
             }
             for path, call in paths.items():
                 for group, sizes in (("decode", DECODE), ("prefill", PREFILL)):
