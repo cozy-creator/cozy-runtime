@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING
 
 import cozy_runtime.author._codec as _codec
 import cozy_runtime.author._color as _color
-from cozy_runtime.author._decode import _matrix_rotation, _rotate_rgb
+from cozy_runtime.author._decode import _matrix_rotation, _rotate_rgb, frame_clock
 from cozy_runtime.author._errors import OutputError
 
 if TYPE_CHECKING:
@@ -216,7 +216,7 @@ def _pictures(av: ModuleType, path: Path) -> _Pictures:
             dts.append(int(packet.dts))
             idr.append(5 in kinds)
         time_base = Fraction(stream.time_base or 0)
-        rate = Fraction(stream.average_rate or 0)
+        step = frame_clock(stream, pts).step
         matrix = context.coded_side_data.get("display_matrix")
         tags = (
             int(context.color_primaries),
@@ -226,11 +226,8 @@ def _pictures(av: ModuleType, path: Path) -> _Pictures:
         )
         width, height, pix_fmt = int(context.width), int(context.height), str(context.pix_fmt)
         sar = Fraction(context.sample_aspect_ratio or 0)
-    order = sorted(pts)
-    steps = {later - earlier for earlier, later in pairwise(order)}
-    if not order or not time_base or len(steps) > 1 or 0 in steps or not (steps or rate):
+    if not pts or step is None:
         raise _refuse("its frames are not on a fixed clock")
-    step = steps.pop() if steps else round(1 / (rate * time_base))
     if any(later <= earlier for earlier, later in pairwise(dts)) or any(
         p < d for p, d in zip(pts, dts, strict=True)
     ):
@@ -247,7 +244,7 @@ def _pictures(av: ModuleType, path: Path) -> _Pictures:
         tuple(dts),
         clean,
         cuts,
-        order[0],
+        min(pts),
         step,
         time_base,
         avcc,
@@ -653,10 +650,18 @@ class VideoSplice:
         pictures = self.pictures
         shift = (self.window - (self.end - self.start)) * pictures.step
         position = 0
+        # Early enough for every picture to decode by its time: a join of tracks that reorder
+        # differently (one with B-frames, one without) starts before its first packet's.
+        copied = (
+            t - i * pictures.step
+            for i, t in enumerate(pictures.pts)
+            if i < self.head or i >= self.tail
+        )
+        origin = min(pictures.dts[0], pictures.first, *copied)
 
         def stamped(packet: Packet[VideoStream], pts: int) -> Packet[VideoStream]:
             nonlocal position
-            packet.pts, packet.dts = pts, pictures.dts[0] + position * pictures.step
+            packet.pts, packet.dts = pts, origin + position * pictures.step
             if packet.pts < packet.dts:
                 raise _refuse("its pictures reorder further than its decode clock allows")
             packet.stream = track

@@ -48,6 +48,7 @@ from PIL import Image
 
 import cozy_runtime.author._color as _color
 from cozy_runtime._cpus import cpus
+from cozy_runtime.author._decode import frame_clock
 from cozy_runtime.author._errors import OutputError
 
 if TYPE_CHECKING:
@@ -722,21 +723,6 @@ def _copy_facts(path: Path) -> tuple[_CopyFacts, int]:
             raise _refuse_copy(f"{path.name} is not exactly one H.264 track")
         stream = streams[0]
         context = stream.codec_context
-        facts = (
-            bytes(context.extradata or b""),
-            int(context.width or 0),
-            int(context.height or 0),
-            Fraction(stream.average_rate or 0),
-            Fraction(stream.sample_aspect_ratio or 1),
-            stream.time_base,
-            int(context.color_primaries),
-            int(context.color_trc),
-            int(context.colorspace),
-            int(context.color_range),
-        )
-        if not facts[3] or (1 / (facts[3] * facts[5])).denominator != 1:
-            raise _refuse_copy("the frame rate is not a whole number of time-base ticks")
-        step = int(1 / (facts[3] * facts[5]))
         times: list[int] = []
         prior: int | None = None
         for packet in container.demux(stream):
@@ -753,8 +739,21 @@ def _copy_facts(path: Path) -> tuple[_CopyFacts, int]:
                 raise _refuse_copy(f"{path.name} has no monotone decode clock")
             prior = packet.dts
             times.append(packet.pts)
-        if sorted(times) != list(range(0, step * len(times), step)) or not times:
+        clock = frame_clock(stream, times)
+        if not times or clock.step is None or clock.rate is None or min(times) != 0:
             raise _refuse_copy(f"{path.name} is not on a zero-based fixed frame clock")
+        facts = (
+            bytes(context.extradata or b""),
+            int(context.width or 0),
+            int(context.height or 0),
+            clock.rate,
+            Fraction(stream.sample_aspect_ratio or 1),
+            stream.time_base,
+            int(context.color_primaries),
+            int(context.color_trc),
+            int(context.colorspace),
+            int(context.color_range),
+        )
         return facts, len(times)
 
 
@@ -1322,7 +1321,8 @@ class FragmentedJoin:
                 pictures = (
                     [packet for packet in source.demux(stream) if packet.size] if video else []
                 )
-                step = int(1 / (Fraction(stream.average_rate) * stream.time_base))
+                facts = self._first[1]
+                step = int(1 / (facts[3] * facts[5]))
                 if pictures and self._delay is None:
                     self._delay = max(0, -int(pictures[0].dts))
                 times = {
@@ -1408,18 +1408,14 @@ def probe_mp4(path: Path) -> EncodedVideoFacts:
                 # Priming before zero is not audio; the edit list removes it on playback.
                 start = int(packet.pts)
                 audio_ticks += max(0, start + int(packet.duration or 0)) - max(0, start)
-        times.sort()
-        steps = {later - earlier for earlier, later in pairwise(times)}
-        if len(steps) > 1 or min(steps, default=1) <= 0:
+        clock = frame_clock(video, times)
+        if len(times) > 1 and clock.step is None:
+            steps = {later - earlier for earlier, later in pairwise(sorted(times))}
             raise OutputError(
                 f"encoded video frame clock is discontinuous: steps={sorted(steps)[:4]}",
                 code="output_probe",
             )
-        frame_rate = (
-            1 / (steps.pop() * Fraction(video.time_base))
-            if steps
-            else Fraction(video.average_rate or 0)
-        )
+        frame_rate = clock.rate or Fraction(0)
         context = video.codec_context
         color_facts = (
             int(context.color_primaries),
