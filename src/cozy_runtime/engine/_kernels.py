@@ -523,6 +523,32 @@ if not TRITON_ABSENT:
         tl.store(out_ptr + row * width + c, (x * rms * (1.0 + w)).to(out_ptr.dtype.element_ty), mask=ok)
 
     @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
+    def slots_kernel(  # type: ignore[no-untyped-def]
+        start_ptr,
+        live_ptr,
+        table_ptr,
+        out_ptr,
+        offset,
+        max_blocks,
+        out_stride,
+        T: tl.constexpr,
+        COUNT: tl.constexpr,
+        WIDTH: tl.constexpr,
+    ):
+        """Each row's token slot (block entry * T + offset in the block) at positions `start[row] +
+        offset + [0, COUNT)`, into `out` (a row every `out_stride`): -1 where the row isn't live or
+        the block isn't assigned. `WIDTH` is COUNT rounded up to a power of two."""
+        row = tl.program_id(0)
+        i = tl.arange(0, WIDTH)
+        ok = i < COUNT
+        at = (tl.load(start_ptr + row) + offset + i).to(tl.int64)
+        index = tl.minimum(tl.maximum(at // T, 0), max_blocks - 1)
+        entry = tl.load(table_ptr + row * max_blocks + index, mask=ok, other=-1).to(tl.int64)
+        live = tl.load(live_ptr + row) != 0
+        slot = tl.where(live & (entry >= 0), entry * T + at % T, -1)
+        tl.store(out_ptr + row * out_stride + i, slot, mask=ok)
+
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
     def gated_norm_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         gate_ptr,
