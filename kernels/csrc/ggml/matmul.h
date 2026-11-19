@@ -25,6 +25,18 @@ enum Activation { kF32 = 0, kBF16 = 1, kF16 = 2 };
 int matmul(int device, int type, const void* w, const void* x, int x_type, float* out, int64_t K, int64_t N,
            int64_t M, void* (*allocate)(size_t, void*), void* context, cudaStream_t stream);
 
+// The bytes of M rows of K quantized to q8_1 as MMVQ reads them.
+size_t quantized_bytes(int64_t K, int64_t M);
+
+// x's M dense 16-bit rows (`x_type`) quantized to q8_1 as MMVQ reads them, into `q8_1` (quantized_bytes), on `stream`:
+// one activation for several weights of the same K (`matmul_quantized`). NOT_SUPPORTED for an f32 x.
+int quantize(int device, const void* x, int x_type, void* q8_1, int64_t K, int64_t M, cudaStream_t stream);
+
+// out[M, N] (f32) = rows `quantize` made times the [N, K] ggml blocks at `w`, by MMVQ; NOT_SUPPORTED where ggml's rule
+// takes another kernel for this card, type and M.
+int matmul_quantized(int device, int type, const void* w, const void* q8_1, float* out, int64_t K, int64_t N,
+                     int64_t M, void* (*allocate)(size_t, void*), void* context, cudaStream_t stream);
+
 const char* error();
 
 }  // namespace cozy_ggml

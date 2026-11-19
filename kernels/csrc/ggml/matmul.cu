@@ -324,6 +324,46 @@ int matmul(int device, int type, const void* w, const void* x, int x_type, float
     }
 }
 
+size_t quantized_bytes(int64_t K, int64_t M) {
+    return size_t(M) * size_t(GGML_PAD(K, MATRIX_ROW_PADDING)) / QK8_1 * sizeof(block_q8_1);
+}
+
+int quantize(int device, const void* x, int x_type, void* q8_1, int64_t K, int64_t M, cudaStream_t stream) {
+    if (K <= 0 || M <= 0 || K % MATRIX_ROW_PADDING) return cudaErrorInvalidValue;
+    if (x_type != kBF16 && x_type != kF16) return cudaErrorNotSupported;
+    const int64_t K_padded = GGML_PAD(K, MATRIX_ROW_PADDING);
+    const dim3 blocks((K_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE, M, 1);
+    const Rows rows{x, x_type};
+    rows.as([&](auto r) {
+        quantize_q8_1_rows<<<blocks, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>(r, (block_q8_1*)q8_1, K, K_padded);
+    });
+    return cudaGetLastError();
+}
+
+int matmul_quantized(int device, int type, const void* w, const void* q8_1, float* out, int64_t K, int64_t N,
+                     int64_t M, void* (*allocate)(size_t, void*), void* context, cudaStream_t stream) {
+    if (!runs(type) || K <= 0 || N <= 0 || M <= 0 || K % MATRIX_ROW_PADDING) return cudaErrorInvalidValue;
+    try {
+        Allocate temporaries{allocate, context};
+        Call call(device, stream, &temporaries);
+        auto& ctx = call.ctx();
+        const auto aligned = reinterpret_cast<const float*>(uintptr_t(256));
+        Node node(ggml_type(type), w, aligned, out, K, N, M);
+        if (choose(device, node) != kMmvq) return cudaErrorNotSupported;
+        // MMVQ's own launch over q8_1 rows another call quantized (`ggml_cuda_op_mul_mat_vec_q`), as `matmul`'s
+        // 16-bit branch launches it after quantizing.
+        ggml_cuda_op_mul_mat_vec_q(ctx, &node.w, &node.x, &node.out, static_cast<const char*>(w), nullptr,
+                                   static_cast<const char*>(q8_1), out, 0, N, M, GGML_PAD(K, MATRIX_ROW_PADDING),
+                                   stream);
+        return cudaGetLastError();
+    } catch (const std::bad_alloc&) {
+        return cudaErrorMemoryAllocation;
+    } catch (const std::exception& failure) {
+        last_error = failure.what();
+        return cudaErrorUnknown;
+    }
+}
+
 const char* error() { return last_error.c_str(); }
 
 }  // namespace cozy_ggml

@@ -1600,6 +1600,16 @@ def _ggml_leaf_class(torch: ModuleType) -> _LeafClass:
                 torch, x, blocks, self.encoding, self.out_features, bias, torch.float32
             )
 
+        def siblings(self, others: list[object], x: Tensor) -> list[Tensor] | None:
+            """This linear's and `others`' f32 products of one `x`, from one q8_1 quantize of it
+            (`ggml_linear.products`), where every one is a ggml leaf without bias that MMVQ serves
+            here; else None."""
+            leaves = [self, *others]
+            if not all(isinstance(o, GgmlLinear) and o.bias is None for o in leaves):
+                return None
+            weights = [(read(o.blocks), o.encoding, int(o.out_features)) for o in leaves]  # type: ignore[attr-defined]
+            return ggml_linear.products(torch, x, weights)
+
     class GgmlEmbedding(_leaf_class(torch)):  # type: ignore[misc]
         """A token table in ggml blocks, as llama.cpp's get_rows reads one: only the looked-up
         rows decode."""
