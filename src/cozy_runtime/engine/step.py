@@ -132,10 +132,13 @@ class Step:
     # ------------------------------------------------------------------ the step
 
     def __call__(self) -> None:
+        reads = self.model.reads
+        reads.begin(self.model.reading(self.drafted, self.span - 1))
         if self.drafted:
             self._drafted()
         else:
             self._plain()
+        reads.end()
         if self.ring is not None:
             self.ring.report(self.rows.report[: self.size])
 

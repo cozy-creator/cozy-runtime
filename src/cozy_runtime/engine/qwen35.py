@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from cozy_runtime.accel.kernels import read
 from cozy_runtime.engine import _kernels
-from cozy_runtime.engine.attention import HostTier, paged_step
+from cozy_runtime.engine.attention import paged_step
 from cozy_runtime.engine.kv import KvLayout, StateSpec
 
 if TYPE_CHECKING:
@@ -313,8 +313,14 @@ class Qwen35:
     small ops as the fused kernels above; False runs each as torch's ops (the same arithmetic,
     more launches), the reference a fused kernel is held against."""
 
-    def __init__(self, model: torch.nn.Module, kv: KvManager, *, fused: bool = True) -> None:
+    def __init__(
+        self, model: torch.nn.Module, kv: KvManager, *, fused: bool = True, in_place: bool = False
+    ) -> None:
+        from cozy_runtime.engine.kv import CopyAhead
+
         self.model, self.kv, self.fused = model, kv, fused
+        #: where each attention layer reads its off-card blocks: copied ahead to a window (or in place)
+        self.reads = CopyAhead(kv, in_place=in_place)
         self.text = text_of(model)
         root = model.get_decoder()  # type: ignore[operator]  # a Transformers model's
         self.layers = [cast("_Layer", layer) for layer in root.layers]
@@ -362,9 +368,10 @@ class Qwen35:
         )  # fmt: skip
         kv = self.kv
         out = paged_step(
-            q_out, k_out, v, kv.blocks, HostTier(kv.host_view, kv_layer), kv.block_table[:rows], tables.lengths, tables.slots,
+            q_out, k_out, v, kv.blocks, self.reads.tier(kv_layer), kv.block_table[:rows], tables.lengths, tables.slots,
             kv.layout, kv_layer, PARTS, dim**-0.5, tables.first_seen, gate=projected[..., dim:],
         )  # fmt: skip
+        self.reads.done()
         return _product(block.o_proj, out.reshape(rows, span, -1))
 
     def _attention_unfused(
@@ -386,9 +393,10 @@ class Qwen35:
         k = torch.cat((k[..., :r] * cos + _rotate(k[..., :r]) * sin, k[..., r:]), dim=-1)
         kv = self.kv
         out = paged_step(
-            q, k, v, kv.blocks, HostTier(kv.host_view, kv_layer), kv.block_table[:rows], tables.lengths, tables.slots,
+            q, k, v, kv.blocks, self.reads.tier(kv_layer), kv.block_table[:rows], tables.lengths, tables.slots,
             kv.layout, kv_layer, PARTS, dim**-0.5, tables.first_seen, fused=False,
         )  # fmt: skip
+        self.reads.done()
         return block.o_proj(out.reshape(rows, span, -1) * torch.sigmoid(gate))
 
     def _mlp(self, m: _Mlp, h: Tensor) -> Tensor:
@@ -477,6 +485,13 @@ class Qwen35:
         x, a = _add_norm(x, mixed, layer.post_attention_layernorm.weight, eps, fused)
         _, out = _add_norm(x, self._mlp(layer.mlp, a), mtp.norm.weight, eps, fused)
         return out
+
+    def reading(self, drafted: bool, depth: int) -> list[int]:
+        """The K/V layers a step's attention reads, in order: the head's for each draft but the
+        first, the body's, the head's again after the verify (drafted); the body's (plain)."""
+        body = [self.slot_of[i] for i in sorted(self.slot_of)]
+        head = self.kv.layout.attn_layers - 1
+        return [head] * (depth - 1) + body + [head] if drafted else body
 
     def logits(self, hidden: Tensor) -> Tensor:
         return self.head(hidden).float()

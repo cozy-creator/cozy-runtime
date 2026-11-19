@@ -112,8 +112,11 @@ def measure() -> dict[str, JSON]:
         runs[f"{name}-chunked"] = chunked(Request(prompts=prompts, max_new=NEW, stops=[])).tokens
         # The card holding 32 tokens of each row's K/V: every older whole block on the host tier,
         # prefilled there and read there each step. The same tokens as all on the card.
-        hosted = Decoder(model, max_rows=4, max_tokens=1024, kv_card_bytes=4 * 32 * decoder.kv.layout.token_bytes)
+        card = 4 * 32 * decoder.kv.layout.token_bytes
+        hosted = Decoder(model, max_rows=4, max_tokens=1024, kv_card_bytes=card)  # copied ahead to the card
         runs[f"{name}-hosted"] = hosted(Request(prompts=prompts, max_new=NEW, stops=[])).tokens
+        in_place = Decoder(model, max_rows=4, max_tokens=1024, kv_card_bytes=card, in_place=True)  # the fallback
+        runs[f"{name}-in-place"] = in_place(Request(prompts=prompts, max_new=NEW, stops=[])).tokens
         row[name]["launcher"] = decoder.launcher  # type: ignore[index]  # the dict just made
     checks: dict[str, JSON] = {}
     wrong: list[str] = []
@@ -160,9 +163,10 @@ def measure() -> dict[str, JSON]:
         checks[f"{name}_replayed_equal"] = runs[f"{name}-replayed"] == runs[name]
         if runs[f"{name}-replayed"] != runs[name]:
             wrong.append(f"{name}: the launcher's tokens are not the host's replays' for the same step")
-        checks[f"{name}_hosted_equal"] = runs[f"{name}-hosted"] == runs[name]
-        if runs[f"{name}-hosted"] != runs[name]:
-            wrong.append(f"{name}: with K/V on the host tier, other tokens than with it all on the card")
+        for arm in ("hosted", "in-place"):
+            checks[f"{name}_{arm}_equal"] = runs[f"{name}-{arm}"] == runs[name]
+            if runs[f"{name}-{arm}"] != runs[name]:
+                wrong.append(f"{name}: with K/V on the host tier ({arm}), other tokens than with it all on the card")
     row["checks"] = checks
     assert not wrong, wrong
     return row
