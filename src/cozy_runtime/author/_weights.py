@@ -80,6 +80,14 @@ class Weights(Generic[M]):
         self._values: ReadValues | None = None
         self._source: Checkpoint | None = None
 
+    @property
+    def ref(self) -> str:
+        """This slot's checkpoint as a call takes it: `ModelChoice(lora=(Lora(weights.ref),))`,
+        `ModelChoice(ref=weights.ref)`, or a string field of another package's request. It is
+        what the slot was bound to, a request's override or its default, as this machine holds
+        it."""
+        return self.checkpoint_ref
+
     def _bind(
         self,
         open: Callable[[], Checkpoint] | None,

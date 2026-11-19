@@ -63,18 +63,25 @@ class ModelArtifact(msgspec.Struct, frozen=True):
 
 class Lora(msgspec.Struct, frozen=True, omit_defaults=True):
     """A LoRA, named as `cozy run --lora` names one: `[org/]name[@release]`,
-    `name@sha256:<commit>`, `local/<alias>`, `hf://…` or `civitai://…`."""
+    `name@sha256:<commit>`, `local/<alias>`, `hf://…` or `civitai://…`; or a `Weights`
+    argument's `ref`, the LoRA its slot was bound to. Without a strength it runs at its release's
+    (`strength` on its Hub card), else 1."""
 
     ref: str
-    strength: float = 1.0
+    strength: float | None = None
 
     def __post_init__(self) -> None:
         if (
             not isinstance(self.ref, str)
             or not self.ref.strip()
-            or not isinstance(self.strength, (int, float))
-            or isinstance(self.strength, bool)
-            or not math.isfinite(self.strength)
+            or (
+                self.strength is not None
+                and (
+                    not isinstance(self.strength, (int, float))
+                    or isinstance(self.strength, bool)
+                    or not math.isfinite(self.strength)
+                )
+            )
         ):
             raise ConformanceError("a LoRA needs a ref and a finite strength", code="model_choice")
 
