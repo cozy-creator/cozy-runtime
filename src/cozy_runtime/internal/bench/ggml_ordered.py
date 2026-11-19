@@ -9,7 +9,6 @@ the control). Where the path is ordered, every raced row equals its settled row.
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable
 from functools import partial
 from types import ModuleType
