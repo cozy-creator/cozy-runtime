@@ -103,7 +103,7 @@ from cozy_runtime.accel import stepcache
 from cozy_runtime.accel.attention import _close as close_producer_states
 from cozy_runtime.accel.kernels import _SETS as KERNEL_SETS
 from cozy_runtime.accel.kernels import Launch, Plan, TritonKernels
-from cozy_runtime.author import _activity, _phases, _split, _watchers
+from cozy_runtime.author import _activity, _model, _phases, _split, _watchers
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._artifacts import ModelChoice
@@ -861,6 +861,7 @@ class _Ranks:
                 "exchange": reply.exchange,
                 "steps": reply.steps,
                 "stages": reply.stages,
+                "crossed": reply.crossed,
             }
         answered = list(zip(group.followers, replies, strict=True))
         ranks.clear({0: ranks.sequence, **{f.rank: r.meetings for f, r in answered}})
@@ -1511,7 +1512,13 @@ class Executor:
         if transport is not None:
             from cozy_runtime.internal.parallel import ulysses
 
-            crossing = {"transport": {**transport.document(), "exchange": ulysses.taken()}}
+            crossing = {
+                "transport": {
+                    **transport.document(),
+                    "exchange": ulysses.taken(),
+                    "stages": spmd.taken(),
+                }
+            }
         if self.group is not None:
             # each follower's exchanges, step points and stalls, by its GPU (`wire.RunReply`)
             crossing["followers"] = {
@@ -1799,6 +1806,7 @@ class Executor:
         from cozy_runtime.internal.parallel import ulysses
 
         ulysses.taken()  # what an earlier attempt left uncounted is not this one's
+        spmd.taken()
         stage_memo.ENGINE.open(None, spool)
         if self.residency is not None:
             self.residency.open_attempt()
@@ -1887,6 +1895,7 @@ class Executor:
             ),
             memory=msgspec.to_builtins(rows[0]) if rows else None,
             exchange=exchange,
+            crossed=spmd.taken(),
             steps={
                 name: list(track.series or ())
                 for name, track in (record.attribution.steps if record else {}).items()
@@ -2004,6 +2013,9 @@ class Executor:
             )
         if hosted:
             object.__setattr__(model, "_cozy_placement", spmd.Placement(hosted, self.rank))
+        # A stage with no sharded component runs on one GPU of the group (`spmd.place`).
+        object.__setattr__(model, "_cozy_group_stages", spmd.Stages(sharded, hosted, roots))
+        _model.PLACE[0] = spmd.place
         self.facts["sequence_parallel"] = {
             "degree": self.world,
             "rank": self.rank,
