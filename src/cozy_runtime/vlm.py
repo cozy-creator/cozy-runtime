@@ -703,6 +703,27 @@ class TransformersEngine:
         on_delta: Callable[[Delta], None],
         progress: Callable[[int], None] | None = None,
     ) -> Final:
+        decoding: _Decoding = {
+            "max_new_tokens": params.max_new_tokens,
+            "presence_penalty": params.presence_penalty,
+            "temperature": params.temperature,
+            "top_p": params.top_p,
+            "top_k": params.top_k,
+            "min_p": params.min_p,
+            "frequency_penalty": params.frequency_penalty,
+            "repetition_penalty": params.repetition_penalty,
+            "allowed": self._allowed(params),
+            "seed": params.seed,
+            "progress": progress,
+            "no_repeat_ngram": params.no_repeat_ngram,
+        }
+        # A thought may say a stop string: then stops cut only the answer, after decoding.
+        stop = [] if params.thinking else params.stop
+        return self._decode(self.inputs(questions, params), stop, decoding, params.thinking, on_delta)
+
+    def inputs(self, questions: list[Question], params: Params) -> BatchFeature:
+        """The questions as the model reads them, rows left-padded: each one's chat, its pictures
+        and its videos (each video's blocks stamped with their `<t seconds>`) through the processor."""
         texts = [
             self._chat(question, params.system, params.thinking, params.reasoning_effort)
             for question in questions
@@ -725,25 +746,7 @@ class TransformersEngine:
                 ],
                 "do_sample_frames": False,
             }
-        decoding: _Decoding = {
-            "max_new_tokens": params.max_new_tokens,
-            "presence_penalty": params.presence_penalty,
-            "temperature": params.temperature,
-            "top_p": params.top_p,
-            "top_k": params.top_k,
-            "min_p": params.min_p,
-            "frequency_penalty": params.frequency_penalty,
-            "repetition_penalty": params.repetition_penalty,
-            "allowed": self._allowed(params),
-            "seed": params.seed,
-            "progress": progress,
-            "no_repeat_ngram": params.no_repeat_ngram,
-        }
-        # A thought may say a stop string: then stops cut only the answer, after decoding.
-        stop = [] if params.thinking else params.stop
-        return self._decode(
-            self._inputs(text=texts, **kwargs), stop, decoding, params.thinking, on_delta
-        )
+        return self._inputs(text=texts, **kwargs)
 
     def _allowed(self, params: Params) -> lm.Constraint | None:
         """`params.allowed`, starting after the thought where the model thinks: the template opens
