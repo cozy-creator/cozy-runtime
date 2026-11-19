@@ -9,7 +9,6 @@
 
 #include <cstdarg>
 #include <cstdio>
-#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -212,14 +211,9 @@ const ggml_cuda_device_info& ggml_cuda_info() {
 }
 
 #if defined(GGML_CUDA_USE_PDL)
-// ggml-cuda.cu's: a kernel launches with programmatic dependent launch when its loaded code is PTX 9.0 or newer
-// (its device-side PDL waits are only there), unless GGML_CUDA_PDL=0.
+// ggml-cuda.cu's rule: a kernel launches with programmatic dependent launch when its loaded code is PTX 9.0 or newer
+// (its device-side PDL waits are only there).
 bool ggml_cuda_kernel_can_use_pdl(const void* kernel) {
-    static const bool enabled = [] {
-        const char* env = getenv("GGML_CUDA_PDL");
-        return env == nullptr || std::atoi(env) != 0;
-    }();
-    if (!enabled) return false;
     static std::mutex lock;
     static std::map<std::pair<int, const void*>, bool> known;
     const std::pair<int, const void*> key{ggml_cuda_get_device(), kernel};
