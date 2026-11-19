@@ -165,6 +165,7 @@ class Decoder:
         fused: bool = True,
         prefill_chunk: int = PREFILL_CHUNK,
         kv_card_bytes: int | None = None,
+        in_place: bool = False,
     ) -> None:
         from tensorfs.varena import _runtime as varena
 
@@ -184,7 +185,7 @@ class Decoder:
         with torch.cuda.stream(self.stream):
             self.kv = KvManager(varena.Device(device.index or 0), layout, max_rows,
                                 -(-max_tokens // layout.block_tokens), host=host)  # fmt: skip
-        self.qwen = Qwen35(model, self.kv, fused=fused)
+        self.qwen = Qwen35(model, self.kv, fused=fused, in_place=in_place)
         if prefill_chunk <= 0 or prefill_chunk % 64:
             raise ValueError(f"a prefill chunk of {prefill_chunk} tokens: a multiple of the gated-delta rule's 64")
         #: a prompt's tokens a prefill forward takes at a time
@@ -199,8 +200,8 @@ class Decoder:
         #: the rows' decoding, at fixed addresses a graph holds; each call fills them
         self.decoding = tuple(full(t) for t in (torch.float32, torch.float32, torch.int64, torch.float32,
                                                     torch.float32, torch.float32, torch.float32, torch.int64))  # fmt: skip
-        #: a bucket's step and its graph, by (rows, drafted, sampled, top_k kept)
-        self.steps: dict[tuple[int, bool, bool, int], tuple[Step, torch.cuda.CUDAGraph | None]] = {}
+        #: a bucket's step and its graph, by (rows, drafted, sampled, top_k kept, host extent)
+        self.steps: dict[tuple[int, bool, bool, int, int], tuple[Step, torch.cuda.CUDAGraph | None]] = {}
         #: the step's weights, retained from the model's placement where it has one, and the
         #: identity the graphs above were recorded against
         self.binding: object | None = None
@@ -209,7 +210,7 @@ class Decoder:
         self.launcher = launcher and not NO_ENGINE
         self.ring = _Ring(LAUNCH_STEPS + 2 * SEGMENT, self.rows.report.nbytes) if self.launcher else None
         #: a bucket's launcher over its step's graph, by the key of `steps`
-        self.segments: dict[tuple[int, bool, bool, int], object] = {}
+        self.segments: dict[tuple[int, bool, bool, int, int], object] = {}
 
     # ------------------------------------------------------------------ a call
 
@@ -400,7 +401,8 @@ class Decoder:
             self._launched(size, rows, drafted, sampling, request, made, told)
             return
         kv, r = self.kv, self.rows
-        key = (size, drafted, sampling.sampled, sampling.kept)
+        # A graph's copies ahead move the host blocks in use when it was recorded: keyed by their extent.
+        key = (size, drafted, sampling.sampled, sampling.kept, self.kv.host_extent())
         step, graph = self.steps.get(key) or (Step(self.qwen, r, sampling, size, drafted, self.ring), None)
         made.captured = graph is not None  # a graph an earlier call recorded serves this one
         reach = (step.span + 1) if drafted else 1
@@ -455,7 +457,8 @@ class Decoder:
         from cozy_runtime._kernels import _engine
 
         kv, r, ring = self.kv, self.rows, cast("_Ring", self.ring)
-        key = (size, drafted, sampling.sampled, sampling.kept)
+        # A graph's copies ahead move the host blocks in use when it was recorded: keyed by their extent.
+        key = (size, drafted, sampling.sampled, sampling.kept, self.kv.host_extent())
         step, graph = self.steps.get(key) or (Step(self.qwen, r, sampling, size, drafted, ring), None)
         made.captured = graph is not None
         reach = (step.span + 1) if drafted else 1
@@ -579,7 +582,15 @@ def _host_tier(model: torch.nn.Module, index: int) -> varena.Pages:
 
     placed = PLACED.get(model)
     pages = getattr(getattr(placed[0], "memory", None), "pages", None) if placed is not None else None
-    return cast("varena.Pages", pages) if pages is not None else _runtime.Pages(index)
+    if pages is not None:
+        return cast("varena.Pages", pages)
+    if index not in _OWN_PAGES:  # one tier a GPU, as a placement keeps one
+        _OWN_PAGES[index] = _runtime.Pages(index)
+    return _OWN_PAGES[index]
+
+
+#: the host tier of a GPU no placement opened one for, made once
+_OWN_PAGES: dict[int, varena.Pages] = {}
 
 
 class _Paged(Protocol):
