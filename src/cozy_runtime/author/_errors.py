@@ -148,6 +148,10 @@ class Outcome:
     #: carries it, and a message alone ("CalledProcessError: … exit status 1") has already
     #: cost a rented-pod round trip that the frames under it would have answered.
     traceback: str = ""
+    #: The failure was the collective layer's own error (torch's `DistBackendError`), told by its
+    #: type: after its group's interrupt it is that GPU's call ending (`Executor._ended`). An
+    #: observation the wire never carries.
+    collective: bool = False
 
 
 #: Tail bound on `Outcome.traceback`. The innermost frames and the exception line are at
@@ -263,7 +267,7 @@ def fault(exc: BaseException) -> Fault:
             if code == _CUDA_OOM:
                 return Fault.OOM
             return Fault.STICKY if code in _STICKY else Fault.DEVICE
-        if kind == "DistBackendError":
+        if _collective(exc):
             return Fault.OOM if _NCCL_OOM in str(exc) else Fault.DEVICE
     if module.partition(".")[0] == "tensorfs" and getattr(exc, "code", "") == "device_memory":
         return Fault.OOM  # a TensorFS CUDA call out of GPU memory (`tensorfs.DeviceMemoryError`)
@@ -282,6 +286,14 @@ def fault(exc: BaseException) -> Fault:
         if text.startswith(_OOM_PREFIXES) or any(status in text for status in _ALLOC_FAILED):
             return Fault.OOM
     return Fault.OTHER
+
+
+def _collective(exc: BaseException) -> bool:
+    """torch's `DistBackendError`: a collective's backend (NCCL, gloo) failed or was aborted."""
+    return (
+        type(exc).__name__ == "DistBackendError"
+        and type(exc).__module__.partition(".")[0] == "torch"
+    )
 
 
 def is_capacity(exc: BaseException) -> bool:
@@ -341,7 +353,9 @@ def classify(exc: BaseException | None) -> Outcome:
         return Outcome("failed", "runtime", MEMORY_EXHAUSTED, str(exc)[:400], (), _trace(exc))
     if found in (Fault.STICKY, Fault.DEVICE):
         text = f"{type(exc).__name__}: {exc}"[:400]
-        return Outcome("failed", "runtime", DEVICE_FAULT, text, (), _trace(exc))
+        return Outcome(
+            "failed", "runtime", DEVICE_FAULT, text, (), _trace(exc), collective=_collective(exc)
+        )
     if type(exc).__module__.partition(".")[0] == "tensorfs" and hasattr(exc, "sticky"):
         return Outcome("failed", "runtime", "memory_error", str(exc)[:400], (), _trace(exc))
     return Outcome(
