@@ -24,11 +24,7 @@ class _Buffer:
     tensor made over it holds this until its storage goes."""
 
     def __init__(self, nbytes: int) -> None:
-        # The machine's one host admission first, so a whole host memory can't hold is refused in
-        # one line, never killed by the kernel (var-030 W5).
-        admit = getattr(tensorfs._ext, "_varena_host_admit", None)
-        if admit is not None and (why := admit(nbytes)) is not None:
-            raise Exhausted(f"a {nbytes / 2**30:.2f} GiB whole in pinned host memory: {why}", nbytes)
+        admit(nbytes, f"a {nbytes / 2**30:.2f} GiB whole in pinned host memory")
         self.host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
         self.address = self.host.data_ptr()
         self.__cuda_array_interface__ = {
@@ -49,6 +45,14 @@ class _Buffer:
             _GOING.append((event, self.host))
         except Exception:  # the device or interpreter is going down: nothing queued reads it
             pass
+
+
+def admit(nbytes: int, what: str) -> None:
+    """The machine's one host admission for `nbytes` more host memory, before it is taken: `what`
+    it can't hold is refused in one line (`Exhausted`), never killed by the kernel (var-030 W5)."""
+    check = getattr(tensorfs._ext, "_varena_host_admit", None)
+    if check is not None and (why := check(nbytes)) is not None:
+        raise Exhausted(f"{what}: {why}", nbytes)
 
 
 #: each live buffer by its first byte's device address

@@ -78,6 +78,7 @@ from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import Cancelled, DoesNotFit, Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded, recovered
+from cozy_runtime.author._numeric import within
 from cozy_runtime.author._services import counting, stage_tokens
 from cozy_runtime import graphs as _graphs
 from cozy_runtime import sampling as sampler
@@ -178,12 +179,6 @@ BUCKETS = (1, 2, 4, 8, 16)
 DRAFT_ROWS = 4
 #: The most the draft head's prompt pass holds of attention scores at once (`_drafted_prompt`).
 DRAFT_SCORES = 256 << 20
-#: The most one fp32 copy of a gated-delta-net layer's prefill piece holds: its queries, keys,
-#: values and chunk decays, every row (`_prefill_pieces`). The torch path holds several copies.
-PREFILL_BYTES = 256 << 20
-#: What a prompt's pieces end on (`_Engine._prefill`): Transformers' gated-delta rule's chunk, so
-#: each chunk is computed as in the whole prompt.
-PREFILL_ALIGN = 64
 
 
 #: Generation-config fields that add a logits processor to greedy decoding, and their no-op values.
@@ -608,9 +603,9 @@ def install(plan: Plan, model: torch.nn.Module) -> str:
         return _report(plan, ABSENT)
     spaces = {sys.modules.get(type(module).__module__) for module in model.modules()}
     for space in spaces:  # the prefill's pieces need no kernel: every device, from now on
-        current = getattr(space, "torch_chunk_gated_delta_rule", None)
+        current = getattr(space, _CHUNK_RULE, None)
         if space is not None and callable(current) and not getattr(current, "_cozy_slot", False):
-            vars(space)["torch_chunk_gated_delta_rule"] = _prefill_pieces(current)
+            vars(space)[_CHUNK_RULE] = _prefill_pieces(current)
     slots = [
         (space, name)
         for space in spaces
@@ -748,14 +743,23 @@ def _conv_slot(original: _ConvUpdate, launch: Launch) -> _ConvUpdate:
     return slot
 
 
+#: Transformers' chunked gated-delta rule, the slot a linear-attention layer's prompt runs through.
+_CHUNK_RULE = "torch_chunk_gated_delta_rule"
+
+
 def _prefill_pieces(original: _DeltaRule) -> _DeltaRule:
-    """A gated-delta-net layer's prompt in pieces within `PREFILL_BYTES`, each starting from the
-    recurrent state the one before ended on: the torch path holds several fp32 copies of a
-    piece's queries, keys, values and decays, so a long prompt's held all at once (Qwen3.5's
-    upsampler at 31,804 tokens, 6.3 GiB live under an 8 GiB cap, run 46625). A piece is sized by
-    all its rows and the layer's own widths: 16 rows of 4,096 tokens on Qwen3.8-27B asked 1.5 GiB
-    for one of its tensors (cr-344). Pieces end on its chunk boundaries, so each chunk is
-    computed as in the whole call."""
+    """A gated-delta-net layer's prompt in pieces the card's room holds now (`_room`), each
+    starting from the recurrent state the one before ended on: the torch path holds several fp32
+    copies of a piece's queries, keys, values and decays (`_rule`), so a long prompt's held all at
+    once (Qwen3.5's upsampler at 31,804 tokens, 6.3 GiB live under an 8 GiB cap, run 46625). A
+    piece is sized by all its rows and the layer's own widths: 16 rows of 4,096 tokens on
+    Qwen3.8-27B asked 1.5 GiB for one of its tensors (cr-344). Pieces end on the rule's own chunks
+    (its `chunk_size`), so each chunk is computed as in the whole call, and write into one output.
+    Without native memory, or for a rule that states no chunk, the call runs as Transformers
+    runs it."""
+    chunk = _default(original, "chunk_size")
+    if not isinstance(chunk, int) or isinstance(chunk, bool) or chunk < 1:
+        return original
 
     def pieces(
         query: torch.Tensor,
@@ -763,36 +767,78 @@ def _prefill_pieces(original: _DeltaRule) -> _DeltaRule:
         value: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-        chunk_size: int = 64,
+        chunk_size: int = chunk,
         initial_state: torch.Tensor | None = None,
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
         **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         rows, length = int(query.shape[0]), int(query.shape[1])
-        widths = query.shape[2:].numel() + key.shape[2:].numel() + value.shape[2:].numel()
-        token = 4 * rows * (widths + int(value.shape[2]) * chunk_size)  # + each head's decays
-        piece = max(chunk_size, PREFILL_BYTES // max(token, 1) // chunk_size * chunk_size)
+        room = _room(query.device)
+        piece = length
+        if room is not None:
+            keys, values = query.shape[2:].numel(), value.shape[2:].numel()
+            token = 4 * rows * _rule(keys, values, int(value.shape[2]), chunk_size)
+            room -= rows * length * values * query.element_size()  # the output, held whole
+            piece = max(chunk_size, room // max(token, 1) // chunk_size * chunk_size)
         if length <= piece or kwargs.get("cu_seqlens") is not None:
             return original(
                 query, key, value, g, beta, chunk_size=chunk_size, initial_state=initial_state,
                 output_final_state=output_final_state,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **kwargs,
             )  # fmt: skip
-        outs: list[torch.Tensor] = []
+        out = query.new_empty((rows, length, *value.shape[2:]))
         state = initial_state
         for at in range(0, length, piece):
             part = slice(at, at + piece)
-            out, state = original(
+            out[:, part], state = original(
                 query[:, part], key[:, part], value[:, part], g[:, part], beta[:, part],
                 chunk_size=chunk_size, initial_state=state, output_final_state=True,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **kwargs,
             )  # fmt: skip
-            outs.append(out)
-        return torch.cat(outs, 1), state if output_final_state else None
+        return out, state if output_final_state else None
 
     vars(pieces)["_cozy_slot"] = True
     return cast("_DeltaRule", pieces)
+
+
+def _rule(keys: int, values: int, heads: int, chunk: int) -> int:
+    """The fp32 elements a token Transformers' torch gated-delta rule holds at its peak, as its
+    code holds them: five of a key width (queries, keys, the keys' beta-weighted and decayed
+    copies, their cumulative decay) and one being made, four of a value width (the values, their
+    beta-weighted copy, the new values, the output) and three chunk-square terms a head (the
+    pairwise decays, the triangular system, the chunk's attention)."""
+    return 6 * keys + 4 * values + 3 * heads * chunk
+
+
+def _native(device: torch.device) -> bool:
+    """Whether native memory serves `device` for the request running now."""
+    from cozy_runtime.internal.execution.catch import CURRENT as SERVING
+
+    request = SERVING.get()
+    return device.type == "cuda" and request is not None and request.memory.cuda
+
+
+def _room(device: torch.device) -> int | None:
+    """What a working allocation on `device` has now, as native selection counts it: the card's
+    capacity less what is live and pinned (`vt.room`). None without native memory."""
+    if not _native(device):
+        return None
+    room = vt.room(device.index or 0)
+    return int(room["capacity"]) - int(room["working_live"]) - int(room["pinned"])
+
+
+def _default(function: object, name: str) -> object:
+    """`function`'s default for its parameter `name`, None where it states none."""
+    if not callable(function):
+        return None
+    try:
+        parameter = inspect.signature(function).parameters.get(name)
+    except (TypeError, ValueError):  # a callable with no signature to read
+        return None
+    if parameter is None or parameter.default is inspect.Parameter.empty:
+        return None
+    return cast("object", parameter.default)
 
 
 def _recurrent_slot(original: _DeltaRule, launch: Launch) -> _DeltaRule:
@@ -1219,15 +1265,16 @@ def _transformers(
     processors.append(_Pick(inputs, picking))
     own: dict[str, float] = {} if picking.repetition == 1 else {"repetition_penalty": 1.0}
     context = CURRENT.get()
-    _pieced(cast("torch.nn.Module", _lm(model).get_decoder()))
+    decoder = cast("torch.nn.Module", _lm(model).get_decoder())
+    _pieced(decoder)
     rows, device = int(inputs["input_ids"].shape[0]), inputs["input_ids"].device
-    paged = _paged(model, device, rows, prompt + max_new_tokens)
-    if paged:
-        row = recovered("keys and values kept on the host", why=paged)
-        if row not in WARNINGS:
-            WARNINGS.append(row)
-    cache = {"past_key_values": DynamicCache(config=model.config, offloading=True)} if paged else {}
     with _PLANE, torch.inference_mode(), ExitStack() as held:
+        cache: dict[str, Cache] = {}
+        if paged := _paged(model, decoder, device, rows, prompt, prompt + max_new_tokens):
+            row = recovered("keys and values kept on the host", why=paged)
+            if row not in WARNINGS:
+                WARNINGS.append(row)
+            cache["past_key_values"] = DynamicCache(config=model.config, offloading=True)
         cancel = _Cancel(context, tell, _Keeper(model, held, why), prompt)
         out = _lm(model).generate(
             **inputs,
@@ -1244,21 +1291,57 @@ def _transformers(
     return out[:, prompt:]
 
 
-def _paged(model: PreTrainedModel, device: torch.device, rows: int, tokens: int) -> str:
+def _paged(
+    model: PreTrainedModel,
+    decoder: torch.nn.Module,
+    device: torch.device,
+    rows: int,
+    prompt: int,
+    tokens: int,
+) -> str:
     """Why Transformers' loop keeps a call's keys and values on the host (its offloaded cache,
-    cr-344), "" where it doesn't: they would outgrow the room the card has now, its capacity less
-    what is live and pinned. Each attention layer's come to the card for its own attention, the
-    next one's on their way meanwhile (`Cache.prefetch`), so a decode step reads them a layer at
-    a time; a linear-attention layer's state stays."""
+    cr-344), "" where it doesn't: they would outgrow the room the card has as the loop starts
+    (`_room`, read under `_PLANE`) less what else the loop holds there: its linear-attention
+    state, its prompt's prefill at the finest cut (`_prefill_need`), the largest block it streams
+    through (a decoder layer, or the output head) and a streamed step's reserve (`KEEP_RESERVE`).
+    Each attention layer's come to the card for its own attention, the next one's on their way
+    meanwhile (`Cache.prefetch`), so a decode step reads them a layer at a time; a
+    linear-attention layer's state stays."""
+    from cozy_runtime.internal.execution import sizing
+
     shapes, why = _shapes(model)
-    if device.type != "cuda" or why:
+    room = _room(device)
+    if why or room is None:
         return ""
-    itemsize = model.dtype.itemsize
-    each = sum(s[1] * (s[2] + s[3]) * itemsize for s in shapes if s[0] == "keys")
-    room = vt.room(device.index or 0)
-    left = int(room["capacity"]) - int(room["working_live"]) - int(room["pinned"])
-    need = rows * tokens * each
-    return f"{_gib(need)} of them beside {_gib(left)} of room" if need > left else ""
+    itemsize = _dtype(decoder, None).itemsize
+    each = state = 0
+    for shape in shapes:
+        if shape[0] == "keys":
+            _, heads, k_width, v_width = shape
+            each += heads * (k_width + v_width) * itemsize
+        else:
+            _, conv, recurrent = shape
+            state += math.prod(conv) * itemsize + math.prod(recurrent) * torch.float32.itemsize
+    unit = _unit(decoder)
+    chunks = -(-prompt // unit)
+    need = _prefill_need(getattr(decoder, "config", None), rows, prompt, chunks, unit, itemsize)
+    prefill = sum(need(sizing.levels(chunks)))
+    head = _lm(model).get_output_embeddings()
+    blocks = [*cast("Iterable[torch.nn.Module]", getattr(decoder, "layers", ())), head]
+    streamed = max((_nbytes(b) for b in blocks if isinstance(b, torch.nn.Module)), default=0)
+    left = room - rows * state - prefill - streamed - KEEP_RESERVE
+    kept = rows * tokens * each
+    if kept <= left:
+        return ""
+    return (
+        f"{_gib(kept)} of them beside {_gib(max(left, 0))} of the card's {_gib(room)} of room "
+        f"after its state, its prefill's {_gib(prefill)} and {_gib(streamed)} streamed through"
+    )
+
+
+def _nbytes(module: torch.nn.Module) -> int:
+    """The bytes of `module`'s weights and buffers."""
+    return sum(t.nbytes for t in (*module.parameters(), *module.buffers()))
 
 
 #: What a streamed decode step needs beyond its kept weights and live memory (its cache's growth,
@@ -1560,17 +1643,22 @@ def _taking(model: PreTrainedModel) -> Iterator[list[torch.Tensor]]:
 def _pieced(decoder: torch.nn.Module) -> None:
     """A prompt's prefill as a cut site (`catch.cut`, cr-344): the model's decoder (after any
     picture's features are merged into its embeddings) over an empty cache, its prompt in 2^level
-    pieces of `PREFILL_ALIGN`-token chunks a row, at the level native selection takes from each
-    piece's need (`_prefill_need`), one level finer after a refusal. Each piece writes its keys
-    and carries its linear-attention state into the next, as a decode step does, so every
-    whole-prompt temporary of a layer shrinks with the piece; a level starts from the empty
-    cache. A call it can't cut (a row padded, an input not one per token) runs whole."""
+    pieces of `_unit` tokens a row, at the level native selection takes from each piece's need
+    (`_prefill_need`), one level finer after a refusal. Each piece writes its keys and carries its
+    linear-attention state into the next, as a decode step does, so every whole-prompt temporary
+    of a layer shrinks with the piece; a level starts from the empty cache (`_Cut`). The decoder
+    goes in pieces once its probe found it computes them as it computes the whole (`_probe`),
+    for each kind of call; a call it can't cut (a row padded, an input neither one per token, a
+    position nor a plain value) and a decoder its probe refused run whole."""
     if vars(decoder).get("_cozy_pieced"):
         return
     forward = decoder.forward
     site = f"{type(decoder).__name__}:prefill"
+    unit = _unit(decoder)
+    #: each kind of call's probe (`_kind`): "" where pieces compute as whole, else why not
+    proven: dict[tuple[tuple[str, int], ...], str] = {}
 
-    def cut(*args: Any, **kwargs: Any) -> Any:  # type: ignore[explicit-any]  # its own signature
+    def cut(*args: object, **kwargs: object) -> object:
         tokens = kwargs.get("inputs_embeds")
         tokens = kwargs.get("input_ids") if tokens is None else tokens
         cache = kwargs.get("past_key_values")
@@ -1578,71 +1666,309 @@ def _pieced(decoder: torch.nn.Module) -> None:
             args
             or not isinstance(tokens, torch.Tensor)
             or tokens.dim() < 2
-            or int(tokens.shape[1]) <= PREFILL_ALIGN  # a decode step, or a short prompt
+            or int(tokens.shape[1]) <= unit  # a decode step: one piece at most
             or not isinstance(cache, Cache)
             or torch.is_grad_enabled()
             or (tokens.is_cuda and torch.cuda.is_current_stream_capturing())
+            or not _native(tokens.device)  # `catch.cut` would run it whole
         ):
             return forward(*args, **kwargs)
-        rows, length = (int(n) for n in tokens.shape[:2])
-        chunks = -(-length // PREFILL_ALIGN)
-        config = getattr(decoder, "config", None)  # read as Transformers reads it, at each call
-        if not _cuttable(kwargs, (rows, length), config) or not _empty(cache):
-            return forward(**kwargs)
         from cozy_runtime.internal.execution import catch, sizing  # it imports the Runtime's own
 
-        itemsize = tokens.element_size() if tokens.is_floating_point() else 2
-        need = _prefill_need(config, rows, length, chunks, itemsize)
-        run = partial(_prefill_level, decoder, forward, kwargs, cache, length, chunks)
+        rows, length = (int(n) for n in tokens.shape[:2])
+        config = getattr(decoder, "config", None)  # read as Transformers reads it, at each call
+        chunks = -(-length // unit)
+        itemsize = _dtype(decoder, kwargs.get("inputs_embeds")).itemsize
+        need = _prefill_need(config, rows, length, chunks, unit, itemsize)
+        kind = _kind(kwargs)
+        if (
+            catch.small(need)  # a verify pass, a short prompt: whole, as `catch.cut` runs it
+            or proven.get(kind)
+            or not _cuttable(kwargs, (rows, length), config)
+            or not _empty(cache)
+        ):
+            return forward(**kwargs)
+        run = _Cut(decoder, forward, kwargs, cache, (rows, length), unit, proven, kind)
         return catch.cut(site, sizing.levels(chunks), need, run)
 
     vars(decoder)["forward"], vars(decoder)["_cozy_pieced"] = cut, True
 
 
-def _prefill_level(  # type: ignore[explicit-any]  # the decoder's own call
-    decoder: torch.nn.Module,
-    forward: Callable[..., Any],
-    kwargs: dict[str, Any],
-    cache: Cache,
-    length: int,
-    chunks: int,
-    level: int,
-) -> Any:
-    """The decoder's call in 2^level pieces of its prompt, from an empty cache. Its tokens are
-    embedded once, before the pieces (the table is read once, beside nothing of the prompt yet),
-    and each piece's states are written where its embeddings were, which no later piece reads:
-    the prompt's states are held once. So are embeddings its model's wrapper made (a picture's
-    features merged in); only a caller's own get a buffer of their own (`_caller`)."""
-    from cozy_runtime.internal.execution import sizing
+#: Each decoder's `_unit`.
+_UNITS: weakref.WeakKeyDictionary[torch.nn.Module, int] = weakref.WeakKeyDictionary()
 
-    _emptied(cache)
-    if not level:
-        return forward(**kwargs)
-    embeds, ids = kwargs.get("inputs_embeds"), kwargs.get("input_ids")
-    if embeds is None:
-        table = cast("Callable[[], torch.nn.Module]", decoder.get_input_embeddings)()
-        states = embeds = table(ids)
-    elif _caller(embeds):  # the caller's own: it may read them again
-        states = torch.empty_like(embeds)
-    else:  # the model's own, made for this call (its wrapper's merged embeddings)
-        states = embeds
-    kwargs = {**kwargs, "input_ids": None, "inputs_embeds": embeds}
-    piece = sizing.pieces(chunks, level) * PREFILL_ALIGN
-    last: object = None
+
+def _unit(decoder: torch.nn.Module) -> int:
+    """The tokens a prompt's pieces end on (`_pieced`): a multiple of every chunk a layer of
+    `decoder` computes (its module's own `chunk_size`, else the default of the chunked
+    gated-delta rule its module's namespace serves), so each chunk is computed as in the whole
+    prompt; 1 where no layer chunks."""
+    unit = _UNITS.get(decoder)
+    if unit is None:
+        modules = list(decoder.modules())
+        spaces = {sys.modules.get(type(module).__module__) for module in modules}
+        sizes = [vars(module).get("chunk_size") for module in modules]
+        sizes += [_default(getattr(space, _CHUNK_RULE, None), "chunk_size") for space in spaces]
+        ints = [n for n in sizes if isinstance(n, int) and not isinstance(n, bool) and n > 0]
+        unit = _UNITS[decoder] = math.lcm(1, *ints)
+    return unit
+
+
+class _Cut:
+    """A decoder's prompt call as its cut site's run (`_pieced`): at level L its prompt in 2^L
+    pieces from the emptied cache; whole at level 0, and where its decoder's probe refused pieces.
+    The pieces' states go where the model's own embeddings were (its wrapper's, a picture's
+    features merged in), which no later piece reads, so the prompt's states are held once; those
+    embeddings are first kept on the host and put back before a level runs again, so a level
+    refused part-way never reads earlier pieces' states as embeddings. A caller's own embeddings
+    (`_caller`), a call of token ids (each piece embeds its own) and embeddings the host has no
+    room for give the states a buffer of their own."""
+
+    def __init__(
+        self,
+        decoder: torch.nn.Module,
+        forward: Callable[..., object],
+        kwargs: Mapping[str, object],
+        cache: Cache,
+        shape: tuple[int, int],
+        unit: int,
+        proven: dict[tuple[tuple[str, int], ...], str],
+        kind: tuple[tuple[str, int], ...],
+    ) -> None:
+        self.decoder, self.forward, self.kwargs, self.cache = decoder, forward, kwargs, cache
+        self.shape, self.unit, self.proven, self.kind = shape, unit, proven, kind
+        #: the model's own embeddings as they were, on the host (`_over`)
+        self.kept: torch.Tensor | None = None
+        #: positions of them a level wrote states over
+        self.written = 0
+
+    def __call__(self, level: int) -> object:
+        from cozy_runtime.internal.execution import sizing
+
+        _emptied(self.cache)
+        embeds = self.kwargs.get("inputs_embeds")
+        if self.written and isinstance(embeds, torch.Tensor):  # a level refused part-way
+            embeds[:, : self.written].copy_(_set(self.kept)[:, : self.written])
+            self.written = 0
+        if not level or not self._proven():
+            return self.forward(**self.kwargs)
+        piece = sizing.pieces(-(-self.shape[1] // self.unit), level) * self.unit
+        over = self._over(embeds)
+        return _through(self.forward, self.kwargs, self.shape, piece, over, self._wrote)
+
+    def _over(self, embeds: object) -> torch.Tensor | None:
+        """What the pieces write their states over: the model's own embeddings, once kept."""
+        if not isinstance(embeds, torch.Tensor) or _caller(embeds):
+            return None
+        if self.kept is None:
+            try:
+                self.kept = _host(embeds, "a prompt's embeddings")
+            except Exhausted:  # no host room for them: the states get a buffer of their own
+                return None
+        return embeds
+
+    def _wrote(self, end: int) -> None:
+        self.written = end
+
+    def _proven(self) -> bool:
+        why = self.proven.get(self.kind)
+        if why is None and self.shape[1] < 2 * max(self.unit, 2):
+            return False  # too short for its probe's two pieces: whole, and no verdict
+        if why is None:
+            name = type(self.decoder).__name__
+            proven, said = _probe(self.decoder, self.forward, self.kwargs, self.unit)
+            why = self.proven[self.kind] = "" if proven else said
+            say(f"lm:{name}:pieces:{self.kind}", f"[lm] {name}: {said}")
+            if why:
+                row = recovered("a prompt's prefill ran whole", why=f"{name}: {why}")
+                if row not in WARNINGS:
+                    WARNINGS.append(row)
+        return not why
+
+
+def _through(
+    forward: Callable[..., object],
+    kwargs: Mapping[str, object],
+    shape: tuple[int, int],
+    piece: int,
+    over: torch.Tensor | None = None,
+    wrote: Callable[[int], None] | None = None,
+) -> MutableMapping[str, object]:
+    """`forward` over a prompt of `shape` (rows, tokens) in pieces of `piece` tokens, each from
+    the cache the one before wrote, its final states written into `over` (`wrote(end)` told
+    first), else into a buffer of their own: the last piece's outputs, with the whole prompt's
+    states, as the call's."""
+    rows, length = shape
+    states = over
+    last: MutableMapping[str, object] | None = None
     for at in range(0, length, piece):
         end = min(at + piece, length)
-        call = dict(kwargs)
-        for name, value in kwargs.items():
-            if isinstance(value, torch.Tensor):
-                cut = slice(0, end) if name == "attention_mask" else slice(at, end)
-                seq = value[..., cut] if name in ("position_ids", "cache_position") else None
-                call[name] = value[:, cut] if seq is None else seq
-        out = forward(**call)
-        states[:, at:end] = out[0]
+        out = cast("MutableMapping[str, object]", forward(**_window(kwargs, at, end)))
+        hidden = cast("torch.Tensor", out[next(iter(out))])  # a model output's first, `out[0]`
+        if states is None:
+            states = hidden.new_empty((rows, length, *hidden.shape[2:]))
+        if over is not None and wrote is not None:
+            wrote(end)
+        states[:, at:end] = hidden
         last = out
-    result = cast("MutableMapping[str, object]", last)  # the last piece's outputs, as a call's
-    result["last_hidden_state"] = states
+    result = _set(last)
+    result[next(iter(result))] = states
     return result
+
+
+#: A decoder call's positions, with tokens on their last dimension (its rows, if any, the one
+#: before): a piece takes its own there.
+_POSITIONS = ("position_ids", "cache_position")
+
+
+def _window(
+    kwargs: Mapping[str, object], at: int, end: int, rows: slice | None = None
+) -> dict[str, object]:
+    """A decoder call's inputs for its tokens [at, end) (and only `rows` of its rows): each
+    per-token tensor's and position's, and the mask over every key to `end`."""
+    call = dict(kwargs)
+    every = slice(None) if rows is None else rows
+    for name, value in kwargs.items():
+        if isinstance(value, torch.Tensor):
+            tokens = slice(0, end) if name == "attention_mask" else slice(at, end)
+            if name not in _POSITIONS:
+                call[name] = value[every, tokens]
+            else:
+                call[name] = value[..., every, tokens] if value.dim() > 1 else value[tokens]
+    return call
+
+
+def _probe(
+    decoder: torch.nn.Module,
+    forward: Callable[..., object],
+    kwargs: Mapping[str, object],
+    unit: int,
+) -> tuple[bool, str]:
+    """Whether `decoder` computes its call's first row's first two pieces of `unit` tokens (two
+    at least: a piece of one is a decode step) as it computes them whole, each from an empty cache
+    of Transformers' own (`DynamicCache`): its outputs and every state its cache keeps within
+    rounding's allowance (`_off`), and what it found. A decoder that carries something from one
+    piece to the next outside its cache, reads an input the cut can't slice, or makes its
+    positions or masks otherwise in pieces differs there (Gemma3n's per-layer inputs, Gemma 4's
+    reversed embeddings, Qwen3-VL's deepstack features against its sliced positions, cr-344's
+    review). Once per decoder and kind of call, the first time a cut level asks for pieces:
+    two passes over a few tokens of one row."""
+    each = max(unit, 2)
+    tokens = kwargs.get("inputs_embeds")
+    tokens = kwargs.get("input_ids") if tokens is None else tokens
+    span = min(int(cast("torch.Tensor", tokens).shape[1]), 2 * each)
+    first = _window(kwargs, 0, span, slice(0, 1))
+    config = getattr(decoder, "config", None)
+    try:
+        caches = DynamicCache(config=config), DynamicCache(config=config)
+        whole = cast("Mapping[str, object]", forward(**{**first, "past_key_values": caches[0]}))
+        pieces = _through(forward, {**first, "past_key_values": caches[1]}, (1, span), each)
+        off, where = _apart(whole, pieces, caches, _dtype(decoder, kwargs.get("inputs_embeds")))
+    except Exception as exc:
+        # A device fault, a cancel, a yield or no room is the call's, never the probe's.
+        if (
+            isinstance(exc, (Cancelled, Yielded))
+            or _short_of_room(exc)
+            or fault(exc) in (Fault.STICKY, Fault.DEVICE)
+        ):
+            raise
+        return False, f"its prompts run whole: in pieces it raised {type(exc).__name__}: {exc}"
+    measured = f"{each}-token pieces against one: {off:.3g} of rounding's allowance at {where}"
+    if within(off, 1.0):
+        return True, f"its prompts go in pieces ({measured})"
+    return False, f"its prompts run whole: {measured}"
+
+
+def _apart(
+    whole: Mapping[str, object],
+    pieces: Mapping[str, object],
+    caches: tuple[Cache, Cache],
+    dtype: torch.dtype,
+) -> tuple[float, str]:
+    """How far `pieces`' outputs and cache (`caches[1]`) lie from `whole`'s (`caches[0]`): the
+    largest share of rounding's allowance (`_off`) and where. A layer's states have passed
+    through it and those before it; the outputs, through every layer."""
+    depth = len(caches[0].layers)
+    pairs: list[tuple[str, int, object, object]] = [
+        (name, depth, value, pieces.get(name))
+        for name, value in whole.items()
+        if not isinstance(value, Cache)
+    ]
+    for i, (a, b) in enumerate(zip(caches[0].layers, caches[1].layers, strict=True)):
+        pairs.append((f"cache layer {i}", i + 1, vars(a), vars(b)))
+    worst, at = 0.0, "nothing"
+    for where, deep, a, b in pairs:
+        got, want = _leaves(b), _leaves(a)
+        off = max(map(partial(_off, depth=deep, dtype=dtype), got, want), default=0.0)
+        if len(got) != len(want):
+            off = math.inf
+        if not off <= worst:  # NaN is the worst
+            worst, at = off, where
+    return worst, at
+
+
+def _leaves(value: object) -> list[torch.Tensor]:
+    """The tensors in `value`, a tensor or a list, tuple or mapping of them, in order."""
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if isinstance(value, Mapping):
+        return [t for item in value.values() for t in _leaves(item)]
+    if isinstance(value, (list, tuple)):
+        return [t for item in value for t in _leaves(item)]
+    return []
+
+
+def _off(got: torch.Tensor, want: torch.Tensor, *, depth: int, dtype: torch.dtype) -> float:
+    """The largest |got - want| as a share of rounding's allowance, inf where they differ in
+    shape, dtype or a non-float value. Rounding alone moves a value by about `eps` of its scale a
+    layer (its own size and its row's root mean square; `eps` of the coarser of its dtype and the
+    decoder's), sqrt(depth) of them after `depth` layers as a random walk; a piece computed wrong
+    moves it by about its whole scale. The allowance is their geometric mean."""
+    if got.shape != want.shape or got.dtype != want.dtype:
+        return math.inf
+    if not want.is_floating_point():
+        return 0.0 if torch.equal(got, want) else math.inf
+    if not want.numel():
+        return 0.0
+    eps = max(torch.finfo(want.dtype).eps, torch.finfo(dtype).eps)
+    rows = (-1, int(want.shape[-1])) if want.dim() else (1, 1)
+    x, y = got.reshape(rows).float(), want.reshape(rows).float()
+    scale = y.abs() + y.square().mean(-1, keepdim=True).sqrt()
+    off = ((x - y).abs() / (math.sqrt(eps * math.sqrt(depth)) * scale)).masked_fill(x == y, 0)
+    return float(off.nan_to_num(nan=math.inf).max())
+
+
+def _kind(kwargs: Mapping[str, object]) -> tuple[tuple[str, int], ...]:
+    """A decoder call's kind, which its probe holds for (`_probe`): the inputs it has, a tensor's
+    with its rank."""
+    return tuple(
+        sorted(
+            (name, value.dim() if isinstance(value, torch.Tensor) else -1)
+            for name, value in kwargs.items()
+            if value is not None and not isinstance(value, Cache)
+        )
+    )
+
+
+def _dtype(decoder: torch.nn.Module, embeds: object) -> torch.dtype:
+    """The dtype a decoder's states take: its embeddings' (given, else its table's), else its
+    own."""
+    if isinstance(embeds, torch.Tensor) and embeds.is_floating_point():
+        return embeds.dtype
+    table = getattr(decoder, "get_input_embeddings", None)
+    weight = getattr(table() if callable(table) else None, "weight", None)
+    if isinstance(weight, torch.Tensor) and weight.is_floating_point():
+        return weight.dtype
+    own = getattr(decoder, "dtype", None)
+    return own if isinstance(own, torch.dtype) else torch.get_default_dtype()
+
+
+def _host(tensor: torch.Tensor, what: str) -> torch.Tensor:
+    """`tensor` copied to host memory, which the machine's host admission takes first."""
+    from cozy_runtime.internal.execution import pinned
+
+    pinned.admit(tensor.nbytes, f"{_gib(tensor.nbytes)} of {what} kept on the host")
+    return tensor.to("cpu")
 
 
 #: The tensors of the Runtime `generate` call running now (`_given`), none outside one: a
@@ -1674,13 +2000,15 @@ def _caller(tensor: torch.Tensor) -> bool:
 
 
 def _prefill_need(
-    config: object, rows: int, length: int, chunks: int, itemsize: int
+    config: object, rows: int, length: int, chunks: int, unit: int, itemsize: int
 ) -> sizing.Need:
     """A prefill piece's allocations at each level, from its decoder's config: the call's output
     held throughout, and the widest of a layer's phases over the piece's tokens: an fp32 norm,
-    the gated MLP, a gated delta net's fp32 copies (queries, keys, values, their beta-weighted
-    copies, cumulative decays, the output and two chunk-square terms a head), and attention's
-    projections beside its mask over every key."""
+    the gated MLP, a gated delta net's projections and output beside the rule's least (it pieces
+    itself to the room it finds, a chunk a row at least: `_prefill_pieces`), and attention's
+    projections beside, in pieces, its mask over every key and the copy of the keys and values to
+    every head that SDPA makes beside a mask (`_grouped`; eager attention always makes it, with
+    its scores)."""
 
     from cozy_runtime.internal.execution import sizing
 
@@ -1691,24 +2019,51 @@ def _prefill_need(
     heads = size("num_attention_heads", 1)
     groups = size("num_key_value_heads", heads)
     head = size("head_dim", width // max(heads, 1))
-    keys = size("linear_num_value_heads") * size("linear_key_head_dim")
-    values = size("linear_num_value_heads") * size("linear_value_head_dim")
-    decays = size("linear_num_value_heads") * PREFILL_ALIGN
-    copies = 4 * keys + 4 * values + 2 * decays  # fp32 elements a token
+    linear = size("linear_num_value_heads")
+    keys, values = linear * size("linear_key_head_dim"), linear * size("linear_value_head_dim")
+    rule = 4 * rows * unit * _rule(keys, values, linear, unit)
+    eager = getattr(config, "_attn_implementation", None) == "eager"
+    copy = 2 * rows * heads * length * head * itemsize if heads > groups else 0
+    copies = {masked: 0 if not eager and _grouped(masked, head) else copy for masked in (0, 1)}
 
     def piece(level: int) -> tuple[int, ...]:
-        n = rows * sizing.pieces(chunks, level) * PREFILL_ALIGN
+        n = rows * sizing.pieces(chunks, level) * unit
+        masked = int(eager or level > 0)  # whole, causal SDPA reads no mask
         return sizing.peak(
             rows * length * width * itemsize,
             (n * width * itemsize, 2 * n * width * 4),
             (n * 2 * inner * itemsize, 2 * n * inner * itemsize),
-            # the rule's own pieces hold at most PREFILL_BYTES a copy (`_prefill_pieces`)
-            (n * 2 * (keys + values) * itemsize, min(4 * n * copies, 4 * PREFILL_BYTES)),
-            # whole, causal attention reads no mask; a piece's is a byte a key, and its bias two
-            (n * (2 * heads + 2 * groups) * head * itemsize, 3 * n * length if level else 0),
+            (n * 2 * (keys + values) * itemsize, n * values * itemsize, rule),
+            # a mask is a byte a key, and its bias two
+            (
+                n * (2 * heads + 2 * groups) * head * itemsize,
+                3 * n * length * masked,
+                copies[masked],
+                heads * n * length * (itemsize + 4) if eager else 0,
+            ),
         )
 
     return piece
+
+
+#: `_grouped`'s answers, by (beside a mask, head width).
+_GROUPED: dict[tuple[int, int], bool] = {}
+
+
+def _grouped(masked: int, head: int) -> bool:
+    """Whether Transformers' SDPA reads grouped keys and values of `head` width as they are,
+    beside a mask or not (`use_gqa_in_sdpa`); else it copies them to every head."""
+    known = _GROUPED.get((masked, head))
+    if known is None:
+        try:
+            from transformers.integrations.sdpa_attention import use_gqa_in_sdpa
+        except ImportError:  # a Transformers without it: the copy is counted
+            known = False
+        else:
+            meta = torch.empty((1, 1, 1, head), device="meta")
+            known = bool(use_gqa_in_sdpa(meta if masked else None, meta, meta))
+        _GROUPED[(masked, head)] = known
+    return known
 
 
 def _empty(cache: Cache) -> bool:
@@ -1744,11 +2099,20 @@ def _cuttable(kwargs: Mapping[str, object], shape: tuple[int, int], config: obje
     """Whether a decoder call can go in pieces: it returns its outputs as a dict, keeps no
     per-layer outputs (by the call's own word, else its decoder's config's, as Transformers'
     output capture takes them), no row is padded (a linear-attention layer masks padding in a
-    prompt's first call only), and every tensor of it is one per token or a position."""
+    prompt's first call only), and every input is one per token or a position (a piece takes its
+    own), its cache, or a plain value: a container or object that holds tensors (Qwen3-VL's
+    deepstack features, a mask per layer type) is nothing a piece can take its own of."""
 
     def said(name: str) -> object:
         own = kwargs.get(name)
         return getattr(config, name, None) if own is None else own
+
+    def sliced(name: str, value: object) -> bool:
+        if isinstance(value, torch.Tensor):
+            if name in _POSITIONS:
+                return value.dim() > 0 and int(value.shape[-1]) == shape[1]
+            return tuple(value.shape[:2]) == shape
+        return isinstance(value, Cache) or _plain(value)
 
     mask = kwargs.get("attention_mask")
     flat = isinstance(mask, torch.Tensor) and mask.ndim == 2
@@ -1758,13 +2122,19 @@ def _cuttable(kwargs: Mapping[str, object], shape: tuple[int, int], config: obje
         and not said("output_hidden_states")
         and not said("output_attentions")
         and unpadded
-        and all(
-            not isinstance(value, torch.Tensor)
-            or name in ("position_ids", "cache_position")
-            or tuple(value.shape[:2]) == shape
-            for name, value in kwargs.items()
-        )
+        and all(sliced(name, value) for name, value in kwargs.items())
     )
+
+
+def _plain(value: object) -> bool:
+    """None, a number, a string, or a list, tuple or dict of them."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_plain(item) for item in value)
+    if isinstance(value, dict):
+        return all(_plain(item) for item in value.values())
+    return False
 
 
 class _RowByRow(TorchFunctionMode):
@@ -1809,7 +2179,7 @@ _VERIFY: contextvars.ContextVar[_Verify | None] = contextvars.ContextVar(
     "cozy_lm_verify", default=None
 )
 #: The Transformers kernel slots a verify pass replaces, and the one-token slots it steps through.
-_MANY = ("causal_conv1d_fn", "torch_chunk_gated_delta_rule")
+_MANY = ("causal_conv1d_fn", _CHUNK_RULE)
 _ONE = ("causal_conv1d_update", "torch_recurrent_gated_delta_rule")
 
 
