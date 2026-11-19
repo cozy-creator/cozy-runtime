@@ -1,0 +1,1 @@
+An attempt's outcome carries, by the exception's type, whether its failure was the collective layer's own (torch's `DistBackendError`), and an interrupted group's GPU ends its call on that fact, not on its message starting with the type's name (xs-220, hack audit runtime #11).

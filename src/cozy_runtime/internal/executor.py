@@ -1924,11 +1924,7 @@ class Executor:
     def _ended(outcome: Outcome, interrupted: bool) -> Outcome:
         """An aborted collective after the group's interrupt is that GPU's call ending, not
         its device failing (`spmd`)."""
-        if (
-            interrupted
-            and outcome.code == DEVICE_FAULT
-            and outcome.message.startswith("DistBackendError")
-        ):
+        if interrupted and outcome.collective:
             return Outcome("failed", "runtime", ENDED, outcome.message)
         return outcome
 
