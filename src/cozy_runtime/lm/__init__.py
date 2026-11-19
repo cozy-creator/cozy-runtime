@@ -107,6 +107,8 @@ if TYPE_CHECKING:
     from transformers import PreTrainedConfig, PreTrainedModel
     from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
 
+    from tensorfs.varena._facts import Room
+
     from cozy_runtime.author._model import Residency, WarningRow
     from cozy_runtime.graphs.domain import Domain
     from cozy_runtime.internal.residency import Binding, Region
@@ -1961,8 +1963,9 @@ class _Engine:
         self.leased: frozenset[int] = frozenset()
         #: the rung the last step ran on (`_Request.rungs`)
         self.rung = ""
-        #: a key judged eager -> the room it was judged in: judged again once the room grew
-        self.judged: dict[_Key, int] = {}
+        #: a key judged eager -> the room it was judged in and what it lacked: judged again once
+        #: the room covers that
+        self.judged: dict[_Key, tuple[int, int]] = {}
         #: heads whose blocks did not fit at home beside the model's
         self.unfit: set[int] = set()
         #: a drafted step could not be captured: drafting pays only replayed, so steps go plain
@@ -2242,7 +2245,8 @@ class _Engine:
         self.where = (*identities, built)
         if self.judged and self.domain is not None:
             room = self._room()
-            for key in [key for key, then in self.judged.items() if room > then]:
+            grown = [key for key, (then, short) in self.judged.items() if room >= then + short]
+            for key in grown:
                 del self.judged[key]
                 self.unrecorded.pop(key, None)
                 self.undrafted = self.undrafted and not key[2]
@@ -2255,8 +2259,9 @@ class _Engine:
 
     def _lease(self, drafted: bool) -> str:
         """The weights a graph of the step reads (`_read`) and the graphs' pool, held for its
-        capture and replays until an eager step or a prefill (`_unlease`): "" once held, else
-        varena's refusal of them, before anything of the step ran."""
+        capture and replays until an eager step or a prefill (`_unlease`): "" once held, else why
+        not: a refusal of them (room, or a binding whose storage changed), before anything of
+        the step ran. Anything else ends the lease and is raised."""
         reads = frozenset(id(m) for m in self._read(drafted))
         if self.lease is not None and reads <= self.leased:
             return ""
@@ -2268,10 +2273,13 @@ class _Engine:
                     lease.enter_context(binding.prepare())
             self.lease, self.leased = lease, reads
             self._pool(True)
-        except Exhausted as exc:
+        except BaseException as exc:
             if self.lease is None:
                 lease.close()
             self._unlease()
+            if not (_short_of_room(exc) or getattr(exc, "code", None) == "STALE_BINDING"):
+                raise
+            _unwind(exc)
             return no_room(_set(self.domain).device, "its graph's weights and pool", 0, exc)
         return ""
 
@@ -3282,29 +3290,36 @@ class _Engine:
         self.eager += 1
         self.rung = f"eager ({why})" if why else "eager"
 
-    def _eager_key(self, key: _Key, why: str) -> None:
-        """`key`'s graph does not fit (`_Judge`), or varena refused its lease: it decodes eagerly,
-        said in the record with the numbers, and is judged again once the card has more room."""
-        self.judged[key] = self._room()
+    def _eager_key(self, key: _Key, why: str, short: int = 1) -> None:
+        """`key`'s graph does not fit (`_Judge`: by `short` bytes), or varena refused its lease:
+        it decodes eagerly, said in the record with the numbers, and is judged again once the card
+        has that much more room, measured with nothing of the decode leased."""
+        self._unlease()
+        self.judged[key] = (self._room(), max(short, 1))
         self._unrecorded(key, why, None)
 
     def _record(
         self, key: _Key, size: int, drafted: bool, placed: tuple[Residency, str] | None
     ) -> None:
-        """`key`'s graph, judged before it is captured (`_Judge`): its weights leased and its
-        step captured, then checked against this token's eager step, which serves. A graph that
-        does not fit leaves the key eager."""
+        """`key`'s graph, judged before it is captured (`_Judge`): its weights leased, then judged
+        with what the lease pinned, and its step captured, then checked against this token's
+        eager step, which serves. A graph that does not fit leaves the key eager. A capture that
+        fails otherwise is the recording's, never the call's (as a component's graph): the key
+        decodes eagerly, and the record says why."""
         from cozy_runtime.internal.execution import rungs  # with Torch
 
         domain = _set(self.domain)
         self._unlease()
+        before = vt.room(domain.device)
+        if why := self._lease(drafted):
+            self._eager_key(key, why)
+            return self._eager(size, why)
         pool_key = self._pool_key(key)
         reserve = max(vt.pool_bytes(self.peaks[key]), rungs.pool(pool_key) if pool_key else 0)
-        judge = _Judge(
-            self, drafted, self.peaks[key], self._check_bytes(size, drafted, None), pool_key
-        )
-        if (why := judge(reserve)) or (why := self._lease(drafted)):
-            self._eager_key(key, why)
+        check = self._check_bytes(size, drafted, None)
+        judge = _Judge(self, before, self.peaks[key], check, pool_key)
+        if why := judge(reserve):
+            self._eager_key(key, why, judge.short)
             return self._eager(size, why)
         capturing = time.perf_counter()
         # Its ops and kernels, set beside the step as written's when its check differs, and
@@ -3337,6 +3352,18 @@ class _Engine:
                         )
                 except (_OverCard, Exhausted) as no:  # its pool, judged or prepared, has no room
                     why, judged = str(no), True
+                except Exception as exc:  # the recording's, never the call's
+                    if isinstance(exc, (Cancelled, Yielded)) or fault(exc) in (
+                        Fault.STICKY,
+                        Fault.DEVICE,
+                    ):
+                        raise
+                    _unwind(exc)
+                    if is_capacity(exc) or isinstance(exc, DoesNotFit):
+                        _answered(exc)
+                    why = f"its capture failed: {type(exc).__name__}: {exc}".splitlines()[0][:300]
+                    self._unrecorded(key, why)  # a safeguard: said once, counted in the record
+                    why = ""
                 if graph is not None and pool.prepared > reserve:
                     self.regrown.append((reserve, pool.prepared))
         except Building:  # eager until a kernel lands
@@ -3367,7 +3394,7 @@ class _Engine:
             if why := judge(_set(self.pool).mapped):
                 self._discard(key, graph, torch.cuda.current_stream(domain.device))
                 writes.clear()
-                self._eager_key(key, why)
+                self._eager_key(key, why, judge.short)
                 return self._eager(size, why)
             try:
                 self._verify(key, graph, size, ops, launch, writes)
@@ -3376,10 +3403,10 @@ class _Engine:
             self.rung = "graph, captured and checked"
             return None
         if judged:
-            self._eager_key(key, why)
+            self._eager_key(key, why, judge.short)
         elif why and self.building != LANDED[0]:
             self._unrecorded(key, why)
-        return self._eager(size, why)
+        return self._eager(size, why or self.unrecorded.get(key, ""))
 
     def _pool_key(self, key: _Key) -> str:
         """Where this machine keeps the pool `key`'s graph measured (`execution.rungs`): the
@@ -4019,31 +4046,29 @@ class _Before:
 
 class _Judge:
     """A key's graph rung (cr-305's rule, the one diffusion's graphs take through `capture`'s
-    `fits`): the weights its step reads, leased for its replays, its pool, what is live, one more
-    eager step (its check's, beside the pool: the key's first step, measured) and the copies its
-    check holds (`_check_bytes`), against the card less what else is pinned. "" when they fit,
-    else why, with the numbers; a pool found too large is remembered for the machine
-    (`execution.rungs`), so the next process judges by it. The room is read once, before the
-    lease, as the capture's own judge reads it."""
+    `fits`): the weights its step reads, as its lease pinned them, its pool, what is live, one
+    more eager step (its check's, beside the pool: the key's first step, measured) and the copies
+    its check holds (`_check_bytes`), against the card less what else was pinned before the lease,
+    what is live read then too (a pool the lease maps is the pool's). "" when they fit, else why,
+    with the numbers; a pool found too large is remembered for the machine (`execution.rungs`), so
+    the next process judges by it."""
 
-    def __init__(
-        self, engine: _Engine, drafted: bool, step: int, check: int, pool_key: str
-    ) -> None:
-        room = vt.room(_set(engine.domain).device)
-        self.weights = sum(
-            block.least_bytes
-            for module in engine._read(drafted)
-            if (binding := engine.addresses.get(id(module))) is not None
-            for block in binding.groups
-        )
-        self.card = room["capacity"] - room["pinned"]
-        self.live, self.step, self.check, self.key = room["working_live"], step, check, pool_key
+    def __init__(self, engine: _Engine, before: Room, step: int, check: int, pool_key: str) -> None:
+        pinned = vt.room(_set(engine.domain).device)["pinned"]
+        #: what the step's lease pinned: the weights its graph reads, as the card holds them
+        self.weights = max(pinned - before["pinned"], 0)
+        self.card = before["capacity"] - before["pinned"]
+        self.live, self.step, self.check, self.key = before["working_live"], step, check, pool_key
+        #: by how much the last pool judged didn't fit
+        self.short = 0
 
     def __call__(self, pool: int) -> str:
         from cozy_runtime.internal.execution import rungs  # with Torch
 
-        if self.weights + pool + self.live + self.step + self.check <= self.card:
+        need = self.weights + pool + self.live + self.step + self.check
+        if need <= self.card:
             return ""
+        self.short = need - self.card
         if self.key and pool > rungs.pool(self.key):
             rungs.put(self.key, pool)
         return (
