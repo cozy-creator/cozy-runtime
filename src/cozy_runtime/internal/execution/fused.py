@@ -9,12 +9,11 @@ Norms, and the scale and shift a block applies after one:
 A module the row cut takes for a norm (`cuts.norm_like`) that states a float `eps` and holds at
 most one vector (its weight) may be such a norm (`_norm`). Its first call runs its
 own forward and the block's ops as written, which serve that call; the kernel's rows of a piece of
-the same input, scale and shift are compared with them on the card, with no wait, under each law
-its weight may follow (as given, or zero-centred: `* (1 + weight)`), and the kernel serves from
-the first call after the comparison lands, under the law where every value compared was within
+the same input, scale and shift are compared with them on the card, with no wait, and the kernel
+serves from the first call after the comparison lands where every value compared was within
 rounding's allowance (`fused_rows.bound`). A norm whose forward is one kernel already (it makes no
-temporary the size of its output), or whose rows are no law's, is left as written, for good, with
-one line.
+temporary the size of its output), or whose rows are another law's, is left as written, for good,
+with one line.
 
 A verdict is its law's, not its instance's: the class's code (its file's digest) and configuration,
 the rows' dtype and width, the card and the Runtime build (`_key`). It is kept in the machine's
@@ -28,9 +27,7 @@ computes them: one kernel reads `x` and writes the result. Anything else that re
 (a projection, a shape other than a scale's) computes them as they stand, the norm alone or with
 its scale, and runs as written on the result. On its proving call a norm's rows hold the eager
 values, so a reader that bypasses torch still reads the right ones; such a reader never computes
-them, and a norm whose proving rows are gone uncomputed is left as written at its next call. A
-norm whose block joined no scale to its proving call's rows returns its kernel's rows computed
-from then on: deferred, they would only cost each of its readers `Rows`' dispatch.
+them, and a norm whose proving rows are gone uncomputed is left as written at its next call.
 
 Rotations: a function an attention processor calls on its queries and keys with one `(cos, sin)`
 pair of fp32 tables (`cuts.rows` hands each call here). Its first call of each shape runs as
@@ -290,8 +287,7 @@ class _Made(TorchDispatchMode):
 @dataclass(slots=True)
 class _Waiting:
     """A norm's comparison on the card: done once `event` is; `host` then holds its share of
-    rounding's allowance under each of its site's `laws`, in order. `ms` the call's time launching
-    it, `values` the values compared."""
+    rounding's allowance. `ms` the call's time launching it, `values` the values compared."""
 
     event: torch.cuda.Event
     host: Tensor
@@ -417,12 +413,6 @@ class _Site:
     waiting: _Waiting | None = None
     #: its first call served by a verdict found before: no comparison
     recall: bool = False
-    #: its weight is zero-centred (`fused_rows.law`'s `centred`), as its comparison found
-    centred: bool = False
-    #: its block joined a scale to its rows on the proving call: later calls return them not yet
-    #: computed (`Rows`) for the block's ops to join; else computed at once, so its readers (an
-    #: LM's projections, a token a call) never pay `Rows`' dispatch
-    joined: bool = False
 
     def weight(self) -> Tensor | None:
         return None if self.weight_name is None else getattr(self.module, self.weight_name)
@@ -461,8 +451,7 @@ class _Site:
         if self.waiting is not None and not self.landed():
             return self.inner(x)  # its comparison is still on the card: as written until it lands
         if self.proven:
-            pending = _Pending(self, launch, x)
-            return _rows(pending) if self.joined else self.rows(pending)
+            return _rows(_Pending(self, launch, x))
         if vars(self.module).get(_SITE) is not self:
             return self.inner(x)  # its comparison just landed outside the law: left as written
         if self.asked is not None and self.asked() is None:
@@ -483,7 +472,7 @@ class _Site:
             whole = self.inner(x)
             if type(whole) is not Tensor or whole.shape != x.shape or whole.dtype != x.dtype:
                 return whole
-            self.recall, self.centred = True, recalled.get("centred") is True
+            self.recall = True
             made = _rows(_Pending(self, launch, x, eager=whole))
             self.asked = weakref.ref(made)
             return made
@@ -520,12 +509,11 @@ class _Site:
 
     def rows(self, pending: _Pending) -> Tensor:
         """The rows `pending` stands for. On the proving call, the eager ones, the kernel's
-        compared with them; whether its block joined a scale to them there says whether later
-        calls defer their rows (`joined`)."""
+        compared with them."""
         x, scale, shift = pending.x, pending.scale, pending.shift
         if pending.eager is not None:
             if not self.proven and not self.left and self.waiting is None:
-                self.asked, self.joined = None, scale is not None
+                self.asked = None
                 if self.recall:
                     self.proven = True
                     _checked("norm", _name(self.module), 0.0, 0.0, 0, recalled=True)
@@ -535,28 +523,19 @@ class _Site:
         if not self.left:
             try:
                 tables = _tables(x, scale, shift)
-                weight, centred = self.weight(), self.centred
-                return fused_rows.launched(
-                    pending.launch, x, self.eps, weight, *tables, centred=centred
-                )
+                return fused_rows.launched(pending.launch, x, self.eps, self.weight(), *tables)
             except Exception as exc:
                 self.leave(_failed(exc))
         out = cast("Tensor", self.inner(x))
         out = out if scale is None else out * scale
         return out if shift is None else out + shift
 
-    def laws(self) -> tuple[bool, ...]:
-        """The laws its rows may follow, each `fused_rows.law`'s `centred`: a weight as given, or
-        zero-centred (`* (1 + weight)`); without a weight, the one."""
-        return (False,) if self.weight_name is None else (False, True)
-
     def compare(self, pending: _Pending, want: Tensor) -> None:
         """Prove the kernel on this call: its rows of the middle of `pending.x`, a piece small
-        enough to run unasked, within rounding's allowance of `want`'s under one of its `laws`.
-        `want` came from the input as it was when the norm was called, so an input changed since
-        fails here too. The comparison runs on the card and nothing waits for it: its share of
-        each law's allowance is copied back behind it, and the norm's next call (or the run's end)
-        takes it (`landed`)."""
+        enough to run unasked, within rounding's allowance of `want`'s. `want` came from the
+        input as it was when the norm was called, so an input changed since fails here too. The
+        comparison runs on the card and nothing waits for it: its share of the allowance is
+        copied back behind it, and the norm's next call (or the run's end) takes it (`landed`)."""
         began = time.perf_counter()
         x, width = pending.x, int(pending.x.shape[-1])
         key = self.key(x)
@@ -568,20 +547,13 @@ class _Site:
         count = _piece(rows, width, x.element_size())
         at = (rows - count) // 2
         try:
-            piece, weight = x.view(rows, width)[at : at + count], self.weight()
-            expected = want.reshape(rows, width)[at : at + count]
+            piece = x.view(rows, width)[at : at + count]
             tables = _tables(x, pending.scale, pending.shift)
+            got = fused_rows.launched(pending.launch, piece, self.eps, self.weight(), *tables, at)
             scale, shift = (t if t is None else fused_rows.rows_of(*t, at, count) for t in tables)
-            shares: list[Tensor] = []
-            for centred in self.laws():  # one after another: one law's temporaries at a time
-                got = fused_rows.launched(
-                    pending.launch, piece, self.eps, weight, *tables, at, centred=centred
-                )
-                allowed = fused_rows.bound(piece, self.eps, weight, scale, shift, centred=centred)
-                shares.append(fused_rows.share(got, expected, allowed))
-                del got, allowed
-            share = torch.stack(shares)
-            host = torch.empty(share.shape, dtype=torch.float32, pin_memory=True)
+            allowed = fused_rows.bound(piece, self.eps, self.weight(), scale, shift)
+            share = fused_rows.share(got, want.reshape(rows, width)[at : at + count], allowed)
+            host = torch.empty((), dtype=torch.float32, pin_memory=True)
             host.copy_(share, non_blocking=True)
             event = torch.cuda.Event()
             event.record()
@@ -601,17 +573,14 @@ class _Site:
             return False
         self.waiting = None
         _WAITING.discard(self)
-        shares = [float(v) for v in waiting.host.tolist()]
-        found = next((i for i, off in enumerate(shares) if off <= 1), None)
-        if found is not None:
-            off, self.centred, self.proven = shares[found], self.laws()[found], True
+        off = float(waiting.host)
+        if off <= 1:
+            self.proven = True
             _checked("norm", _name(self.module), waiting.ms, off, waiting.values)
-            _remember(waiting.key, {"why": "", "centred": self.centred}, off)
-            law = " of (1 + weight)" if self.centred else ""
-            _say(f"{_name(self.module)}: one kernel a call{law}, each proven on its first call")
+            _remember(waiting.key, {"why": ""}, off)
+            _say(f"{_name(self.module)}: one kernel a call, each proven on its first call")
         else:
-            lie = f"{shares[0]:.3g}" + "".join(f" (zero-centred {v:.3g})" for v in shares[1:])
-            why = f"its rows lie {lie} times rounding's allowance from the kernel's"
+            why = f"its rows lie {off:.3g} times rounding's allowance from the kernel's"
             self.left_checked(waiting.ms, why, waiting.values, waiting.key)
         return True
 

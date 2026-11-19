@@ -1,12 +1,10 @@
 """Rows a model's blocks compute value by value, each in one pass (`execution.fused` says whose):
 
-    norm:     out = rms(x) [* weight | * (1 + weight)] [* scale] [+ shift]
+    norm:     out = rms(x) [* weight] [* scale] [+ shift]
     rotation: out = x * cos + turn(x) * sin
 
 The norm is over `[..., width]` rows in bf16 or fp16, `rms(x) = x * rsqrt(mean(x^2) + eps)` in
-float32, each step rounded to the rows' dtype where torch rounds it (`law`). A zero-centred weight
-(`centred`: `rms(x) * (1 + weight)`, Gemma's and Qwen3.5's) is applied in float32 and rounded
-once with it, as its authors write it. Eager, that is an
+float32, each step rounded to the rows' dtype where torch rounds it (`law`). Eager, that is an
 fp32 upcast, its square, a mean, an fp32 product and a downcast, then a pass for each of the scale
 and the shift: about 30 bytes moved a value for the norm alone, 4 here. `scale` and `shift` are
 tables in the rows' dtype that broadcast over `x`'s leading axes (`table`): one row for every
@@ -106,13 +104,11 @@ if not TRITON_ABSENT:
         shift_stride,
         eps,
         WEIGHT: tl.constexpr,
-        CENTRED: tl.constexpr,
         MODULATE: tl.constexpr,
         ROUND: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        # One row a program, in BLOCK-wide tiles: its squares, then its writes. CENTRED: the
-        # weight is (1 + weight), applied in fp32 before the one rounding. MODULATE 1: the
+        # One row a program, in BLOCK-wide tiles: its squares, then its writes. MODULATE 1: the
         # scale; 2: the scale and the shift. Row r of the launch is row `first + r` of the call,
         # and reads table entry `(row // per) % count`, `stride` elements from the one before.
         row = tl.program_id(0).to(tl.int64)
@@ -131,14 +127,10 @@ if not TRITON_ABSENT:
             at = tile * BLOCK + cols
             mask = at < n_cols
             x = tl.load(x_ptr + base + at, mask=mask, other=0.0).to(tl.float32)
-            out = x * inv
+            out = _round(x * inv, ROUND)
             if WEIGHT:
                 weight = tl.load(weight_ptr + at, mask=mask, other=0.0).to(tl.float32)
-                if CENTRED:
-                    out = out * (1.0 + weight)
-                else:
-                    out = _round(out, ROUND) * weight
-            out = _round(out, ROUND)
+                out = _round(out * weight, ROUND)
             if MODULATE > 0:
                 scale = tl.load(scale_ptr + scale_row + at, mask=mask, other=0.0).to(tl.float32)
                 out = _round(out * scale, ROUND)
@@ -197,8 +189,8 @@ def _entries() -> tuple[TritonEntry, ...]:
         return ()
     found: list[TritonEntry] = []
     pointers = ("x_ptr", "out_ptr", "weight_ptr", "scale_ptr", "shift_ptr")
-    for (pointer, rounding), (weight, centred), modulate in itertools.product(
-        _DTYPES.values(), ((0, 0), (1, 0), (1, 1)), (0, 1, 2)
+    for (pointer, rounding), weight, modulate in itertools.product(
+        _DTYPES.values(), (0, 1), (0, 1, 2)
     ):
         sizes = {"n_cols": "i32", "n_tiles": "i32", "eps": "fp32"}
         types = {**dict.fromkeys(pointers, pointer), **sizes}
@@ -206,8 +198,7 @@ def _entries() -> tuple[TritonEntry, ...]:
             name: "constexpr" if name.isupper() else types.get(name, "i64")
             for name in norm_rows_kernel.arg_names
         }
-        constexprs = {"WEIGHT": weight, "CENTRED": centred, "MODULATE": modulate}
-        constexprs |= {"ROUND": rounding, "BLOCK": BLOCK}
+        constexprs = {"WEIGHT": weight, "MODULATE": modulate, "ROUND": rounding, "BLOCK": BLOCK}
         # The rows are addressed at `row * n_cols`: every launch's are 16-byte aligned (`takes`).
         found.append(
             TritonEntry(
@@ -299,12 +290,10 @@ def launched(
     scale: tuple[Tensor, Table] | None = None,
     shift: tuple[Tensor, Table] | None = None,
     first: int = 0,
-    *,
-    centred: bool = False,
 ) -> Tensor:
     """`law` of `x` (`takes(x)`) in one launch: a fresh tensor of `x`'s shape. `scale` and
     `shift` come with their `table` over the whole call's rows, of which `x` holds those from
-    `first`; a `shift` comes with a `scale`; `centred`, a weight's, as `law` says it."""
+    `first`; a `shift` comes with a `scale`."""
     width = int(x.shape[-1])
     rows = x.numel() // width
     out = torch.empty_like(x)
@@ -332,7 +321,6 @@ def launched(
         shift_stride,
         float(eps),
         int(weight is not None),
-        int(centred and weight is not None),
         (scale is not None) + (shift is not None),
         _DTYPES[x.dtype][1],
         BLOCK,
@@ -346,17 +334,11 @@ def law(
     weight: Tensor | None = None,
     scale: Tensor | None = None,
     shift: Tensor | None = None,
-    *,
-    centred: bool = False,
 ) -> Tensor:
     """The norm's rows in torch ops: what the kernel computes, step for step, but for the order
-    its mean sums in. `centred`: the weight is zero-centred, `* (1 + weight)` in float32 before the
-    norm's one rounding."""
+    its mean sums in."""
     wide = x.float()
-    out = wide * torch.rsqrt(wide.pow(2).mean(-1, keepdim=True) + eps)
-    if centred and weight is not None:
-        out, weight = out * (1 + weight.float()), None
-    out = out.to(x.dtype)
+    out = (wide * torch.rsqrt(wide.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype)
     for factor in (weight, scale):
         out = out if factor is None else out * factor
     return out if shift is None else out + shift
@@ -368,20 +350,15 @@ def bound(
     weight: Tensor | None = None,
     scale: Tensor | None = None,
     shift: Tensor | None = None,
-    *,
-    centred: bool = False,
 ) -> Tensor:
     """How far two computations of `law(x, ...)` may lie apart, a value at a time, from rounding
     alone. Each step that rounds to the rows' dtype moves its value by at most half a step there,
     at most half `finfo.eps` of its size, and a later factor carries that; two computations differ
     by twice that. The mean's sum, in either order over `width` positive squares, is within
-    `width` fp32 epsilons of the other's (rsqrt halves it), and that carries to the end too. A
-    `centred` weight is applied before the norm's rounding: one step for both."""
+    `width` fp32 epsilons of the other's (rsqrt halves it), and that carries to the end too."""
     info, single = torch.finfo(x.dtype), torch.finfo(torch.float32).eps
     value = x.float()
     value = value * torch.rsqrt(value.pow(2).mean(-1, keepdim=True) + eps)
-    if centred and weight is not None:
-        value, weight = value * (1 + weight.float()), None
     carried, rounded = value.abs(), 1
     for factor in (weight, scale):
         if factor is not None:
@@ -625,14 +602,13 @@ def probe(device: torch.device, launch: Launch) -> verify.Verdict:
 def _probe_norms(
     device: torch.device, launch: Launch, generator: torch.Generator
 ) -> tuple[float, int] | verify.Verdict:
-    """Norms: both dtypes; a row of one tile, of several and of a ragged last one; without a
-    weight, with one and with a zero-centred one; no table, a scale, and a scale and a shift, as
-    one row, one a batch, one a token from a wider table's slices, and one a token shared by the
-    batch; rows from `first` on. The worst share of rounding's allowance and the cases, or the
-    first failure."""
+    """Norms: both dtypes; a row of one tile, of several and of a ragged last one; with and
+    without a weight; no table, a scale, and a scale and a shift, as one row, one a batch, one a
+    token from a wider table's slices, and one a token shared by the batch; rows from `first` on.
+    The worst share of rounding's allowance and the cases, or the first failure."""
     worst, cases = 0.0, 0
-    for dtype, width, (weighted, centred) in itertools.product(
-        _DTYPES, (BLOCK, 4 * BLOCK, 2 * BLOCK + 48), ((False, False), (True, False), (True, True))
+    for dtype, width, weighted in itertools.product(
+        _DTYPES, (BLOCK, 4 * BLOCK, 2 * BLOCK + 48), (False, True)
     ):
         batch, tokens = 3, 37
         make = partial(_case, generator, dtype, device=device)
@@ -655,14 +631,12 @@ def _probe_norms(
                     return verify.Verdict(False, f"a {shape} table over {tuple(x.shape)}")
                 pairs.append(None if value is None or read_as is None else (value, read_as))
             rows = x.view(-1, width)[first:]
-            got = launched(launch, rows, 1e-6, weight, pairs[0], pairs[1], first, centred=centred)
-            want = law(x, 1e-6, weight, scale, shift, centred=centred).view(-1, width)[first:]
-            allowed = bound(x, 1e-6, weight, scale, shift, centred=centred)
-            off = within(got, want, allowed.view(-1, width)[first:])
+            got = launched(launch, rows, 1e-6, weight, pairs[0], pairs[1], first)
+            want = law(x, 1e-6, weight, scale, shift).view(-1, width)[first:]
+            off = within(got, want, bound(x, 1e-6, weight, scale, shift).view(-1, width)[first:])
             worst, cases = max(worst, off), cases + 1
             if not off <= 1:
-                weighed = "centred" if centred else str(weighted)
-                case = f"norm {dtype} width {width} weight {weighed} first {first}"
+                case = f"norm {dtype} width {width} weight {weighted} first {first}"
                 return verify.Verdict(False, f"{case}: {off:.3g} of rounding's allowance")
     return worst, cases
 
