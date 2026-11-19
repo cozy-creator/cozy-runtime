@@ -949,7 +949,9 @@ def _degree(
 ) -> object:
     """A sharded stage at its key's degree (`degrees.choose`, GPU 0's word for every GPU): the
     group's, or one GPU, where every GPU runs it unsharded on its own (the same inputs, the same
-    program: nothing crosses). GPU 0 measures a degree its key has no time for and records it."""
+    program: nothing crosses). One GPU only where the stage's unsharded working memory fits beside
+    its weights on every GPU (`_fits`), else the group's. GPU 0 measures a degree its key has no
+    time for and records it, with every GPU's working peak."""
     import torch
 
     from cozy_runtime.internal.parallel import cp, degrees
@@ -957,11 +959,18 @@ def _degree(
     card = torch.cuda.get_device_name(ranks.device) if torch.cuda.is_available() else "cpu"
     shape = _shape((args, kwargs))
     key = degrees.Key(ranks.call[0], ranks.call[1], stage, shape, card, ranks.world, _runtime())
-    chosen = degrees.choose(key) if ranks.rank == 0 else 0
-    degree = int(cast("int", ranks.told({"degree": chosen}, f"degree {stage}")["degree"]))
-    measure = ranks.rank == 0 and degree not in degrees.known(key) and torch.cuda.is_available()
+    told: dict[str, object] = {}
+    if ranks.rank == 0:
+        chosen = degrees.choose(key)
+        measuring = torch.cuda.is_available() and chosen not in degrees.known(key)
+        told = {"degree": chosen, "measure": measuring}
+    told = dict(ranks.told(cast("dict[str, Json]", told), f"degree {stage}"))
+    degree, measure = int(cast("int", told["degree"])), bool(told["measure"])
     what = f"stage {stage.rpartition('.')[2]}"
-    with _STEPS.measuring(measure):
+    if degree == 1 < ranks.world and not ranks.all(_fits(stages, key), f"degree 1 fits {stage}"):
+        degree, measure = ranks.world, False
+        _row(what)["refused_degree_1"] = 1.0
+    with _STEPS.measuring(measure and ranks.rank == 0):
         if degree == 1:
             roots = [stages.roots[name] for name in sorted(stages.sharded)]
             alone = _alone(ranks, stages, 0, what, served=False)
@@ -973,13 +982,50 @@ def _degree(
                     _ALONE.unsharded = False
         else:
             result = run()
-    steady = _STEPS.steady_ms() if measure else None
-    if steady is not None:
+    steady = _STEPS.steady_ms() if measure and ranks.rank == 0 else None
+    if measure:
         from cozy_runtime.internal import attention_ulysses
 
-        degrees.record(key, degree, {"steady_ms": steady, "kernels": attention_ulysses.served()})
+        rows = ranks.meet({"peak": _peak()}, f"peak {stage}")
+        peak = max(int(cast("int", row["peak"])) for row in rows)
+        if steady is not None:
+            row = {"steady_ms": steady, "peak_bytes": peak, "kernels": attention_ulysses.served()}
+            degrees.record(key, degree, row)
     row = _row(what)
     row["degree"] = float(degree)
     if steady is not None:
         row["steady_ms"] = steady
     return result
+
+
+def _peak() -> int:
+    """This GPU's working high-water in the request so far (`accel.allocator_peak`): at least the
+    stage's, so a degree-1 need taken from it errs large."""
+    from cozy_runtime.internal import accel
+    from cozy_runtime.internal.execution import catch
+
+    request = catch.CURRENT.get()
+    return accel.allocator_peak(request.memory, request.id) if request is not None else 0
+
+
+def _fits(stages: Stages, key: object) -> bool:
+    """Whether a stage of `key` fits unsharded on this GPU: its sharded components' weights and
+    the group's degree times the working peak a GPU took at that degree (attention and activations
+    scale with a GPU's share of the sequence) within the card's capacity. Nothing measured: no."""
+    import tensorfs.varena.torch as vt
+    import torch
+
+    from cozy_runtime.internal.parallel import degrees
+
+    assert isinstance(key, degrees.Key)
+    row = degrees.known(key).get(key.world, {})
+    need = int(cast("int", row.get("peak_bytes", 0)))
+    if not need or not torch.cuda.is_available():
+        return False
+    weights = sum(
+        p.numel() * p.element_size()
+        for name in stages.sharded
+        for p in cast("torch.nn.Module", stages.roots[name]).parameters()
+    )
+    capacity = int(vt.room(torch.cuda.current_device())["capacity"])
+    return weights + key.world * need <= capacity
