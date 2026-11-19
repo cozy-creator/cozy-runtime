@@ -12,6 +12,7 @@ and notes.
 
 from __future__ import annotations
 
+import contextvars
 import functools
 import hashlib
 import time
@@ -471,6 +472,44 @@ class Backend:
         finally:
             binding.close()
 
+    def merge_ahead(self) -> list[dict[str, object]]:
+        """This construction's LoRAs merged ahead of any request (cl-1318; Paul, 11-19: "if you have to do a LoRA merge,
+        do it as soon as possible, prior to receiving a request"): each LoRA'd component's every block filled once, on
+        the GPU, under the fill its request will ask (its declared LoRAs, and an overlay's arming read off the loaded
+        models, `_Bakes.ahead`). Each merged page stays in the host tier and is written to the OS's temporary storage
+        (TensorFS `derived`), where a later load, in this process or another, reads it at the disk's bound. A call that
+        comes meanwhile waits for it, as for any `map`. What each merge did."""
+        merged: list[dict[str, object]] = []
+        torch = self.torch
+        group = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+        for name, bakes in self.bakes.items():
+            model = self.models.get(name)
+            if model is None or model.closed or bakes.gpu is None:
+                continue
+            arming = bakes.ahead()
+            if not arming and not bakes.merges():
+                continue
+            how = "eager" if group else lora_bake.served(torch, bakes.gpu)
+            try:
+                facts: dict[str, object] = contextvars.copy_context().run(self._merge, bakes, model, arming)
+            except Exception as exc:  # its request merges what this didn't, as before
+                facts = {"error": f"{type(exc).__name__}: {exc}"[:300]}
+            merged.append({"component": name, "how": how, "armed": len(arming), **facts})
+        return merged
+
+    def _merge(self, bakes: _Bakes, model: Model, arming: dict[LoRASource, Factors]) -> dict[str, object]:
+        """`model`'s merge, in a context of its own: its fill choice and arming are this thread's alone. The
+        overlay's factors are held for it whole, one read, as each block's bake reads them."""
+        bakes.choose("bake")
+        _AHEAD.set(arming)
+        overlays = {owned[0] for f in arming.values() if (owned := self._owner(f)) is not None}
+        with ExitStack() as held:
+            for overlay in overlays:
+                binding = overlay.retain(("",))
+                held.callback(binding.close)
+                held.enter_context(binding.prepare())
+            return self.memory.fill_each(model)
+
     def _route(self, key: str) -> str:
         return str(self.selected[key].provider.route)
 
@@ -851,6 +890,17 @@ class LoRASource(Protocol):
     def lora_factors(self) -> tuple[str, Tensor, Tensor, float] | None: ...
 
 
+class Factors(Protocol):
+    """One linear's factors in an overlay's own model (`cozy_runtime.accel.lora.Factors`)."""
+
+    def factors(self) -> tuple[Tensor, Tensor, float]: ...
+
+
+#: A merge ahead's arming (`Backend.merge_ahead`, cl-1318), on its own thread only: each overlay hook's factors as the
+#: forward that arms them would serve them. Every other hook adds nothing there, whatever another thread armed.
+_AHEAD: ContextVar[Mapping[LoRASource, Factors] | None] = ContextVar("cozy_lora_ahead", default=None)
+
+
 class KronLayer(Protocol):
     """A LoKr'd linear (`lora_composition._Kron`): each adapter's scale and rows of the product."""
 
@@ -914,8 +964,13 @@ class _Bakes:
         )
         self._last: tuple[lora_bake.Strategy, lora_bake.How | None] = ("per_step", None)
         self.baked = 0
+        #: host time binding factors another model holds (`Filling.factors_ns`)
+        self.factors_ns = 0
         #: block -> the package hooks its fill bakes (`overlay`)
         self._hooked: dict[str, tuple[LoRASource, ...]] = {}
+        #: each baked hook's linear, by its path under the root (`ahead`)
+        self.hooked_at: dict[LoRASource, str] = {}
+        self.memory, self.key, self.root = backend.memory, backend.key, root
         names = {row.key.partition(".")[2]: stored for stored, row in rows.items()}
         for local, stored in names.items():
             encoded = rows[stored].encoded
@@ -934,6 +989,7 @@ class _Bakes:
             hooks: list[object] = list(module._forward_hooks.values()) if module is not None else []
             if _unit(site, blocks):  # a block holds it: a lookup per prefix, not a scan of them
                 bake.hooks = [hook for hook in hooks if isinstance(hook, LoRASource)]
+                self.hooked_at.update((hook, site) for hook in bake.hooks)
             target = site.removesuffix(".base_layer")
             kron = cast("KronLayer | None", root.get_submodule(target) if target != site else None)
             if kron is not None and getattr(type(kron), "_cozy_kron", False):
@@ -1045,7 +1101,7 @@ class _Bakes:
         package that loaded them: a published package and its source installed locally bake the
         same bytes), path, dtypes and scale. Factors no loaded model holds have no name: a fresh
         object, equal to no other."""
-        got = hook.lora_factors()
+        got = self._factors(hook)
         if got is None:
             return None
         named = self.owner(got[0])
@@ -1053,6 +1109,45 @@ class _Bakes:
             return object()
         model, path = named
         return (model.content, path, str(got[1].dtype), str(got[2].dtype), repr(float(got[3])))
+
+    @staticmethod
+    def _factors(hook: LoRASource) -> tuple[object, Tensor, Tensor, float] | None:
+        """`hook.lora_factors()`, or under a merge ahead the factors its arming gives it (`_AHEAD`)."""
+        ahead = _AHEAD.get()
+        if ahead is None:
+            return hook.lora_factors()
+        factors = ahead.get(hook)
+        return None if factors is None else (factors, *factors.factors())
+
+    def ahead(self) -> dict[LoRASource, Factors]:
+        """What this component's overlay hooks would serve in the forward that arms them, read off the loaded models
+        (cl-1318), so their merge needs no request: the factors of the one other model of this construction whose
+        factor modules (`lora.Factors`) each sit at a path of this root, one of them at a baked hook's. Empty where
+        no model, or more than one, does (H3's two trunks' overlays beside both DiTs): its merge then waits for the
+        forward that arms it. A page is served only to a use wanting the overlay it was made under (`overlay`), so a
+        reading this got wrong costs its merge, never an output."""
+        if not self.hooked_at:
+            return {}
+        paths = set(self.hooked_at.values())
+        modules = {path for path, _ in self.root.named_modules()}
+        found: list[dict[str, Factors]] = []
+        for model in list(self.memory.models.values()):
+            if model.construction != self.key or model.closed or model.module is self.root:
+                continue
+            factors = {
+                path: cast(Factors, sub)
+                for path, sub in model.module.named_modules()
+                if path and callable(getattr(sub, "factors", None))
+            }
+            if factors and factors.keys() <= modules and factors.keys() & paths:
+                found.append(factors)
+        if len(found) != 1:
+            return {}
+        return {hook: found[0][path] for hook, path in self.hooked_at.items() if path in found[0]}
+
+    def merges(self) -> bool:
+        """Whether a fill of this component bakes without its forward: a LoRA its construction declared."""
+        return any(b.layer is not None or b.kron is not None for b in self.bakes.values())
 
     def _described(self, *, armed: bool) -> str | None:
         """`identity`, or with `armed` each hook's armed delta too: what seeds a bake's rounding."""
@@ -1141,11 +1236,13 @@ class _Bakes:
             # then asked for again, as the bound tensors.
             with ExitStack() as reading:
                 for hook in bake.hooks:
-                    named = hook.lora_factors()
+                    named = self._factors(hook)
                     if named is None:
                         continue
+                    bound = time.perf_counter_ns()
                     reading.enter_context(self.reading(named[0]))
-                    got = hook.lora_factors()
+                    self.factors_ns += time.perf_counter_ns() - bound
+                    got = self._factors(hook)
                     assert got is not None
                     downs.append(got[1])
                     ups.append(got[2] * got[3])
