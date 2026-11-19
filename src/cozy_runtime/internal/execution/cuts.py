@@ -660,12 +660,8 @@ def _norm(site: str, module: nn.Module, forward: Forward, widths: frozenset[int]
                 return forward(*args, **kwargs)
             began = time.perf_counter()
             _LOCAL[key], held = _probe(original, args, kwargs, axis, dims)
-            said = f"row-local along axis {axis}: cut" if _LOCAL[key] else "not row-local: whole"
-            print(
-                f"cozy-runtime: {type(module).__module__}.{type(module).__qualname__} {said} (its "
-                f"probe {(time.perf_counter() - began) * 1e3:.1f} ms, {held / (1 << 20):.2f} MiB)",
-                file=sys.stderr,
-            )
+            name = f"{type(module).__module__}.{type(module).__qualname__}"
+            _probed(site, name, axis, _LOCAL[key] is not None, began, held)
         local = _LOCAL[key]
         if local is None:
             return forward(*args, **kwargs)
