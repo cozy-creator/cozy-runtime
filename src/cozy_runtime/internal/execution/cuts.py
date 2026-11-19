@@ -91,10 +91,9 @@ def install(module: nn.Module) -> int:
             count += 1
         # A norm reduces each row alone: row pieces are the whole (v7 H3 13826 ran out in a DiT
         # block's 546 MiB rms_norm, a site with no cut), whoever wrote it (`_norm_like`).
-        widths = _norm_like(sub)
-        if widths and "forward" not in vars(sub) and "_cozy_cut" not in vars(sub):
+        if _norm_like(sub) and "forward" not in vars(sub) and "_cozy_cut" not in vars(sub):
             norm: nn.Module = sub
-            norm.forward = catch.transparent(_norm(f"{path}:rows", sub, _forward(sub), widths))
+            norm.forward = catch.transparent(_norm(f"{path}:rows", sub, _forward(sub)))
             vars(sub)["_cozy_cut"] = True
             count += 1
             continue
@@ -591,19 +590,38 @@ def _tokens(forward: Forward, x: Tensor, tokens: int, level: int, rank: bool = F
     return out.view(*x.shape[:-1], *out.shape[1:])
 
 
-def _norm_like(module: nn.Module) -> frozenset[int]:
-    """A leaf module whose own weights are all vectors, a norm's scale and shift whoever wrote it
-    (torch's, Diffusers', Transformers', a package's): their lengths, the widths of an input it may
-    be a norm over. Empty for anything else."""
-    forward = type(module).forward
-    if forward is nn.Module.forward or forward.__module__.startswith("cozy_runtime."):
-        return frozenset()
+def _vectors(module: nn.Module) -> frozenset[int]:
+    """The lengths of a leaf module's own weights where every one is a vector, a norm's scale and
+    shift whoever wrote it: the widths of an input it may be a norm over. Empty for anything else."""
     if next(module.children(), None) is not None:
         return frozenset()
     own = [*module.parameters(recurse=False), *module.buffers(recurse=False)]
     if not own or any(t.dim() != 1 for t in own):
         return frozenset()
     return frozenset(int(t.shape[0]) for t in own)
+
+
+def _norm_like(module: nn.Module) -> bool:
+    """A leaf module with a forward of its own (torch's, Diffusers', Transformers', a package's,
+    never the Runtime's) whose own weights are all vectors (`_vectors`)."""
+    forward = type(module).forward
+    if forward is nn.Module.forward or forward.__module__.startswith("cozy_runtime."):
+        return False
+    return bool(_vectors(module))
+
+
+def _form(args: Sequence[object], kwargs: dict[str, object]) -> tuple[object, ...] | None:
+    """A call's form, what its cut is decided from: each tensor's shape and dtype, each scalar and
+    the names given. None where an argument is anything else."""
+    form: list[object] = [*kwargs]
+    for value in (*args, *kwargs.values()):
+        if isinstance(value, Tensor):
+            form += (value.shape, value.dtype)
+        elif isinstance(value, _SCALARS):
+            form.append(value)
+        else:
+            return None
+    return tuple(form)
 
 
 def _norm_call(
@@ -633,13 +651,21 @@ def _norm_call(
     return axis, tuple(dims), (axis, x.dtype, x.dim(), tuple(kwargs), *form)
 
 
-def _norm(site: str, module: nn.Module, forward: Forward, widths: frozenset[int]) -> Forward:
-    """A norm-like module (`_norm_like`) in pieces of rows along its input's longest leading axis,
-    where its class's first call of that shape proved its forward row-local there (`_probe`, which
-    also measures what a row allocates). Whole without native memory, in training, under autograd or
-    compilation, and for any other call."""
+def _norm(site: str, module: nn.Module, forward: Forward) -> Forward:
+    """A norm-like module (a leaf whose own weights are vectors, `_vectors`) in pieces of rows along
+    its input's longest leading axis, where its class's first call of that shape proved its forward
+    row-local there (`_probe`, which also measures what a row allocates). Whole without native
+    memory, in training, under autograd or compilation, and for any other call. A call of the form
+    of the last that ran whole for its form (not a norm's call, not row-local, or too small for a
+    cut to be asked, `catch.cut`'s rule) runs whole at once: an LM's decode calls every norm of
+    every layer each token."""
+    widths = _vectors(module)
+    whole: list[object] = [None]
 
     def cut(*args: object, **kwargs: object) -> object:
+        form = _form(args, kwargs)
+        if form is not None and form == whole[0]:
+            return forward(*args, **kwargs)
         x = args[0] if args else None
         request = catch.CURRENT.get()
         if (
@@ -651,6 +677,7 @@ def _norm(site: str, module: nn.Module, forward: Forward, widths: frozenset[int]
             return forward(*args, **kwargs)
         found = _norm_call(widths, x, args, kwargs)
         if found is None:
+            whole[0] = form
             return forward(*args, **kwargs)
         axis, dims, shape = found
         key = (type(module), *shape)
@@ -664,6 +691,7 @@ def _norm(site: str, module: nn.Module, forward: Forward, widths: frozenset[int]
             _probed(site, name, axis, _LOCAL[key] is not None, began, held)
         local = _LOCAL[key]
         if local is None:
+            whole[0] = form
             return forward(*args, **kwargs)
         assert isinstance(x, Tensor)
         length, (out, made), size = int(x.shape[axis]), local, x.numel()
@@ -671,6 +699,9 @@ def _norm(site: str, module: nn.Module, forward: Forward, widths: frozenset[int]
             length,
             lambda n: sizing.peak(math.ceil(out * size), (math.ceil(made * size * n / length),)),
         )
+        if catch.small(need):
+            whole[0] = form
+            return forward(*args, **kwargs)
         run = functools.partial(_rowed, original, args, kwargs, axis, dims)
         return catch.cut(site, levels(length), need, run)
 
