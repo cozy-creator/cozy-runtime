@@ -629,9 +629,11 @@ def runtime_cache() -> Row:
 
 @case
 def host_cache() -> Row:
-    """cr-336 V2, the host half: what this GPU answers about reading registered host memory in
-    place (`host_addressing`), and where it says yes: a window committed, written on the host,
-    read by a kernel through the device's view and copied to the card, then released."""
+    """cr-336 V2, the host half: what this GPU answers about registered host memory
+    (`host_addressing`: `supported`, the tier exists; `in_place`, a kernel may read it at the host's
+    address), and where the tier exists: a window committed, written on the host and copied to the
+    card; where `in_place`, also read and written by a kernel through the device's view, and where
+    not, that view refused. Then released."""
     probe = varena.host_addressing(0)
     row: dict[str, JSON] = {"probe": cast("JSON", dict(probe))}
     if not probe["supported"]:
@@ -643,16 +645,26 @@ def host_cache() -> Row:
     if not cache.commit(window, window):
         return {**row, "host": "the host tier has no room for one window now"}
     host = cache.host(torch.int32, (window // 4,), byte_offset=window)
-    seen = cache.tensor(torch.int32, (window // 4,), byte_offset=window)
-    assert seen.is_cuda and seen.data_ptr() == host.data_ptr() == cache.base + window
     host.copy_(torch.arange(window // 4, dtype=torch.int32))
-    in_place = int(seen.sum(dtype=torch.int64))  # a kernel reading host memory through the device
     copied = torch.empty(window // 4, dtype=torch.int32, device="cuda").copy_(host)
     want = (window // 4) * (window // 4 - 1) // 2
-    assert in_place == int(copied.sum(dtype=torch.int64)) == want, (in_place, want)
-    seen[:8].fill_(-1)  # and writing it
-    torch.cuda.synchronize()
-    assert host[:9].tolist() == [-1] * 8 + [8], host[:9].tolist()
+    assert int(copied.sum(dtype=torch.int64)) == want
+    seen: torch.Tensor | None = None
+    if dict(probe).get("in_place", True):  # an older TensorFS: in place wherever supported
+        seen = cache.tensor(torch.int32, (window // 4,), byte_offset=window)
+        assert seen.is_cuda and seen.data_ptr() == host.data_ptr() == cache.base + window
+        in_place = int(seen.sum(dtype=torch.int64))  # a kernel reading host memory through the device
+        assert in_place == want, (in_place, want)
+        seen[:8].fill_(-1)  # and writing it
+        torch.cuda.synchronize()
+        assert host[:9].tolist() == [-1] * 8 + [8], host[:9].tolist()
+    else:
+        try:
+            cache.tensor(torch.int32, (window // 4,), byte_offset=window)
+        except ValueError:
+            row["device_view"] = "refused"
+        else:
+            raise AssertionError("a device view of host memory this GPU can't read in place")
     refused = 0
     try:
         cache.close()
@@ -664,6 +676,34 @@ def host_cache() -> Row:
     cache.close()
     assert refused == 1 and cache.stats()["mapped_bytes"] == 0
     return row
+
+
+@case
+def use_export() -> Row:
+    """A Region exported as typed tensors through varena's public API (`Region.tensor`, then
+    `Use.tensor` and `_ext._varena_public_use_dlpack`: the capsule helper V2 shares with the Cache,
+    and the path `vt.offload` takes): the bytes read back as filled, whole as bytes and at an offset
+    as int32, and a tensor outlives its Region and its Use."""
+    from tensorfs.varena import api
+
+    data = bytes(range(256)) * 4096
+    want = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+    gpu = api.open(0)
+    region = gpu.region(data)
+    stream = torch.cuda.Stream()
+    whole = region.tensor(dtype=torch.uint8, shape=(len(data),), stream=stream.cuda_stream)
+    words = region.tensor(dtype=torch.int32, shape=(1024,), byte_offset=4096, stream=stream.cuda_stream)
+    stream.synchronize()
+    assert whole.is_cuda and torch.equal(whole.cpu(), want)
+    assert torch.equal(words.cpu(), want[4096 : 4096 + 4096].view(torch.int32))
+    region.close()
+    with torch.cuda.stream(stream):
+        kept = bool(torch.equal(whole.cpu(), want))  # its storage holds its own pin
+    assert kept
+    del whole, words
+    gc.collect()
+    gpu.close()
+    return {"bytes": len(data), "outlives_region": kept}
 
 
 @case
