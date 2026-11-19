@@ -131,7 +131,7 @@ nb::list kinds(uintptr_t graph) {
     std::vector<std::string> found;
     kinds_of(reinterpret_cast<cudaGraph_t>(graph), found);
     nb::list out;
-    for (const std::string& name : found) out.append(name);
+    for (const std::string& name : found) out.append(nb::str(name.c_str()));  // no stl caster is included
     return out;
 }
 
