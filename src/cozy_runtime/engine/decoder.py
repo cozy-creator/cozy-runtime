@@ -222,6 +222,9 @@ class Decoder:
         #: identity the graphs above were recorded against
         self.binding: object | None = None
         self.recorded: object | None = None
+        #: the kernels serving when they were recorded (`kernel_ready.epoch`): a set landing since, or one a
+        #: capture waited on (`Building`), records them again, as `lm`'s engine does
+        self.epoch = -1
         #: steps run by the launcher's WHILE node, else replayed by the host `SEGMENT` at a time
         self.launcher = launcher and not NO_ENGINE
         self.ring = _Ring(LAUNCH_STEPS + 2 * SEGMENT, self.rows.report.nbytes) if self.launcher else None
@@ -246,6 +249,7 @@ class Decoder:
             try:
                 try:
                     call.enter_context(self._leased())
+                    self._kernels_landed()
                     for row, prompt in enumerate(request.prompts):
                         self._admit(row, len(prompt), request, drafted)
                         admitted.append(row)
@@ -417,6 +421,18 @@ class Decoder:
                 self.segments.clear()
             self.recorded = binding.identity
             yield
+
+    def _kernels_landed(self) -> None:
+        """Every bucket's graph and launcher recorded again where the kernels serving changed since they
+        were: a graph holds the kernels of its recording, and a step whose capture a kernel still
+        building refused (`Building`) would otherwise run eagerly for the process's life."""
+        from cozy_runtime.internal import kernel_ready
+
+        epoch = kernel_ready.epoch()
+        if epoch != self.epoch:
+            self.steps.clear()
+            self.segments.clear()
+            self.epoch = epoch
 
     # ------------------------------------------------------------------ decode
 
