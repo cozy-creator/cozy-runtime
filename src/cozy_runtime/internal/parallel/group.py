@@ -351,11 +351,15 @@ class Board:
     file takes a lock and a read a call and its poll backs off well past a late GPU's arrival.
     Each GPU has two slots, by the meeting's parity: it writes meeting n+1 only once it has read
     every GPU's meeting n, so no GPU still reads the slot it overwrites. A word is its meeting's
-    number, its length and its CRC-32, then its bytes; a reader takes one whose number and CRC
-    match, so a word read while it is written is read again. One host's GPUs only (`LOOPBACK`)."""
+    number, its length and a CRC-32 over both and its bytes, then its bytes; the writer stores the
+    number last, and a reader takes only a non-empty word whose number and CRC match, so a slot
+    read while it is written (a fresh slot's zeros under a new number among them) is read again.
+    One host's GPUs only (`LOOPBACK`)."""
 
     SLOT = mmap.PAGESIZE
     _HEAD = struct.Struct("<QII")
+    _NUMBER = struct.Struct("<Q")
+    _TAIL = struct.Struct("<II")
     #: the bytes a word may hold
     ROOM = SLOT - _HEAD.size
 
@@ -407,22 +411,26 @@ class Board:
         at = ((n % 2) * self.world + rank) * self.SLOT
         return self.view[at : at + self.SLOT]
 
+    def _crc(self, n: int, word: bytes) -> int:
+        return zlib.crc32(word, zlib.crc32(self._NUMBER.pack(n) + len(word).to_bytes(4, "little")))
+
     def _read(self, rank: int, n: int) -> bytes | None:
         slot = self._slot(rank, n)
         number, length, crc = self._HEAD.unpack_from(slot)
-        if number != n or length > self.ROOM:
+        if number != n or not 0 < length <= self.ROOM:
             return None
         word = bytes(slot[self._HEAD.size : self._HEAD.size + length])
-        return word if zlib.crc32(word) == crc else None
+        return word if self._crc(n, word) == crc else None
 
     def meet(self, n: int, word: bytes, what: str) -> list[bytes]:
         """Every GPU's word at meeting `n` (numbered from 1, one after another on every GPU). A
         wait ends as a store meeting's does when the formation ends (`abort_process_group`)."""
-        if len(word) > self.ROOM:
-            raise ValueError(f"{what}: a {len(word)} B word exceeds the board's {self.ROOM} B")
+        if not 0 < len(word) <= self.ROOM:
+            raise ValueError(f"{what}: a {len(word)} B word; the board holds 1 to {self.ROOM} B")
         slot = self._slot(self.rank, n)
         slot[self._HEAD.size : self._HEAD.size + len(word)] = word
-        self._HEAD.pack_into(slot, 0, n, len(word), zlib.crc32(word))
+        self._TAIL.pack_into(slot, self._NUMBER.size, len(word), self._crc(n, word))
+        self._NUMBER.pack_into(slot, 0, n)  # last: a reader that sees it sees the rest
         words: list[bytes | None] = [None] * self.world
         words[self.rank] = word
         while True:
