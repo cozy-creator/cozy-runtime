@@ -523,14 +523,18 @@ class Decoder:
                 self.steps[key] = (step, graph)
                 if graph is not None:
                     unchecked = sorted(set(_engine.kinds(graph.raw_cuda_graph())) - COVERED)
-                    if unchecked:  # the launcher check never ran them: this call and the next replay it
-                        self.launcher = False
-                        self.unlaunched = f"the step holds {', '.join(unchecked)} nodes, which the launcher check does not run"
-                        made.notes.append(self.unlaunched)
+                    why = f"the step holds {', '.join(unchecked)} nodes, which the launcher check does not run" if unchecked else ""
+                    if not why:
+                        try:
+                            with first(index, launch=False):  # a driver the launcher crashes refuses it next process
+                                self.segments[key] = _engine.Segment(graph.raw_cuda_graph(), r.go.data_ptr(), index)
+                        except ValueError as refused:  # a body the launcher can't hold (`lower`)
+                            why = str(refused)
+                    if why:  # this call and the next replay the step from the host
+                        self.launcher, self.unlaunched = False, why
+                        made.notes.append(why)
                         self._decode(size, rows, drafted, sampling, request, made, told)
                         return
-                    with first(index, launch=False):  # a driver the launcher crashes refuses it next process
-                        self.segments[key] = _engine.Segment(graph.raw_cuda_graph(), r.go.data_ptr(), index)
             if graph is None:  # a new key's first step, or a step that can't be captured: eagerly
                 step()
                 self.stream.synchronize()
