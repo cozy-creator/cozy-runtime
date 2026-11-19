@@ -9,10 +9,10 @@ upsampler's factor. A conv with a stride, or a norm whose statistics span rows, 
 
 The first call of a shape measures the block's peak on two whole crops of its input (`_Call.fit`):
 each level's need, whole or a strip, comes from that, so a block whose whole fits runs whole. A
-level that cuts first probes the shape: on a crop, whole and in two strips must give the same rows.
-A block inside a block running at a level its measured peak chose ran whole in that measure, so it
-starts whole and goes finer only where it is refused (`catch.cut`'s `covered`).
-A block that reads across rows (an attention) fails it and runs whole from then on. A strip reads
+block inside a block that runs whole, its measured peak admitted, ran whole in that measure: it
+starts whole and goes finer only where it is refused (`catch.cut`'s `covered`). A level that cuts
+first probes the shape: on a crop, whole and in two strips must give the same rows. A block that
+reads across rows (an attention) fails it and runs whole from then on. A strip reads
 its rows of each cache entry and writes its own rows of the entry's next value; the entries go to
 host memory once a block cuts (they are saved inputs, read back a strip at a time). Nothing is
 committed until every strip is done, so a refused strip runs again finer. A block that keeps
@@ -168,7 +168,7 @@ type _Key = tuple[str, tuple[int, ...], torch.dtype]
 _VERDICTS: dict[_Key, bool] = {}
 #: a block's peak over its call, measured on crops (`_Call.fit`); None where it could not be
 _FITS: dict[_Key, _Fit | None] = {}
-#: a block runs at a level its measured peak chose: each block inside it ran whole in that measure
+#: a block runs whole, its measured peak admitted: each block inside it ran whole in that measure
 _MEASURED: ContextVar[bool] = ContextVar("strips_measured", default=False)
 
 
@@ -273,7 +273,7 @@ def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) 
         def run(level: int) -> object:
             if level and key not in _VERDICTS and not catch._capturing():
                 _VERDICTS[key] = call.probe()
-            measured = _MEASURED.set(fit is not None)
+            measured = _MEASURED.set(fit is not None and not level)
             try:
                 if not level or not _VERDICTS.get(key):
                     return call.strips([(0, height)], host=False)
