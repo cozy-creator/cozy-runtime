@@ -166,7 +166,7 @@ from cozy_runtime.author._model import (
     WarningRow,
     component_use,
 )
-from cozy_runtime.author._observations import DEVICE, PLANS, Attribution, Observation
+from cozy_runtime.author._observations import DEVICE, FIELDS_CAP, PLANS, Attribution, Observation
 from cozy_runtime.author._preview import PreviewFrame
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
@@ -1087,6 +1087,15 @@ class _PlanRefusal(RuntimeError):
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(detail)
         self.code = code
+
+
+def _fitted(common: Mapping[str, Scalar], fields: Mapping[str, Scalar]) -> list[dict[str, Scalar]]:
+    """`fields` in as many rows as an observation's fields take (`FIELDS_CAP`), in order, each row
+    `common` too; one row of `common` alone when `fields` is empty."""
+    room = FIELDS_CAP - len(common)
+    items = list(fields.items())
+    rows = [{**common, **dict(items[at : at + room])} for at in range(0, len(items), room)]
+    return rows or [dict(common)]
 
 
 def _dense(kernels: Iterable[str]) -> str:
@@ -4304,26 +4313,18 @@ class Executor:
             sparse_kernels = attention.sparse_names(served_attention.totals())
             if sparse_kernels:
                 sparse_name = "+".join(sparse_kernels)
-                # The counts that happened: all six beside these three overrun an observation's
-                # eight fields, which dropped the last (xs-142).
-                record.emit(
-                    "confession",
-                    "attention.sol.calls",
-                    sparse_name,
-                    rank=0,
-                    world=self.world,
-                    dense_reference=_dense(sparse_kernels),
-                    **{kind: n for kind, n in sol_counts.items() if n},
-                )
+                # The counts that happened, in as many rows as an observation's fields take.
+                common: dict[str, Scalar] = {
+                    "rank": 0,
+                    "world": self.world,
+                    "dense_reference": _dense(sparse_kernels),
+                }
+                for row in _fitted(common, {kind: n for kind, n in sol_counts.items() if n}):
+                    record.emit("confession", "attention.sol.calls", sparse_name, **row)
                 for rank, counts in sorted(sol_rank_counts.items()):
-                    record.emit(
-                        "confession",
-                        "attention.sol.calls",
-                        sparse_name,
-                        rank=rank,
-                        world=self.world,
-                        **{kind: n for kind, n in counts.items() if n},
-                    )
+                    common = {"rank": rank, "world": self.world}
+                    for row in _fitted(common, {kind: n for kind, n in counts.items() if n}):
+                        record.emit("confession", "attention.sol.calls", sparse_name, **row)
             # Where this request's Sol kernel came from (h3a-087): loaded from the machine
             # store, waited for behind a builder, or compiled here, and how long each took.
             for row in sol_kernels:
@@ -4937,13 +4938,9 @@ class Executor:
     @staticmethod
     def _emit_attention(record: AuthorAttempt, choices: attention.Applied, name: str) -> None:
         for kernel, artifact in (choices.artifacts or {}).items():
-            record.emit(
-                "confession",
-                "attention.artifact",
-                kernel,
-                selection=name,
-                **artifact,
-            )
+            # A sparse kernel's names its dense and prefix kernels' too (`dense_*`, `prefix_*`).
+            for fitted in _fitted({"selection": name}, artifact):
+                record.emit("confession", "attention.artifact", kernel, **fitted)
         for component, kernels in choices.hosts.items():
             for kernel, sites in kernels.items():
                 record.emit(
