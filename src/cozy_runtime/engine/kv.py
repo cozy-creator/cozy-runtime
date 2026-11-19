@@ -19,6 +19,13 @@ device or releases pages does so on the calling thread's current stream.
 
 Every size comes from the model's layout, the request and the card's page size. Pages of a row
 that left are released as it leaves, so nothing here is idle memory for the core to ask back.
+
+A host tier (`host`, V2's HostCache in pinned host memory the device addresses) holds the K/V the
+card doesn't: block ids at and above `card_blocks` are its blocks, laid out layer-major
+(`[layer][block][K|V][token][kv_head][head_dim]`, `host_view`), so one layer's off-card blocks are
+one range. Which of a row's blocks are there is decided when it joins (`admit`'s `host_tokens`): its
+oldest whole blocks, never its tail, so a step writes nothing on the host. Where a host block is
+read from (in place, or a window it was copied to) is the attention op's one `resolve`.
 """
 
 from __future__ import annotations
@@ -143,6 +150,43 @@ class _Pages:
         return all(p in self.held for p in self._span(offset, nbytes))
 
 
+class _HostPages:
+    """`_Pages` for a HostCache: windows mapped at their first holder and released at their last.
+    A commit the host has no room for raises, naming the bytes."""
+
+    def __init__(self, cache: varena.HostCache) -> None:
+        self.cache, self.page = cache, cache.granularity
+        self.held: dict[int, int] = {}
+
+    def _span(self, offset: int, nbytes: int) -> range:
+        return range(offset // self.page, (offset + nbytes - 1) // self.page + 1)
+
+    def take(self, ranges: Sequence[tuple[int, int]]) -> None:
+        fresh = sorted({p for at, n in ranges for p in self._span(at, n) if p not in self.held})
+        mapped: list[tuple[int, int]] = []
+        for first, count in _runs(fresh):
+            if not self.cache.commit(first * self.page, count * self.page):
+                for at, n in mapped:
+                    self.cache.release(at * self.page, n * self.page)
+                raise RuntimeError(f"the host has no room for {count * self.page} more bytes of K/V now")
+            mapped.append((first, count))
+        for at, n in ranges:
+            for p in self._span(at, n):
+                self.held[p] = self.held.get(p, 0) + 1
+
+    def drop(self, ranges: Sequence[tuple[int, int]]) -> None:
+        """Release what none holds now; it waits for the device's queued work (HostCache.release)."""
+        gone: list[int] = []
+        for at, n in ranges:
+            for p in self._span(at, n):
+                self.held[p] -= 1
+                if not self.held[p]:
+                    del self.held[p]
+                    gone.append(p)
+        for first, count in _runs(sorted(gone)):
+            self.cache.release(first * self.page, count * self.page)
+
+
 def _runs(pages: Sequence[int]) -> list[tuple[int, int]]:
     """Sorted pages as (first, count) of each consecutive run."""
     runs: list[tuple[int, int]] = []
@@ -163,7 +207,12 @@ class KvManager:
     step's), never the default stream: the core orders releases on it."""
 
     def __init__(
-        self, gpu: varena.Device, layout: KvLayout, max_rows: int, max_blocks: int
+        self,
+        gpu: varena.Device,
+        layout: KvLayout,
+        max_rows: int,
+        max_blocks: int,
+        host: varena.Pages | None = None,
     ) -> None:
         self.layout, self.max_rows, self.max_blocks = layout, max_rows, max_blocks
         self.device = torch.device("cuda", gpu.device)
@@ -238,6 +287,28 @@ class KvManager:
         #: the other free blocks, lowest first; an entry may be stale (`_take` checks it)
         self._fresh: list[int] = list(range(1, self.card_blocks))
         self._respare([0])
+        # The host tier: address space for a whole row's blocks a row, its first window mapped for
+        # the manager's life (the tier's base is a kernel's pointer: Triton asks the driver of it).
+        self.host_blocks = 0
+        self._host: varena.HostCache | None = None
+        self._host_pages: _HostPages | None = None
+        self._host_free: list[int] = []
+        if host is not None:
+            layer_bytes = layout.block_bytes // layout.attn_layers
+            self.host_blocks = max_rows * max_blocks
+            self._host = host.cache(layout.attn_layers * self.host_blocks * layer_bytes)
+            self._host_pages = _HostPages(self._host)
+            self._host_pages.take([(0, layer_bytes)])
+            self._host_free = list(range(self.host_blocks))
+        #: [attn_layers, host_blocks, 2, block_tokens, kv_heads, head_dim] as the device addresses it
+        #: (a view over the whole host reservation; only mapped windows are touched), or a 1-block
+        #: stand-in on the card where there is no host tier
+        self.host_view: Tensor = (
+            self._host.tensor(layout.dtype, (layout.attn_layers, self.host_blocks, 2, layout.block_tokens,
+                                             layout.kv_heads, layout.head_dim))
+            if self._host is not None
+            else self.blocks[:1].transpose(0, 1)
+        )  # fmt: skip
 
     # ------------------------------------------------------------------ what a call needs
 
@@ -276,10 +347,11 @@ class KvManager:
 
     # ------------------------------------------------------------------ rows
 
-    def admit(self, row: int, prompt_tokens: int, *, drafted: bool = False) -> Tensor:
+    def admit(self, row: int, prompt_tokens: int, *, drafted: bool = False, host_tokens: int = 0) -> Tensor:
         """`row` joins with a prompt of `prompt_tokens`: its blocks, a state slot and, drafting,
-        its scratch are mapped, all or none. Returns the token slot of each prompt position
-        (int64 [prompt_tokens]) for `write`. Its state is the prefill's to write."""
+        its scratch are mapped, all or none. Its first `host_tokens // block_tokens` blocks (whole
+        ones, never its tail) are on the host tier, the rest on the card. Returns the token slot of
+        each prompt position (int64 [prompt_tokens]) for `write`. Its state is the prefill's to write."""
         if row in self._held or not 0 <= row < self.max_rows:
             raise ValueError(f"row {row}: already decoding, or not one of {self.max_rows}")
         layout = self.layout
@@ -292,8 +364,12 @@ class KvManager:
         if first:
             state.append((0, self._tables))
         self._state_pages.take(state)
+        count = -(-prompt_tokens // layout.block_tokens)
+        hosted = min(host_tokens // layout.block_tokens, max(count - 1, 0))
+        if hosted and self._host is None:
+            raise ValueError(f"{hosted} blocks asked of a host tier this manager has none of")
         try:
-            blocks = self._take(-(-prompt_tokens // layout.block_tokens))
+            blocks = self._take_host(hosted) + self._take(count - hosted)
         except BaseException:
             self._state_pages.drop(state)
             raise
@@ -331,14 +407,24 @@ class KvManager:
 
     def gather(self, layer: int, row: int, start: int, count: int) -> tuple[Tensor, Tensor]:
         """`row`'s K and V of `layer` at positions `start + [0, count)`, each contiguous
-        `[count, kv_heads, head_dim]`: what a prefill's attention reads (its blocks mapped)."""
+        `[count, kv_heads, head_dim]`: what a prefill's attention reads (its blocks mapped), from
+        either tier."""
         tokens, held = self.layout.block_tokens, self._held[row]
         first, last = start // tokens, (start + count - 1) // tokens
-        blocks = self._ints(held[first : last + 1], torch.int64)
+        chosen = held[first : last + 1]
         at = start - first * tokens
-        keys, values = self.kv(layer)
-        return (keys.index_select(0, blocks).flatten(0, 1)[at : at + count],
-                values.index_select(0, blocks).flatten(0, 1)[at : at + count])  # fmt: skip
+        parts: list[tuple[Tensor, Tensor]] = []
+        for on_card, run in _tier_runs(chosen, self.card_blocks):
+            if on_card:
+                keys, values = self.kv(layer)
+                index = self._ints(run, torch.int64)
+            else:
+                keys, values = self.host_view[layer, :, 0], self.host_view[layer, :, 1]
+                index = self._ints([b - self.card_blocks for b in run], torch.int64)
+            parts.append((keys.index_select(0, index), values.index_select(0, index)))
+        keys = torch.cat([k for k, _ in parts]) if len(parts) > 1 else parts[0][0]
+        values = torch.cat([v for _, v in parts]) if len(parts) > 1 else parts[0][1]
+        return keys.flatten(0, 1)[at : at + count], values.flatten(0, 1)[at : at + count]
 
     def settle(self, row: int, length: int) -> None:
         """The host read `row`'s length back: `reserve_ahead` counts from it."""
@@ -357,17 +443,27 @@ class KvManager:
 
     def write(self, layer: int, k: Tensor, v: Tensor, slots: Tensor) -> None:
         """A prefill's K and V for `layer` ([n, kv_heads, head_dim], contiguous in the prompt)
-        into their token slots (`admit`'s)."""
+        into their token slots (`admit`'s), on whichever tier each block is."""
         tokens = self.layout.block_tokens
-        where = (slots // tokens, slots % tokens)
+        entry, offset = slots // tokens, slots % tokens
         keys, values = self.kv(layer)
-        keys.index_put_(where, k.to(keys.dtype))
-        values.index_put_(where, v.to(values.dtype))
+        if self._host is None:
+            keys.index_put_((entry, offset), k.to(keys.dtype))
+            values.index_put_((entry, offset), v.to(values.dtype))
+            return
+        card = entry < self.card_blocks
+        host_keys, host_values = self.host_view[layer, :, 0], self.host_view[layer, :, 1]
+        for mine, (tier_k, tier_v), base in ((card, (keys, values), 0), (~card, (host_keys, host_values), self.card_blocks)):
+            index = (entry[mine] - base, offset[mine])
+            tier_k.index_put_(index, k[mine].to(tier_k.dtype))
+            tier_v.index_put_(index, v[mine].to(tier_v.dtype))
 
     def free(self, row: int) -> None:
         """`row` leaves: its table entries go, and every page only it held is released behind
         the current stream."""
-        blocks, slot = self._held.pop(row), self._slots.pop(row)
+        held, slot = self._held.pop(row), self._slots.pop(row)
+        blocks = [b for b in held if b < self.card_blocks]
+        self._give_host([b for b in held if b >= self.card_blocks])
         del self._known[row]
         self.block_table[row].fill_(-1)
         self.lengths[row] = -1
@@ -417,6 +513,37 @@ class KvManager:
         self._respare(fresh)
         return blocks
 
+    def _host_range(self, block: int, layer: int) -> tuple[int, int]:
+        piece = self.layout.block_bytes // self.layout.attn_layers
+        return (layer * self.host_blocks + block) * piece, piece
+
+    def _take_host(self, count: int) -> list[int]:
+        """`count` host blocks (ids from `card_blocks`), the lowest free; their windows mapped."""
+        if not count:
+            return []
+        assert self._host_pages is not None
+        if count > len(self._host_free):
+            raise RuntimeError(f"{count} host K/V blocks asked with {len(self._host_free)} free")
+        chosen = heapq.nsmallest(count, self._host_free)
+        self._host_pages.take([self._host_range(b, layer) for b in chosen for layer in range(self.layout.attn_layers)])
+        taken = set(chosen)
+        self._host_free = [b for b in self._host_free if b not in taken]
+        heapq.heapify(self._host_free)
+        return [self.card_blocks + b for b in chosen]
+
+    def _give_host(self, blocks: Sequence[int]) -> None:
+        if not blocks:
+            return
+        assert self._host_pages is not None
+        own = [b - self.card_blocks for b in blocks]
+        self._host_pages.drop([self._host_range(b, layer) for b in own for layer in range(self.layout.attn_layers)])
+        for b in own:
+            heapq.heappush(self._host_free, b)
+
+    def host_bytes(self) -> int:
+        """The host tier's bytes held by rows now."""
+        return sum(1 for held in self._held.values() for b in held if b >= self.card_blocks) * self.layout.block_bytes
+
     def _give(self, blocks: Sequence[int]) -> None:
         self._kv_pages.drop([self._range(b) for b in blocks])
         self._free.update(blocks)
@@ -448,3 +575,19 @@ class KvManager:
         self._kv_pages.drop([(0, self.layout.block_bytes)])
         self._kv.close()
         self._state.close()
+        if self._host is not None and self._host_pages is not None:
+            del self.host_view
+            self._host_pages.drop([(0, self.layout.block_bytes // self.layout.attn_layers)])
+            self._host.close()
+
+
+def _tier_runs(blocks: Sequence[int], card_blocks: int) -> list[tuple[bool, list[int]]]:
+    """`blocks` in order as runs on one tier each: (on the card, the run)."""
+    runs: list[tuple[bool, list[int]]] = []
+    for b in blocks:
+        on_card = b < card_blocks
+        if runs and runs[-1][0] == on_card:
+            runs[-1][1].append(b)
+        else:
+            runs.append((on_card, [b]))
+    return runs
