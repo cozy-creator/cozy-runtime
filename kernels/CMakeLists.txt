@@ -265,23 +265,24 @@ target_compile_options(conv8_units PRIVATE -O3 --use_fast_math --expt-relaxed-co
                        $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus>)
 kernel_module(_conv conv.cpp conv_units conv8_units)
 
-# llama.cpp's quantized matmuls for the ggml.* lanes (xs-213): MMVQ, few-row MMQ and MMQ from `csrc/ggml/ggml`,
-# vendored unmodified at b12466 (MIT, `csrc/ggml/UPSTREAM.md`), with ggml-cuda's own nvcc flags, through our shim
+# llama.cpp's quantized matmuls for the ggml.* lanes (xs-213): MMVQ (with MUL_MAT_ID's), few-row MMQ and MMQ from
+# `csrc/ggml/ggml`, vendored at b12466 with one patch (MIT, `csrc/ggml/UPSTREAM.md`), with ggml-cuda's own nvcc flags, through our shim
 # (`csrc/ggml/shim.cu`: no ggml graph, allocator, backend or cuBLAS). Built for the families the lanes serve, with
 # llama.cpp's own targets for them (`120a`, as its release builds Blackwell).
 set(GGML "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ggml")
 set(GGML_CUDA "${GGML}/ggml/src/ggml-cuda")
 set(GGML_ARCHS "80-real;86-real;89-real;120a-real")
-# The vendored files are upstream's byte for byte: each one's digest as UPSTREAM.md lists it, or no build.
+# The vendored files are upstream's byte for byte but the one patch UPSTREAM.md names: each one's digest as it lists it,
+# or no build.
 file(STRINGS "${GGML}/UPSTREAM.md" ggml_manifest REGEX "^\\| `[^`]+` \\| `[0-9a-f]+` \\|$")
 foreach(row ${ggml_manifest})
     string(REGEX MATCH "^\\| `([^`]+)` \\| `([0-9a-f]+)`" _ "${row}")
     file(SHA256 "${GGML}/${CMAKE_MATCH_1}" ggml_digest)
     if(NOT ggml_digest STREQUAL CMAKE_MATCH_2)
-        message(FATAL_ERROR "${CMAKE_MATCH_1} is not llama.cpp's (UPSTREAM.md): never edit a vendored file")
+        message(FATAL_ERROR "${CMAKE_MATCH_1} is not as UPSTREAM.md lists it: never edit a vendored file but by its recorded patch")
     endif()
 endforeach()
-add_library(ggml_units OBJECT "${GGML}/shim.cu" "${GGML}/matmul.cu" "${GGML_CUDA}/mmvq.cu" "${GGML_CUDA}/mmq-few.cu"
+add_library(ggml_units OBJECT "${GGML}/shim.cu" "${GGML}/matmul.cu" "${GGML}/ids.cu" "${GGML_CUDA}/mmvq.cu" "${GGML_CUDA}/mmq-few.cu"
             "${GGML_CUDA}/quantize.cu")
 foreach(type q8_0 q5_0 q5_1 q4_k q5_k q6_k)
     target_sources(ggml_units PRIVATE "${GGML_CUDA}/template-instances/mmq-instance-${type}.cu")

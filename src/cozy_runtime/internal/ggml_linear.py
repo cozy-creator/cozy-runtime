@@ -144,6 +144,50 @@ def matmul(
     return shaped
 
 
+def ids_unserved(torch: ModuleType, index: int) -> str:
+    """Why this card's ggml kernels can't run a mixture's routed products (`matmul_ids`) now, or "":
+    the wheel's `_ggml` has no MUL_MAT_ID, or its probe hasn't passed here (`VERIFYING` while it runs)."""
+    if absent := carried(capability(torch, index)):
+        return absent
+    ops = native(torch, index)
+    if ops is None:
+        return why(index) or VERIFYING
+    if not hasattr(ops, "matmul_ids"):
+        return "this wheel's _ggml has no MUL_MAT_ID (matmul_ids)"
+    return ""
+
+
+#: `ids_unserved` while this card's ggml probe runs: it serves from the next request.
+VERIFYING = "the ggml kernels are being verified on this card"
+
+
+def matmul_ids(
+    ops: ModuleType, torch: ModuleType, x: Tensor, table: Tensor, ids: Tensor, scheme: str, n: int
+) -> Tensor:
+    """f32 `[T * k, n]`: each (token t, slot j) pair's product of its row of `x` (f32, `[T, K]`, a row a
+    token, or `[T * k, K]`, a row a pair) by the `[n, K]` `scheme` blocks of expert `ids[t, j]` (int32),
+    read at `table[expert]` (int64 addresses on the device): llama.cpp's MUL_MAT_ID by MMVQ (`ops`, this
+    card's `native`), a few tokens a launch. Raises what the module said; `ids_unserved` first."""
+    tokens, k = (int(s) for s in ids.shape)
+    rows, width = (int(s) for s in x.shape)
+    if rows not in (tokens, tokens * k):
+        raise ValueError(f"{rows} rows of x for {tokens} tokens of {k} experts")
+    out: Tensor = torch.empty(tokens * k, n, dtype=torch.float32, device=x.device)
+
+    def allocate(nbytes: int) -> Tensor:
+        held: Tensor = torch.empty(nbytes, dtype=torch.uint8, device=x.device)
+        return held
+
+    code = ops.matmul_ids(
+        x.get_device(), TYPES[scheme], table.data_ptr(), x.data_ptr(), rows // tokens, ids.data_ptr(),
+        out.data_ptr(), width, n, tokens, k, allocate, torch.cuda.current_stream(x.device).cuda_stream,
+    )  # fmt: skip
+    if code != 0:
+        said = ops.error() if code == ops.UNKNOWN else ops.error_name(code)
+        raise RuntimeError(f"ggml MUL_MAT_ID ({scheme}, {width}x{n}, {tokens} tokens of {k}): {said}")
+    return out
+
+
 def products(torch: ModuleType, x: Tensor, weights: list[tuple[Tensor, str, int]]) -> list[Tensor] | None:
     """Each weight's f32 product `x[..., K] @ W.T` of one 16-bit `x`, from one q8_1 quantize of it,
     where ggml's rule takes MMVQ for every one of them on this card (a few rows): the quantize
@@ -269,7 +313,43 @@ def _probe(torch: ModuleType, index: int, ops: ModuleType) -> verify.Verdict:
                 errors[f"{scheme} m={m} {str(dtype).removeprefix('torch.')}"] = verify.error(
                     torch, got, want
                 )
+        if hasattr(ops, "matmul_ids"):
+            errors.update(_probe_ids(torch, ops, index, generator, scheme, blocks, exact))
     return verify.within(errors, BUDGET)
+
+
+def _probe_ids(
+    torch: ModuleType, ops: ModuleType, index: int, generator: object, scheme: str, blocks: Tensor,
+    exact: Tensor,
+) -> dict[str, float]:
+    """MUL_MAT_ID over a table of three experts (`blocks` and two more of `scheme`) at 1, 3 and 9 tokens
+    (one token's kernel, several tokens', two launches) of 2 slots, a row a token and a row a pair, against
+    each pair's f64 product over the exact decode."""
+    from cozy_runtime.internal.decode_schemes import BY_SCHEME
+    from cozy_runtime.internal.encoding.adapters import CoreDequant
+
+    device = torch.device("cuda", index)
+    n, k = (int(s) for s in exact.shape)
+    held, decoded = [blocks], [exact]
+    core = CoreDequant(scheme, params_of(BY_SCHEME[scheme].probe_params))
+    for _ in range(2):
+        more = encode(torch, scheme, torch.randn(n, k, generator=generator) * 0.05).to(device)
+        out = torch.empty(n, k, dtype=torch.float32, device=device)
+        core.decode(torch, {"blocks": more}, out)
+        held.append(more)
+        decoded.append(out)
+    table = torch.tensor([b.data_ptr() for b in held], dtype=torch.int64, device=device)
+    errors: dict[str, float] = {}
+    for tokens in (1, 3, 9):
+        ids = torch.randint(0, len(held), (tokens, 2), generator=generator, dtype=torch.int32).to(device)
+        for per in (1, 2):
+            x = (torch.randn(tokens * per, k, generator=generator) * 0.5).to(device)
+            got = matmul_ids(ops, torch, x, table, ids, scheme, n)
+            rows = x.double().repeat_interleave(2 // per, dim=0)
+            weights = torch.stack([decoded[int(e)] for e in ids.reshape(-1).tolist()]).double()
+            want = torch.einsum("pk,pnk->pn", rows, weights)
+            errors[f"{scheme} ids t={tokens} rows={per}"] = verify.error(torch, got, want)
+    return errors
 
 
 def encode(torch: ModuleType, scheme: str, weight: Tensor) -> Tensor:

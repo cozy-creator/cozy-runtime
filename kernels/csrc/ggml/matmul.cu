@@ -24,16 +24,6 @@ namespace {
 
 thread_local std::string last_error;
 
-bool runs(int type) {
-    switch (type) {
-        case GGML_TYPE_Q8_0: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
-            return true;
-        default:
-            return false;
-    }
-}
-
 // ggml's MUL_MAT node over the caller's buffers: weights [N, K] in `type`, x [M, K] f32, out [M, N] f32.
 struct Node {
     ggml_tensor w{}, x{}, out{};
@@ -364,6 +354,18 @@ int matmul_quantized(int device, int type, const void* w, const void* q8_1, floa
         return cudaErrorUnknown;
     }
 }
+
+bool runs(int type) {
+    switch (type) {
+        case GGML_TYPE_Q8_0: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void failed(const char* what) { last_error = what; }
 
 const char* error() { return last_error.c_str(); }
 

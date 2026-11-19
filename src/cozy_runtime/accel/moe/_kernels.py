@@ -44,17 +44,23 @@ if not TRITON_ABSENT:
         div,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        ALIGNED: tl.constexpr,
     ):
         """`out[p] = W[experts[p]] @ x[p // div]`: bf16 `[n, k]` weights at `weights[e]`, f32
-        accumulation, rounded to bf16 once."""
+        accumulation, rounded to bf16 once. `ALIGNED`: every weight's address and `k` are
+        multiples of 16 (the entry declares `k` so), so its rows load in 16-byte vectors."""
         p = tl.program_id(0)
         rows = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
         expert = tl.load(experts_ptr + p)
         w = tl.load(weights_ptr + expert).to(tl.pointer_type(tl.bfloat16))
+        if ALIGNED:  # on the pointer: a hint on the integer address is lost in its cast
+            w = tl.multiple_of(w, 16)
         x = x_ptr + (p // div) * k
         acc = tl.zeros([BLOCK_N], dtype=tl.float32)
         for start in range(0, k, BLOCK_K):
             cols = start + tl.arange(0, BLOCK_K)
+            if ALIGNED:
+                cols = tl.max_contiguous(tl.multiple_of(cols, BLOCK_K), BLOCK_K)
             xv = tl.load(x + cols, mask=cols < k, other=0.0).to(tl.float32)
             ok = (rows[:, None] < n) & (cols[None, :] < k)
             wv = tl.load(w + rows[:, None] * k + cols[None, :], mask=ok, other=0.0)
@@ -74,18 +80,23 @@ if not TRITON_ABSENT:
         div,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        ALIGNED: tl.constexpr,
     ):
         """`int8.convrot` W8A8 as `int8_linear.eager`: int8 rows (rotated, per-row scale) times
         the int8 `[n, k]` weight at `weights[e]`, exact in int32, then the row's scale and the
-        weight row's (`scales[e]`, f32), rounded to bf16 once."""
+        weight row's (`scales[e]`, f32), rounded to bf16 once. `ALIGNED` as the bf16 kernel's."""
         p = tl.program_id(0)
         rows = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
         expert = tl.load(experts_ptr + p)
         w = tl.load(weights_ptr + expert).to(tl.pointer_type(tl.int8))
+        if ALIGNED:  # on the pointer, as the bf16 kernel's
+            w = tl.multiple_of(w, 16)
         x = x_ptr + (p // div) * k
         acc = tl.zeros([BLOCK_N], dtype=tl.int32)
         for start in range(0, k, BLOCK_K):
             cols = start + tl.arange(0, BLOCK_K)
+            if ALIGNED:
+                cols = tl.max_contiguous(tl.multiple_of(cols, BLOCK_K), BLOCK_K)
             xv = tl.load(x + cols, mask=cols < k, other=0).to(tl.int32)
             ok = (rows[:, None] < n) & (cols[None, :] < k)
             wv = tl.load(w + rows[:, None] * k + cols[None, :], mask=ok, other=0)
@@ -154,7 +165,7 @@ if not TRITON_ABSENT:
         )
         if expert < 0:
             return
-        w = tl.multiple_of(tl.load(weights_ptr + expert), 16).to(tl.pointer_type(tl.bfloat16))
+        w = tl.multiple_of(tl.load(weights_ptr + expert).to(tl.pointer_type(tl.bfloat16)), 16)
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         for start in range(0, k, BLOCK_K):
             kk = start + tl.arange(0, BLOCK_K)
@@ -193,7 +204,7 @@ if not TRITON_ABSENT:
         )
         if expert < 0:
             return
-        w = tl.multiple_of(tl.load(weights_ptr + expert), 16).to(tl.pointer_type(tl.int8))
+        w = tl.multiple_of(tl.load(weights_ptr + expert).to(tl.pointer_type(tl.int8)), 16)
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
         for start in range(0, k, BLOCK_K):
             kk = start + tl.arange(0, BLOCK_K)
@@ -202,7 +213,7 @@ if not TRITON_ABSENT:
             b_ok = (kk[:, None] < k) & (cols[None, :] < n)
             b = tl.load(w + cols[None, :] * k + kk[:, None], mask=b_ok, other=0)
             acc = tl.dot(a, b, acc, out_dtype=tl.int32)
-        s = tl.multiple_of(tl.load(scales_ptr + expert), 16).to(tl.pointer_type(tl.float32))
+        s = tl.multiple_of(tl.load(scales_ptr + expert).to(tl.pointer_type(tl.float32)), 16)
         y = acc.to(tl.float32) * tl.load(x_scale_ptr + source, mask=live, other=0.0)[:, None]
         y = y * tl.load(s + cols, mask=cols < n, other=0.0)[None, :]
         ok = live[:, None] & (cols[None, :] < n)
@@ -217,22 +228,26 @@ def _signature(kernel: JitKernel, **types: str) -> dict[str, str]:
     }
 
 
-def entries() -> list[TritonEntry]:
+def entries(*kinds: str) -> list[TritonEntry]:
+    """The grouped kernels' entries for `kinds` ("bf16", "int8"; every kind by default)."""
     if TRITON_ABSENT:
         return []
-    blocks = {"BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K}
-    bf16 = TritonEntry(
-        experts_bf16_kernel,
-        _signature(experts_bf16_kernel, x_ptr="*bf16", out_ptr="*bf16"),
-        blocks,
-        num_warps=4,
-    )
-    int8 = TritonEntry(
-        experts_int8_kernel,
-        _signature(experts_int8_kernel, x_ptr="*i8", x_scale_ptr="*fp32", out_ptr="*bf16"),
-        blocks,
-        num_warps=4,
-    )
+    kinds = kinds or ("bf16", "int8")
+    gemvs = [
+        TritonEntry(
+            kernel,
+            _signature(kernel, out_ptr="*bf16", **types),
+            {"BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K, "ALIGNED": aligned},
+            aligned=("x_ptr", "k") if aligned else (),
+            num_warps=4,
+        )
+        for kind, kernel, types in (
+            ("bf16", experts_bf16_kernel, {"x_ptr": "*bf16"}),
+            ("int8", experts_int8_kernel, {"x_ptr": "*i8", "x_scale_ptr": "*fp32"}),
+        )
+        if kind in kinds
+        for aligned in (1, 0)
+    ]
     tile = {"BLOCK_M": GEMM_M, "BLOCK_N": GEMM_N, "GROUP": GROUP}
     grouped = [
         TritonEntry(
@@ -247,6 +262,7 @@ def entries() -> list[TritonEntry]:
             ("bf16", grouped_bf16_kernel, {"x_ptr": "*bf16"}),
             ("int8", grouped_int8_kernel, {"x_ptr": "*i8", "x_scale_ptr": "*fp32"}),
         )
+        if kind in kinds
         for gather in (1, 0)
     ]
-    return [bf16, int8, *grouped]
+    return [*gemvs, *grouped]

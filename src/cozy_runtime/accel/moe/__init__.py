@@ -7,16 +7,17 @@
     out = self.experts(hidden, top_k_index, top_k_weights)
 
 An expert is two Linears, `gate_and_up_proj` [2I, H] and `down_proj` [H, I], so every lane's leaf
-serves it (int8.convrot, w4a8, nvfp4) and varena pages it on its own (`RoutedExpert` in the model's
-`_no_split_modules`). `split` turns Transformers' fused experts (`gate_up_proj` [E, 2I, H],
+serves it (int8.convrot, w4a8, nvfp4, the ggml types) and varena pages it on its own (`RoutedExpert`
+in the model's `_no_split_modules`). `split` turns Transformers' fused experts (`gate_up_proj` [E, 2I, H],
 `down_proj` [E, H, I]) into these; the checkpoint stores them per expert (TensorFS splits fused
 uploads at ingest).
 
 A few rows (decode, a verify pass) run as one grouped GEMV per projection over every (token,
 expert) pair; more (a prefill, a denoise step) as one grouped GEMM per projection over the pairs
 sorted by expert on the device. Each reads its expert's weight through a table of addresses
-(`install`, bf16 and int8.convrot): routing stays on the device, so a decode or denoise step
-records as one graph. They serve only while every expert is bound (an all-resident model, its
+(`install`, bf16 and int8.convrot; ggml's leaves by llama.cpp's MUL_MAT_ID, `ggml_linear.matmul_ids`,
+up to `GGML_TOKENS` tokens): routing stays on the device, so a decode or denoise step records as one
+graph. They serve only while every expert is bound (an all-resident model, its
 blocks leased by a loop); otherwise each hit expert runs its own Linears after one stable sort,
 the host reading the counts, and a capture refuses there, typed.
 
@@ -48,13 +49,16 @@ from cozy_runtime.accel.moe import _kernels
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._model import Building
 from cozy_runtime.graphs import say
-from cozy_runtime.internal import int8_linear
+from cozy_runtime.internal import ggml_linear, int8_linear
 
 #: Routed-expert caches a `Routing` replays, in experts.
 CACHES = (256, 512, 1024)
 #: The most (token, expert) pairs a layer runs as a grouped GEMV per projection: decode's and a
 #: verify pass's largest batches (16 rows of 8 experts). More run as a grouped GEMM.
 GROUPED = 128
+#: The most tokens a layer of ggml experts runs by MUL_MAT_ID (MMVQ, ggml's few tokens a launch); more
+#: (a prefill) run each hit expert's own leaf.
+GGML_TOKENS = 64
 KERNELS = TritonKernels("cozy-moe-experts", _kernels.entries(), origin=__name__)
 #: While the grouped kernels build, a capture waits for them (`Building`).
 COMPILING = "compiling: it serves from the next request"
@@ -100,6 +104,12 @@ class _Int8Leaf(Protocol):
     scale: torch.Tensor
 
 
+class _GgmlLeaf(Protocol):
+    """A ggml leaf's stored blocks (`_kind` "ggml")."""
+
+    blocks: torch.Tensor
+
+
 class _FusedExperts(Protocol):
     """A Transformers fused-experts module (`split`)."""
 
@@ -143,27 +153,40 @@ class Experts(nn.ModuleList):
         self._table: torch.Tensor | None = None
         self._addresses: list[int] = []
         self._aligned = False
+        #: ggml's: the block types of gate-and-up and of down, every expert's alike
+        self._schemes: tuple[str, str] = ("", "")
 
     def forward(
         self, hidden: torch.Tensor, index: torch.Tensor, weights: torch.Tensor
     ) -> torch.Tensor:
         tokens, k = index.shape
-        out = self._grouped(hidden, index)
+        out = self.pairs(hidden, index).to(hidden.dtype)  # ggml's f32, rounded as its leaf rounds
+        return (out.view(tokens, k, -1) * weights.unsqueeze(-1)).sum(dim=1)
+
+    def pairs(
+        self, hidden: torch.Tensor, index: torch.Tensor, launch: Launch | None = None
+    ) -> torch.Tensor:
+        """Each (token, k) pair's expert output, `[T * k, H]`: `forward` before its weighted sum.
+        By the grouped kernels where they serve (bf16, f32 from ggml's), through `launch` (the
+        model's own set's launcher; by default the one `install` made); else by each hit
+        expert's own Linears (bf16)."""
+        out = self._grouped(hidden, index, launch)
         if isinstance(out, str):
             self._uncaptured(hidden, out)
-            out = self._sorted(hidden, index)
-        elif self.trace is not None:
+            return self._sorted(hidden, index)
+        if self.trace is not None:
             self._uncaptured(hidden, "a routing trace reads the counts on the host")
             self.trace(self.layer, torch.bincount(index.reshape(-1), minlength=len(self)).tolist())
-        return (out.view(tokens, k, -1) * weights.unsqueeze(-1)).sum(dim=1)
+        return out
 
     def _uncaptured(self, hidden: torch.Tensor, why: str) -> None:
         """Inside a CUDA graph capture, the host read `why` names refused before it runs:
-        `Building` while the grouped kernels compile, else a refusal no retry changes."""
+        `Building` while the grouped kernels compile or ggml's are verified, else a refusal no
+        retry changes."""
         if not (hidden.is_cuda and torch.cuda.is_current_stream_capturing()):
             return
         detail = f"moe layer {self.layer}: {why}"
-        if why == COMPILING:
+        if why in (COMPILING, ggml_linear.VERIFYING):
             raise Building(detail)
         raise CapabilityError(detail, code="prepared_graph_ineligible")
 
@@ -185,21 +208,46 @@ class Experts(nn.ModuleList):
         out[order] = torch.cat(outputs)
         return out
 
-    def _grouped(self, hidden: torch.Tensor, index: torch.Tensor) -> torch.Tensor | str:
+    def _grouped(
+        self, hidden: torch.Tensor, index: torch.Tensor, launch: Launch | None = None
+    ) -> torch.Tensor | str:
         """Each (token, expert) pair's expert output, `[T * k, H]`, by the grouped kernels; else
         why they do not serve (not built, not bf16 on a GPU, an expert not bound or of another
-        kind, the GEMM's reads not aligned)."""
-        launch = _LAUNCH[0]
-        if isinstance(launch, str):
-            return launch
+        kind, the GEMM's reads not aligned, ggml's kernels not verified or too many tokens)."""
         if not hidden.is_cuda or hidden.dtype != torch.bfloat16:
             return f"the grouped kernels take bf16 on a GPU, not {hidden.dtype} on {hidden.device}"
         found = self._operands(hidden.device)
         if isinstance(found, str):
             return found
+        kind, table = found
+        if kind == "ggml":
+            if index.shape[0] > GGML_TOKENS:
+                return f"{index.shape[0]} tokens: MUL_MAT_ID's MMVQ takes up to {GGML_TOKENS} a layer"
+            if why := ggml_linear.ids_unserved(torch, hidden.get_device()):
+                return why
+            return self._ggml(table, hidden, index)
+        launcher = _LAUNCH[0] if launch is None else launch
+        if isinstance(launcher, str):
+            return launcher
         if index.numel() > GROUPED and not self._aligned:
             return "an expert's operand or width is not 16-byte aligned, as the grouped GEMM reads"
-        return self._run(launch, *found, hidden, index)
+        return self._run(launcher, kind, table, hidden, index)
+
+    def _ggml(self, table: torch.Tensor, hidden: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        """`[pairs, H]` f32 by llama.cpp's MUL_MAT_ID over f32 rows (as llama.cpp's activations
+        are; exact from bf16), rounded between the projections as `RoutedExpert.forward` rounds its
+        leaves' outputs: gate-and-up of each token's row, then down of each pair's gated row."""
+        first = cast("RoutedExpert", self[0])  # an Experts holds RoutedExperts
+        size, inner = first.down_proj.out_features, first.down_proj.in_features
+        ids = index.to(torch.int32).contiguous()
+        ops = ggml_linear.native(torch, hidden.get_device())
+        assert ops is not None  # `ids_unserved` passed it
+        up_scheme, down_scheme = self._schemes
+        x = hidden.reshape(-1, size).float()
+        up = ggml_linear.matmul_ids(ops, torch, x, table[0], ids, up_scheme, 2 * inner)
+        a, b = up.to(hidden.dtype).chunk(2, dim=-1)
+        gated = first.act(a) * b if first.gate_first else a * first.act(b)
+        return ggml_linear.matmul_ids(ops, torch, gated.float(), table[1], ids, down_scheme, size)
 
     def _run(
         self,
@@ -239,12 +287,13 @@ class Experts(nn.ModuleList):
         pairs, width = int(experts.numel()), int(x.shape[-1])
         out = torch.empty((pairs, n), dtype=torch.bfloat16, device=x.device)
         grid = (pairs, -(-n // _kernels.BLOCK_N), 1)
-        blocks = (_kernels.BLOCK_N, _kernels.BLOCK_K)
         if kind == "bf16":
+            blocks = (_kernels.BLOCK_N, _kernels.BLOCK_K, int(self._aligned and x.data_ptr() % 16 == 0))
             launch(_kernels.experts_bf16_kernel, grid, x, table[which], experts, out, n, width,
                    div, *blocks)  # fmt: skip
         else:
             rows, scales = int8_linear.quantize_rows(torch, x)
+            blocks = (_kernels.BLOCK_N, _kernels.BLOCK_K, int(self._aligned and rows.data_ptr() % 16 == 0))
             launch(_kernels.experts_int8_kernel, grid, rows, scales, table[2 * which],
                    table[2 * which + 1], experts, out, n, width, div, *blocks)  # fmt: skip
         return out
@@ -307,23 +356,33 @@ class Experts(nn.ModuleList):
         return order, spans, tiles
 
     def _operands(self, device: torch.device) -> tuple[str, torch.Tensor] | str:
-        """The kind ("bf16": plain Linears; "int8": int8.convrot leaves) and the address table
-        (bf16: weights of gate-and-up, of down; int8: data and scale of each), when every
-        expert's operands are bound, contiguous and of that kind on `device`; else why not.
-        Outside a capture a changed address set is written to the table; inside one it is a
-        refusal."""
-        head = cast("RoutedExpert", self[0]).gate_and_up_proj  # an Experts holds RoutedExperts
-        kind = _kind(head)
+        """The kind ("bf16": plain Linears; "int8": int8.convrot leaves; "ggml": ggml leaves, one
+        block type a projection) and the address table (bf16: weights of gate-and-up, of down;
+        int8: data and scale of each; ggml: blocks of each), when every expert's operands are
+        bound, contiguous and of that kind on `device`; else why not. Outside a capture a changed
+        address set is written to the table; inside one it is a refusal."""
+        first = cast("RoutedExpert", self[0])  # an Experts holds RoutedExperts
+        kind = _kind(first.gate_and_up_proj)
         if kind is None:
-            name = getattr(head, "provider", None) or type(head).__name__
-            return f"its experts are {name}: the grouped kernels take bf16 and int8.convrot"
-        rows: list[list[int]] = [[] for _ in range(2 if kind == "bf16" else 4)]
+            return unserved(self)
+        schemes = (_scheme(first.gate_and_up_proj), _scheme(first.down_proj))
+        if kind == "ggml":
+            for linear in (first.gate_and_up_proj, first.down_proj):
+                if why := ggml_linear.unserved(cast("_GgmlLeaf", linear).blocks, linear.in_features):
+                    return why
+        rows: list[list[int]] = [[] for _ in range(4 if kind == "int8" else 2)]
         for expert in cast("Iterable[RoutedExpert]", self):  # an Experts holds RoutedExperts
             for which, linear in enumerate((expert.gate_and_up_proj, expert.down_proj)):
-                if _kind(linear) != kind:
+                if _kind(linear) != kind or (kind == "ggml" and _scheme(linear) != schemes[which]):
                     return "its experts are not all of one kind"
                 leaf = cast("_Int8Leaf", linear)  # read only when `_kind` found an int8 leaf
-                operands = (linear.weight,) if kind == "bf16" else (leaf.data, leaf.scale)
+                operands: tuple[torch.Tensor, ...]
+                if kind == "bf16":
+                    operands = (linear.weight,)
+                elif kind == "int8":
+                    operands = (leaf.data, leaf.scale)
+                else:
+                    operands = (cast("_GgmlLeaf", linear).blocks,)  # `_kind` found a ggml leaf
                 for role, tensor in enumerate(operands):
                     address = _address(tensor, device)
                     if not address:
@@ -335,9 +394,12 @@ class Experts(nn.ModuleList):
                 return "an expert's operands moved inside a capture"
             self._table = torch.tensor(rows, dtype=torch.int64, device=device)
             self._addresses = addresses
+            self._schemes = schemes
             down = cast("RoutedExpert", self[0]).down_proj  # an Experts holds RoutedExperts
             widths = (down.in_features, down.out_features)
             self._aligned = all(a % 16 == 0 for a in (*addresses, *widths))
+        if kind == "ggml" and not self._aligned:
+            return "ggml's kernels read a weight 16-byte aligned, and an expert's is not"
         assert self._table is not None
         return kind, self._table
 
@@ -381,13 +443,41 @@ def _report(plan: Plan, reason: str = "") -> str:
 
 
 def _kind(linear: nn.Module) -> str | None:
-    """ "bf16" for a plain bias-free bf16 Linear, "int8" for an int8.convrot leaf, else None."""
+    """ "bf16" for a plain bias-free bf16 Linear, "int8" for an int8.convrot leaf, "ggml" for a
+    bias-free ggml leaf of a type MUL_MAT_ID runs, else None."""
+    from cozy_runtime.internal.encoding.leaves import GGML
+
     if type(linear) is nn.Linear:
         bias = cast("torch.Tensor | None", linear.bias)  # torch types it Tensor; bias=False: None
         return "bf16" if bias is None and linear.weight.dtype == torch.bfloat16 else None
-    if getattr(linear, "provider", None) == INT8_CONVROT and getattr(linear, "bias", 0) is None:
+    if getattr(linear, "bias", 0) is not None:
+        return None
+    provider = getattr(linear, "provider", None)
+    if provider == INT8_CONVROT:
         return "int8"
+    if provider == GGML and getattr(linear, "encoding", None) in ggml_linear.TYPES:
+        return "ggml"
     return None
+
+
+def _scheme(linear: nn.Module) -> str:
+    """A leaf's encoding (a ggml leaf's block type: one MUL_MAT_ID reads one), "" for a Linear."""
+    encoding = getattr(linear, "encoding", "")
+    return encoding if isinstance(encoding, str) else ""
+
+
+def unserved(experts: Experts) -> str:
+    """Why the grouped kernels can't run `experts`' kind (by their first expert's), or ""."""
+    head = cast("RoutedExpert", experts[0]).gate_and_up_proj  # an Experts holds RoutedExperts
+    if _kind(head) is not None:
+        return ""
+    name = getattr(head, "encoding", None) or getattr(head, "provider", None) or type(head).__name__
+    return f"its experts are {name}: the grouped kernels take bf16, int8.convrot and ggml's types"
+
+
+def kind(experts: Experts) -> str | None:
+    """The grouped kernels' kind of `experts` (by their first expert's): "bf16", "int8", "ggml"."""
+    return _kind(cast("RoutedExpert", experts[0]).gate_and_up_proj)  # an Experts holds RoutedExperts
 
 
 def _address(tensor: torch.Tensor, device: torch.device) -> int:

@@ -37,6 +37,12 @@ int quantize(int device, const void* x, int x_type, void* q8_1, int64_t K, int64
 int matmul_quantized(int device, int type, const void* w, const void* q8_1, float* out, int64_t K, int64_t N,
                      int64_t M, void* (*allocate)(size_t, void*), void* context, cudaStream_t stream);
 
+// Whether these kernels run `type`'s blocks: the six types the `ggml.*` lanes write.
+bool runs(int type);
+
+// What `error()` says next: a failure ggml raised (`ids.cu`'s too).
+void failed(const char* what);
+
 const char* error();
 
 }  // namespace cozy_ggml

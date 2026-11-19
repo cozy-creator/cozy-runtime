@@ -5,7 +5,8 @@ call's start, before anything is told). Once a token is told nothing falls back.
 which engine served it, and why not this one, in the run record's `<model>.engine` note.
 
 It serves a CUDA Qwen3.5 text call: text-only questions, at most `ROWS` rows, no repeat-n-gram cut,
-on a dense model whose step linears are all of `LANES`, with a TensorFS that has the K/V cache, once
+on a dense model or a mixture of experts split per expert (`engine.moe`) whose step linears are all of
+`LANES`, with a TensorFS that has the K/V cache, once
 the model's kernel set has landed (`install`: built while it loads, never on a request) and this
 driver's launch path is known (`engine.launcher`: the WHILE-node launcher, else the host replaying
 the step's graph, else none, checked in a child process). The
@@ -22,7 +23,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 
-from cozy_runtime.engine import launcher
+from cozy_runtime.engine import launcher, moe
 from cozy_runtime.engine.decoder import Decoder, Request, Short, answered, short_of_room
 from cozy_runtime.engine.launch import Run
 from cozy_runtime.engine.qwen35 import text_of
@@ -78,8 +79,8 @@ def serves(model: torch.nn.Module) -> str:
     root = model.get_decoder()  # type: ignore[operator]  # a Transformers model's
     head = getattr(model, "mtp", None)
     layers = [*root.layers, *(head.layers if head is not None else [])]
-    if not all(hasattr(layer.mlp, part) for layer in layers for part in ("gate_proj", "up_proj", "down_proj")):
-        return "its MLPs are experts: the engine's step has none"
+    if why := next((w for layer in layers if (w := moe.unserved(layer.mlp))), ""):
+        return why
     reads = (root, model.get_output_embeddings(), head)  # type: ignore[operator]  # as above
     lanes = {_lane(m) for read in reads if read is not None for m in read.modules()} - {""}
     if unproven := sorted(lanes - LANES):

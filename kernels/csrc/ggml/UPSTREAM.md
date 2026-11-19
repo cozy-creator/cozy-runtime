@@ -11,10 +11,15 @@ of the six types the `ggml.*` lanes use, with ggml-cuda's own flags. The rest ar
 
 Ours, not upstream's: `shim.cu`/`shim.h` (what these sources take from ggml-cuda.cu and ggml.c: the device table, a
 context on the caller's stream with the caller's allocator as its pool, ggml's tensor arithmetic for these types),
-`shim/` (cuBLAS's names, declared only: nothing here calls cuBLAS), `matmul.cu`/`matmul.h` (ggml's MUL_MAT choice
+`shim/` (cuBLAS's names, declared only: nothing here calls cuBLAS), `ids.cu`/`ids.h` (MUL_MAT_ID's MMVQ over a table of experts), `matmul.cu`/`matmul.h` (ggml's MUL_MAT choice
 among the three, and MMQ's dense host launch adapted from `ggml_cuda_mul_mat_q` in `mmq.cu`) and `../ggml.cpp`.
 
-A new tag replaces these files whole and updates this list.
+One upstream file is patched: `ggml-cuda/mmvq.cu` (upstream SHA-256 `11c41a96…0850659e9`). Its two MUL_MAT_ID kernels
+(`mul_mat_vec_q` with one token, `mul_mat_vec_q_moe` with more) read `vx` as a table of each expert's weight when the
+experts' channel stride is 0 (`// cozy:`, four lines each): our experts are separate paging units, not one stack
+(`ids.cu`). A stacked weight's stride is never 0, so llama.cpp's own calls are unchanged.
+
+A new tag replaces these files whole, reapplies that patch, and updates this list.
 
 | file | SHA-256 |
 |---|---|
@@ -44,7 +49,7 @@ A new tag replaces these files whole and updates this list.
 | `ggml/src/ggml-cuda/mmq-few.cuh` | `8c3147331e494dbe80070541920cacd12ce2b1f1ae59755bc27ff67101f5c8e8` |
 | `ggml/src/ggml-cuda/mmq-load-tiles.cuh` | `2583bb2f978afafc8bbcd9cba40e4cd7c1abbecfaba1bfc93bb2b420ee31f283` |
 | `ggml/src/ggml-cuda/mmq-vec-dot.cuh` | `c038cf45ca87552e8c7c81f71f8c908c7d07460a55a571522abd562640c692b3` |
-| `ggml/src/ggml-cuda/mmvq.cu` | `11c41a96e5a7ce60c56d0f20236ca2ec974f016da2f5feafbe49d3d0850659e9` |
+| `ggml/src/ggml-cuda/mmvq.cu` | `8e31d072abf0794a430d8d0a4e40f7aece13fdf14e8fe648e5de9cf6ee3c7be0` |
 | `ggml/src/ggml-cuda/mmvq.cuh` | `b37f8359f519ba90ddecd9cb3ca5f8c2ae05685bfae6813d435d75763c2bb006` |
 | `ggml/src/ggml-cuda/quantize.cu` | `c8beca1390a33dc3ed8666662baf5837f1fa435d8a53b712594c130233f408fe` |
 | `ggml/src/ggml-cuda/quantize.cuh` | `66a47a5cd9a6624b5d2c2ef89f6b7287408a822332e113795e3f6182d9eb2ac0` |

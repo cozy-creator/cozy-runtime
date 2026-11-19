@@ -18,7 +18,8 @@ from typing import TYPE_CHECKING, Protocol, cast
 import torch
 
 from cozy_runtime.accel.kernels import TritonEntry, TritonKernels
-from cozy_runtime.engine import _kernels
+from cozy_runtime.accel.moe import _kernels as grouped
+from cozy_runtime.engine import _kernels, _moe, moe
 from cozy_runtime.engine.launch import TRITON
 from cozy_runtime.engine.qwen35 import CONV_BLOCK, MLP_BLOCK, NORM_WIDEST, PARTS, VALUE_BLOCK, layout_of, text_of
 
@@ -52,14 +53,20 @@ class Shapes:
     dk: int
     dv: int
     conv: int
-    #: each product role's dtype: q, k, v, o, gate, up, down, qkv, z, a, b, out
+    #: each product role's dtype: q, k, v, o, gate, up, down, qkv, z, a, b, out (a routed MLP's gate, up and
+    #: down are its shared expert's, and shared_gate that expert's gate)
     products: tuple[tuple[str, str], ...]
     #: each parameter role's dtype: norm, qk_norm, gated_norm, conv, a_log, dt_bias
     weights: tuple[tuple[str, str], ...]
+    #: a mixture of experts' routing and experts' kind (`engine.moe`); None for a dense model
+    moe: moe.Routed | None = None
 
     @property
     def digest(self) -> str:
-        return hashlib.sha256(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()[:16]
+        fields = asdict(self)
+        if fields["moe"] is None:  # a dense model's sets keep the names they had before `moe`
+            del fields["moe"]
+        return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()[:16]
 
 
 class _Linear(Protocol):
@@ -94,6 +101,8 @@ def shapes_of(model: torch.nn.Module) -> Shapes:
     layers = [*root.layers, *(mtp.layers if mtp is not None else [])]
     products: dict[str, set[str]] = {}
     weights: dict[str, set[str]] = {}
+    routed: set[moe.Routed] = set()
+    renorm = bool(getattr(config, "norm_topk_prob", True))
 
     def product(role: str, linear: object) -> None:
         products.setdefault(role, set()).add(_product(linear, act))
@@ -104,8 +113,13 @@ def shapes_of(model: torch.nn.Module) -> Shapes:
     for layer in layers:
         weight("norm", layer.input_layernorm.weight)
         weight("norm", layer.post_attention_layernorm.weight)
+        mlp = layer.mlp
+        if moe.is_routed(mlp):
+            routed.add(moe.routed_of(mlp, renorm))
+            product("shared_gate", moe.shared_gate(mlp))
+            mlp = moe.shared(mlp)
         for role in ("gate", "up", "down"):
-            product(role, getattr(layer.mlp, f"{role}_proj"))
+            product(role, getattr(mlp, f"{role}_proj"))
         attention, delta = getattr(layer, "self_attn", None), getattr(layer, "linear_attn", None)
         if attention is not None:
             for role in ("q", "k", "v", "o"):
@@ -134,7 +148,17 @@ def shapes_of(model: torch.nn.Module) -> Shapes:
         conv=text.conv,
         products=tuple((role, _one(f"{role} products", found)) for role, found in sorted(products.items())),
         weights=tuple((role, _one(f"{role} weights", found)) for role, found in sorted(weights.items())),
+        moe=_routing(routed, len(layers)),
     )  # fmt: skip
+
+
+def _routing(routed: set[moe.Routed], layers: int) -> moe.Routed | None:
+    """The one routing every layer's MLP takes; None for a dense model. Raises `ValueError` for a mix."""
+    if not routed:
+        return None
+    if len(routed) != 1:
+        raise ValueError(f"its routed MLPs take {len(routed)} routings")
+    return next(iter(routed))
 
 
 class _Configured(Protocol):
@@ -253,6 +277,15 @@ def entries(shapes: Shapes) -> list[TritonEntry]:
                    ("q_ptr", *lined, "a_ptr", "b_ptr", "out_ptr"), 4),
             _entry(k.slots_kernel, {"start_ptr": i32, "live_ptr": "*i1", "table_ptr": i32, "out_ptr": i64},
                    {"T": s.block_tokens, "COUNT": span, "WIDTH": _pow2(span)}, (), 1),
+        ]  # fmt: skip
+    if (routed := s.moe) is not None:
+        found += [
+            _entry(_moe.route_kernel, {"logits_ptr": act, "index_ptr": f"*{TRITON[routed.index]}", "weights_ptr": act},
+                   {"E_BLOCK": _pow2(routed.experts), "K": routed.top_k, "RENORM": routed.renorm}, (), 4),
+            _entry(_moe.combine_kernel, {"pairs_ptr": f"*{routed.pairs}", "weights_ptr": act, "shared_ptr": p["down"],
+                                        "gate_ptr": p["shared_gate"], "out_ptr": p["residual"]},
+                   {"K": routed.top_k, "BLOCK": moe.COMBINE_BLOCK}, (), 4),
+            *(grouped.entries(routed.kind) if routed.kind != "ggml" else ()),
         ]  # fmt: skip
     return found
 

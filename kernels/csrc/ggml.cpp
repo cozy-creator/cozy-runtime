@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// `_kernels._ggml`: llama.cpp's quantized matmuls (MMVQ, few-row MMQ, MMQ; `ggml/`, vendored at b12466) for the
-// `ggml.*` lanes, on the caller's buffers: raw device pointers, sizes, a stream and a stream-ordered allocator for
+// `_kernels._ggml`: llama.cpp's quantized matmuls (MMVQ, few-row MMQ, MMQ, MMVQ's MUL_MAT_ID; `ggml/`, vendored at
+// b12466) for the `ggml.*` lanes, on the caller's buffers: raw device pointers, sizes, a stream and a stream-ordered allocator for
 // the temporaries, so neither torch nor the Python version is a build input. Every call returns its CUDA error code:
 // 0 ran, NOT_SUPPORTED has no kernel for this card, type or shape; `error()` names a failure ggml raised.
 #include <nanobind/nanobind.h>
@@ -9,6 +9,7 @@
 
 #include <cstdint>
 
+#include "ggml/ids.h"
 #include "ggml/matmul.h"
 
 namespace nb = nanobind;
@@ -80,6 +81,22 @@ int matmul_quantized(int device, int type, uintptr_t w, uintptr_t q8_1, uintptr_
                                        reinterpret_cast<cudaStream_t>(stream));
 }
 
+int ids_batch(int device, int type) {
+    const OnDevice guard(device);
+    if (guard.error() != cudaSuccess) return 0;
+    return cozy_ggml::ids_batch(device, type);
+}
+
+int matmul_ids(int device, int type, uintptr_t table, uintptr_t x, int64_t rows, uintptr_t ids, uintptr_t out, int64_t K,
+               int64_t N, int64_t T, int64_t k, nb::handle allocator, uintptr_t stream) {
+    const OnDevice guard(device);
+    if (guard.error() != cudaSuccess) return guard.error();
+    Held held{allocator, {}};
+    return cozy_ggml::matmul_ids(device, type, reinterpret_cast<const void*>(table), reinterpret_cast<const float*>(x),
+                                 rows, reinterpret_cast<const int32_t*>(ids), reinterpret_cast<float*>(out), K, N, T, k,
+                                 &allocate, &held, reinterpret_cast<cudaStream_t>(stream));
+}
+
 }  // namespace
 
 NB_MODULE(_ggml, m) {
@@ -96,6 +113,9 @@ NB_MODULE(_ggml, m) {
           "allocate"_a.none(), "stream"_a);
     m.def("quantized_bytes", &cozy_ggml::quantized_bytes, "K"_a, "M"_a);
     m.def("quantize", &quantize, "device"_a, "x"_a, "x_type"_a, "q8_1"_a, "K"_a, "M"_a, "stream"_a);
+    m.def("ids_batch", &ids_batch, "device"_a, "type"_a);
+    m.def("matmul_ids", &matmul_ids, "device"_a, "type"_a, "table"_a, "x"_a, "rows"_a, "ids"_a, "out"_a, "K"_a, "N"_a,
+          "T"_a, "k"_a, "allocate"_a.none(), "stream"_a);
     m.def("matmul_quantized", &matmul_quantized, "device"_a, "type"_a, "w"_a, "q8_1"_a, "out"_a, "K"_a, "N"_a, "M"_a,
           "allocate"_a.none(), "stream"_a);
 }

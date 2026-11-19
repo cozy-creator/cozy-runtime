@@ -41,3 +41,19 @@ def matmul_quantized(
     allocate: Callable[[int], _Buffer] | None,
     stream: int,
 ) -> int: ...
+def ids_batch(device: int, type: int) -> int: ...
+def matmul_ids(
+    device: int,
+    type: int,
+    table: int,
+    x: int,
+    rows: int,
+    ids: int,
+    out: int,
+    K: int,
+    N: int,
+    T: int,
+    k: int,
+    allocate: Callable[[int], _Buffer] | None,
+    stream: int,
+) -> int: ...

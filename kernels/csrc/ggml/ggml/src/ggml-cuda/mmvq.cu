@@ -666,6 +666,10 @@ static __global__ void mul_mat_vec_q(
 
     ggml_cuda_pdl_sync();
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
+    // cozy: experts held apart (ids, no channel stride): vx is a table of each expert's weight.
+    if (ids && stride_channel_x == 0 && !shared_expert) {
+        vx = ((const void * const *) vx_ptr)[channel_x];
+    }
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
@@ -946,6 +950,10 @@ static __global__ void mul_mat_vec_q_moe(
 
     ggml_cuda_pdl_sync();
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    // cozy: experts held apart (no channel stride): vx is a table of each expert's weight.
+    if (stride_channel_x == 0 && !shared_expert) {
+        vx = ((const void * const *) vx_ptr)[channel_x];
+    }
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;

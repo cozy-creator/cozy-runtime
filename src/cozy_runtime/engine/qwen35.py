@@ -21,13 +21,13 @@ import torch
 import torch.nn.functional as F
 
 from cozy_runtime.accel.kernels import read
-from cozy_runtime.engine import _kernels
+from cozy_runtime.engine import _kernels, moe
 from cozy_runtime.engine.attention import paged_step
 from cozy_runtime.engine.kv import KvLayout, StateSpec
 from cozy_runtime.engine.launch import JIT, Run
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from torch import Tensor
 
@@ -83,7 +83,7 @@ class _Mlp(Protocol):
 
 class _Layer(Protocol):
     """`Qwen3_5DecoderLayer`, as the step reads it: an attention layer has `self_attn`, a
-    gated-delta one `linear_attn`."""
+    gated-delta one `linear_attn`; `mlp` is dense, or routed experts (`engine.moe`)."""
 
     input_layernorm: _Norm
     post_attention_layernorm: _Norm
@@ -336,8 +336,22 @@ class Qwen35:
         self.slot_of = {layer: i for i, layer in enumerate(text.attention)}
         self.delta_of = {layer: i for i, layer in enumerate(text.delta)}
         mlps = [layer.mlp for layer in self.layers] + ([layer.mlp for layer in self.mtp.layers] if self.mtp else [])
-        #: every MLP's activation is SiLU, so SiLU(gate) * up is one launch
-        self.silu = all(type(m.act_fn).__name__ in ("SiLU", "SiLUActivation") for m in mlps)
+        dense = [cast("_Mlp", moe.shared(m)) if moe.is_routed(m) else m for m in mlps]
+        #: every dense MLP's activation (a routed one's shared expert's) is SiLU, so SiLU(gate) * up is one launch
+        self.silu = all(type(m.act_fn).__name__ in ("SiLU", "SiLUActivation") for m in dense)
+        config = cast("_Configured", model).config.get_text_config(decoder=True)
+        #: whether a routed MLP's top-k weights are renormalized (Qwen3.5's always are)
+        self.renorm = bool(getattr(config, "norm_topk_prob", True))
+        #: each layer's MLP as the step calls it, and the head's: dense, or a routed `moe.Block`
+        self.mlps = [self._mlp_of(layer.mlp) for layer in self.layers]
+        self.mtp_mlp = self._mlp_of(self.mtp.layers[0].mlp) if self.mtp else None
+
+    def _mlp_of(self, mlp: _Mlp) -> Callable[[Tensor], Tensor]:
+        if not moe.is_routed(mlp):
+            return lambda h: self._mlp(mlp, h)
+        shared = cast("_Mlp", moe.shared(mlp))
+        return moe.Block(mlp, moe.routed_of(mlp, self.renorm), shared=lambda h: self._mlp(shared, h), product=_product,
+                         run=self.run, fused=self.fused)  # fmt: skip
 
     # ------------------------------------------------------------------ pieces
 
@@ -468,7 +482,7 @@ class Qwen35:
                 mixed = self._delta(layer.linear_attn, h, self.delta_of[i])
             x, h = _add_norm(x, mixed, layer.post_attention_layernorm.weight, eps, fused, run)
             after = layers[i + 1].input_layernorm.weight if i + 1 < len(layers) else self.final.weight
-            x, h = _add_norm(x, self._mlp(layer.mlp, h), after, eps, fused, run)
+            x, h = _add_norm(x, self.mlps[i](h), after, eps, fused, run)
         return h
 
     def draft(self, ids: Tensor, hidden: Tensor, positions: Tensor, tables: Tables) -> Tensor:
@@ -485,7 +499,7 @@ class Qwen35:
         a = _norm(x, layer.input_layernorm.weight, eps, fused, run)
         mixed = self._attention(layer.self_attn, a, positions.contiguous(), self.kv.layout.attn_layers - 1, tables, eps)
         x, a = _add_norm(x, mixed, layer.post_attention_layernorm.weight, eps, fused, run)
-        _, out = _add_norm(x, self._mlp(layer.mlp, a), mtp.norm.weight, eps, fused, run)
+        _, out = _add_norm(x, cast("Callable[[Tensor], Tensor]", self.mtp_mlp)(a), mtp.norm.weight, eps, fused, run)
         return out
 
     def reading(self, drafted: bool, depth: int) -> list[int]:
