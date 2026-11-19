@@ -145,6 +145,7 @@ from cozy_runtime.author._model import (
     ModelRegistry,
     WarningRow,
     component_use,
+    recovered,
 )
 from cozy_runtime.author._observations import DEVICE, FIELDS_CAP, PLANS, Attribution, Observation
 from cozy_runtime.author._preview import PreviewFrame
@@ -1679,11 +1680,17 @@ class Executor:
     def _formed(self, pg: torch.distributed.ProcessGroup) -> None:
         """Rank 0 maps the exchange of the group and checks its bytes (`copy_engine.form`)."""
         assert self.transport is not None
+        asked = self._group_exchange()
         exchange, self.transport.check = copy_engine.form(
-            self.torch, pg, 0, self.world, self._group_exchange(), self._host_tier()  # type: ignore[arg-type]  # torch is imported before a request reaches here
+            self.torch, pg, 0, self.world, asked, self._host_tier()  # type: ignore[arg-type]  # torch is imported before a request reaches here
         )
         copy_engine.install(exchange, pg)
         self.transport.route = exchange.name if exchange is not None else "nccl"
+        if failed := self.transport.check.get("failed"):
+            # The links probe proved the route in a group of processes: a failure here is a bug,
+            # said in the next call to end, beside the check `cozy run show` reports.
+            said = f"the {asked} exchange failed, so NCCL carries it"
+            WARNINGS.append(recovered(said, route=asked, reason=str(failed)))
 
     def _formation_stalled(self, step: str, why: str) -> None:
         """A formation stalled where NCCL connects and moves its first bytes, over peer memory
