@@ -12,8 +12,13 @@ attention layer, a multi-token-prediction head), against Transformers' own forwa
   scores can still turn a draw, so equality is told, not required of the real model).
 - The step's graph: recorded once and replayed (or why not).
 
-The head is scaled so greedy choices are decisive with random weights. It reports and fails on a
-wrong token.
+The head is scaled so greedy choices are decisive with random weights. A choice is clear where the
+top logit leads the next by more than `ULPS` steps of bf16 at the top logit's size: the logits' own
+resolution, which two correct computations (another reduction order, Transformers' own cached
+decode) can turn within. Transformers' cached decode of each row is held to the same check, so a
+check that its own reference fails fails as a check (44511992508: a lead of exactly 0.5, one or two
+bf16 steps at those logits, missed by Transformers' decode as by the engine). It reports and fails
+on a wrong token.
 """
 
 from __future__ import annotations
@@ -26,8 +31,8 @@ import torch
 
 type JSON = None | bool | int | float | str | Sequence[JSON] | Mapping[str, JSON]
 
-#: A clear choice: the top logit leads the next by at least this.
-MARGIN = 0.5
+#: A clear choice: the top logit leads the next by more than this many bf16 steps at its size.
+ULPS = 4
 NEW = 48
 
 
@@ -59,12 +64,24 @@ def _model() -> torch.nn.Module:
     return model
 
 
-def _forced(model: torch.nn.Module, ids: list[int]) -> tuple[list[int], list[float]]:
-    """Transformers' greedy choice after each position of `ids`, and its lead over the next."""
+def _forced(model: torch.nn.Module, ids: list[int]) -> tuple[list[int], list[bool]]:
+    """Transformers' greedy choice after each position of `ids`, and whether it is clear: its
+    lead over the next is more than `ULPS` bf16 steps at the top logit's size."""
     with torch.inference_mode():
         logits = model(input_ids=torch.tensor([ids], device="cuda")).logits[0].float()
     top = logits.topk(2, dim=-1)
-    return top.indices[:, 0].tolist(), (top.values[:, 0] - top.values[:, 1]).tolist()
+    lead = top.values[:, 0] - top.values[:, 1]
+    step = torch.exp2(torch.floor(torch.log2(top.values[:, 0].abs().clamp(min=2**-126))) - 7)
+    return top.indices[:, 0].tolist(), (lead > ULPS * step).tolist()
+
+
+def _decoded(model: torch.nn.Module, prompt: list[int]) -> list[int]:
+    """Transformers' own cached greedy decode of `prompt`, `NEW` tokens: the check's control."""
+    ids = torch.tensor([prompt], device="cuda")
+    with torch.inference_mode():
+        made = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=NEW,  # type: ignore[operator]  # Transformers'
+                              min_new_tokens=NEW, do_sample=False)  # fmt: skip
+    return cast("list[int]", made[0, len(prompt) :].tolist())
 
 
 def measure() -> dict[str, JSON]:
@@ -122,12 +139,12 @@ def measure() -> dict[str, JSON]:
     wrong: list[str] = []
 
     def forced(prompt: list[int], made: list[int]) -> tuple[int, int, int | None]:
-        choice, lead = _forced(model, list(prompt) + made[:-1])
+        choice, decisive = _forced(model, list(prompt) + made[:-1])
         clear = agreed = 0
         first_wrong: int | None = None
         for t, token in enumerate(made):
             at = len(prompt) - 1 + t
-            if lead[at] >= MARGIN:
+            if decisive[at]:
                 clear += 1
                 if choice[at] == token:
                     agreed += 1
@@ -135,7 +152,13 @@ def measure() -> dict[str, JSON]:
                     first_wrong = t
         return clear, agreed, first_wrong
 
+    if hasattr(model, "mtp"):
+        del model.mtp  # Transformers' own decode, plain
     for i, prompt in enumerate(prompts):
+        _, control_agreed, control_wrong = forced(prompt, _decoded(model, prompt))
+        checks[f"row{i}_transformers_decode_agreed"] = control_agreed
+        if control_wrong is not None:
+            wrong.append(f"row {i}: Transformers' own decode misses its token {control_wrong}: the check can't judge")
         plain = runs["plain"][i]
         clear, agreed, first_wrong = forced(prompt, plain)
         _, unfused_agreed, unfused_wrong = forced(prompt, runs["plain-unfused"][i])
