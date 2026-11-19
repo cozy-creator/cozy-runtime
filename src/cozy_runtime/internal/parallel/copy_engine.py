@@ -416,9 +416,7 @@ class HostStagedExchange(Exchange):
         widths = self._check(sends, matrices, out)
         plan = _plan(widths, matrices, world)
         longest = _longest(plan)
-        # Two rounds at least: one round's reads overlap the next one's writes, so a crossing
-        # smaller than a slot is not its writes and then its reads in series.
-        size = max(min(chunk or -(-longest // 2), self.slot), 1)
+        size = min(chunk or self.slot, self.slot)
         sent, into = _bytes(sends, torch), _bytes(out, torch)
         ready = torch.cuda.Event()
         ready.record(torch.cuda.current_stream(self.device))

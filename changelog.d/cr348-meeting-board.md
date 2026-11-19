@@ -1,0 +1,1 @@
+A Ulysses call's meeting of the group's GPUs is a page of shared memory they all map, not the group's file store: 0.09 ms a call where the store took 0.34 ms in step, and 0.1 ms past a GPU 2 ms late where the store's backing-off poll took 0.5 ms (2x RTX 4090, cr-348).
