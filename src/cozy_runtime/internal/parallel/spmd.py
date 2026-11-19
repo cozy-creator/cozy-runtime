@@ -975,12 +975,14 @@ class _Choice:
     anyway. The key's shape class is that call's (`_shape_class`): a request's video chooses, and
     its seed, its words or its prompt's length within a power of two do not.
 
-    At one GPU, GPU 0 runs each sharded call unsharded and its output crosses (`hosted_call`); the
+    At one GPU, one GPU runs each sharded call unsharded and its output crosses (`hosted_call`):
+    GPU 0, unless its stated room cannot hold the stage's need and another's can (`_home`). The
     others run the rest of the stage's program on it, so its random streams, generators and
     callbacks stay theirs, and compute, fetch and hold none of the call. A stage whose output once
     could not cross runs unsharded on every GPU where it fits there (`_fits`), else at the group's.
 
-    Measuring, GPU 0 times each sharded call (steps 2 on: step 1 carries fills and compiles); a
+    Measuring, the GPU running them times each sharded call (steps 2 on: step 1 carries fills and
+    compiles); a
     step in which a GPU read weights from disk or saw a kernel build or land makes the record cold
     (`_cold`). Trying the group's degree, its second step is compared with one GPU's steady step at
     the third call, and a slower one moves the rest of the stage to one GPU (`_trial`)."""
@@ -992,13 +994,15 @@ class _Choice:
         self.measure = False
         #: one GPU's steady step the group's degree is tried against (`degrees.Decision`)
         self.against_ms: float | None = None
-        #: at one GPU: GPU 0 runs each sharded call and its output crosses
+        #: at one GPU: the GPU `home` runs each sharded call and its output crosses
         self.hosted = False
+        self.home = 0
         #: what the stage runs inside from its first sharded call to its end, at degree 1
         self.scope = contextlib.ExitStack()
-        #: GPU 0's, measuring: an event at each sharded call's start, then the stage's end
+        #: the timing GPU's (`_timer`), measuring: an event at each sharded call's start, then the
+        #: stage's end
         self.events: list[torch.cuda.Event] = []
-        #: GPU 0's, measuring one GPU: the weight bytes filled onto it at each event
+        #: the timing GPU's, measuring one GPU: the weight bytes filled onto it at each event
         self.filled: list[int] = []
         self.calls = 0
         #: this GPU's `_cold` at the steady steps' start and at the stage's end
@@ -1077,8 +1081,38 @@ class _Choice:
         if self.stage in _UNHOSTED:
             self._everywhere()
         else:
-            self.hosted = True
+            self.hosted, self.home = True, self._home(roots)
             _row(self.what)["hosted"] = 1.0
+            _row(self.what)["home"] = float(self.home)
+
+    def _home(self, roots: list[object]) -> int:
+        """The GPU that runs the stage's sharded calls at one GPU: GPU 0 where its stated room (the
+        card less what other processes hold, `vt.room`) holds the stage's need, its sharded weights
+        and one GPU's recorded working peak; else the GPU with the most room, the lowest on a tie.
+        Another executor may hold much of a card (a machine serving one-GPU and group requests)."""
+        import tensorfs.varena.torch as vt
+        import torch
+
+        from cozy_runtime.internal.parallel import degrees
+
+        need = None
+        if self.ranks.rank == 0:
+            row = degrees.known(cast("degrees.Key", self.key)).get(1, {})
+            need = int(cast("int", row.get("peak_bytes", 0))) + sum(
+                p.numel() * p.element_size()
+                for root in roots
+                for p in cast("torch.nn.Module", root).parameters()
+            )
+        room = int(vt.room(torch.cuda.current_device())["capacity"])
+        rows = self.ranks.meet({"room": room, "need": need}, f"home {self.stage}")
+        rooms = [int(cast("int", r["room"])) for r in rows]
+        if rooms[0] >= int(cast("int", rows[0]["need"])):
+            return 0
+        return max(range(len(rooms)), key=lambda r: (rooms[r], -r))
+
+    def _timer(self) -> int:
+        """The GPU whose stream runs the stage's sharded calls: the home at one GPU, else GPU 0."""
+        return self.home if self.hosted else 0
 
     def _everywhere(self) -> None:
         """Every GPU runs the rest of the stage unsharded on its own, nothing crossing."""
@@ -1089,29 +1123,30 @@ class _Choice:
     def hosted_call(
         self, module: torch.nn.Module, args: tuple[object, ...], kwargs: dict[str, object]
     ) -> object:
-        """One sharded call at one GPU: GPU 0 runs it unsharded, and its output crosses."""
-        ranks, what = self.ranks, f"{self.what} hosted"
-        if ranks.rank != 0:
-            told = cast("dict[str, object]", ranks.cross(None, 0, what))
+        """One sharded call at one GPU: its home runs it unsharded, and its output crosses."""
+        ranks, home, what = self.ranks, self.home, f"{self.what} hosted"
+        if ranks.rank != home:
+            told = cast("dict[str, object]", ranks.cross(None, home, what))
             if told.get("op") == "done":
                 return told["out"]
             if told.get("op") != "everywhere":
-                why = f"{what}: {ranks.gpu(0)} failed: {told.get('why', '')}"
+                why = f"{what}: {ranks.gpu(home)} failed: {told.get('why', '')}"
                 raise GroupRefusal(why[:900], code=ENDED)
             self._unhosted()
             return type(module)._call_impl(module, *args, **kwargs)
         try:
-            with _alone(ranks, self.stages, 0, what, served=False), _unsharded():
+            with _alone(ranks, self.stages, home, what, served=False), _unsharded():
                 out = type(module)._call_impl(module, *args, **kwargs)
         except BaseException as exc:
             with contextlib.suppress(Exception):
-                ranks.cross({"op": "failed", "why": f"{type(exc).__name__}: {exc}"[:600]}, 0, what)
+                why = f"{type(exc).__name__}: {exc}"[:600]
+                ranks.cross({"op": "failed", "why": why}, home, what)
             raise
         if not _crossable(out, []):
-            ranks.cross({"op": "everywhere"}, 0, what)
+            ranks.cross({"op": "everywhere"}, home, what)
             self._unhosted()
             return out
-        ranks.cross({"op": "done", "out": out}, 0, what)
+        ranks.cross({"op": "done", "out": out}, home, what)
         return out
 
     def _unhosted(self) -> None:
@@ -1152,7 +1187,7 @@ class _Choice:
         self._one()
 
     def _mark(self) -> None:
-        if self.measure and self.ranks.rank == 0:
+        if self.measure and self.ranks.rank == self._timer():
             import torch
 
             event = torch.cuda.Event(enable_timing=True)
@@ -1187,26 +1222,33 @@ class _Choice:
         row["degree"] = float(self.degree)
         if not self.measure:
             return
-        steady = self._steady_ms() if self.ranks.rank == 0 else None
+        timer = self._timer()
+        mine = self.ranks.rank == timer
+        steady = self._steady_ms() if mine else None
+        # the weight bytes filled onto the timing GPU over its last sharded call (`degrees.choose`)
+        paged = self.filled[-1] - self.filled[-2] if mine and len(self.filled) > 1 else None
         warm = len(self.cold) == 2 and self.cold[0] == self.cold[1] and not self.cold[1][2]
-        rows = self.ranks.meet({"peak": _peak(), "warm": warm}, f"peak {self.stage}")
-        if steady is None:
+        told = {"peak": _peak(), "warm": warm, "steady": steady, "paged": paged, "kernels": None}
+        if mine:
+            told["kernels"] = cast("dict[str, Json]", attention_ulysses.served())
+        rows = self.ranks.meet(told, f"peak {self.stage}")
+        if rows[timer]["steady"] is None:
             return
-        row["steady_ms"] = steady
-        # At one GPU only GPU 0 computes the stage's sharded calls.
-        timed = rows[:1] if self.hosted else rows
+        row["steady_ms"] = steady = float(cast("float", rows[timer]["steady"]))
+        # At one GPU only its home computes the stage's sharded calls.
+        timed = [rows[timer]] if self.hosted else rows
         kept: dict[str, object] = {
             "steady_ms": steady,
             "peak_bytes": max(int(cast("int", r["peak"])) for r in timed),
-            "kernels": attention_ulysses.served(),
+            "kernels": rows[timer]["kernels"],
         }
         if not all(r["warm"] for r in timed):
             row["cold"] = 1.0
             kept["cold"] = True
-        if self.degree == 1:
-            # the weight bytes filled onto GPU 0 over its last sharded call (`degrees.choose`)
-            kept["paged_bytes"] = row["paged_bytes"] = float(self.filled[-1] - self.filled[-2])
-        degrees.record(self.key, self.degree, kept)
+        if self.degree == 1 and rows[timer]["paged"] is not None:
+            kept["paged_bytes"] = row["paged_bytes"] = float(cast("float", rows[timer]["paged"]))
+        if self.ranks.rank == 0:
+            degrees.record(self.key, self.degree, kept)
 
 
 @contextlib.contextmanager
