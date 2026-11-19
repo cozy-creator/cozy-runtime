@@ -92,7 +92,7 @@ class Step:
         kv = model.kv
         self.span = kv.layout.span if drafted else 1
         device = kv.device
-        self.steps = torch.arange(self.span, device=device)
+        self.steps = torch.arange(self.span, dtype=torch.int32, device=device)  # positions are int32 (`kernels`)
         #: the draft head's tables: a position ahead of the body's, seeing from 1
         self.mtp_lengths = torch.full((size,), -1, dtype=torch.int32, device=device)
         self.mtp_slots = torch.full((size, kv.layout.span), -1, dtype=torch.int64, device=device)
@@ -111,9 +111,9 @@ class Step:
             entry = kv.block_table[: self.size].gather(1, index).long()
             out[:, :count].copy_(torch.where(live[:, None] & (entry >= 0), entry * tokens + at % tokens, -1))
             return
-        _kernels.slots_kernel[(self.size,)](
+        self.model.run(_kernels.slots_kernel, (self.size,),
             start, live, kv.block_table, out, offset, kv.max_blocks, int(out.stride(0)),
-            T=kv.layout.block_tokens, COUNT=count, WIDTH=1 << max(count - 1, 0).bit_length(), num_warps=1,
+            kv.layout.block_tokens, count, 1 << max(count - 1, 0).bit_length(), num_warps=1,
         )  # fmt: skip
 
     def _scores(self, logits: Tensor, ahead: Tensor | None = None) -> Tensor:

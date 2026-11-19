@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from cozy_runtime.engine import _kernels
+from cozy_runtime.engine.launch import JIT, Run
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -84,6 +85,7 @@ def paged_step(
     first_seen: int = 0,
     gate: Tensor | None = None,
     fused: bool = True,
+    run: Run = JIT,
 ) -> Tensor:
     """A decode step's attention for `layer`: the step's own K and V (`k_new`, `v_new`,
     `[rows, S, kv_heads, head_dim]`) written at each query's token slot (`slot_mapping`'s first
@@ -93,28 +95,27 @@ def paged_step(
     nothing (its output is zero). Positions below `first_seen` are never read. `gate`, an output
     gate (`[rows, S, heads, head_dim]`, its last dimension contiguous; Qwen3.5's), multiplies each
     head's output by its sigmoid. `fused`: the parts joined (and gated) in one launch, else by
-    torch's ops (the reference).
+    torch's ops (the reference). `run` launches the kernels (the model's set, `engine.kernels`).
     Returns `[rows, S, heads, head_dim]` in q's dtype. Every length, slot and table entry is read
     on the device, so the step's graph holds only addresses."""
     rows, span, heads, dim = (int(n) for n in q.shape)
     kvh = layout.kv_heads
     group = heads // kvh
     tokens = layout.block_tokens
-    _kernels.write_step_kernel[(rows, span)](
+    run(_kernels.write_step_kernel, (rows, span),
         k_new.contiguous(), v_new.contiguous(), card, slot_mapping, lengths, layer,
         int(slot_mapping.stride(0)),
-        L=layout.attn_layers, S=span, T=tokens, KVH=kvh, D=dim, num_warps=4,
+        layout.attn_layers, span, tokens, kvh, dim, num_warps=4,
     )  # fmt: skip
     fixed = (rows * kvh, parts, span * group)
     part_m = torch.empty(fixed, dtype=torch.float32, device=q.device)
     part_l = torch.empty(fixed, dtype=torch.float32, device=q.device)
     part_acc = torch.empty((*fixed, dim), dtype=torch.float32, device=q.device)
-    _kernels.paged_step_kernel[(rows * kvh, parts)](
+    run(_kernels.paged_step_kernel, (rows * kvh, parts),
         q.contiguous(), card, host.blocks, block_table, lengths, part_m, part_l, part_acc,
         heads, int(block_table.shape[1]), int(card.shape[0]), layer, host.layer,
         int(host.blocks.shape[1]), first_seen, scale,
-        L=layout.attn_layers, S=span, T=tokens, KVH=kvh, G=group,
-        Q=_power_of_two(span * group), D=dim, P=parts, num_warps=4,
+        layout.attn_layers, span, tokens, kvh, group, _power_of_two(span * group), dim, parts, num_warps=4,
     )  # fmt: skip
     if not fused:
         best = part_m.amax(1, keepdim=True)
@@ -127,10 +128,10 @@ def paged_step(
     out = torch.empty((rows, span, heads, dim), dtype=q.dtype, device=q.device)
     if gate is not None and (gate.shape != out.shape or gate.stride(-1) != 1 or gate.stride(0) != span * gate.stride(1)):
         gate = gate.contiguous()
-    _kernels.paged_join_kernel[(rows * kvh, span * group)](
+    run(_kernels.paged_join_kernel, (rows * kvh, span * group),
         part_m, part_l, part_acc, gate if gate is not None else out, out, heads,
         int(gate.stride(1)) if gate is not None else 0, int(gate.stride(2)) if gate is not None else 0,
-        S=span, KVH=kvh, G=group, D=dim, P=parts, GATED=gate is not None, num_warps=4,
+        span, kvh, group, dim, parts, int(gate is not None), num_warps=4,
     )  # fmt: skip
     return out
 
