@@ -687,48 +687,11 @@ class Model:
         finally:
             self.memory._close(self, executing=executing)
 
-    def keep(self, since_ns: int, reserve: int) -> tuple[Binding, int, int] | None:
-        """For a loop of its forwards that can't hold it whole (an LM decoding streamed): of its
-        blocks used since `since_ns`, the most bytes that fit beside its live working memory,
-        `reserve` bytes and room for the largest of the rest to stream through, largest first. A
-        binding over them, which the caller prepares and holds while the loop runs, so each
-        forward reads only the others again; with the bytes kept and those still read a forward.
-        None when none fits. An embedding table is no block a forward reads whole: under the loop
-        it gathers its rows on the host (`gathering`)."""
-        if self.memory.native is None:
-            return None
-        # The common group (embeddings, the head, final norms) serves every forward, entered
-        # around it rather than block by block.
-        used = sorted(
-            (b for b in self.groups() if (b is self.common or b.last >= since_ns) and not b.table),
-            key=lambda b: b.least_bytes,
-            reverse=True,
-        )
-        room = vt.room(self.memory.device.index or 0)
-        budget = room["capacity"] - room["working_live"] - reserve
-        kept: list[_Block] = []
-        held = streamed = 0
-        for at, block in enumerate(used):
-            after = used[at + 1].least_bytes if at + 1 < len(used) else 0
-            if held + block.least_bytes + max(streamed, after) <= budget:
-                kept.append(block)
-                held += block.least_bytes
-            else:
-                streamed = max(streamed, block.least_bytes)
-        if not kept:
-            return None
-        self._claim()
-        try:
-            self.memory._declare(self)
-            return Binding(self, kept), held, sum(b.least_bytes for b in used) - held
-        finally:
-            self._release()
-
     @contextmanager
     def gathering(self) -> Iterator[None]:
-        """While a loop streams it (`keep`): its embedding tables, which `keep` leaves no room,
+        """While a loop of its forwards streams it (an LM's eager decode): its embedding tables
         serve from their device page while varena keeps it and otherwise gather their rows on the
-        host (`Memory._gather`), never filling whole again. Filled whole, a table took the room
+        host (`Memory._gather`), never filling whole again; the plan holds them absent meanwhile. Filled whole, a table took the room
         the loop's working memory had, which took it back the next token: MiniMax-H3-Image's
         expander on a 4090 refilled its 2.37 GiB table 685 times in 1,573 tokens (cr-332)."""
         with self.memory.lock:
@@ -1175,9 +1138,6 @@ class Memory:
         self.models: dict[nn.Module, Model] = {}
         self._working_phase_owners: dict[str, set[Model | Request]] = {}
         self.regions: weakref.WeakSet[Region] = weakref.WeakSet()
-        #: what holds weights only for speed (a streamed decode's kept blocks, `lm._Keeper`): asked
-        #: to let them go when a block it doesn't hold is refused room, before the refusal stands
-        self.sheds: list[Callable[[int], bool]] = []
         self.requests: set[Request] = set()
         self.last: RequestStats | None = None
         self.native: varena.Device | None = None
@@ -2083,7 +2043,7 @@ class Memory:
             bindings = []
             for block in model.groups():
                 if block.gathered is not None:
-                    return [], [], "host_gathered_representation"
+                    continue  # on the host while it gathers: the plan holds it absent
                 raw_needed = (
                     block.aliases is None or any(block.aliases.values()) or not block.finals
                 )
@@ -2355,23 +2315,15 @@ class Memory:
             self._ensure(block, True, overlay)
         except Exhausted:
             return False
-        block.gathered = None
+        self._ungathered(block)
         return True
 
-    def _placed_after_shed(self, block: _Block, overlay: Hashable) -> bool:
-        """`block` placed after what holds weights only for speed let them go (`sheds`): False
-        when nothing did, or it still has no room. A refused block beside them is the refusal
-        that gives way first (cr-319: Klein's upsampler at a 6 GiB cap held 4.0 GiB of its 10.1
-        to decode streamed, and a 0.2 GiB layer it streams had no room; gate 44062127052)."""
-        need = block.allocation_bytes
-        if not any([shed(need) for shed in list(self.sheds)]):
-            return False
-        try:
-            self._ensure(block, True, overlay)
-        except Exhausted:
-            return False
-        block.gathered = None
-        return True
+    def _ungathered(self, block: _Block) -> None:
+        """`block` serves from the device again: a plan that held it absent while it gathered on
+        the host (`_gather`) is made again with it."""
+        if block.gathered is not None:
+            block.gathered = None
+            self._retire_phase_plan("host_gathered_returned", model=block.model)
 
     @torch.inference_mode(False)
     def _gather(self, block: _Block, overlay: Hashable) -> None:
@@ -2381,9 +2333,10 @@ class Memory:
         copy is the host tier's page when it keeps one, else read once and held while the table
         gathers; each entry tries the device first. A linear layer refused so (`_Block.leaf`)
         stays there the same way, in pinned memory; its windows' rows are copied in
-        (`_streamed`)."""
-        self._retire_phase_plan("host_gathered_representation", model=block.model)
+        (`_streamed`). The plan is made again without it once, as it leaves (`_phase_regions`
+        holds a gathered block absent), not at each of its entries."""
         if block.gathered is None or block.gathered[0] != overlay:
+            self._retire_phase_plan("host_gathered_representation", model=block.model)
             block.gathered = None
             model = block.model
             raw = _host(block.storage_bytes, pinned=not block.table)
@@ -2531,14 +2484,11 @@ class Memory:
                             self._gather(block, overlay)
                     else:
                         self._ensure(block, reclaim, overlay)
-                        block.gathered = None
+                        self._ungathered(block)
                 except Exhausted:  # varena refused its region before its forward ran
                     if not (reclaim and self.cuda and not capturing):
                         raise
-                    if not (
-                        self._placed_after_reads(block, overlay)
-                        or self._placed_after_shed(block, overlay)
-                    ):
+                    if not self._placed_after_reads(block, overlay):
                         if not (block.table or self._streams(block)):
                             raise
                         gathered = block.gathered is not None and block.gathered[0] == overlay
@@ -2880,7 +2830,7 @@ class Memory:
         floor = model.escape_floor
         if any(b.retained for b in model.groups()):
             # Held blocks are in the pass's held bytes already: the floor is what still streams
-            # (a decode keeping what fits, `keep`); an embedding table gathers on the host.
+            # (a graph's lease of its decode set); an embedding table gathers on the host.
             shared = model.common
             floor = (shared.allocation_bytes if shared and not shared.retained else 0) + max(
                 (
