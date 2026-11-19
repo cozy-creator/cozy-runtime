@@ -336,6 +336,7 @@ class Decoder:
         kv, r = self.kv, self.rows
         key = (size, drafted, sampling.sampled, sampling.kept)
         step, graph = self.steps.get(key) or (Step(self.qwen, r, sampling, size, drafted), None)
+        made.captured = graph is not None  # a graph an earlier call recorded serves this one
         reach = (step.span + 1) if drafted else 1
         ring = torch.empty((SEGMENT, *r.report[:size].shape), dtype=torch.int32, device=self.device)
         live = [True] * rows
