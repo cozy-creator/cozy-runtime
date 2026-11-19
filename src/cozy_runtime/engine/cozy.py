@@ -155,13 +155,6 @@ class CozyEngine:
             self.unserved = serves(self.model) or "the engine's kernels were never installed (no execution plan)"
         if self.unserved:
             return self.unserved
-        if self.run is None:
-            return f"the engine's kernels ({self.building}) are building"
-        paths = launcher.judged(self.index)
-        if paths is None:
-            return "the engine's launcher is being checked on this driver"
-        if paths.launcher and paths.replayed:
-            return f"this driver runs neither of the engine's launch paths: {paths.launcher}; {paths.replayed}"
         if any(not isinstance(p, str) for q in questions for p in q.everything()):
             return "the engine's prefill reads text only"
         if params.allowed is not None:
@@ -170,6 +163,13 @@ class CozyEngine:
             return f"the engine decodes at most {ROWS} rows at once"
         if params.no_repeat_ngram:
             return "the engine has no repeat-n-gram cut"
+        if self.run is None:
+            return f"the engine's kernels ({self.building}) are building"
+        paths = launcher.judged(self.index)
+        if paths is None:
+            return "the engine's launcher is being checked on this driver"
+        if paths.launcher and paths.replayed:
+            return f"this driver runs neither of the engine's launch paths: {paths.launcher}; {paths.replayed}"
         return ""
 
     def generate(

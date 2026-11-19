@@ -138,6 +138,23 @@ def guarded(kernel: str, artifact: str, sm: int) -> Iterator[None]:
             path.unlink(missing_ok=True)
 
 
+def remember_crash(kernel: str, artifact: str, sm: int, why: str) -> None:
+    """A crash this process saw in another (a child that checked `kernel`, ended by a signal):
+    `kernel` is refused in this boot's next processes of this Runtime build here, as when its
+    probe crashes this one (`crashed`)."""
+    key = (kernel, artifact, sm, accel.driver_version(), RUNTIME)
+    path = _path(key)
+    if path is None:
+        return
+    crash = f"fault-{path.stem}"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        (path.parent / crash).write_text(why)
+    except OSError:
+        return
+    _write(path, key, Verdict(False, CRASHED), crash)
+
+
 def crashed(kernel: str, artifact: str, sm: int) -> bool:
     """Whether a probe or a `guarded` block of `kernel` crashed an earlier process of this Runtime
     build here, this boot."""
