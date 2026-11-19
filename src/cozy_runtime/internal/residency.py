@@ -690,10 +690,13 @@ class Model:
     @contextmanager
     def gathering(self) -> Iterator[None]:
         """While a loop of its forwards streams it (an LM's eager decode): its embedding tables
-        serve from their device page while varena keeps it and otherwise gather their rows on the
-        host (`Memory._gather`), never filling whole again; the plan holds them absent meanwhile. Filled whole, a table took the room
-        the loop's working memory had, which took it back the next token: MiniMax-H3-Image's
-        expander on a 4090 refilled its 2.37 GiB table 685 times in 1,573 tokens (cr-332)."""
+        gather the rows each forward reads on the host (`Memory._gather`), and the plan holds them
+        absent, so their room goes to the blocks the loop streams. A forward reads a row of a
+        table a token: kept on the card, Klein's upsampler's 1.89 GiB table sat in the plan's
+        prefix at a 6 GiB cap, and the loop read 5.8 GiB again a token (cr-336). Filled whole, a
+        table took the room the loop's working memory had, which took it back the next token:
+        MiniMax-H3-Image's expander on a 4090 refilled its 2.37 GiB table 685 times in 1,573
+        tokens (cr-332)."""
         with self.memory.lock:
             self.gathers += 1
         try:
@@ -2478,7 +2481,6 @@ class Memory:
                         and model.gathers
                         and self.native is not None
                         and not capturing
-                        and (gathered or not block.cached())
                     ):  # `Model.gathering`: on the host, it stays there to the loop's end
                         with nullcontext() if gathered else self._read_told(block):
                             self._gather(block, overlay)
