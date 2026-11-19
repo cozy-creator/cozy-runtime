@@ -26,6 +26,7 @@ import torch
 
 from cozy_runtime.engine.kv import KvManager
 from cozy_runtime.engine.launch import JIT, Run
+from cozy_runtime.engine.launcher import first
 from cozy_runtime.engine.qwen35 import Qwen35, layout_of, text_of
 from cozy_runtime.engine.sampling import Sampling
 from cozy_runtime.engine.step import Rows, Step, rows_for
@@ -514,11 +515,13 @@ class Decoder:
                     ahead = min(LAUNCH_STEPS, max(request.max_new - len(made.tokens[row]), 0)) + reach
                     kv.reserve_ahead(row, ahead)
                     r.budget[row] = min(kv.committed(row), length + ahead)
+            index = self.device.index or 0
             if graph is None and made.steps and key not in self.steps:  # the second step is recorded
                 graph = self._capture(step, made, keep_graph=True)
                 self.steps[key] = (step, graph)
                 if graph is not None:
-                    self.segments[key] = _engine.Segment(graph.raw_cuda_graph(), r.go.data_ptr(), self.device.index or 0)
+                    with first(index, launch=False):  # a driver the launcher crashes refuses it next process
+                        self.segments[key] = _engine.Segment(graph.raw_cuda_graph(), r.go.data_ptr(), index)
             if graph is None:  # a new key's first step, or a step that can't be captured: eagerly
                 step()
                 self.stream.synchronize()
@@ -528,7 +531,7 @@ class Decoder:
                 segment = cast("_engine.Segment", self.segments[key])
                 # The graph's pool mapped and retained through every launch on the stream,
                 # the segment's parent graph holding its clone among them (var-032).
-                with vt.launching(graph, stream=self.stream):
+                with first(index, launch=True), vt.launching(graph, stream=self.stream):
                     segment.launch(self.stream.cuda_stream)
                     done = torch.cuda.Event(blocking=True)
                     done.record(self.stream)

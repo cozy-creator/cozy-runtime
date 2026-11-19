@@ -742,6 +742,20 @@ def engine_loop() -> Row:
     return bench.measure()
 
 
+def _engine_loop_section(section: str) -> Callable[[], Row]:
+    def one() -> Row:
+        from cozy_runtime.internal.bench import engine_loop as bench
+
+        return bench.measure(section)
+
+    return one
+
+
+#: One section of `engine-loop` a case, in its own process: one that crashes the driver names itself.
+for _section in ("loop", "polled", "attention", "ggml", "copies", "replayed"):
+    CASES[f"engine-loop-{_section}"] = _engine_loop_section(_section)
+
+
 def main(name: str) -> None:
     function = CASES.get(name)
     if function is None:
