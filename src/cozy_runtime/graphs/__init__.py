@@ -107,15 +107,11 @@ if TYPE_CHECKING:
     type _Counts = tuple[int, int, float, float, float]
 
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
-#: Gates only, never a setting: every path records at its first sight, whatever it would save, so
-#: a gate build proves each model captures and replays (cr-297). False in every release.
-FORCE = False
 #: A dev machine's (`dev = true` in its config.toml, sent in the executor's `Start`): its replays
 #: are audited.
 AUDIT = False
-#: Under `FORCE` or `AUDIT`, every this-many-th replay of a region also runs as written from the
-#: same state and the two are compared (`_Audit`): a graph that drifts from its call after its one
-#: check goes
+#: Under `AUDIT`, every this-many-th replay of a region also runs as written from the same state
+#: and the two are compared (`_Audit`): a graph that drifts from its call after its one check goes
 _AUDIT = 16
 #: Set while a region warms up its capture: the regions under it run as written.
 _WARMING = contextvars.ContextVar("cozy_graphs_warming", default=False)
@@ -1573,7 +1569,7 @@ def _region_path(
         recorder.began = recorder.latest
     if key in recorder.paths:
         audit: list[_Audit] | None = (
-            [] if (FORCE or AUDIT) and recorder.replays % _AUDIT == _AUDIT - 1 else None
+            [] if AUDIT and recorder.replays % _AUDIT == _AUDIT - 1 else None
         )
         result = _replay_call(torch, module, recorder, key, leaves, placed, audit)
         if audit and result is not _EAGER and result is not _STALE:
@@ -1585,26 +1581,6 @@ def _region_path(
             return result
         # No graph of this path holds now (what it read outside the call is gone, or a module
         # attribute it read has another value): this call records one.
-    if (
-        FORCE
-        and key not in recorder.seen
-        and key not in recorder.failed
-        and key not in recorder.judged
-        and recorder.eager.calls  # a region's first call autotunes and pages in
-    ):
-        # Gates only: every path records at its first sight, sized by its region's peak.
-        peak = max((s.peak or 0 for s in recorder.seen.values()), default=0)
-        # Recorded, timed events: `device_ms` reads the time between them (two never recorded
-        # raised there once the capture succeeded).
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
-        end.record()
-        warm = _Seen(0.0, 0.0, start, end, peak or None)
-        result = _capture_call(
-            torch, module, recorder, call, key, spec, leaves, (args, kwargs), placed, warm
-        )
-        if result is not _EAGER:
-            return result
     if (seen := recorder.seen.get(key)) is not None and key not in recorder.failed:
         if key not in recorder.judged:
             if (changed := recorder.impure.get(key)) is None:
@@ -1970,8 +1946,6 @@ def _fits(
     key = _pool_key(module, leaves, device)
 
     def fits(pool: int) -> str:
-        if FORCE:
-            return ""
         why = _over_card(device, placed, recorder, pool, live)
         if why and key and pool > rungs.pool(key):
             rungs.put(key, pool)
@@ -2073,12 +2047,12 @@ def _capture_call(
     written and tries again at a later call; one the code refuses, or a mismatch, runs as
     written for the process, and the run says why. Never an error a call as written would not
     raise."""
-    if seen.peak is None and not FORCE:
+    if seen.peak is None:
         # its pass was observed inside another's: a later call may be
         recorder.gap = "its calls' working memory is not measured"
         _note(recorder, "building", recorder.gap)
         return _EAGER
-    if seen.hosted and not FORCE:
+    if seen.hosted:
         # The graph rung sits above the host rung: a call that had no room for a split's whole
         # on the card has none for a pool holding it. A later call at the card rung records.
         recorder.gap = _HOSTED
@@ -2091,21 +2065,21 @@ def _capture_call(
             recorder.codes[key] = "refused"
         _note(recorder, "refused", why)
         return _EAGER
-    if not FORCE and (why := _churning(recorder, key)):
+    if why := _churning(recorder, key):
         recorder.gap = why
         _note(recorder, "refused", why)
         return _EAGER
-    if not FORCE and _key_moved(recorder, key):
+    if _key_moved(recorder, key):
         recorder.gap = "its key moved since its last request's graphs: an idle period records it"
         _note(recorder, "deferred", recorder.gap)
         return _EAGER
-    if not FORCE and (why := _BUDGET.over(_capture_cost(recorder, seen))):
+    if why := _BUDGET.over(_capture_cost(recorder, seen)):
         recorder.gap = why
         _note(recorder, "deferred", why)
         return _EAGER
     # Admission before anything is made for a capture: a declined path leaves no capture streams
     # or library workspaces behind, which a capped card's weights would otherwise lose to.
-    if placed is not None and not FORCE:
+    if placed is not None:
         pool = _pool_need(module, leaves, seen.peak or 0, torch.cuda.current_device())
         if over := _over_card(torch.cuda.current_device(), placed, recorder, pool):
             with recorder.lock:
@@ -2215,7 +2189,7 @@ def _capture_call(
         recorder.capture_ms += took
         _BUDGET.spend(took - max(seen.host_ms, seen.device_ms() or 0.0))  # past the call served
         recording.writes, replayed.saved, replayed.wrote, replayed.inputs = [], [], [], []
-        if not (FORCE or AUDIT):  # an audit sets its replays beside them (`_Audit`)
+        if not AUDIT:  # an audit sets its replays beside them (`_Audit`)
             recording.ops, recording.levels = [], {}
         if not kept:
             with recorder.lock:
@@ -3087,7 +3061,7 @@ def _record(
         if placed is not None and not placed[0].graph_accounted():
             _failed(module, recorder, key, "driver/context memory is unmeasured", idle=True)
             return True
-        if placed is not None and not FORCE:
+        if placed is not None:
             # Before its weights or warm-up take room: a pool known not to fit beside them
             seen = recorder.seen.get(key)
             last = seen.peak if seen is not None and seen.peak is not None else 0
@@ -3140,7 +3114,7 @@ def _record(
                 if not peak:
                     recorder.idle_failed[key] = "its warm-up's working memory was not measured"
                     return True
-                if _made() != made and not FORCE:
+                if _made() != made:
                     return _short(module, recorder, key, _HOSTED, idle=True)
                 IDLE.check()
                 stage = "its capture"
@@ -3161,7 +3135,7 @@ def _record(
                     )
                     _failed(module, recorder, key, differs, "replay_mismatch", idle=True)
                     return True
-                if not (FORCE or AUDIT):  # an audit sets its replays beside them (`_Audit`)
+                if not AUDIT:  # an audit sets its replays beside them (`_Audit`)
                     entry.ops, entry.levels = [], {}
                 if not _faster(torch, recorder, key, entry, inputs):
                     return True

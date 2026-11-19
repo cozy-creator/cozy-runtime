@@ -1,0 +1,1 @@
+`graphs.FORCE` goes: a source constant for gate builds that no code, CI or gate set, which recorded every path at first sight past every admission check. The replay audit it also turned on runs on a dev machine (`dev = true`, `graphs.AUDIT`), as before (xs-220, hack audit runtime #9).
