@@ -400,6 +400,8 @@ class _Progress:
     total: Tensor | None = None
     done: list[Window] = field(default_factory=list)
     dtype: torch.dtype | None = None
+    #: a blended whole's float32 overlaps (`_Bands`); None once it fell back to a float32 whole
+    bands: _Bands | None = None
 
     def finished(self, window: Window) -> bool:
         return any(
@@ -430,14 +432,14 @@ def _run[W](
         return window if runtime is None else runtime.read(window)
 
     if into is not None:  # each window writes its own rows of `into` (`split(out=)`)
-        write = cast("Callable[[W, Tensor], object]", fn)  # `out`: the second overload
+        fill = cast("Callable[[W, Tensor], object]", fn)  # `out`: the second overload
         for window in windows:
             index = [slice(None)] * ndim
             for d, (a, b) in zip(dims, window, strict=True):
                 index[d] = slice(a, b)
             if runtime is not None:
                 runtime.piece()
-            write(at(index), into[tuple(index)])
+            fill(at(index), into[tuple(index)])
         return into
     fn = cast("Callable[[W], Tensor]", fn)  # no `out`: the first overload
     if len(windows) == 1 and not progress.done:
@@ -445,16 +447,33 @@ def _run[W](
         return fn(cast("W", x if runtime is None else runtime.read(x)))
     blend = any(c.overlap for c in cuts)
     sizes = [math.ceil(x.shape[d] * c.scale - 1e-9) for d, c in zip(dims, cuts, strict=True)]
+    if blend and progress.bands is None and not progress.done:
+        progress.bands = _Bands(tuple(int(n) for n in x.shape), cuts, dims, windows, sizes)
     if runtime is not None:
         if progress.out is not None and host:
             progress.out = runtime.moved(progress.out)  # its finished windows come with it
         elif progress.out is None:
-            progress.out = runtime.ahead(key, host, blend)  # measured: before any window runs
+            # measured: before any window runs; a float32 whole only once it fell back to one
+            progress.out = runtime.ahead(key, host, blend and progress.bands is None)
     if blend and progress.out is not None and progress.total is None:
         made = progress.out.shape
         progress.total = progress.out.new_zeros(
-            [made[d] if d in dims else 1 for d in range(len(made))]
+            [made[d] if d in dims else 1 for d in range(len(made))], dtype=_wide(progress.out.dtype)
         )
+
+    def write(dst: Tensor, src: Tensor) -> None:
+        if runtime is None:
+            dst.copy_(src)
+        else:
+            runtime.write(dst, src)
+
+    def band(shape: Sequence[int], kinds: str, like: Tensor) -> Tensor:
+        """A float32 band of a blended whole, placed as the whole is (card, else host)."""
+        probe = like.new_empty((0,), dtype=_wide(like.dtype))
+        if runtime is None:
+            return probe.new_zeros(shape)
+        return runtime.whole(probe, shape, f"{key}|{kinds}", host, zeros=True)
+
     for window in windows:
         if progress.finished(window):
             continue
@@ -473,14 +492,15 @@ def _run[W](
             for d, size in zip(dims, sizes, strict=True):
                 shape[d] = size
             if blend:
-                wide = part if part.dtype.itemsize >= 4 else part.float()
+                # The whole is in the windows' dtype; only a fallback's is float32 (`_Bands`).
                 progress.out = (
-                    wide.new_zeros(shape)
+                    part.new_empty(shape)
                     if runtime is None
-                    else runtime.whole(wide, shape, key, host, zeros=True)
+                    else runtime.whole(part, shape, key, host)
                 )
                 progress.total = progress.out.new_zeros(
-                    [size if d in dims else 1 for d, size in enumerate(shape)]
+                    [size if d in dims else 1 for d, size in enumerate(shape)],
+                    dtype=_wide(part.dtype),
                 )
             else:
                 progress.out = (
@@ -498,23 +518,197 @@ def _run[W](
                 runtime.write(out[tuple(place)], part[trim])
             progress.done.append(window)
             continue
-        weight = out.new_ones([1] * part.dim())
+        held = cast("Tensor", progress.total)  # blending: made with `out`
+        weight = held.new_ones([1] * part.dim())
         for d, c, (a, b) in zip(dims, cuts, window, strict=True):
             length = place[d].stop - place[d].start
             ramp = _ramp(length, round(c.overlap * c.scale), a > 0, b < x.shape[d])
             shape = [1] * part.dim()
             shape[d] = length
-            weight = weight * out.new_tensor(ramp).view(shape)
-        out[tuple(place)] += part[trim].to(out.dtype) * weight
-        held = cast("Tensor", progress.total)  # blending: made with `out`
+            weight = weight * held.new_tensor(ramp).view(shape)
+        bands = progress.bands
+        if bands is not None and not bands.add(out, part[trim], window, place, weight, write, band):
+            # A window off the layout `_Bands` read from the windows: the float32 whole from here.
+            progress.out = out = bands.widened(out, progress.done, write, band)
+            progress.bands = None
+        if progress.bands is None:
+            out[tuple(place)] += part[trim].to(out.dtype) * weight
         held[tuple(s if i in dims else slice(None) for i, s in enumerate(place))] += weight
         progress.done.append(window)
     whole = cast("Tensor", progress.out)  # made at the latest at the first window
     if blend:
-        whole.div_(cast("Tensor", progress.total))
+        total = cast("Tensor", progress.total)
+        if progress.bands is not None:
+            progress.bands.finish(whole, total, write)
+            return whole
+        whole.div_(total)
         dtype = cast("torch.dtype", progress.dtype)  # at least one window ran
         return whole.to(dtype) if runtime is None else runtime.narrowed(whole, dtype)
     return whole
+
+
+def _wide(dtype: torch.dtype) -> torch.dtype:
+    """What a blended whole accumulates in: float32, or the windows' own dtype if wider."""
+    import torch
+
+    return dtype if dtype.itemsize >= 4 else torch.float32
+
+
+#: (start, stop, blended, offset): a run of output positions along one cut, whether one window
+#: covers them at weight 1 (not blended) or not, and where it starts among positions of its kind
+type _Run = tuple[int, int, bool, int]
+type _Band = Callable[[Sequence[int], str, Tensor], Tensor]
+type _Write = Callable[[Tensor, Tensor], None]
+
+
+class _Bands:
+    """A blended split's whole in its windows' dtype, float32 only where windows overlap.
+
+    One float32 whole adds each window's `value * weight` and divides by the weights' sum at the
+    end. An element one window covers at weight 1 ends as that window's value ((0 + v * 1) / 1,
+    cast back), so it is written as its window comes. The others accumulate in float32 bands, one
+    per class (inside each cut's overlaps or not), and divide at the end: the same operations in
+    the same order as the float32 whole. SeedVR2's 2160p decode kept 36 GB of float32 and its
+    18 GB narrowed copy on host for an 18 GB result (var-030 section 14).
+
+    The layout is read from the windows before they run, each output span predicted as `split`
+    places it; a window whose output lands elsewhere turns the call into the float32 whole it
+    would have been (`widened`)."""
+
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        cuts: tuple[Cut, ...],
+        dims: list[int],
+        windows: list[Window],
+        sizes: list[int],
+    ) -> None:
+        self.dims = dims
+        self.places: list[dict[tuple[int, int], tuple[int, int]]] = []
+        self.runs: list[list[_Run]] = []
+        self.counts: list[tuple[int, int]] = []
+        self.bands: dict[tuple[bool, ...], Tensor] = {}
+        for d, c, size, spans in zip(dims, cuts, sizes, zip(*windows, strict=True), strict=True):
+            cover, ones = [0] * size, [True] * size
+            places: dict[tuple[int, int], tuple[int, int]] = {}
+            for a, b in sorted(set(spans)):
+                start = round(a * c.scale)
+                stop = min(start + round((b - a) * c.scale), size)
+                places[(a, b)] = (start, stop)
+                ramp = _ramp(stop - start, round(c.overlap * c.scale), a > 0, b < shape[d])
+                for at, weight in zip(range(start, stop), ramp, strict=True):
+                    cover[at] += 1
+                    ones[at] = ones[at] and weight == 1.0
+            blended = [cover[at] != 1 or not ones[at] for at in range(size)]
+            runs: list[_Run] = []
+            counts = [0, 0]
+            at = 0
+            while at < size:
+                end = at
+                while end < size and blended[end] == blended[at]:
+                    end += 1
+                runs.append((at, end, blended[at], counts[blended[at]]))
+                counts[blended[at]] += end - at
+                at = end
+            self.places.append(places)
+            self.runs.append(runs)
+            self.counts.append((counts[0], counts[1]))
+
+    def _pieces(self, cut: int, start: int, stop: int) -> list[_Run]:
+        """The runs of `cut` inside [start, stop), each clipped, its offset moved with its start."""
+        return [
+            (max(a, start), min(b, stop), kind, offset + max(a, start) - a)
+            for a, b, kind, offset in self.runs[cut]
+            if a < stop and start < b
+        ]
+
+    def _band(self, kinds: tuple[bool, ...], like: Tensor, make: _Band) -> Tensor:
+        held = self.bands.get(kinds)
+        if held is None:
+            shape = list(like.shape)
+            for cut, (d, kind) in enumerate(zip(self.dims, kinds, strict=True)):
+                shape[d] = self.counts[cut][kind]
+            held = self.bands[kinds] = make(shape, "".join("b" if k else "i" for k in kinds), like)
+        return held
+
+    def add(
+        self,
+        out: Tensor,
+        part: Tensor,
+        window: Window,
+        place: list[slice[int | None]],
+        weight: Tensor,
+        write: _Write,
+        make: _Band,
+    ) -> bool:
+        """`part` (trimmed to `place`) into `out` and the bands; False, with nothing written, when
+        its output span is not the one the layout read."""
+        spans = [
+            (int(cast("int", place[d].start)), int(cast("int", place[d].stop))) for d in self.dims
+        ]
+        if any(
+            self.places[cut].get(w) != s
+            for cut, (w, s) in enumerate(zip(window, spans, strict=True))
+        ):
+            return False
+        pieces = [self._pieces(cut, *span) for cut, span in enumerate(spans)]
+        for combo in itertools.product(*pieces):
+            whole, local, inner = (
+                list(place),
+                [slice(None)] * part.dim(),
+                [slice(None)] * part.dim(),
+            )
+            for d, (lo, hi, _, offset), (start, _) in zip(self.dims, combo, spans, strict=True):
+                whole[d], local[d], inner[d] = (
+                    slice(lo, hi),
+                    slice(lo - start, hi - start),
+                    slice(offset, offset + hi - lo),
+                )
+            kinds = tuple(kind for _, _, kind, _ in combo)
+            if not any(kinds):
+                write(out[tuple(whole)], part[tuple(local)])
+                continue
+            share = weight[tuple(local)]
+            self._band(kinds, out, make)[tuple(inner)] += part[tuple(local)].to(share.dtype) * share
+        return True
+
+    def _places(
+        self, kinds: tuple[bool, ...], ndim: int
+    ) -> Iterator[tuple[tuple[slice[int | None], ...], tuple[slice[int | None], ...]]]:
+        """Each block of a class: its index in the whole and in its band."""
+        runs = [[r for r in self.runs[cut] if r[2] == kind] for cut, kind in enumerate(kinds)]
+        for combo in itertools.product(*runs):
+            whole, inner = [slice(None)] * ndim, [slice(None)] * ndim
+            for d, (lo, hi, _, offset) in zip(self.dims, combo, strict=True):
+                whole[d], inner[d] = slice(lo, hi), slice(offset, offset + hi - lo)
+            yield tuple(whole), tuple(inner)
+
+    def finish(self, out: Tensor, total: Tensor, write: _Write) -> None:
+        """Each band's sums over their weights' sums, cast to the whole's dtype, into the whole."""
+        for kinds, held in self.bands.items():
+            for whole, inner in self._places(kinds, out.dim()):
+                weights = tuple(s if i in self.dims else slice(None) for i, s in enumerate(whole))
+                write(out[whole], (held[inner] / total[weights]).to(out.dtype))
+        self.bands.clear()
+
+    def widened(self, out: Tensor, done: list[Window], write: _Write, make: _Band) -> Tensor:
+        """The float32 whole the finished windows would have made: their single-window elements
+        and the bands."""
+        wide = make(list(out.shape), "", out)
+        for window in done:
+            spans = [self.places[cut][w] for cut, w in enumerate(window)]
+            for combo in itertools.product(*(self._pieces(cut, *s) for cut, s in enumerate(spans))):
+                if any(kind for _, _, kind, _ in combo):
+                    continue
+                index = [slice(None)] * out.dim()
+                for d, (lo, hi, _, _) in zip(self.dims, combo, strict=True):
+                    index[d] = slice(lo, hi)
+                write(wide[tuple(index)], out[tuple(index)].to(wide.dtype))
+        for kinds, held in self.bands.items():
+            for whole, inner in self._places(kinds, out.dim()):
+                write(wide[whole], held[inner])
+        self.bands.clear()
+        return wide
 
 
 def _ramp(length: int, overlap: int, start: bool, end: bool) -> list[float]:
