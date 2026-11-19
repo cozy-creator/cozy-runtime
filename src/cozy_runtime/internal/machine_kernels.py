@@ -1,9 +1,9 @@
 """The machine's kernels, compiled at machine start on the cards present while weights download:
 first the links between its GPUs (`parallel.links`), which a group reads, then each card row's
 attention cells (`boot`) and the LoRA bake set (`lora_bake.KERNELS`), so a new generation's first
-LoRA request bakes, and the Runtime's own Triton sets the row runs (`triton_sets`), so no request
-compiles them. The Runtime wheel's prebuilt kernels (the 8-bit op, FA3) need no build; packages'
-sets build in their import-only parents.
+LoRA request bakes, the decode cores' set (`decode_kernels`), and the Runtime's own Triton sets
+the row runs (`triton_sets`), so no request compiles them. The Runtime wheel's prebuilt kernels
+(the 8-bit op, FA3) need no build; packages' sets build in their import-only parents.
 
 The machine launches `python -m cozy_runtime.internal.machine_kernels` once per installed
 generation, under that generation's own seal: its interpreter and torch, every card of the
@@ -79,12 +79,11 @@ def triton_sets(row: arch.Row) -> list[TritonKernels]:
     as `attention` opens them: Sage3's fixed means, Sage2's fixed K mean, the E4M3 quantizers),
     the encoded linears' (nvfp4 on every row, SVDQuant on FP4 rows), counter noise's (`philox`),
     Ulysses' int8 wire's (`parallel.turn`) and the fused rows' (`fused_rows`: norms and
-    rotations) and the decode cores' (`decode_kernels`). None without Triton."""
+    rotations). None without Triton."""
     if triton_kernels.TRITON_ABSENT:
         return []
     found = [import_module(c.kernels).KERNELS for c in boot(row) if c.kernels]
     found += [nvfp4_linear.KERNELS, *([svdq_linear.KERNELS] if row.fp4 else []), philox.KERNELS]
-    found += [decode_kernels.kernels()]
     found += [turn.KERNELS, fused_rows.KERNELS] if row.family else []  # bf16: Ampere on
     return list({kernels.name: kernels for kernels in found if kernels.entries}.values())
 
@@ -109,7 +108,8 @@ def rows(present: Mapping[int, str]) -> dict[int, arch.Row]:
 
 def jobs(present: Mapping[int, str], held: Mapping[int, arch.Row]) -> list[kernel_compile.Job]:
     """Each card architecture's attention (`boot`, by its row in HELD), once per key, none the
-    wheel serves; its LoRA bake set; and its Runtime Triton sets (`triton_sets`)."""
+    wheel serves; its LoRA bake set; the decode cores' set (`decode_kernels`, which the wheel
+    doesn't prebuild: 315 entries); and its Runtime Triton sets (`triton_sets`)."""
     found: dict[str, kernel_compile.Job] = {}
     for sm, device in sorted(present.items()):
         row = held[sm]
@@ -118,9 +118,11 @@ def jobs(present: Mapping[int, str], held: Mapping[int, arch.Row]) -> list[kerne
                 job = _job(candidate.artifact, sm, device)
                 if job is not None:
                     found.setdefault(job.key.digest, job)
-        if lora_bake.KERNELS.entries and not triton_kernels.TRITON_ABSENT:
-            bake = triton_kernels.job(lora_bake.KERNELS, sm)
-            found.setdefault(bake.key.digest, bake)
+        sets = () if triton_kernels.TRITON_ABSENT else (lora_bake.KERNELS, decode_kernels.kernels())
+        for kernels in sets:
+            if kernels.entries:
+                job = triton_kernels.job(kernels, sm)
+                found.setdefault(job.key.digest, job)
         for kernels in triton_sets(row):
             job = triton_kernels.job(kernels, sm)
             found.setdefault(job.key.digest, job)
