@@ -249,7 +249,7 @@ Call::Call(int device, cudaStream_t stream, Allocate* allocate) {
     if (contexts[device] == nullptr) contexts[device] = std::make_unique<ggml_backend_cuda_context>(device);
     ctx_ = contexts[device].get();
     ctx_->curr_stream_no = 0;
-    ctx_->streams[device][0] = stream;
+    ctx_->streams[device][0] = launch_stream(stream);
     current = allocate;
 }
 
