@@ -87,6 +87,8 @@ class Ranks:
         self.rank, self.world, self.pg, self.device, self.gpu = rank, world, pg, device, gpu
         #: the generation and the function this attempt runs: a stage's degree key (`degrees`)
         self.call = call
+        #: each sharded stage's calls so far in this attempt: a record row a call (`_degree`)
+        self.calls: dict[str, int] = {}
         #: tells the machine a long meeting's wait as the call's stage (GPU 0's; None elsewhere)
         self.stage = stage
         self.store = PrefixStore(f"cozy.spmd/{tag}/", _get_process_group_store(pg))
@@ -966,7 +968,10 @@ def _degree(
         told = {"degree": chosen, "measure": measuring}
     told = dict(ranks.told(cast("dict[str, Json]", told), f"degree {stage}"))
     degree, measure = int(cast("int", told["degree"])), bool(told["measure"])
-    what = f"stage {stage.rpartition('.')[2]}"
+    # A stage called again in one attempt has its own key (its shape class) and its own row.
+    method = stage.rpartition(".")[2]
+    ranks.calls[method] = nth = ranks.calls.get(method, 0) + 1
+    what = f"stage {method}" if nth == 1 else f"stage {method} {nth}"
     if degree == 1 < ranks.world and not ranks.all(_fits(stages, key), f"degree 1 fits {stage}"):
         degree, measure = ranks.world, False
         _row(what)["refused_degree_1"] = 1.0
