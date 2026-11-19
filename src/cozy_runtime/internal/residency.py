@@ -2878,15 +2878,21 @@ class Memory:
                 default=0,
             )
         floor = model.escape_floor
-        if any(b.retained for b in model.groups()):
+
+        def held(b: _Block) -> bool:
+            return bool(b.retained or b.count)
+
+        if any(held(b) for b in model.groups()):
             # Held blocks are in the pass's held bytes already: the floor is what still streams
-            # (a decode keeping what fits, `keep`); an embedding table gathers on the host.
+            # (a decode keeping what fits, `keep`); an embedding table gathers on the host. A block
+            # pinned now is held too: a forward's common enters before its first block marks the
+            # pass, and counted again here it refused LTX's refine by its 0.86 GB common (census).
             shared = model.common
-            floor = (shared.allocation_bytes if shared and not shared.retained else 0) + max(
+            floor = (shared.allocation_bytes if shared and not held(shared) else 0) + max(
                 (
                     b.allocation_bytes
                     for b in model.blocks.values()
-                    if not (b.retained or b.table or b.leaf is not None)
+                    if not (held(b) or b.table or b.leaf is not None)
                 ),
                 default=0,
             )

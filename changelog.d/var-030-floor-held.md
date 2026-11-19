@@ -1,0 +1,1 @@
+Runtime: a model forward's admission no longer counts weights it already holds twice. A block pinned when the pass is marked (a forward's shared block, entered before its first block) is in the pass's held bytes, so the floor leaves it out, as it leaves out retained blocks (var-030).
