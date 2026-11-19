@@ -40,7 +40,7 @@ import sys
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 import torch
 from torch import Tensor, nn
@@ -487,7 +487,7 @@ def _turning(
 
 def _turned(
     launch: Launch, x: Tensor, cos: Tensor, sin: Tensor, want: Tensor
-) -> fused_rows.Turn | None | bool:
+) -> fused_rows.Turn | Literal[False] | None:
     """The first layout (`fused_rows.turns`) whose rotation of the middle of `x`, a piece small
     enough to run unasked, is within rounding's allowance of `want`'s; None for none; False where
     the call left that piece as it was (no layout can be told from another there)."""
