@@ -12,8 +12,8 @@ from types import ModuleType
 
 from tensorfs import UnsupportedError, _ext, raw
 
-from cozy_runtime.internal.decode_cores import HAS_TRITON, Cores
-from cozy_runtime.internal.decode_schemes import ADAPTERS, Adapter, geometry_rule, params_rule, run
+from cozy_runtime.internal import decode_kernels
+from cozy_runtime.internal.decode_schemes import ADAPTERS, Adapter, geometry_rule, params_rule
 from cozy_runtime.internal.encoding.comfy import _decoder_identity, _descriptor
 from cozy_runtime.internal.encoding.formats import Params, Tensor
 
@@ -99,5 +99,4 @@ class CoreDequant:
                     params=dict(self.params),
                 )
                 return
-        cores = Cores(torch, kernel=destination.is_cuda and HAS_TRITON)
-        run(self.adapter, cores, parts, dict(self.params), destination)
+        decode_kernels.decode(torch, self.adapter, parts, dict(self.params), destination)

@@ -999,7 +999,7 @@ def _cores_reference(
     implementation of the arithmetic the Triton kernels run."""
     reference: Tensor = torch.empty(*shape, dtype=torch.float32)
     host = {role: part.cpu() for role, part in roles.items()}
-    run(provider.adapter, Cores(torch, kernel=False), host, dict(provider.params), reference)
+    run(provider.adapter, Cores(torch, None), host, dict(provider.params), reference)
     return reference
 
 
