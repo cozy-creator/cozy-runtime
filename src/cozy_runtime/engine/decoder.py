@@ -20,13 +20,13 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 
-from cozy_runtime.engine.attention import HostTier
 from cozy_runtime.engine.kv import KvManager
 from cozy_runtime.engine.qwen35 import Qwen35, layout_of, text_of
 from cozy_runtime.engine.sampling import Sampling
 from cozy_runtime.engine.step import Rows, Step, rows_for
 
 if TYPE_CHECKING:
+    from tensorfs.varena import _runtime as varena
     from transformers.cache_utils import CacheLayerMixin
 
 class _TextConfig(Protocol):
@@ -164,6 +164,7 @@ class Decoder:
         launcher: bool = True,
         fused: bool = True,
         prefill_chunk: int = PREFILL_CHUNK,
+        kv_card_bytes: int | None = None,
     ) -> None:
         from tensorfs.varena import _runtime as varena
 
@@ -177,11 +178,13 @@ class Decoder:
         self.stream = torch.cuda.Stream(device)
         layout = layout_of(self.text, depth=2, drafting=self.drafting)
         self.max_rows = max_rows
+        #: the card's share of a call's K/V, in bytes; the rest goes to the host tier (None: all on the card)
+        self.kv_card_bytes = kv_card_bytes
+        host = _host_tier(model, device.index or 0) if kv_card_bytes is not None else None
         with torch.cuda.stream(self.stream):
-            self.kv = KvManager(varena.Device(device.index or 0), layout, max_rows, -(-max_tokens // layout.block_tokens))
-        nothing = torch.zeros((1, 1, 2, layout.block_tokens, layout.kv_heads, layout.head_dim),
-                              dtype=layout.dtype, device=device)  # fmt: skip
-        self.qwen = Qwen35(model, self.kv, HostTier(nothing, 0), fused=fused)
+            self.kv = KvManager(varena.Device(device.index or 0), layout, max_rows,
+                                -(-max_tokens // layout.block_tokens), host=host)  # fmt: skip
+        self.qwen = Qwen35(model, self.kv, fused=fused)
         if prefill_chunk <= 0 or prefill_chunk % 64:
             raise ValueError(f"a prefill chunk of {prefill_chunk} tokens: a multiple of the gated-delta rule's 64")
         #: a prompt's tokens a prefill forward takes at a time
@@ -265,7 +268,7 @@ class Decoder:
         hf, kv, qwen, r = self.hf, self.kv, self.qwen, self.rows
         ids = torch.tensor([list(prompt)], dtype=torch.long, device=self.device)
         length = ids.shape[1]
-        kv.admit(row, length, drafted=drafted)
+        kv.admit(row, length, drafted=drafted, host_tokens=self._host_tokens(length, request))
         kv.reserve_ahead(row, (SEGMENT + 1) * (kv.layout.span + 1))  # the head's position P, and the first steps
         cache = DynamicCache(config=hf.config.get_text_config(decoder=True))  # type: ignore[arg-type]  # its own config type
         for layer, index in qwen.slot_of.items():
@@ -310,6 +313,16 @@ class Decoder:
         r.counts[row, first] += 1.0
         r.budget[row] = kv.committed(row)
         return first
+
+    def _host_tokens(self, prompt: int, request: Request) -> int:
+        """A row's tokens of K/V beyond its share of the card's (`kv_card_bytes` across the call's
+        rows): its oldest whole blocks, on the host tier."""
+        if self.kv_card_bytes is None:
+            return 0
+        layout = self.kv.layout
+        need = prompt + request.max_new + layout.span + 1
+        card = self.kv_card_bytes // max(len(request.prompts), 1) // layout.token_bytes
+        return max(need - card, 0)
 
     def _draft_prompt(self, tokens: torch.Tensor, y: torch.Tensor, at: int, head: _Paged) -> torch.Tensor:
         """The head's K/V for positions `at` to `at + n - 1` (token p with the model's state at
@@ -555,6 +568,18 @@ def _held(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> Iterator[No
     finally:
         _ext._varena_working_pool_record_stream(device, pool, stream.cuda_stream, False)
         _ext._varena_working_pool_release(device, pool)
+
+
+def _host_tier(model: torch.nn.Module, index: int) -> varena.Pages:
+    """The GPU's host tier the model's placement opened (`Memory.pages`), else one of this
+    decoder's own (a model with no placement: a bench's)."""
+    from tensorfs.varena import _runtime
+
+    from cozy_runtime.author._model import PLACED
+
+    placed = PLACED.get(model)
+    pages = getattr(getattr(placed[0], "memory", None), "pages", None) if placed is not None else None
+    return cast("varena.Pages", pages) if pages is not None else _runtime.Pages(index)
 
 
 class _Paged(Protocol):
