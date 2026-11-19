@@ -208,8 +208,22 @@ class Tables:
     first_seen: int = 0
 
 
+#: The widest row the fused norm takes in one program.
+NORM_WIDEST = 8192
+
+
 def _norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
-    """`Qwen3_5RMSNorm`: in f32, times 1 + weight, back to x's dtype."""
+    """`Qwen3_5RMSNorm`: in f32, times 1 + weight, back to x's dtype: one launch for every row on CUDA
+    (`_kernels.rms_norm_kernel`), else torch's seven ops."""
+    width = int(x.shape[-1])
+    if x.is_cuda and not _kernels.TRITON_ABSENT and width <= NORM_WIDEST:
+        rows = x.reshape(-1, width).contiguous()
+        out = torch.empty_like(rows)
+        block = 1 << max(width - 1, 0).bit_length()
+        _kernels.rms_norm_kernel[(int(rows.shape[0]),)](
+            rows, weight, out, width, eps, BLOCK=block, num_warps=8 if block >= 2048 else 4
+        )
+        return out.view(x.shape)
     y = x.float()
     y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + eps)
     return (y * (1.0 + weight.float())).type_as(x)
