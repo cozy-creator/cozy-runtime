@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 import torch
 
 from cozy_runtime.engine.kv import KvManager
+from cozy_runtime.engine.launch import JIT, Run
 from cozy_runtime.engine.qwen35 import Qwen35, layout_of, text_of
 from cozy_runtime.engine.sampling import Sampling
 from cozy_runtime.engine.step import Rows, Step, rows_for
@@ -176,6 +177,7 @@ class Decoder:
         prefill_chunk: int = PREFILL_CHUNK,
         kv_card_bytes: int | None = None,
         in_place: bool = False,
+        run: Run = JIT,
     ) -> None:
         from tensorfs.varena import _runtime as varena
 
@@ -198,7 +200,7 @@ class Decoder:
         with torch.cuda.stream(self.stream):
             self.kv = KvManager(varena.Device(device.index or 0), layout, max_rows,
                                 -(-max_tokens // layout.block_tokens), host=host)  # fmt: skip
-        self.qwen = Qwen35(model, self.kv, fused=fused, in_place=in_place)
+        self.qwen = Qwen35(model, self.kv, fused=fused, in_place=in_place, run=run)
         if prefill_chunk <= 0 or prefill_chunk % 64:
             raise ValueError(f"a prefill chunk of {prefill_chunk} tokens: a multiple of the gated-delta rule's 64")
         #: a prompt's tokens a prefill forward takes at a time
@@ -367,8 +369,8 @@ class Decoder:
         eps = text.eps
         from cozy_runtime.engine.qwen35 import _norm
 
-        e = _norm(qwen.embed(tokens[None]), mtp.pre_fc_norm_embedding.weight, eps, qwen.fused)
-        h = _norm(y[None], mtp.pre_fc_norm_hidden.weight, eps, qwen.fused)
+        e = _norm(qwen.embed(tokens[None]), mtp.pre_fc_norm_embedding.weight, eps, qwen.fused, qwen.run)
+        h = _norm(y[None], mtp.pre_fc_norm_hidden.weight, eps, qwen.fused, qwen.run)
         x = mtp.fc(torch.cat([e, h], -1))
         positions = torch.arange(at, at + n, device=self.device)
         rope = hf.get_decoder().rotary_emb(x, positions.view(1, 1, -1).expand(3, 1, -1))

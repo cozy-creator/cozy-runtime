@@ -604,7 +604,11 @@ class VisionLM(Model[Pipeline]):
 
     def execution_plan(self, plan: Plan) -> str:
         model = self.pipe.components[COMPONENT]
-        return "+".join(filter(None, (lm.install(plan, model), moe.install(plan, model))))
+        installed = [lm.install(plan, model), moe.install(plan, model)]
+        install = getattr(self.engine, "install", None)  # CozyEngine's kernel set
+        if install is not None:
+            installed.append(install(plan))
+        return "+".join(filter(None, installed))
 
     def unload(self, loader: Loader) -> None:
         del self.pipe, self.engine

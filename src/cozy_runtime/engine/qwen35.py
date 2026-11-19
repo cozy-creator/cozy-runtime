@@ -24,6 +24,7 @@ from cozy_runtime.accel.kernels import read
 from cozy_runtime.engine import _kernels
 from cozy_runtime.engine.attention import paged_step
 from cozy_runtime.engine.kv import KvLayout, StateSpec
+from cozy_runtime.engine.launch import JIT, Run
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -217,7 +218,7 @@ NORM_WIDEST = 8192
 MLP_BLOCK = 1024
 
 
-def _norm(x: Tensor, weight: Tensor, eps: float, fused: bool = True) -> Tensor:
+def _norm(x: Tensor, weight: Tensor, eps: float, fused: bool, run: Run) -> Tensor:
     """`Qwen3_5RMSNorm`: in f32, times 1 + weight, back to x's dtype: one launch for every row on CUDA
     (`_kernels.rms_norm_kernel`) where `fused`, else torch's seven ops."""
     width = int(x.shape[-1])
@@ -225,25 +226,24 @@ def _norm(x: Tensor, weight: Tensor, eps: float, fused: bool = True) -> Tensor:
         rows = x.reshape(-1, width).contiguous()
         out = torch.empty_like(rows)
         block = 1 << max(width - 1, 0).bit_length()
-        _kernels.rms_norm_kernel[(int(rows.shape[0]),)](
-            rows, read(weight), out, width, eps, BLOCK=block, num_warps=8 if block >= 2048 else 4
-        )
+        run(_kernels.rms_norm_kernel, (int(rows.shape[0]),), rows, read(weight), out, width, eps, block,
+            num_warps=8 if block >= 2048 else 4)
         return out.view(x.shape)
     y = x.float()
     y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + eps)
     return (y * (1.0 + weight.float())).type_as(x)
 
 
-def _gated(x: Tensor, gate: Tensor, weight: Tensor, eps: float, fused: bool = True) -> Tensor:
+def _gated(x: Tensor, gate: Tensor, weight: Tensor, eps: float, fused: bool, run: Run) -> Tensor:
     """`Qwen3_5RMSNormGated`: the norm before the gate, SiLU of the gate in f32: one launch for
     every row on CUDA (`_kernels.gated_norm_kernel`) where `fused`, else torch's ops."""
     width = int(x.shape[-1])
     if fused and x.is_cuda and not _kernels.TRITON_ABSENT and (width & (width - 1)) == 0 and width <= NORM_WIDEST:
         rows = x.reshape(-1, width).contiguous()
         out = torch.empty_like(rows)
-        _kernels.gated_norm_kernel[(int(rows.shape[0]),)](
+        run(_kernels.gated_norm_kernel, (int(rows.shape[0]),),
             rows, gate.reshape(-1, width).contiguous(), read(weight), out, eps,
-            D=width, WEIGHT_ROUNDS=weight.dtype == x.dtype, num_warps=1 if width <= 256 else 4,
+            width, int(weight.dtype == x.dtype), num_warps=1 if width <= 256 else 4,
         )  # fmt: skip
         return out.view(x.shape)
     dtype = x.dtype
@@ -253,7 +253,7 @@ def _gated(x: Tensor, gate: Tensor, weight: Tensor, eps: float, fused: bool = Tr
     return (y * F.silu(gate.float())).to(dtype)
 
 
-def _add_norm(x: Tensor, h: Tensor, weight: Tensor, eps: float, fused: bool = True) -> tuple[Tensor, Tensor]:
+def _add_norm(x: Tensor, h: Tensor, weight: Tensor, eps: float, fused: bool, run: Run) -> tuple[Tensor, Tensor]:
     """The residual stream `x + h` and its `Qwen3_5RMSNorm`: one launch for every row on CUDA
     (`_kernels.add_norm_kernel`) where `fused`, else torch's add and `_norm`."""
     width = int(x.shape[-1])
@@ -261,13 +261,13 @@ def _add_norm(x: Tensor, h: Tensor, weight: Tensor, eps: float, fused: bool = Tr
         rows = x.reshape(-1, width).contiguous()
         total, out = torch.empty_like(rows), torch.empty_like(rows)
         block = 1 << max(width - 1, 0).bit_length()
-        _kernels.add_norm_kernel[(int(rows.shape[0]),)](
-            rows, h.reshape(-1, width).contiguous(), read(weight), total, out, width, eps,
-            BLOCK=block, num_warps=8 if block >= 2048 else 4,
+        run(_kernels.add_norm_kernel, (int(rows.shape[0]),),
+            rows, h.reshape(-1, width).contiguous(), read(weight), total, out, width, eps, block,
+            num_warps=8 if block >= 2048 else 4,
         )  # fmt: skip
         return total.view(x.shape), out.view(x.shape)
     total = x + h.to(x.dtype)
-    return total, _norm(total, weight, eps, fused)
+    return total, _norm(total, weight, eps, fused, run)
 
 
 def _product(linear: _Linear, x: Tensor) -> Tensor:
@@ -296,14 +296,13 @@ def _rotate(x: Tensor) -> Tensor:
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
 
-def _silu_mul(gate: Tensor, up: Tensor, dtype: torch.dtype) -> Tensor:
+def _silu_mul(gate: Tensor, up: Tensor, dtype: torch.dtype, run: Run) -> Tensor:
     """SiLU(gate) * up in `dtype`, one launch (`_kernels.silu_mul_kernel`)."""
     width = int(gate.shape[-1])
     out = torch.empty(gate.shape, dtype=dtype, device=gate.device)
     rows = gate.numel() // width
-    _kernels.silu_mul_kernel[(rows, -(-width // MLP_BLOCK))](
-        gate.contiguous(), up.contiguous(), out, width, BLOCK=MLP_BLOCK, num_warps=4
-    )
+    run(_kernels.silu_mul_kernel, (rows, -(-width // MLP_BLOCK)),
+        gate.contiguous(), up.contiguous(), out, width, MLP_BLOCK, num_warps=4)
     return out
 
 
@@ -314,11 +313,13 @@ class Qwen35:
     more launches), the reference a fused kernel is held against."""
 
     def __init__(
-        self, model: torch.nn.Module, kv: KvManager, *, fused: bool = True, in_place: bool = False
+        self, model: torch.nn.Module, kv: KvManager, *, fused: bool = True, in_place: bool = False, run: Run = JIT
     ) -> None:
         from cozy_runtime.engine.kv import CopyAhead
 
         self.model, self.kv, self.fused = model, kv, fused
+        #: how the step launches its kernels: through the model's set (`engine.kernels`), else the JIT
+        self.run = run
         #: where each attention layer reads its off-card blocks: copied ahead to a window (or in place)
         self.reads = CopyAhead(kv, in_place=in_place)
         self.text = text_of(model)
@@ -362,14 +363,14 @@ class Qwen35:
         v = v.view(rows, span, -1, dim)
         q_out = torch.empty((rows, span, heads, dim), dtype=x.dtype, device=x.device)
         k_out = torch.empty((rows, span, text.kv_heads, dim), dtype=x.dtype, device=x.device)
-        _kernels.qk_norm_rope_kernel[(rows * span, heads + text.kv_heads)](
+        self.run(_kernels.qk_norm_rope_kernel, (rows * span, heads + text.kv_heads),
             projected.contiguous(), k, read(block.q_norm.weight), read(block.k_norm.weight), positions, self.inv_freq,
-            q_out, k_out, eps, heads, text.kv_heads, 2 * dim, D=dim, R=text.rotary, num_warps=2,
+            q_out, k_out, eps, heads, text.kv_heads, 2 * dim, dim, text.rotary, num_warps=2,
         )  # fmt: skip
         kv = self.kv
         out = paged_step(
             q_out, k_out, v, kv.blocks, self.reads.tier(kv_layer), kv.block_table[:rows], tables.lengths, tables.slots,
-            kv.layout, kv_layer, PARTS, dim**-0.5, tables.first_seen, gate=projected[..., dim:],
+            kv.layout, kv_layer, PARTS, dim**-0.5, tables.first_seen, gate=projected[..., dim:], run=self.run,
         )  # fmt: skip
         self.reads.done()
         return _product(block.o_proj, out.reshape(rows, span, -1))
@@ -382,8 +383,8 @@ class Qwen35:
         text, dim = self.text, self.text.head_dim
         q, gate = torch.chunk(block.q_proj(x).view(rows, span, -1, dim * 2), 2, dim=-1)
         gate = gate.reshape(rows, span, -1)
-        q = _norm(q, block.q_norm.weight, eps, False)
-        k = _norm(block.k_proj(x).view(rows, span, -1, dim), block.k_norm.weight, eps, False)
+        q = _norm(q, block.q_norm.weight, eps, False, self.run)
+        k = _norm(block.k_proj(x).view(rows, span, -1, dim), block.k_norm.weight, eps, False, self.run)
         v = block.v_proj(x).view(rows, span, -1, dim)
         freqs = positions[..., None].float() * self.inv_freq
         both = torch.cat((freqs, freqs), dim=-1)
@@ -402,7 +403,7 @@ class Qwen35:
     def _mlp(self, m: _Mlp, h: Tensor) -> Tensor:
         if self.fused and self.silu and h.is_cuda:
             gate, up = _products((m.gate_proj, m.up_proj), h)
-            act = _silu_mul(gate, up, h.dtype)
+            act = _silu_mul(gate, up, h.dtype, self.run)
             return _product(m.down_proj, act)
         return m.down_proj(m.act_fn(m.gate_proj(h)) * m.up_proj(h))
 
@@ -420,11 +421,11 @@ class Qwen35:
         # driver of each): one token writes no scratch, so it is given the state again.
         windows, kept_windows = kv.state(0), kv.state_scratch[0]
         window_scratch = kept_windows[:, :, index] if span > 1 else windows[:, index]
-        _kernels.conv_span_kernel[(rows, -(-channels // CONV_BLOCK))](
+        self.run(_kernels.conv_span_kernel, (rows, -(-channels // CONV_BLOCK)),
             mixed, read(block.conv1d.weight), kv.state_slot[:rows], windows[:, index],
             window_scratch, conv, channels, int(windows.stride(0)),
             int(kept_windows.stride(0)), int(kept_windows.stride(1)),
-            S=span, W=text.conv - 1, BLOCK=CONV_BLOCK, num_warps=4,
+            span, text.conv - 1, CONV_BLOCK, num_warps=4,
         )  # fmt: skip
         keys = text.k_heads * text.dk
         q, k, v = conv[..., :keys], conv[..., keys : 2 * keys], conv[..., 2 * keys :]
@@ -436,16 +437,17 @@ class Qwen35:
             first = (-block.A_log.float().exp() * F.softplus(a.float() + block.dt_bias)).contiguous()
         states, kept_states = kv.state(1), kv.state_scratch[1]
         state_scratch = kept_states[:, :, index] if span > 1 else states[:, index]
-        _kernels.delta_span_kernel[(rows * text.v_heads, text.dv // VALUE_BLOCK)](
+        self.run(_kernels.delta_span_kernel, (rows * text.v_heads, text.dv // VALUE_BLOCK),
             q, k, v, first, second, read(block.A_log), read(block.dt_bias), kv.state_slot[:rows],
             states[:, index], state_scratch,
             out, text.v_heads, text.v_heads // text.k_heads, int(conv.stride(1)),
             int(conv.stride(1)), int(states.stride(0)), int(kept_states.stride(0)),
             int(kept_states.stride(1)), float(text.dk) ** 0.5,
-            S=span, DK=text.dk, DV=text.dv, BV=VALUE_BLOCK, GIVEN=not self.fused, num_warps=4,
+            span, text.dk, text.dv, VALUE_BLOCK, int(not self.fused), num_warps=4,
         )  # fmt: skip
         normed = _gated(
-            out.reshape(-1, text.dv), z.reshape(-1, text.dv), block.norm.weight, block.norm.variance_epsilon, self.fused
+            out.reshape(-1, text.dv), z.reshape(-1, text.dv), block.norm.weight, block.norm.variance_epsilon, self.fused,
+            self.run,
         )
         return linear(block.out_proj, normed.reshape(rows, span, -1))
 
@@ -456,17 +458,17 @@ class Qwen35:
         at text `positions` `[rows, S]`; their K/V written at `tables`' slots and their states
         into the slots (one token) or the scratch (a span)."""
         x = self.embed(ids)
-        eps, layers, fused = self.text.eps, self.layers, self.fused
+        eps, layers, fused, run = self.text.eps, self.layers, self.fused, self.run
         positions = positions.contiguous()
-        h = _norm(x, layers[0].input_layernorm.weight, eps, fused)
+        h = _norm(x, layers[0].input_layernorm.weight, eps, fused, run)
         for i, layer in enumerate(layers):
             if i in self.slot_of:
                 mixed = self._attention(layer.self_attn, h, positions, self.slot_of[i], tables, eps)
             else:
                 mixed = self._delta(layer.linear_attn, h, self.delta_of[i])
-            x, h = _add_norm(x, mixed, layer.post_attention_layernorm.weight, eps, fused)
+            x, h = _add_norm(x, mixed, layer.post_attention_layernorm.weight, eps, fused, run)
             after = layers[i + 1].input_layernorm.weight if i + 1 < len(layers) else self.final.weight
-            x, h = _add_norm(x, self._mlp(layer.mlp, h), after, eps, fused)
+            x, h = _add_norm(x, self._mlp(layer.mlp, h), after, eps, fused, run)
         return h
 
     def draft(self, ids: Tensor, hidden: Tensor, positions: Tensor, tables: Tables) -> Tensor:
@@ -475,15 +477,15 @@ class Qwen35:
         mtp = self.mtp
         if mtp is None:
             raise RuntimeError("this checkpoint has no multi-token-prediction head")
-        eps, fused = self.text.eps, self.fused
-        e = _norm(self.embed(ids), mtp.pre_fc_norm_embedding.weight, eps, fused)
-        h = _norm(hidden, mtp.pre_fc_norm_hidden.weight, eps, fused)
+        eps, fused, run = self.text.eps, self.fused, self.run
+        e = _norm(self.embed(ids), mtp.pre_fc_norm_embedding.weight, eps, fused, run)
+        h = _norm(hidden, mtp.pre_fc_norm_hidden.weight, eps, fused, run)
         x = mtp.fc(torch.cat([e, h], -1))
         layer = mtp.layers[0]
-        a = _norm(x, layer.input_layernorm.weight, eps, fused)
+        a = _norm(x, layer.input_layernorm.weight, eps, fused, run)
         mixed = self._attention(layer.self_attn, a, positions.contiguous(), self.kv.layout.attn_layers - 1, tables, eps)
-        x, a = _add_norm(x, mixed, layer.post_attention_layernorm.weight, eps, fused)
-        _, out = _add_norm(x, self._mlp(layer.mlp, a), mtp.norm.weight, eps, fused)
+        x, a = _add_norm(x, mixed, layer.post_attention_layernorm.weight, eps, fused, run)
+        _, out = _add_norm(x, self._mlp(layer.mlp, a), mtp.norm.weight, eps, fused, run)
         return out
 
     def reading(self, drafted: bool, depth: int) -> list[int]:
@@ -503,9 +505,9 @@ class Qwen35:
         rows = int(kept.shape[0])
         for state, scratch in zip((kv.state(0), kv.state(1)), kv.state_scratch, strict=True):
             words = scratch[0, 0].numel() * scratch.element_size() // 4
-            _kernels.keep_kernel[(rows, -(-words // 1024))](
+            self.run(_kernels.keep_kernel, (rows, -(-words // 1024)),
                 scratch.view(torch.uint8), kv.state_slot[:rows], kept, state.view(torch.uint8), words,
                 int(state.stride(0) * state.element_size() // 4),
                 int(scratch.stride(0) * scratch.element_size() // 4),
-                int(scratch.stride(1) * scratch.element_size() // 4), BLOCK=1024, num_warps=4,
+                int(scratch.stride(1) * scratch.element_size() // 4), 1024, num_warps=4,
             )  # fmt: skip

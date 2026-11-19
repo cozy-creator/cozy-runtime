@@ -5,7 +5,8 @@ call's start, before anything is told). Once a token is told nothing falls back.
 which engine served it, and why not this one, in the run record's `<model>.engine` note.
 
 It serves a CUDA Qwen3.5 text call: text-only questions, at most `ROWS` rows, no repeat-n-gram cut,
-on a dense model whose step linears are all of `LANES`, with a TensorFS that has the K/V cache. The
+on a dense model whose step linears are all of `LANES`, with a TensorFS that has the K/V cache, once
+the model's kernel set has landed (`install`: built while it loads, never on a request). The
 questions are read as Transformers' engine reads them (its chat template and tokenizer), each row's
 text is handed on as it comes (at most every `STREAM_S`), and stops are cut as `VisionLM.ask` cuts
 them.
@@ -20,12 +21,15 @@ from typing import TYPE_CHECKING, Protocol, cast
 import torch
 
 from cozy_runtime.engine.decoder import Decoder, Request, Short, answered, short_of_room
+from cozy_runtime.engine.launch import Run
 from cozy_runtime.engine.qwen35 import text_of
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from transformers import ProcessorMixin
+
+    from cozy_runtime.accel.kernels import Launch, Plan
 
     from cozy_runtime.vlm import Delta, Final, Params, Pipeline, Question
 
@@ -100,14 +104,52 @@ class CozyEngine:
         self.fallback = TransformersEngine(pipe, processor)
         self.model = pipe.components[COMPONENT]
         self.decoder: Decoder | None = None
-        #: why the engine can't decode the model ("" where it can), judged at the first call
+        #: why the engine can't decode the model ("" where it can), judged as it installs
         self.unserved: str | None = None
+        #: the model's kernel set as it launches, once it landed (`install`)
+        self.run: Run | None = None
+        #: that set's name, while it builds
+        self.building = ""
+
+    def install(self, plan: Plan) -> str:
+        """The model's kernel set (`engine.kernels`), built while the model loads: the engine serves
+        from when it lands (`plan.when_ready`), Transformers' engine until then, so a request never
+        compiles one. Returns the set's identity, "" where the engine can't serve the model."""
+        from cozy_runtime.accel.kernels import KernelsUnavailable
+        from cozy_runtime.engine import kernels
+
+        self.unserved = serves(self.model)
+        if self.unserved:
+            return ""
+        try:
+            shapes = kernels.shapes_of(self.model)
+            made = kernels.kernels_for(shapes)
+        except ValueError as exc:
+            self.unserved = f"the engine's kernels: {exc}"
+            return ""
+        self.building = made.name
+        print(f"[engine] {made.name}: {len(made.entries)} kernels for {shapes}", file=sys.stderr)
+
+        def activate(launch: Launch) -> None:
+            self.run = Run(launch, made)
+
+        try:
+            if plan.when_ready is None:
+                activate(plan.load(made))
+            else:
+                plan.when_ready(made, activate)
+        except KernelsUnavailable as exc:
+            self.unserved = f"the engine's kernels ({made.name}): {exc.code}: {exc}"
+            return ""
+        return f"{made.name}:{made.identity}"
 
     def _why(self, questions: list[Question], params: Params) -> str:
         if self.unserved is None:
-            self.unserved = serves(self.model)
+            self.unserved = serves(self.model) or "the engine's kernels were never installed (no execution plan)"
         if self.unserved:
             return self.unserved
+        if self.run is None:
+            return f"the engine's kernels ({self.building}) are building"
         if any(not isinstance(p, str) for q in questions for p in q.everything()):
             return "the engine's prefill reads text only"
         if params.allowed is not None:
@@ -155,8 +197,9 @@ class CozyEngine:
         single = [ids[0] for ids in (tokenizer.encode(s, add_special_tokens=False) for s in stop) if len(ids) == 1]
         stops = [t for t in dict.fromkeys([*(configured if isinstance(configured, list) else [configured]), tokenizer.eos_token_id, *single]) if t is not None]
         if self.decoder is None:
+            assert self.run is not None  # `_why` serves no call before the set lands
             try:
-                self.decoder = Decoder(self.model, max_rows=ROWS)
+                self.decoder = Decoder(self.model, max_rows=ROWS, run=self.run)
             except Exception as exc:
                 if not short_of_room(exc):
                     raise
