@@ -3362,7 +3362,8 @@ class Request:
         self.retries = 0
         #: split sites whose whole output the card had no room for, kept in host memory (cr-305):
         #: the card's room when its allocation was refused there, else whether selection judged
-        #: the package's estimate of it or its measure (`execution.cuts._hosted`)
+        #: the package's estimate of it or its measure (`execution.cuts._hosted`); and blocks cut
+        #: by rows, for their cache entries or a refused whole output (`execution.strips`)
         self.hosted: dict[str, str] = {}
         #: refusals a CUDA graph capture answered by recording again with room for them
         #: (`graphs.capture`): what runs is the same

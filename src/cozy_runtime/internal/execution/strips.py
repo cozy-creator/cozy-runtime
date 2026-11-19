@@ -186,7 +186,7 @@ def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) 
         key = (site, (*(int(n) for n in x.shape[:-2]), int(x.shape[-1])), x.dtype)
         if _VERDICTS.get(key) is False:
             return forward(*args, **kwargs)
-        call = _Call(module, forward, block, bound, names[1])
+        call = _Call(site, module, forward, block, bound, names[1])
         row = x.narrow(-2, 0, 1).numel() * x.element_size()
         out_row = row * block.scale * block.scale
 
@@ -199,7 +199,7 @@ def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) 
 
         def run(level: int) -> object:
             if level and key not in _VERDICTS and not catch._capturing():
-                _VERDICTS[key] = call.probe(site)
+                _VERDICTS[key] = call.probe()
             if not level or not _VERDICTS.get(key):
                 return call.strips([(0, height)], host=False)
             n = sizing.pieces(height, level)
@@ -221,13 +221,15 @@ class _Call:
 
     def __init__(
         self,
+        site: str,
         module: nn.Module,
         forward: catch.Forward,
         block: Block,
         bound: inspect.BoundArguments,
         first: str,
     ) -> None:
-        self.module, self.forward, self.block, self.first = module, forward, block, first
+        self.site, self.module, self.forward = site, module, forward
+        self.block, self.first = block, first
         self.bound: dict[str, object] = dict(bound.arguments)
         self.signature = bound.signature
         self.x = cast("Tensor", self.bound[first])
@@ -290,6 +292,7 @@ class _Call:
         out: Tensor | None = None
         made: dict[int, object] = {}
         end: int | None = None
+        on_host = self.site if host else None
         for a, b in spans:
             catch.checkpoint()
             lo, hi = max(0, a - reach), min(height, b + reach)
@@ -302,13 +305,13 @@ class _Call:
                 out = y
             else:
                 if out is None:
-                    out = _whole(y, (*y.shape[:-2], height * scale, y.shape[-1]))
+                    out = _whole(self.site, y, (*y.shape[:-2], height * scale, y.shape[-1]))
                 pinned.write(out.narrow(-2, a * scale, (b - a) * scale), kept)
             del y, kept
             if rows is not None:
                 for index, value in rows.written.items():
                     made[index] = _assemble(
-                        made.get(index), value, height, a, b, lo, hi, host, len(spans)
+                        made.get(index), value, height, a, b, lo, hi, on_host, len(spans)
                     )
         assert out is not None
         if self.cache is not None and self.index is not None and end is not None:
@@ -317,17 +320,22 @@ class _Call:
             self.index[0] = end
         return out
 
-    def probe(self, site: str) -> bool:
+    def probe(self) -> bool:
         """Whether the block's rows are its strips': on a crop of its input, whole and in two
         strips, the same output and the same cache writes. Kernels may round a different shape
         differently, so a difference within a few units of the output's last place passes."""
-        x, block = self.x, self.block
+        x, block, site = self.x, self.block, self.site
         height, width = int(x.shape[-2]), int(x.shape[-1])
         tall = min(height, 4 * block.rows + 4)
         wide = min(width, 4 * block.columns + 4)
         top, left = (height - tall) // 2, (width - wide) // 2
         crop = _Call(
-            self.module, self.forward, block, self.signature.bind_partial(**self.bound), self.first
+            site,
+            self.module,
+            self.forward,
+            block,
+            self.signature.bind_partial(**self.bound),
+            self.first,
         )
         for name, value in self.bound.items():
             if (
@@ -354,7 +362,7 @@ class _Call:
                 if rows is not None:
                     for index, value in rows.written.items():
                         writes[index] = _assemble(
-                            writes.get(index), value, tall, a, b, lo, hi, False, 2
+                            writes.get(index), value, tall, a, b, lo, hi, None, 2
                         )
         except _Mismatch as exc:
             print(f"cozy-runtime: {site} runs whole: {exc}", file=sys.stderr)
@@ -412,10 +420,11 @@ def _assemble(
     b: int,
     lo: int,
     hi: int,
-    host: bool,
+    host: str | None,
     count: int,
 ) -> object:
-    """A cache entry's next value with a strip's own rows [a, b) of `value` (rows [lo, hi))."""
+    """A cache entry's next value with a strip's own rows [a, b) of `value` (rows [lo, hi)): in
+    host memory for the cut block `host`, else on the device."""
     if not isinstance(value, Tensor):
         return value
     if count == 1:
@@ -424,25 +433,47 @@ def _assemble(
     if not isinstance(whole, Tensor):
         shape = (*value.shape[:-2], height * f, value.shape[-1])
         whole = (
-            pinned.empty(shape, value.dtype, value.device)
-            if host and value.is_cuda
+            _hosted(host, "its cache entries (cut by rows)", shape, value.dtype, value.device)
+            if host is not None and value.is_cuda
             else torch.empty(shape, dtype=value.dtype, device=value.device)
         )
     pinned.write(whole.narrow(-2, a * f, (b - a) * f), value.narrow(-2, (a - lo) * f, (b - a) * f))
     return whole
 
 
-def _whole(part: Tensor, shape: tuple[int, ...]) -> Tensor:
+def _whole(site: str, part: Tensor, shape: tuple[int, ...]) -> Tensor:
     """A cut block's whole output: on the card in `part`'s layout, else in pinned host memory the
-    card addresses, where the card refuses it beside the strips (the next block reads its rows
-    back a strip at a time)."""
+    card addresses, where the card refuses it beside the strips (a Runtime retry; the next block
+    reads its rows back a strip at a time)."""
     try:
         return torch.empty(shape, dtype=part.dtype, device=part.device, memory_format=_format(part))
     except BaseException as exc:
-        if not part.is_cuda or not is_capacity(exc) or catch._capturing():
+        request = catch.CURRENT.get()
+        if request is None or not part.is_cuda or not is_capacity(exc) or catch._capturing():
             raise
+        room = catch.room(part.device.index or 0)  # beside the refused bytes, for the record
+        why = f"its whole output (refused beside {room})"
+        try:
+            out = _hosted(site, why, shape, part.dtype, part.device)
+        except Exception as failed:
+            exc.add_note(f"its whole output in host memory failed too: {failed}")
+            raise exc from None
         unwind(exc)
-    return pinned.empty(shape, part.dtype, part.device)
+        request.retries += 1  # the refusal is answered: no OOM a package swallowed (`contract`)
+        return out
+
+
+def _hosted(
+    site: str, why: str, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> Tensor:
+    """Pinned host memory for `site`, named in its request (`Request.hosted`), which frees the
+    pinned buffers at its end."""
+    out = pinned.empty(shape, dtype, device)
+    request = catch.CURRENT.get()
+    if request is not None and site not in request.hosted:
+        request.hosted[site] = why
+        print(f"cozy-runtime: {site} keeps {why} in host memory", file=sys.stderr)
+    return out
 
 
 def _format(t: Tensor) -> torch.memory_format:
