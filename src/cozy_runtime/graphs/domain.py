@@ -65,13 +65,15 @@ class Pool:
     mapped: int = 0
 
 
-def cuda_graph() -> CUDAGraph:
+def cuda_graph(*, keep_graph: bool = False) -> CUDAGraph:
     """A CUDA graph whose capture refuses only its own thread's unsafe calls (`thread_local`).
     Under Torch's default (`global`) any other thread's call that CUDA deems unsafe during it ends
     the capture: TensorFS registering the host pages it reads ahead, a kernel opening. The decode
     step then failed at its next launch, "operation failed due to a previous error during capture",
-    and the call decoded eagerly (cr-291). The step's own calls are refused as before."""
-    return _thread_graph()()
+    and the call decoded eagerly (cr-291). The step's own calls are refused as before.
+    `keep_graph`: torch keeps the captured `cudaGraph_t` (`raw_cuda_graph()`), instantiated at the
+    first replay, so a launcher can run it as a node of its own graph (`_kernels._engine`)."""
+    return _thread_graph()(keep_graph=keep_graph)
 
 
 @functools.cache
