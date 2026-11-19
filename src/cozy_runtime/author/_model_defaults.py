@@ -143,6 +143,49 @@ def model_needs(value: object) -> dict[str, str]:
     return out
 
 
+#: What an `estimate=` may say of a request beside its `size` (cl-1286).
+ESTIMATE_OUTPUTS = ("ms", "cold_ms", "peak_device_bytes", "peak_host_bytes")
+
+
+def model_estimate(value: object) -> dict[str, object]:
+    """Copy an `estimate=` declaration: `size`, each variable a function's cost depends on -> a
+    CEL number over `request`; and any of `ESTIMATE_OUTPUTS` -> a CEL number over `request`,
+    `size` and `machine`. `cozy` type-checks them when it reads the package."""
+    if value is None:
+        return {}
+
+    def expression(where: str, held: object) -> str:
+        if not isinstance(held, str) or not held.strip() or len(held) > MAX_NEEDS_RULE:
+            raise ConformanceError(
+                f"estimate {where} must be one CEL expression, at most {MAX_NEEDS_RULE} characters",
+                code="estimate",
+            )
+        return held.strip()
+
+    if not isinstance(value, Mapping):
+        raise ConformanceError(
+            "estimate must map `size` and outputs to CEL expressions", code="estimate"
+        )
+    out: dict[str, object] = {}
+    for name, held in value.items():
+        if name == "size":
+            if not isinstance(held, Mapping) or not held or len(held) > 16:
+                raise ConformanceError(
+                    "estimate size must map 1 to 16 variable names to CEL expressions",
+                    code="estimate",
+                )
+            if any(not isinstance(key, str) or not key.isidentifier() for key in held):
+                raise ConformanceError("estimate size names must be identifiers", code="estimate")
+            out["size"] = {key: expression(f"size[{key!r}]", rule) for key, rule in held.items()}
+        elif name in ESTIMATE_OUTPUTS:
+            out[name] = expression(repr(name), held)
+        else:
+            has = ", ".join(map(repr, ESTIMATE_OUTPUTS))
+            message = f"estimate has no {name!r}: it has 'size', {has}"
+            raise ConformanceError(message, code="estimate")
+    return out
+
+
 def check_model_arguments(
     declared: Mapping[str, object], parameters: Sequence[str], *, what: str = "defaults"
 ) -> None:

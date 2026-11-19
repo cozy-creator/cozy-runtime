@@ -53,6 +53,7 @@ from cozy_runtime.author._model import Model, component_method, component_set
 from cozy_runtime.author._model_defaults import (
     model_components,
     model_defaults,
+    model_estimate,
     model_needs,
     model_on_demand,
 )
@@ -420,6 +421,7 @@ _ENTRYPOINT_KEYWORDS = frozenset(
         "memoize",
         "on_demand",
         "needs",
+        "estimate",
         "accelerator",
         "weights",
         "private",
@@ -1584,6 +1586,8 @@ class Registration:
     tool: author.Tool | None = None
     #: `needs=`: a Model argument or a called function -> its CEL rule over `request`.
     model_needs: Mapping[str, str] = field(default_factory=dict)
+    #: `estimate=`: its size variables and its cost (`model_estimate`).
+    estimate: Mapping[str, object] = field(default_factory=dict)
 
     def declaration(
         self,
@@ -1613,6 +1617,7 @@ class Registration:
             model_components=self.model_components,
             model_on_demand=self.model_on_demand,
             model_needs=self.model_needs,
+            estimate=self.estimate,
             payload_type=payload_type,
             result_type=result_type,
             contexts=contexts,
@@ -2790,6 +2795,7 @@ def _registration(
     weights: tuple[author.WeightsOutput, ...] = ()
     on_demand: tuple[str, ...] = ()
     needs: dict[str, str] = {}
+    estimate: dict[str, object] = {}
     box: dict[str, object] = {}
     for keyword in keywords:
         if method == "tool" and keyword.arg == "ui":
@@ -2825,6 +2831,8 @@ def _registration(
             on_demand = model_on_demand(value)
         elif keyword.arg == "needs":
             needs = model_needs(value)
+        elif keyword.arg == "estimate":
+            estimate = model_estimate(value)
         elif keyword.arg == "name":
             name = str(value)
         elif keyword.arg in _TOOL_KEYWORDS:
@@ -2862,6 +2870,7 @@ def _registration(
         model_components=used_components,
         tool=tool,
         model_needs=needs,
+        estimate=estimate,
     )
 
 

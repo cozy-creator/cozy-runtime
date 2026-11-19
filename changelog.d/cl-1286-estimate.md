@@ -1,0 +1,1 @@
+`estimate=` beside `needs=`: a function names the variables its cost depends on (`size`), each CEL over its request, and optionally its time and peaks on a machine (`ms`, `cold_ms`, `peak_device_bytes`, `peak_host_bytes`) over `request`, `size` and `machine` with `measured(machine)`, `pow`, `sum`; the interface carries it as `estimate`.

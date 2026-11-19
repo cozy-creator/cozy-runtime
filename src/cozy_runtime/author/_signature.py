@@ -385,6 +385,8 @@ class Declaration:
     model_needs: Mapping[str, str] = field(default_factory=dict)
     """A Model argument, or a function this one calls, -> the CEL rule over `request` that
     says whether a request needs it (`needs=`)."""
+    estimate: Mapping[str, object] = field(default_factory=dict)
+    """`estimate=`: its size variables and its cost, CEL over its request (`model_estimate`)."""
     parameters: tuple[str, ...] | None = None
     """Its request's fields, when they are its own parameters; None: its request is its one
     struct parameter."""
@@ -577,6 +579,7 @@ def analyze(
     model_components: Mapping[str, tuple[str, ...]] | None = None,
     model_on_demand: tuple[str, ...] = (),
     model_needs: Mapping[str, str] | None = None,
+    estimate: Mapping[str, object] | None = None,
     model_classes: Mapping[str, type[Model[object]]] | None = None,
 ) -> Surface:
     """Derive the whole surface from the signature. Every refusal here is a BUILD refusal.
@@ -755,6 +758,7 @@ def analyze(
         model_components=model_components or {},
         model_on_demand=model_on_demand,
         model_needs=model_needs or {},
+        estimate=estimate or {},
         parameters=tuple(callers) if keyword else None,
         parameter_defaults={
             name: signature.parameters[name].default

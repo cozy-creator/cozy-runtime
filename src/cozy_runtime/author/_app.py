@@ -22,6 +22,7 @@ from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import (
     model_components,
     model_defaults,
+    model_estimate,
     model_needs,
     model_on_demand,
 )
@@ -42,6 +43,7 @@ class RegistrationOptions(TypedDict, total=False):
     memoize: bool
     on_demand: Sequence[str]
     needs: Mapping[str, str] | None
+    estimate: Mapping[str, object] | None
     accelerator: bool | None
     weights: tuple[WeightsOutput, ...]
     private: bool
@@ -65,6 +67,7 @@ class Registration:
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
     model_needs: Mapping[str, str] = field(default_factory=dict)
+    estimate: Mapping[str, object] = field(default_factory=dict)
     #: A model argument's class where the Runtime names it (`cozy_runtime.derive.recipes`).
     model_classes: Mapping[str, type[Model[object]]] = field(default_factory=dict)
     weights_outputs: tuple[WeightsOutput, ...] = ()
@@ -96,6 +99,7 @@ class Registration:
                 model_components=self.model_components,
                 model_on_demand=self.model_on_demand,
                 model_needs=self.model_needs,
+                estimate=self.estimate,
                 model_classes=self.model_classes,
             )
         return self._surface
@@ -139,6 +143,11 @@ class App:
           starts; where false they aren't fetched. The argument is built when the function
           first reads it. In a function that loads no model and calls others, a key names a
           function it calls. No rule: always needed.
+        - `estimate={"size": {"seconds": "request.duration"}, "ms": "measured(machine)..."}`:
+          the variables a request's cost depends on, each a CEL number over `request`, kept as its
+          run's size; and optionally its cost on a machine (`ms`, `cold_ms`, `peak_device_bytes`,
+          `peak_host_bytes`), CEL numbers over `request`, `size` and `machine` that read the
+          package's benchmark rows with `measured(machine)`. No `ms`: the platform's default.
         - `accelerator`: defaults to GPU for a constructed `Model` parameter, else CPU.
           `True` selects the machine's GPU for custom compute without a `Model`; `False`
           stays CPU only. Raw `Weights` inputs do not select a GPU.
@@ -201,6 +210,7 @@ class App:
         memoize: bool = False,
         on_demand: Sequence[str] = (),
         needs: Mapping[str, str] | None = None,
+        estimate: Mapping[str, object] | None = None,
         accelerator: bool | None = None,
         weights: tuple[WeightsOutput, ...] = (),
         private: bool = False,
@@ -219,6 +229,7 @@ class App:
         declared_components = model_components(components)
         declared_on_demand = model_on_demand(on_demand)
         declared_needs = model_needs(needs)
+        declared_estimate = model_estimate(estimate)
 
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
             if self._frozen:
@@ -239,6 +250,7 @@ class App:
                 model_components=declared_components,
                 model_on_demand=declared_on_demand,
                 model_needs=declared_needs,
+                estimate=declared_estimate,
                 model_classes=dict(model_classes or {}),
                 weights_outputs=weights,
                 preflight=preflight,

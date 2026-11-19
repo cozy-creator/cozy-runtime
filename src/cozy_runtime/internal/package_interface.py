@@ -279,6 +279,8 @@ def entry(declared: Declaration) -> dict[str, Json]:
         doc["assets"] = {"parameter": assets.parameter, "kinds": kinds}
     if not declared.accelerator:
         doc["accelerator"] = False
+    if declared.estimate:
+        doc["estimate"] = cast(Json, dict(declared.estimate))
     if declared.tool is not None:
         doc["tool"] = declared.tool.document()
     if declared.weights_outputs:
