@@ -9,10 +9,17 @@ Norms, and the scale and shift a block applies after one:
 A module the row cut takes for a norm (`cuts.norm_like`) that states a float `eps` and holds at
 most one vector (its weight) may be such a norm (`_norm`). Its first call runs its
 own forward and the block's ops as written, which serve that call; the kernel's rows of a piece of
-the same input, scale and shift are compared with them, and from the next call on the kernel
-serves where every value compared was within rounding's allowance (`fused_rows.bound`). A norm
-whose forward is one kernel already (it makes no temporary the size of its output), or whose rows
-are another law's, is left as written, for good, with one line.
+the same input, scale and shift are compared with them on the card, with no wait, and the kernel
+serves from the first call after the comparison lands where every value compared was within
+rounding's allowance (`fused_rows.bound`). A norm whose forward is one kernel already (it makes no
+temporary the size of its output), or whose rows are another law's, is left as written, for good,
+with one line.
+
+A verdict is its law's, not its instance's: the class's code (its file's digest) and configuration,
+the rows' dtype and width, the card and the Runtime build (`_key`). It is kept in the machine's
+kernel store beside the compiled kernels, so another instance, or a later process, recalls it and
+runs no comparison: a norm recalled as served still runs its first call as written, which shows
+that its block reads its rows through torch, and serves the kernel from the next.
 
 A proven norm returns its rows not yet computed (`Rows`). The block's own `* table` then
 `+ table` join them where the table broadcasts over the rows (`fused_rows.table`), and the add
@@ -26,8 +33,8 @@ Rotations: a function an attention processor calls on its queries and keys with 
 pair of fp32 tables (`cuts.rows` hands each call here). Its first call of each shape runs as
 written and serves; the kernel's rotation of a piece of the same input, in each layout the tables
 could be read in (`fused_rows.turns`), is compared with it, and the first within rounding's
-allowance serves that shape from then on. A call that left its input as it was proves nothing and
-is tried again at the next.
+allowance serves that shape from then on, recalled by later processes as a norm's verdict is. A
+call that left its input as it was proves nothing and is tried again at the next.
 
 The kernels make no temporary, so they need only their output and are never cut; whatever does
 not take them (another dtype, a narrow or unaligned row, autograd, a kernel not ready) runs the
@@ -36,11 +43,18 @@ forward or function as it was, under the cut it had.
 
 from __future__ import annotations
 
+import functools
+import hashlib
+import inspect
+import json
+import queue
 import sys
+import threading
 import time
 import weakref
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 from typing import Literal, Protocol, cast
 
 import torch
@@ -52,7 +66,7 @@ import cozy_runtime.internal.execution.cuts as cuts
 from cozy_runtime.accel.kernels import Launch
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._model import Building, Yielded
-from cozy_runtime.internal import fused_rows
+from cozy_runtime.internal import fused_rows, kernel_cache, verify
 
 #: a module's site, on the module (None once it is left as written)
 _SITE = "_cozy_fused_rows"
@@ -106,13 +120,16 @@ class Check:
     worst: float = 0.0
     values: int = 0
     ms: float = 0.0
+    recalled: int = 0
 
 
 #: each (kind, law)'s checks since the executor last took them for a run's record
 _CHECKS: dict[tuple[str, str], Check] = {}
 
 
-def _checked(kind: str, law: str, began: float, off: float, values: int, why: str = "") -> None:
+def _checked(
+    kind: str, law: str, ms: float, off: float, values: int, why: str = "", recalled: bool = False
+) -> None:
     check = _CHECKS.setdefault((kind, law), Check())
     if why:
         check.left += 1
@@ -121,15 +138,114 @@ def _checked(kind: str, law: str, began: float, off: float, values: int, why: st
         check.served += 1
         check.worst = max(check.worst, off)
     check.values += values
-    check.ms += (time.perf_counter() - began) * 1e3
+    check.ms += ms
+    check.recalled += int(recalled)
+
+
+def _since(began: float) -> float:
+    return (time.perf_counter() - began) * 1e3
 
 
 def taken() -> list[tuple[str, str, Check]]:
     """The first-call checks since the last take, for the attempt's record (the executor's
-    `kernel.fused_rows`): a check is said in the run whose call ran it."""
+    `kernel.fused_rows`): a check is said in the run whose call ran it, and one still on the card
+    when its run ends in the run it lands in."""
+    for site in list(_WAITING):
+        site.landed()
     rows = [(kind, law, check) for (kind, law), check in sorted(_CHECKS.items())]
     _CHECKS.clear()
     return rows
+
+
+#: each verdict this process found or recalled, by its key's digest: {"why": ""} where the kernel
+#: serves it ({"turn": ...} for a rotation, its layout), else {"why": <why it runs as written>}
+_VERDICTS: dict[str, dict[str, object]] = {}
+#: the norms whose comparison is still on the card
+_WAITING: weakref.WeakSet[_Site] = weakref.WeakSet()
+
+
+def _jsonable(value: object) -> object:
+    """`value` as a key's JSON: dtypes, floats and shapes said as strings and lists."""
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, tuple | list | torch.Size):
+        return [_jsonable(v) for v in value]
+    if value is None or isinstance(value, bool | int | str):
+        return value
+    return repr(value)
+
+
+@functools.cache
+def _source(of: object) -> str:
+    """The sha256 of the file that defines `of` (a class or a function); "" where it has none."""
+    try:
+        path = inspect.getsourcefile(cast("type[object]", of))
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else ""
+    except (OSError, TypeError):
+        return ""
+
+
+def _key(kind: str, of: object, device: torch.device, **inputs: object) -> kernel_cache.Key | None:
+    """A verdict's key: what decides it (`of`'s code by its file, the Runtime build, the card and
+    `inputs`); None where `of` has no file to read."""
+    source = _source(of)
+    if not source:
+        return None
+    named = f"{getattr(of, '__module__', '')}.{getattr(of, '__qualname__', '')}"
+    card = torch.cuda.get_device_capability(device)
+    document = {"runtime": verify.RUNTIME, "kind": kind, "of": named, "source": source}
+    shaped = cast("Mapping[str, object]", _jsonable({**document, "card": card, **inputs}))
+    return kernel_cache.Key.of("fused-rows-verdict", shaped)
+
+
+def _recalled(key: kernel_cache.Key | None) -> dict[str, object] | None:
+    """`key`'s verdict as this process or the machine's store holds it (`_VERDICTS`); None where
+    none was found yet."""
+    if key is None:
+        return None
+    if key.digest in _VERDICTS:
+        return _VERDICTS[key.digest]
+    store = kernel_cache.configured()
+    try:
+        data = None if store is None else store.get(key)
+        found = None if data is None else json.loads(data)
+    except (OSError, ValueError, kernel_cache.KernelCacheRefusal):
+        found = None
+    if not isinstance(found, dict):
+        return None
+    _VERDICTS[key.digest] = verdict = cast("dict[str, object]", found)
+    return verdict
+
+
+def _remember(key: kernel_cache.Key | None, verdict: dict[str, object], off: float) -> None:
+    """`key`'s verdict for this process at once, and for the machine's store off the call's path
+    (`_keep`): a verdict not kept before the process ends is found again by the next one."""
+    if key is None or key.digest in _VERDICTS:
+        return
+    _VERDICTS[key.digest] = verdict
+    store = kernel_cache.configured()
+    if store is None:
+        return
+    if not _KEEPING:
+        _KEEPING.append(threading.Thread(target=_keep, name="fused-rows verdicts", daemon=True))
+        _KEEPING[0].start()
+    _KEPT.put((store, key, json.dumps(verdict).encode(), repr(off)))
+
+
+#: verdicts on their way to the machine's store, and the thread that writes them
+type _Kept = tuple[kernel_cache.Store, kernel_cache.Key, bytes, str]
+_KEPT: queue.SimpleQueue[_Kept] = queue.SimpleQueue()
+_KEEPING: list[threading.Thread] = []
+
+
+def _keep() -> None:
+    while True:
+        store, key, data, off = _KEPT.get()
+        try:
+            if store.get(key) is None:
+                store.put(key, data, {"worst": off})
+        except (OSError, ValueError, kernel_cache.KernelCacheRefusal):
+            pass
 
 
 def _piece(rows: int, width: int, itemsize: int) -> int:
@@ -166,6 +282,18 @@ class _Made(TorchDispatchMode):
             if isinstance(value, Tensor) and slot.alias_info is None:
                 self.made += value.numel() * value.element_size()
         return out
+
+
+@dataclass(slots=True)
+class _Waiting:
+    """A norm's comparison on the card: done once `event` is; `host` then holds its share of
+    rounding's allowance. `ms` the call's time launching it, `values` the values compared."""
+
+    event: torch.cuda.Event
+    host: Tensor
+    key: kernel_cache.Key | None
+    ms: float
+    values: int
 
 
 @dataclass(slots=True)
@@ -270,16 +398,21 @@ def _plain(value: object) -> object:
 class _Site:
     """One norm module: its forward as it stood (`inner`: its cut, or its class's), the instance
     forward this one replaced, its epsilon and its weight's name. `asked`: the rows a proving call
-    handed out, until they are computed."""
+    handed out, until they are computed; `waiting`: its comparison, until it lands."""
 
     module: nn.Module
     inner: catch.Forward
     own: catch.Forward | None
     eps: float
     weight_name: str | None
+    #: where it is: its root's class and its path under it, part of its verdict's key
+    path: str = ""
     proven: bool = False
     asked: weakref.ref[Tensor] | None = None
     left: bool = False
+    waiting: _Waiting | None = None
+    #: its first call served by a verdict found before: no comparison
+    recall: bool = False
 
     def weight(self) -> Tensor | None:
         return None if self.weight_name is None else getattr(self.module, self.weight_name)
@@ -315,42 +448,77 @@ class _Site:
         launch = _launch(x.device)
         if launch is None:
             return self.inner(x)
+        if self.waiting is not None and not self.landed():
+            return self.inner(x)  # its comparison is still on the card: as written until it lands
         if self.proven:
             return _rows(_Pending(self, launch, x))
+        if self.left:
+            return self.inner(x)
         if self.asked is not None and self.asked() is None:
-            self.left_checked(time.perf_counter(), "its rows were read where they cannot wait")
+            self.left_checked(0.0, "its rows were read where they cannot wait", key=self.key(x))
             return self.inner(x)
         if torch.cuda.is_current_stream_capturing():
             return self.inner(x)  # a capture cannot hold the proof's comparison
+        key = self.key(x)
+        recalled = _recalled(key)
+        if recalled is not None:
+            why = str(recalled.get("why", ""))
+            if why:
+                self.leave(why)
+                _checked("norm", _name(self.module), 0.0, 0.0, 0, why, recalled=True)
+                return self.inner(x)
+            # served before: this call runs as written, so its block's reads show they go
+            # through torch (`asked`), and the kernel serves from the next
+            whole = self.inner(x)
+            if type(whole) is not Tensor or whole.shape != x.shape or whole.dtype != x.dtype:
+                return whole
+            self.recall = True
+            made = _rows(_Pending(self, launch, x, eager=whole))
+            self.asked = weakref.ref(made)
+            return made
         counted = _Made()  # type: ignore[no-untyped-call]  # TorchDispatchMode's __init__
         with counted:
             whole = self.inner(x)
-        began = time.perf_counter()
         if not (
             type(whole) is Tensor
             and whole.shape == x.shape
             and whole.dtype == x.dtype
             and whole.device == x.device
         ):
-            self.left_checked(began, "its result is not its input's rows")
+            self.left_checked(0.0, "its result is not its input's rows", key=key)
             return whole
         if counted.made < 2 * whole.numel() * whole.element_size():
             # one kernel already: no temporary the size of its output (said once, in the record)
             self.leave()
-            _checked("norm", _name(self.module), began, 0.0, 0, "one kernel already")
+            _checked("norm", _name(self.module), 0.0, 0.0, 0, "one kernel already")
+            _remember(key, {"why": "one kernel already"}, 0.0)
             return whole
         made = _rows(_Pending(self, launch, x, eager=whole))
         self.asked = weakref.ref(made)
         return made
+
+    def key(self, x: Tensor) -> kernel_cache.Key | None:
+        """This norm's verdict's key: its class's code, configuration and place, its weight's
+        kind, and the rows' dtype and width (`_key`)."""
+        weight = self.weight()
+        held = None if weight is None else (int(weight.shape[0]), weight.dtype)
+        return _key(
+            "norm", type(self.module), x.device, path=self.path, eps=self.eps, weight=held,
+            config=cuts._config(self.module), dtype=x.dtype, width=int(x.shape[-1]),
+        )  # fmt: skip
 
     def rows(self, pending: _Pending) -> Tensor:
         """The rows `pending` stands for. On the proving call, the eager ones, the kernel's
         compared with them."""
         x, scale, shift = pending.x, pending.scale, pending.shift
         if pending.eager is not None:
-            if not self.proven and not self.left:
+            if not self.proven and not self.left and self.waiting is None:
                 self.asked = None
-                self.compare(pending, pending.eager)
+                if self.recall:
+                    self.proven = True
+                    _checked("norm", _name(self.module), 0.0, 0.0, 0, recalled=True)
+                else:
+                    self.compare(pending, pending.eager)
             return pending.eager
         if not self.left:
             try:
@@ -365,11 +533,15 @@ class _Site:
     def compare(self, pending: _Pending, want: Tensor) -> None:
         """Prove the kernel on this call: its rows of the middle of `pending.x`, a piece small
         enough to run unasked, within rounding's allowance of `want`'s. `want` came from the
-        input as it was when the norm was called, so an input changed since fails here too."""
+        input as it was when the norm was called, so an input changed since fails here too. The
+        comparison runs on the card and nothing waits for it: its share of the allowance is
+        copied back behind it, and the norm's next call (or the run's end) takes it (`landed`)."""
         began = time.perf_counter()
         x, width = pending.x, int(pending.x.shape[-1])
+        key = self.key(x)
         if want.shape != x.shape or want.dtype != x.dtype:
-            self.left_checked(began, "its block's scale or shift changes its rows' shape or dtype")
+            why = "its block's scale or shift changes its rows' shape or dtype"
+            self.left_checked(_since(began), why, key=key)
             return
         rows = x.numel() // width
         count = _piece(rows, width, x.element_size())
@@ -380,22 +552,46 @@ class _Site:
             got = fused_rows.launched(pending.launch, piece, self.eps, self.weight(), *tables, at)
             scale, shift = (t if t is None else fused_rows.rows_of(*t, at, count) for t in tables)
             allowed = fused_rows.bound(piece, self.eps, self.weight(), scale, shift)
-            off = fused_rows.within(got, want.reshape(rows, width)[at : at + count], allowed)
+            share = fused_rows.share(got, want.reshape(rows, width)[at : at + count], allowed)
+            host = torch.empty((), dtype=torch.float32, pin_memory=True)
+            host.copy_(share, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
         except Exception as exc:
-            self.left_checked(began, _failed(exc))
+            self.left_checked(_since(began), _failed(exc))
             return
-        if not off <= 1:
-            why = f"its rows lie {off:.3g} times rounding's allowance from the kernel's"
-            self.left_checked(began, why, count * width)
-            return
-        self.proven = True
-        _checked("norm", _name(self.module), began, off, count * width)
-        _say(f"{_name(self.module)}: one kernel a call, each proven on its first call")
+        self.waiting = _Waiting(event, host, key, _since(began), count * width)
+        _WAITING.add(self)
 
-    def left_checked(self, began: float, why: str, values: int = 0) -> None:
-        """Its check refused it: left as written, said in the record and once in a line."""
+    def landed(self) -> bool:
+        """Whether this norm's comparison has landed (`compare`), taking its verdict if so: the
+        kernel serves from here on, or the norm is left as written; the verdict is kept."""
+        waiting = self.waiting
+        if waiting is None:
+            return True
+        if not waiting.event.query():
+            return False
+        self.waiting = None
+        _WAITING.discard(self)
+        off = float(waiting.host)
+        if off <= 1:
+            self.proven = True
+            _checked("norm", _name(self.module), waiting.ms, off, waiting.values)
+            _remember(waiting.key, {"why": ""}, off)
+            _say(f"{_name(self.module)}: one kernel a call, each proven on its first call")
+        else:
+            why = f"its rows lie {off:.3g} times rounding's allowance from the kernel's"
+            self.left_checked(waiting.ms, why, waiting.values, waiting.key)
+        return True
+
+    def left_checked(
+        self, ms: float, why: str, values: int = 0, key: kernel_cache.Key | None = None
+    ) -> None:
+        """Its check refused it: left as written, said in the record and once in a line, and
+        kept as its verdict where `key` names it (a refusal of the call, not the law, is not)."""
         self.leave(why)
-        _checked("norm", _name(self.module), began, 0.0, values, why)
+        _checked("norm", _name(self.module), ms, 0.0, values, why)
+        _remember(key, {"why": why}, 0.0)
 
     def leave(self, why: str = "") -> None:
         """This module runs as written from here on: its forward goes back where it is still this
@@ -448,13 +644,13 @@ def install(module: nn.Module) -> int:
     serves it after; its forward as it stands now (its cut) stays under it. Returns how many."""
     if fused_rows.TRITON_ABSENT:
         return 0
-    count = 0
-    for sub in module.modules():
+    count, root = 0, f"{type(module).__module__}.{type(module).__qualname__}"
+    for path, sub in module.named_modules():
         found = None if _SITE in vars(sub) else _norm(sub)
         if found is None:
             continue
         own = cast("catch.Forward | None", vars(sub).get("forward"))
-        site = _Site(sub, own or catch.current(sub), own, *found)
+        site = _Site(sub, own or catch.current(sub), own, *found, path=f"{root}:{path}")
         vars(sub)[_SITE] = site
         sub.forward = catch.transparent(site)
         count += 1
@@ -474,49 +670,79 @@ def rotation(
     kwargs: Mapping[str, object],
 ) -> object:
     """A call of `original`, a function an attention processor calls on its queries or keys:
-    the rotation kernel's result where this shape of call proved it (`_turned`), else
-    `eager(*args, **kwargs)`, its cut, which serves the proving call."""
+    the rotation kernel's result where this shape of call proved it (`_turned`) or a verdict kept
+    before says so (`_recalled`), else `eager(*args, **kwargs)`, its cut, which serves the
+    proving call."""
     call = _turning(args, kwargs)
     if call is None:
         return eager(*args, **kwargs)
     x, cos, sin, form = call
-    key = (id(original), *form)
-    launch, known, turn = _launch(x.device), key in _TURNS, _TURNS.get(key)
-    if launch is None or (known and turn is None):
+    local, law = (id(original), *form), _function(original)
+    launch = _launch(x.device)
+    if launch is None:
+        return eager(*args, **kwargs)
+    key = None if local in _TURNS else _key("rotation", original, x.device, form=form)
+    recalled = _recalled(key)
+    if recalled is not None:
+        _TURNS[local] = _turn(recalled)
+        why = "" if _TURNS[local] is not None else str(recalled.get("why", "")) or "no layout"
+        _checked("rotation", law, 0.0, 0.0, 0, why, recalled=True)
+    known, turn = local in _TURNS, _TURNS.get(local)
+    if known and turn is None:
         return eager(*args, **kwargs)
     if turn is not None:
         try:
             return fused_rows.turned(launch, x, cos, sin, turn)
         except Exception as exc:
-            _TURNS[key] = None
-            _say(f"{_function(original)}: left as written ({_failed(exc)})")
+            _TURNS[local] = None
+            _say(f"{law}: left as written ({_failed(exc)})")
             return eager(*args, **kwargs)
     if torch.cuda.is_current_stream_capturing():
         return eager(*args, **kwargs)  # a capture cannot hold the proof's comparison
-    want, law = eager(*args, **kwargs), _function(original)
+    want = eager(*args, **kwargs)
     began = time.perf_counter()
     if type(want) is not Tensor or want.shape != x.shape or want.dtype != x.dtype:
-        _TURNS[key] = None
-        _checked("rotation", law, began, 0.0, 0, "its result is not its input's shape and dtype")
+        why = "its result is not its input's shape and dtype"
+        _TURNS[local] = None
+        _checked("rotation", law, _since(began), 0.0, 0, why)
+        _remember(key, {"why": why}, 0.0)
         return want
     try:
         proven, off, values = _turned(launch, x, cos, sin, want)
     except Exception as exc:
-        _TURNS[key] = None
+        _TURNS[local] = None
         why = _failed(exc)
-        _checked("rotation", law, began, 0.0, 0, why)
+        _checked("rotation", law, _since(began), 0.0, 0, why)
         _say(f"{law}: left as written ({why})")
         return want
     if proven is not False:
-        _TURNS[key] = proven
+        _TURNS[local] = proven
         if proven is None:
             why = "no layout of its tables matches"
-            _checked("rotation", law, began, 0.0, values, why)
+            _checked("rotation", law, _since(began), 0.0, values, why)
+            _remember(key, {"why": why}, 0.0)
             _say(f"{law}: left as written ({why})")
         else:
-            _checked("rotation", law, began, off, values)
+            _checked("rotation", law, _since(began), off, values)
+            _remember(key, {"turn": _jsonable(asdict(proven))}, off)
             _say(f"{law}: one kernel a call, proven on each shape's first call")
     return want
+
+
+def _turn(verdict: Mapping[str, object]) -> fused_rows.Turn | None:
+    """The layout a kept rotation verdict names, or None (it runs as written)."""
+    held = verdict.get("turn")
+    if not isinstance(held, dict):
+        return None
+    try:
+        sizes, strides = (tuple(int(n) for n in held[k]) for k in ("sizes", "strides"))
+        return fused_rows.Turn(
+            int(held["head"]), bool(held["split"]), bool(held["wide"]),
+            (sizes[0], sizes[1], sizes[2]), (strides[0], strides[1], strides[2]),
+            int(held["column"]),
+        )  # fmt: skip
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
 
 
 def _turning(

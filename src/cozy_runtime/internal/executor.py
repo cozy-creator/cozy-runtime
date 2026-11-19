@@ -4471,12 +4471,15 @@ class Executor:
         per kind (norm or rotation) and law, the sites the kernel serves after theirs and those left
         as written with the first reason, the worst difference seen as a share of rounding's
         allowance (1 or less is the same computation), the values compared and the checks' time.
-        A `kernel.` name, so TensorD keeps it in the run's measurements."""
+        Its value: `left` where any was, `recalled` where every site took a verdict kept before
+        (no comparison ran), else `served`. A `kernel.` name, so TensorD keeps it in the run's
+        measurements."""
         from cozy_runtime.internal.execution import fused
 
         for kind, law, check in fused.taken():
+            said = "left" if check.left else "recalled" if check.recalled == check.served else "served"
             record.emit(
-                "confession", "kernel.fused_rows", "left" if check.left else "served",
+                "confession", "kernel.fused_rows", said,
                 kind=kind, law=law, served=check.served, left=check.left,
                 worst=round(check.worst, 4), values=check.values, ms=round(check.ms, 1),
                 why=check.why,

@@ -377,11 +377,16 @@ def bound(
 def within(got: Tensor, want: Tensor, allowed: Tensor) -> float:
     """The largest difference between `got` and `want` as a share of what rounding allows there:
     1 or less where they are the same computation. NaN where either is not finite."""
+    return float(share(got, want, allowed))
+
+
+def share(got: Tensor, want: Tensor, allowed: Tensor) -> Tensor:
+    """`within`, left on the device: a float32 scalar no host waits for."""
     if got.shape != want.shape or got.dtype != want.dtype:
         raise ValueError(f"{tuple(got.shape)} {got.dtype} against {tuple(want.shape)} {want.dtype}")
     if not got.numel():
-        return 0.0
-    return float(((got.float() - want.float()).abs() / allowed).max())
+        return torch.zeros((), dtype=torch.float32, device=got.device)
+    return ((got.float() - want.float()).abs() / allowed).amax()
 
 
 # --------------------------------------------------------------------------- rotations
