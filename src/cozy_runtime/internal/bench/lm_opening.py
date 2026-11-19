@@ -15,6 +15,7 @@ the end; a decode that fails raises.
 from __future__ import annotations
 
 import time
+from typing import cast
 
 #: The primed probe's time to open: far longer than the decode, so the decode's first steps meet it opening.
 PROBE_S = 20.0
@@ -38,7 +39,8 @@ def measure() -> dict[str, object]:
         tie_word_embeddings=False,
     )  # fmt: skip
     torch.manual_seed(213)
-    model = Qwen3_5ForCausalLM(config).to(device="cuda", dtype=torch.bfloat16).eval()  # type: ignore[no-untyped-call]
+    model = Qwen3_5ForCausalLM(config)  # type: ignore[no-untyped-call]  # unannotated in Transformers
+    cast("torch.nn.Module", model).to(device="cuda", dtype=torch.bfloat16).eval()  # in place, as engine-step moves it
     name = f"xs213-slow-probe cuda:{torch.cuda.current_device()}"
 
     def slow(wait: bool) -> object:
@@ -53,11 +55,21 @@ def measure() -> dict[str, object]:
     began = time.perf_counter()
     out = lm.generate(model, inputs, max_new_tokens=NEW, stop=[], pad=0, temperature=0.0)
     torch.cuda.synchronize()
+    seconds = round(time.perf_counter() - began, 3)
     engine = lm._ENGINES.get(model)
+    still = kernel_ready.opening(name)
+    # Returned while the probe still opened, every `recording()` in this executor would refuse (`Building`) for the rest
+    # of its 20 s: lm's captures refused, and a timed decode right after measuring eager steps. So the cell ends only
+    # once the probe's opener has ended.
+    deadline = time.monotonic() + PROBE_S + 60
+    while kernel_ready.opened(name) is None and kernel_ready.failed(name) is None:
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"{name} still opening {PROBE_S + 60:.0f} s after it was primed")
+        time.sleep(0.1)
     return {
         "tokens": int(out.shape[-1]),
-        "s": round(time.perf_counter() - began, 3),
+        "s": seconds,
         "opening_at_start": opening,
-        "still_opening": kernel_ready.opening(name),
+        "still_opening": still,
         "eager_steps": None if engine is None else engine.eager,
     }
