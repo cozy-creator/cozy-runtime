@@ -932,8 +932,8 @@ def _model(param: Param, inv: Invocation, surface: Surface) -> object:
         # Weights alike (cl-1281): its machine bound it none, and reading it refuses.
         refusal = (
             "model_ruled_out",
-            f"{param.name!r} is not this request's: its needs rule ({rule}) is false for it, so "
-            "its machine bound no model, and the function read it",
+            f"the function read {param.name!r}, which its machine bound no model for this request "
+            f"(its needs rule: {rule})",
         )
     if rule is not None or param.name in surface.deferred:
         # A request may leave it unused: refused only when read.
