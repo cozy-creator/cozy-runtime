@@ -1,0 +1,1 @@
+A retained state whose region finds no room on the card when it is written (a prefix's K/V) is kept on its host copy, which TensorFS writes then, and filled from there at its first use, instead of failing `memory_exhausted` (var-030 §1.3 row 13; needs the TensorFS that returns None from `Retained.write`).

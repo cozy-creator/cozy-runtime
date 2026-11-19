@@ -3208,8 +3208,13 @@ class Retained:
             views.append((end, tensor.nbytes, tensor.dtype, tensor.shape))
             end = (end + tensor.nbytes + 255) // 256 * 256
         region = varena.Retained(memory._device_native(), memory._tier(), end)
-        written = region.write(memory._cuda_stream().cuda_stream, parts, spill=self.spill)
-        ptr = written.tensor.data_ptr()
+        # None (a newer TensorFS's): the card had no room, so it went to its host copy and its
+        # first use fills it from there.
+        written = cast(
+            "varena.Use | None",
+            region.write(memory._cuda_stream().cuda_stream, parts, spill=self.spill),
+        )
+        ptr = int(getattr(region, "ptr", 0)) if written is None else written.tensor.data_ptr()
         del dense, written
         kept = _Kept(memory, region, views, ptr, end)
         KEPT.add(kept)
