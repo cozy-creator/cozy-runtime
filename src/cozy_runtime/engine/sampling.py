@@ -1,9 +1,13 @@
 """A step's token choice on the device (xs-213 phase 2), in vLLM's order: the repetition,
 frequency and presence penalties; then each sampling row's temperature, top-k, top-p and min-p cut;
 then its draw: the argmax of the kept scores plus Gumbel noise hashed from (seed, the token's index
-in the row's output, the vocabulary entry), so the same seed draws the same token on any device and
-a drafted step keeps exactly the tokens an undrafted one draws. A greedy row (temperature 0) takes
-the argmax of its penalized scores. Every setting is per row; nothing is read back to the host.
+in the row's output, the vocabulary entry). The noise is the same bits on every device, and a drafted
+token is kept only where it is the model's own draw at its index with that noise, so drafting samples
+the same distribution as an undrafted call. The scores it is added to are not bit for bit the same
+between calls (a verify pass against a one-token step, kernels' reduction order), so where two
+entries nearly tie the draw can turn: the same seed gives the same text only up to such ties. A
+greedy row (temperature 0) takes the argmax of its penalized scores. Every setting is per row;
+nothing is read back to the host.
 
 Where a row has a top-k, its top-p nucleus lies inside those k entries (top-p cuts the top-k
 filtered distribution), so the cut and the draw run over the k kept entries alone: exact, and no
