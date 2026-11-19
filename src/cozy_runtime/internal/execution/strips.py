@@ -4,27 +4,32 @@ rows at a time, each strip reading its rows and a halo either side and keeping o
 A block is a module whose forward takes Diffusers' causal cache (`feat_cache`, `feat_idx`: Wan's,
 Qwen-Image's and their kin's residual blocks, resamples and up blocks), or a conv subclass whose
 forward wraps its conv (a causal pad). Its halo and scale come from its module tree: each conv's
-reach along a row (`dilation * (kernel - 1) // 2`, summed: a bound for convs in sequence), each
-upsampler's factor. A conv with a stride, or a norm whose statistics span rows, is no block.
+reach along a row on its wider side (its kernel's span less the padding before it, or that
+padding; summed, a bound for convs in sequence), each nearest upsampler's factor. A conv with a
+stride or a wrapping pad, a norm whose statistics span rows, an interpolating upsampler, a
+transposed conv, a pool or a pixel shuffle makes it no block.
 
 The first call of a shape measures the block's peak on two whole crops of its input (`_Call.fit`):
 each level's need, whole or a strip, comes from that, so a block whose whole fits runs whole. A
 block inside a block that runs whole, its measured peak admitted, ran whole in that measure: it
 starts whole and goes finer only where it is refused (`catch.cut`'s `covered`). A level that cuts
-first probes the shape: on a crop, whole and in two strips must give the same rows. A block that
-reads across rows (an attention) fails it and runs whole from then on. A strip reads
+first probes the shape: on a crop, whole and in two strips must give the same rows, each element
+within a few units of its own last place, so a halo short by one row fails. A block that reads
+across rows (an attention) fails it and runs whole from then on. A strip reads
 its rows of each cache entry and writes its own rows of the entry's next value; the entries go to
 host memory once a block cuts (they are saved inputs, read back a strip at a time). Nothing is
 committed until every strip is done, so a refused strip runs again finer. A block that keeps
-tensors on itself between calls (a causal conv holding its last frames as an attribute) runs
-whole: strips see only the caches handed to them. PAN2's 5 s decode at a 6 GiB cap ran out in a
-causal pad (`up_blocks.3.resnets.0.conv1`, 1.36 GB beside 3.2 GiB, pod-session 44426689158).
+tensors between calls, on itself or a module under it, as an attribute or in a list or dict (a
+causal conv holding its last frames) runs whole: strips see only the caches handed to them.
+PAN2's 5 s decode at a 6 GiB cap ran out in a causal pad (`up_blocks.3.resnets.0.conv1`, 1.36 GB
+beside 3.2 GiB, pod-session 44426689158).
 """
 
 from __future__ import annotations
 
 import functools
 import inspect
+import math
 import sys
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
@@ -37,9 +42,31 @@ import torch
 from torch import Tensor, nn
 
 from cozy_runtime.author._errors import is_capacity, unwind
+from cozy_runtime.internal import residency
 from cozy_runtime.internal.execution import catch, pinned, sizing
 
 _ROW_NORMS = (nn.GroupNorm, nn.BatchNorm2d, nn.BatchNorm3d, nn.InstanceNorm2d, nn.InstanceNorm3d)
+#: modules whose reach along rows the tree does not give: a block holding one is no block
+_UNBOUNDED = (
+    nn.Conv1d,
+    nn.ConvTranspose1d,
+    nn.ConvTranspose2d,
+    nn.ConvTranspose3d,
+    nn.MaxPool2d,
+    nn.MaxPool3d,
+    nn.AvgPool2d,
+    nn.AvgPool3d,
+    nn.AdaptiveAvgPool2d,
+    nn.AdaptiveAvgPool3d,
+    nn.AdaptiveMaxPool2d,
+    nn.AdaptiveMaxPool3d,
+    nn.PixelShuffle,
+    nn.PixelUnshuffle,
+    nn.Fold,
+    nn.Unfold,
+)
+#: what every module keeps in itself: its parameters, buffers, children, hooks and flags
+_TORCH = frozenset(vars(nn.Module()))
 
 
 class _Cache(Protocol):
@@ -91,14 +118,21 @@ def _block(module: nn.Module) -> Block | None:
     rows = columns = 0
     scale = 1
     for sub in module.modules():
-        if isinstance(sub, _ROW_NORMS):
+        if isinstance(sub, _ROW_NORMS + _UNBOUNDED):
             return None
         if isinstance(sub, nn.Conv2d | nn.Conv3d):
-            if sub.stride[-1] != 1 or sub.stride[-2] != 1 or sub.padding == "valid":
+            if (
+                sub.stride[-1] != 1
+                or sub.stride[-2] != 1
+                or sub.padding == "valid"
+                or sub.padding_mode == "circular"  # a strip's edge would wrap to its own far edge
+            ):
                 return None
-            rows += sub.dilation[-2] * (sub.kernel_size[-2] - 1) // 2
-            columns += sub.dilation[-1] * (sub.kernel_size[-1] - 1) // 2
+            reach = _reach(sub)
+            rows, columns = rows + reach[0], columns + reach[1]
         elif isinstance(sub, nn.Upsample):
+            if sub.mode not in ("nearest", "nearest-exact"):
+                return None  # an interpolating one reads its neighbours
             factor = sub.scale_factor
             first = factor[-2] if isinstance(factor, tuple) else factor
             if first is None or float(first) != int(first) or int(first) < 1:
@@ -109,6 +143,21 @@ def _block(module: nn.Module) -> Block | None:
         ):
             return None  # an asymmetric pad ahead of a strided conv: the encoder's downsample
     return Block(rows, columns, scale, signature)
+
+
+def _reach(conv: nn.Conv2d | nn.Conv3d) -> tuple[int, int]:
+    """The input rows and columns an output reads past its own on its wider side: the kernel's
+    span less the padding before it, or that padding, whichever is more (an even kernel or a
+    one-sided pad reads more on one side). Padding added outside the conv counts as none, the
+    widest it can be."""
+
+    def side(axis: int) -> int:
+        span = conv.dilation[axis] * (conv.kernel_size[axis] - 1)
+        padding = conv.padding
+        before = span // 2 if isinstance(padding, str) else int(padding[axis])
+        return max(before, span - before)
+
+    return side(-2), side(-1)
 
 
 class _Rows:
@@ -162,12 +211,8 @@ def _factor(size: int, height: int) -> int:
     return size // height
 
 
-#: a block's call by (site, shape without its rows)
-type _Key = tuple[str, tuple[int, ...], torch.dtype]
-#: a block's probe verdict
-_VERDICTS: dict[_Key, bool] = {}
-#: a block's peak over its call, measured on crops (`_Call.fit`); None where it could not be
-_FITS: dict[_Key, _Fit | None] = {}
+#: a block's call by its shape without its rows
+type _Key = tuple[tuple[int, ...], torch.dtype]
 #: a block runs whole, its measured peak admitted: each block inside it ran whole in that measure
 _MEASURED: ContextVar[bool] = ContextVar("strips_measured", default=False)
 
@@ -184,8 +229,24 @@ class _Fit:
 
     def of(self, rows: int, width: int) -> int:
         return self.fixed + int(self.cell * (rows + 2 * self.rows) * (width + 2 * self.columns))
-#: sites whose module keeps tensors on itself between calls: they run whole
-_STATEFUL: set[str] = set()
+
+
+@dataclass(slots=True)
+class _Seen:
+    """What a block's calls found, kept on the block itself, so no other model's block of the same
+    path and shape reads it: each shape's probe verdict and measured peak (None where it could not
+    be measured), and whether the block keeps state between calls."""
+
+    verdicts: dict[_Key, bool] = field(default_factory=dict)
+    fits: dict[_Key, _Fit | None] = field(default_factory=dict)
+    stateful: bool = False
+
+
+def _seen(module: nn.Module) -> _Seen:
+    seen = vars(module).get("_cozy_strips")
+    if not isinstance(seen, _Seen):
+        seen = vars(module)["_cozy_strips"] = _Seen()
+    return seen
 
 
 def _state(module: nn.Module) -> dict[str, Tensor]:
@@ -196,9 +257,64 @@ def _state(module: nn.Module) -> dict[str, Tensor]:
     }
 
 
-def _keeps(site: str, names: Iterable[str]) -> str:
-    _STATEFUL.add(site)
-    return f"it keeps {', '.join(sorted(names))} on itself between calls"
+type _Held = dict[tuple[int, str], tuple[nn.Module, object, object]]
+
+
+def _held(module: nn.Module) -> _Held:
+    """What `module` and every module under it keep as plain attributes that are or hold tensors
+    (not parameters, buffers or children, nor the Runtime's `_cozy_*` marks): each one's value
+    and, for a list or dict, a copy of its items now."""
+    out: _Held = {}
+    for m in module.modules():
+        for k, v in vars(m).items():
+            if k in _TORCH or k.startswith("_cozy"):
+                continue
+            if isinstance(v, list | tuple):
+                if any(isinstance(item, Tensor) for item in v):
+                    out[(id(m), k)] = (m, v, list(v))
+            elif isinstance(v, dict):
+                if any(isinstance(item, Tensor) for item in v.values()):
+                    out[(id(m), k)] = (m, v, dict(v))
+            elif isinstance(v, Tensor):
+                out[(id(m), k)] = (m, v, None)
+    return out
+
+
+def _same(a: object, b: object) -> bool:
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(a[k] is b[k] for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(x is y for x, y in zip(a, b, strict=True))
+    return a is b
+
+
+def _kept(before: _Held, module: nn.Module) -> list[str]:
+    """The attributes a call of `module` set, rebound or changed in place under it since
+    `before` (its own or any module's below it), each put back as it was."""
+    after, changed = _held(module), []
+    for key in before.keys() | after.keys():
+        then, now = before.get(key), after.get(key)
+        if then is not None and now is not None and then[1] is now[1] and _same(then[2], now[2]):
+            continue
+        held = then if then is not None else now
+        assert held is not None
+        m, name = held[0], key[1]
+        changed.append(name)
+        if then is None:
+            del vars(m)[name]
+            continue
+        vars(m)[name] = then[1]
+        if isinstance(then[1], list) and isinstance(then[2], list):
+            then[1][:] = then[2]
+        elif isinstance(then[1], dict) and isinstance(then[2], dict):
+            then[1].clear()
+            then[1].update(then[2])
+    return changed
+
+
+def _keeps(module: nn.Module, names: Iterable[str]) -> str:
+    _seen(module).stateful = True
+    return f"it keeps {', '.join(sorted(set(names)))} between calls"
 
 
 def _records(module: nn.Module, values: Iterable[object]) -> bool:
@@ -210,17 +326,15 @@ def _records(module: nn.Module, values: Iterable[object]) -> bool:
 
 
 def _peak[T](run: Callable[[], T], device: torch.device) -> tuple[T, int | None]:
-    """`run()`, and the working bytes it held at its peak above what was live as it began. varena's
-    peak resets here, as residency's first-block probe resets it; the request keeps its peak."""
+    """`run()`, and the working bytes it held at its peak above what was live as it began, measured
+    as nested in whatever measures around it (`residency.peak_within`)."""
     request = catch.CURRENT.get()
     if request is None or not request.memory.cuda or device.type != "cuda":
         return run(), None
     index = device.index or 0
-    request.sample()
     before = int(vt.stats(index)["allocated_bytes"])
-    vt.reset_peak(index)
-    out = run()
-    return out, max(int(vt.stats(index)["allocated_peak"]) - before, 0)
+    out, peak = residency.peak_within(index, run)
+    return out, max(peak - before, 0)
 
 
 def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) -> catch.Forward:
@@ -239,29 +353,30 @@ def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) 
             or _records(module, bound.arguments.values())
             or module.training
             or getattr(type(module), "_cozy_fused", None)
-            or site in _STATEFUL
+            or _seen(module).stateful
         ):
             return forward(*args, **kwargs)
         if held := _state(module):
-            print(f"cozy-runtime: {site} runs whole: {_keeps(site, held)}", file=sys.stderr)
+            print(f"cozy-runtime: {site} runs whole: {_keeps(module, held)}", file=sys.stderr)
             return forward(*args, **kwargs)
         height = int(x.shape[-2])
         reach = max(block.rows, 1)
         if height < 2 * block.rows + 2:
             return forward(*args, **kwargs)
-        key = (site, (*(int(n) for n in x.shape[:-2]), int(x.shape[-1])), x.dtype)
-        if _VERDICTS.get(key) is False:
+        seen = _seen(module)
+        key = ((*(int(n) for n in x.shape[:-2]), int(x.shape[-1])), x.dtype)
+        if seen.verdicts.get(key) is False:
             return forward(*args, **kwargs)
         call = _Call(site, module, forward, block, bound, names[1])
         width = int(x.shape[-1])
-        if key not in _FITS and not catch._capturing():
+        if key not in seen.fits and not catch._capturing():
             try:
-                _FITS[key] = call.fit()
+                seen.fits[key] = call.fit()
             except _Mismatch as exc:
-                _VERDICTS[key] = False
+                seen.verdicts[key] = False
                 print(f"cozy-runtime: {site} runs whole: {exc}", file=sys.stderr)
                 return forward(*args, **kwargs)
-        fit = _FITS.get(key)
+        fit = seen.fits.get(key)
 
         def need(level: int) -> tuple[int, ...]:
             if fit is None:
@@ -271,11 +386,11 @@ def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) 
             return (fit.of(rows, width),)
 
         def run(level: int) -> object:
-            if level and key not in _VERDICTS and not catch._capturing():
-                _VERDICTS[key] = call.probe()
+            if level and key not in seen.verdicts and not catch._capturing():
+                seen.verdicts[key] = call.probe()
             measured = _MEASURED.set(fit is not None and not level)
             try:
-                if not level or not _VERDICTS.get(key):
+                if not level or not seen.verdicts.get(key):
                     return call.strips([(0, height)], host=False)
                 n = sizing.pieces(height, level)
                 spans = [(a, min(height, a + n)) for a in range(0, height, n)]
@@ -287,7 +402,7 @@ def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) 
         try:
             return catch.cut(site, finest, need, run, covered=_MEASURED.get())
         except _Mismatch as exc:
-            _VERDICTS[key] = False
+            seen.verdicts[key] = False
             print(f"cozy-runtime: {site} runs whole: {exc}", file=sys.stderr)
             return forward(*args, **kwargs)
 
@@ -352,15 +467,10 @@ class _Call:
             arguments["feat_cache"] = rows
             arguments["feat_idx"] = index
         call = inspect.BoundArguments(self.signature, OrderedDict(arguments))
-        before = dict(vars(self.module))
+        before = _held(self.module)
         y = self.forward(*call.args[1:], **call.kwargs)
-        if kept := _state(self.module):
-            for name in kept:  # undone: the call runs again whole from the state it began with
-                if name in before:
-                    vars(self.module)[name] = before[name]
-                else:
-                    del vars(self.module)[name]
-            raise _Mismatch(_keeps(self.site, kept))
+        if kept := _kept(before, self.module):  # undone: the call runs again whole as it began
+            raise _Mismatch(_keeps(self.module, kept))
         if not isinstance(y, Tensor):
             raise _Mismatch(f"returned {type(y).__name__}")
         span = (hi - lo) * self.block.scale
@@ -470,8 +580,9 @@ class _Call:
 
     def probe(self) -> bool:
         """Whether the block's rows are its strips': on a crop of its input, whole and in two
-        strips, the same output and the same cache writes. Kernels may round a different shape
-        differently, so a difference within a few units of the output's last place passes."""
+        strips, the same output and the same cache writes, each element within a few units of
+        its own last place (kernels round a different shape differently), its size counted with
+        the output's mean so an element near zero is not judged on its rounding alone."""
         x, block, site = self.x, self.block, self.site
         tall, wide = self._crop_size()
         crop, cache = self._crop(tall, wide)
@@ -520,15 +631,17 @@ class _Call:
                 return False
             if torch.equal(expected, got):
                 continue
-            scale = float(expected.abs().max()) or 1.0
-            gap = float((expected.float() - got.float()).abs().max()) / scale
-            worst = max(worst, gap)
+            # each element against its own size and the output's typical one: a row read without
+            # its neighbour (a halo short by one) is off by that neighbour's share of it
+            size = expected.float().abs()
+            gap = (expected.float() - got.float()).abs() / (size + size.mean())
+            worst = max(worst, float(gap.max().nan_to_num(float("inf"))))
         eps = torch.finfo(x.dtype).eps if x.dtype.is_floating_point else 0.0
         if x.dtype == torch.float32 and torch.backends.cudnn.allow_tf32:
             eps = 2.0**-10  # a float32 conv computes in TF32's 10 bits
         bound = 8 * eps
         verdict = worst <= bound
-        how = "exact" if worst == 0 else f"within {worst:.2g} of its scale"
+        how = "exact" if worst == 0 else f"within {worst:.2g} of each element's size"
         print(
             f"cozy-runtime: {site} {'cuts by rows' if verdict else 'runs whole'}: strips of a "
             f"{tall}x{wide} crop are {how} (halo {block.rows}, scale {block.scale})",
@@ -549,7 +662,8 @@ def _assemble(
     count: int,
 ) -> object:
     """A cache entry's next value with a strip's own rows [a, b) of `value` (rows [lo, hi)): in
-    host memory for the cut block `host`, else on the device."""
+    host memory for the cut block `host` (selection cut it for want of room, and its entries are
+    saved inputs, read back a strip at a time), else on the device, as inside a capture."""
     if not isinstance(value, Tensor):
         return value
     if count == 1:
@@ -559,7 +673,7 @@ def _assemble(
         shape = (*value.shape[:-2], height * f, value.shape[-1])
         whole = (
             _hosted(host, "its cache entries (cut by rows)", shape, value.dtype, value.device)
-            if host is not None and value.is_cuda
+            if host is not None and value.is_cuda and not catch._capturing()
             else torch.empty(shape, dtype=value.dtype, device=value.device)
         )
     pinned.write(whole.narrow(-2, a * f, (b - a) * f), value.narrow(-2, (a - lo) * f, (b - a) * f))
@@ -567,21 +681,38 @@ def _assemble(
 
 
 def _whole(site: str, part: Tensor, shape: tuple[int, ...]) -> Tensor:
-    """A cut block's whole output: on the card in `part`'s layout, else in pinned host memory the
-    card addresses, where the card refuses it beside the strips (a Runtime retry; the next block
-    reads its rows back a strip at a time)."""
+    """A cut block's whole output, in `part`'s layout (the next block reads its rows back a strip
+    at a time)."""
+    return _placed(site, "its whole output", shape, part, _format(part))
+
+
+def _placed(
+    site: str, what: str, shape: tuple[int, ...], like: Tensor, layout: torch.memory_format
+) -> Tensor:
+    """`what` of a cut block: on the card where its room holds it (the card less what is live and
+    the weights in use, as a nested cut reads it) and the allocation is not refused, else in
+    pinned host memory the card addresses, named in the request (a refusal answered so counts
+    as a Runtime retry). Inside a capture it stays on the card, as the capture's own do."""
+    request = catch.CURRENT.get()
+    hostable = request is not None and like.is_cuda and not catch._capturing()
+    device = like.device.index or 0
+    if hostable:
+        room = vt.room(device)
+        usable = int(room["capacity"]) - int(room["working_live"]) - int(room["pinned"])
+        if math.prod(shape) * like.element_size() > usable:
+            why = f"{what} (more than the room beside {catch.room(device)})"
+            return _hosted(site, why, shape, like.dtype, like.device)
     try:
-        return torch.empty(shape, dtype=part.dtype, device=part.device, memory_format=_format(part))
+        return torch.empty(shape, dtype=like.dtype, device=like.device, memory_format=layout)
     except BaseException as exc:
-        request = catch.CURRENT.get()
-        if request is None or not part.is_cuda or not is_capacity(exc) or catch._capturing():
+        if not hostable or not is_capacity(exc):
             raise
-        room = catch.room(part.device.index or 0)  # beside the refused bytes, for the record
-        why = f"its whole output (refused beside {room})"
+        assert request is not None
+        why = f"{what} (refused beside {catch.room(device)})"
         try:
-            out = _hosted(site, why, shape, part.dtype, part.device)
+            out = _hosted(site, why, shape, like.dtype, like.device)
         except Exception as failed:
-            exc.add_note(f"its whole output in host memory failed too: {failed}")
+            exc.add_note(f"{what} in host memory failed too: {failed}")
             raise exc from None
         unwind(exc)
         request.retries += 1  # the refusal is answered: no OOM a package swallowed (`contract`)

@@ -81,7 +81,36 @@ __all__ = [
 def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
     """Working allocation demand/backing/peak; native weight bytes are counted separately."""
     stats = vt.stats(device.index or 0)
-    return int(stats["allocated_bytes"]), int(stats["mapped_bytes"]), int(stats["allocated_peak"])
+    peak = working_peak(device.index or 0, stats)
+    return int(stats["allocated_bytes"]), int(stats["mapped_bytes"]), peak
+
+
+#: By device, the working peak a measurement nested in another (`peak_within`) took from it.
+_CARRIED: dict[int, int] = {}
+
+
+def reset_peak(device: int) -> None:
+    """varena's working peak starts over at what is live, and so does what nested measurements
+    carried."""
+    vt.reset_peak(device)
+    _CARRIED[device] = 0
+
+
+def working_peak(device: int, stats: WorkingStats | None = None) -> int:
+    """The working peak since `reset_peak`, a nested measurement's included."""
+    read = vt.stats(device) if stats is None else stats
+    return max(int(read["allocated_peak"]), _CARRIED.get(device, 0))
+
+
+def peak_within[T](device: int, run: Callable[[], T]) -> tuple[T, int]:
+    """`run()` and varena's working peak over it alone. Measuring resets varena's peak, so the
+    peak before it is carried for whatever measures around it (`working_peak`)."""
+    outer = working_peak(device)
+    vt.reset_peak(device)
+    try:
+        return run(), int(vt.stats(device)["allocated_peak"])
+    finally:
+        _CARRIED[device] = max(outer, int(vt.stats(device)["allocated_peak"]))
 
 
 #: Other overlays' pages a block keeps parked: base and a LoRA alternate with one.
@@ -2595,7 +2624,7 @@ class Memory:
         device = self.device.index or 0
         request.sample()  # the request keeps its peak so far
         stats, room = vt.stats(device), vt.room(device)
-        vt.reset_peak(device)
+        reset_peak(device)
         self._probe = _Probe(
             block,
             key,
@@ -2613,7 +2642,7 @@ class Memory:
         if request is None:
             return
         stats, room = vt.stats(device), vt.room(device)
-        peak, allocated = int(stats["allocated_peak"]), int(stats["allocated_bytes"])
+        peak, allocated = working_peak(device, stats), int(stats["allocated_bytes"])
         self._probed[probe.key] = peak - probe.allocated
         request.first_blocks.append(
             {
@@ -3399,7 +3428,7 @@ class Request:
         if memory.cuda and torch.cuda.is_initialized() and not memory.requests:
             # The working peak is process-wide since its reset: alone, a request starts its own,
             # or its floor is the largest decode the process ever ran (sieg: SDXL gave nothing)
-            vt.reset_peak(memory.device.index or 0)
+            reset_peak(memory.device.index or 0)
         self.sample()
 
     def first_read(self, block: _Block) -> bool:
