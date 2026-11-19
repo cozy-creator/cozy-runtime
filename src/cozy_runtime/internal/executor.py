@@ -171,6 +171,7 @@ from cozy_runtime.internal import (
     effect_interfaces,
     execution_evidence,
     fp8_linear,
+    fused_rows,
     int8_linear,
     kernel_cache,
     kernel_compile,
@@ -2833,9 +2834,12 @@ class Executor:
             # its whole stage on a fallback while it landed (Klein's on-demand upsampler; H3's
             # nvfp4 layers through step 1 on an RTX 5090, cr-241; on two 5060 Tis, cr-261). Each
             # first ask waits for it; a group's GPUs state theirs in their load's reply. So does
-            # counter noise's kernel, which a recorded step's draw needs before its capture.
+            # counter noise's kernel, which a recorded step's draw needs before its capture, and
+            # the fused rows' kernels, which each norm's and rotation's first call proves
+            # (`execution.fused`).
             leaves.prime(torch, torch.cuda.current_device())
             philox.prime(torch.cuda.current_device())
+            fused_rows.prime(torch.cuda.current_device())
             if self.world > 1:  # a group's int8 wire (`ulysses`)
                 from cozy_runtime.internal.parallel import turn
 
@@ -4240,6 +4244,7 @@ class Executor:
                 self._emit_gemm(record, member)
                 self._emit_lora(record, member)
                 self._emit_compute(record, member)
+            self._emit_fused(record)
             for feature, instead in accel.unavailable(self.device_kind) if self.models else ():
                 record.emit(
                     "log", f"{feature} unavailable on {self.device_kind}", "info", instead=instead
@@ -4459,6 +4464,26 @@ class Executor:
                     "confession", "gemm.lora", bakes.serving, how=bakes.how or "",
                     component=prefix + component, linears=len(bakes.bakes),
                 )  # fmt: skip
+
+    @staticmethod
+    def _emit_fused(record: AuthorAttempt) -> None:
+        """`kernel.fused_rows`: each law's first-call checks this attempt ran (`execution.fused`):
+        per kind (norm or rotation) and law, the sites the kernel serves after theirs and those left
+        as written with the first reason, the worst difference seen as a share of rounding's
+        allowance (1 or less is the same computation), the values compared and the checks' time.
+        Its value: `left` where any was, `recalled` where every site took a verdict kept before
+        (no comparison ran), else `served`. A `kernel.` name, so TensorD keeps it in the run's
+        measurements."""
+        from cozy_runtime.internal.execution import fused
+
+        for kind, law, check in fused.taken():
+            said = "left" if check.left else "recalled" if check.recalled == check.served else "served"
+            record.emit(
+                "confession", "kernel.fused_rows", said,
+                kind=kind, law=law, served=check.served, left=check.left,
+                worst=round(check.worst, 4), values=check.values, ms=round(check.ms, 1),
+                why=check.why,
+            )  # fmt: skip
 
     @staticmethod
     def _emit_compute(record: AuthorAttempt, member: Executor) -> None:
