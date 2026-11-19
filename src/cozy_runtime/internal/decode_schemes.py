@@ -881,6 +881,7 @@ if HAS_TRITON:
 FORMS = ("q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "mxfp4",
          "nvfp4", "q1_0", "q2_0")  # fmt: skip
 assert set(FORMS) == set(GGML), "every ggml struct is a form of _blocks_kernel"
+assert len(FORMS) == 14, "_blocks_kernel has one branch per form: a new struct needs its own"
 
 
 def _ggml_eager(name: str) -> Callable[[ModuleType, Tensor], Tensor]:
