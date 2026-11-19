@@ -4128,6 +4128,9 @@ def _hooks(model: Model) -> None:
             model.handles.extend(_gathering(sub, memory))
         elif memory.cuda:
             block.leaves = _leaves(sub, block.path, model.blocks)
+    if memory.cuda and model.common is not None:
+        # The common's own layers, outside every block: RelayVSR's, refused at a norm's read.
+        model.common.leaves = _leaves(model.module, "", model.blocks)
 
 
 def _linear(module: nn.Module) -> bool:
