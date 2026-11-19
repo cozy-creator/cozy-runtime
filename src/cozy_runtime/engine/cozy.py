@@ -52,8 +52,12 @@ def serves(model: torch.nn.Module) -> str:
 
     if not torch.cuda.is_available():
         return "the engine decodes on CUDA"
+    from tensorfs.varena import _runtime as varena
+
     if TRITON_ABSENT:
         return f"the engine's kernels need Triton: {TRITON_ABSENT}"
+    if not hasattr(varena.Device, "cache"):
+        return "this TensorFS has no K/V cache (varena's Device.cache)"
     try:
         text = text_of(model)
     except (AttributeError, KeyError, TypeError) as exc:
