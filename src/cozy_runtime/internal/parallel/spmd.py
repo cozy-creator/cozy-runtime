@@ -10,7 +10,7 @@ A stage (`uses_components`) none of whose components is sharded runs on one GPU 
 components' home, else GPU 0. Its result and the random streams' state after it cross to the
 others, which fetch, hold and compute nothing for it; while they wait they serve its `spread`
 calls. A stage with a sharded component runs on every GPU, at the degree chosen at its first
-sharded call (`_Choice`).
+sharded call (`_Choice`); at one GPU, GPU 0 runs its sharded calls and their outputs cross.
 """
 
 from __future__ import annotations
@@ -81,6 +81,7 @@ class Ranks:
         gpu: Callable[[int], str],
         stage: Callable[[str], None] | None = None,
         call: tuple[str, str] = ("", ""),
+        route: str = "",
     ) -> None:
         import torch.distributed as dist
         from torch._C._distributed_c10d import PrefixStore
@@ -89,6 +90,8 @@ class Ranks:
         self.rank, self.world, self.pg, self.device, self.gpu = rank, world, pg, device, gpu
         #: the generation and the function this attempt runs: a stage's degree key (`degrees`)
         self.call = call
+        #: the route the group's exchange takes (`links.Transport.route`; GPU 0's, which chooses)
+        self.route = route
         #: each sharded stage's calls so far in this attempt: a record row a call (`_degree`)
         self.calls: dict[str, int] = {}
         #: tells the machine a long meeting's wait as the call's stage (GPU 0's; None elsewhere)
@@ -305,6 +308,8 @@ def _checked_call(module: torch.nn.Module, *args: object, **kwargs: object) -> o
     choice = getattr(_CHOICE, "stage", None)
     if choice is not None:
         choice.called(module, name, args, kwargs)
+        if choice.hosted:
+            return choice.hosted_call(module, args, kwargs)
     if not getattr(_ALONE, "unsharded", False):  # a stage at degree 1 runs on its own
         ranks = current()
         if ranks is None:
@@ -763,9 +768,12 @@ def taken() -> dict[str, dict[str, float | str]]:
         found.setdefault(name, {})["everywhere"] = why or "its result cannot cross"
     for name, digest in _CHOSEN.items():
         found.setdefault(name, {})["key"] = digest
+    for name, why in _SKIPPED.items():
+        found.setdefault(name, {})["skipped_degree"] = why
     _CROSSED.clear()
     _EVERYWHERE.clear()
     _CHOSEN.clear()
+    _SKIPPED.clear()
     return found
 
 
@@ -936,6 +944,10 @@ def _runtime() -> str:
 _CHOICE = threading.local()
 #: By stage row, this attempt: its degree key's digest (`degrees.Key.digest`), its record's name.
 _CHOSEN: dict[str, str] = {}
+#: By stage row, this attempt: why its group's degree was not tried (`degrees.Decision.skipped`).
+_SKIPPED: dict[str, str] = {}
+#: Sharded stages whose sharded call's output once could not cross: at one GPU every GPU runs them.
+_UNHOSTED: set[str] = set()
 
 
 def _degree(ranks: Ranks, stages: Stages, stage: str, run: Callable[[], object]) -> object:
@@ -958,27 +970,36 @@ def _degree(ranks: Ranks, stages: Stages, stage: str, run: Callable[[], object])
 
 
 class _Choice:
-    """A sharded stage's degree: its group's, or one GPU, whichever was measured faster for its
-    key (`degrees.choose`, GPU 0's word for every GPU), chosen at the stage's first sharded call,
-    where every GPU meets anyway. The key's shape class is that call's (`_shape_class`): a
-    request's video chooses, and its seed, its words or its prompt's length within a power of two
-    do not. One GPU only where the unsharded stage fits on every GPU (`_fits`), else the group's;
-    there every GPU runs the rest of the stage unsharded on its own, the same inputs and the same
-    program, nothing crossing.
+    """A sharded stage's degree: its group's, or one GPU, by its key's records (`degrees.choose`,
+    GPU 0's word for every GPU), chosen at the stage's first sharded call, where every GPU meets
+    anyway. The key's shape class is that call's (`_shape_class`): a request's video chooses, and
+    its seed, its words or its prompt's length within a power of two do not.
 
-    A degree its key has no time for is measured: GPU 0's steady step (steps 2 on), recorded only
-    where no GPU read weights from disk or saw a kernel build or land over those steps (`_cold`);
-    a key measured cold is measured again by its next request."""
+    At one GPU, GPU 0 runs each sharded call unsharded and its output crosses (`hosted_call`); the
+    others run the rest of the stage's program on it, so its random streams, generators and
+    callbacks stay theirs, and compute, fetch and hold none of the call. A stage whose output once
+    could not cross runs unsharded on every GPU where it fits there (`_fits`), else at the group's.
+
+    Measuring, GPU 0 times each sharded call (steps 2 on: step 1 carries fills and compiles); a
+    step in which a GPU read weights from disk or saw a kernel build or land makes the record cold
+    (`_cold`). Trying the group's degree, its second step is compared with one GPU's steady step at
+    the third call, and a slower one moves the rest of the stage to one GPU (`_trial`)."""
 
     def __init__(self, ranks: Ranks, stages: Stages, stage: str, what: str) -> None:
         self.ranks, self.stages, self.stage, self.what = ranks, stages, stage, what
         self.key: object = None
         self.degree = ranks.world
         self.measure = False
+        #: one GPU's steady step the group's degree is tried against (`degrees.Decision`)
+        self.against_ms: float | None = None
+        #: at one GPU: GPU 0 runs each sharded call and its output crosses
+        self.hosted = False
         #: what the stage runs inside from its first sharded call to its end, at degree 1
         self.scope = contextlib.ExitStack()
         #: GPU 0's, measuring: an event at each sharded call's start, then the stage's end
         self.events: list[torch.cuda.Event] = []
+        #: GPU 0's, measuring one GPU: the weight bytes filled onto it at each event
+        self.filled: list[int] = []
         self.calls = 0
         #: this GPU's `_cold` at the steady steps' start and at the stage's end
         self.cold: list[tuple[int, int, bool]] = []
@@ -998,24 +1019,32 @@ class _Choice:
             )
         elif self.calls == 2 and self.measure:
             self.cold.append(_cold())
+        elif self.calls == 3 and self.measure and self.against_ms is not None:
+            self._trial()
         self._mark()
 
     def _choose(self, shape: str) -> None:
         import torch
 
-        from cozy_runtime.internal.parallel import cp, degrees
+        from cozy_runtime.internal.parallel import degrees
 
         ranks = self.ranks
         told: dict[str, Json] = {}
         if ranks.rank == 0:
             card = torch.cuda.get_device_name(ranks.device) if torch.cuda.is_available() else "cpu"
             key = degrees.Key(*ranks.call, self.stage, shape, card, ranks.world, _runtime())
-            chosen = degrees.choose(key)
-            measure = torch.cuda.is_available() and chosen not in degrees.known(key)
+            # Nothing is measured on a CPU: its group's degree throughout.
+            decision = (
+                degrees.choose(key, ranks.route)
+                if torch.cuda.is_available()
+                else degrees.Decision(ranks.world)
+            )
             told = {
                 "key": cast("dict[str, Json]", key.document()),
-                "degree": chosen,
-                "measure": measure,
+                "degree": decision.degree,
+                "measure": decision.measure,
+                "against_ms": decision.against_ms,
+                "skipped": decision.skipped,
             }
         told = dict(ranks.told(told, f"degree {self.stage}"))
         key = degrees.Key.of(cast("dict[str, Json]", told["key"]))
@@ -1024,17 +1053,103 @@ class _Choice:
             int(cast("int", told["degree"])),
             bool(told["measure"]),
         )
+        against = told.get("against_ms")
+        self.against_ms = None if against is None else float(cast("float", against))
         _CHOSEN[self.what] = key.digest()
-        if self.degree == 1 < ranks.world and not ranks.all(
-            _fits(self.stages, key), f"degree 1 fits {self.stage}"
+        if told.get("skipped"):
+            _SKIPPED[self.what] = str(told["skipped"])
+        if self.degree == 1 < ranks.world:
+            self._one()
+
+    def _one(self) -> None:
+        """The rest of the stage at one GPU."""
+        from cozy_runtime.internal.parallel import cp
+
+        ranks = self.ranks
+        roots = [self.stages.roots[name] for name in sorted(self.stages.sharded)]
+        if self.stage in _UNHOSTED and not ranks.all(
+            _fits(self.stages, self.key), f"degree 1 fits {self.stage}"
         ):
             self.degree, self.measure = ranks.world, False
             _row(self.what)["refused_degree_1"] = 1.0
-        if self.degree == 1:
-            roots = [self.stages.roots[name] for name in sorted(self.stages.sharded)]
-            self.scope.enter_context(_alone(ranks, self.stages, 0, self.what, served=False))
-            self.scope.enter_context(cp.unsharded(cast("list[torch.nn.Module]", roots)))
-            self.scope.enter_context(_unsharded())
+            return
+        self.scope.enter_context(cp.unsharded(cast("list[torch.nn.Module]", roots)))
+        if self.stage in _UNHOSTED:
+            self._everywhere()
+        else:
+            self.hosted = True
+            _row(self.what)["hosted"] = 1.0
+
+    def _everywhere(self) -> None:
+        """Every GPU runs the rest of the stage unsharded on its own, nothing crossing."""
+        self.hosted = False
+        self.scope.enter_context(_alone(self.ranks, self.stages, 0, self.what, served=False))
+        self.scope.enter_context(_unsharded())
+
+    def hosted_call(
+        self, module: torch.nn.Module, args: tuple[object, ...], kwargs: dict[str, object]
+    ) -> object:
+        """One sharded call at one GPU: GPU 0 runs it unsharded, and its output crosses."""
+        ranks, what = self.ranks, f"{self.what} hosted"
+        if ranks.rank != 0:
+            told = cast("dict[str, object]", ranks.cross(None, 0, what))
+            if told.get("op") == "done":
+                return told["out"]
+            if told.get("op") != "everywhere":
+                why = f"{what}: {ranks.gpu(0)} failed: {told.get('why', '')}"
+                raise GroupRefusal(why[:900], code=ENDED)
+            self._unhosted()
+            return type(module)._call_impl(module, *args, **kwargs)
+        try:
+            with _alone(ranks, self.stages, 0, what, served=False), _unsharded():
+                out = type(module)._call_impl(module, *args, **kwargs)
+        except BaseException as exc:
+            with contextlib.suppress(Exception):
+                ranks.cross({"op": "failed", "why": f"{type(exc).__name__}: {exc}"[:600]}, 0, what)
+            raise
+        if not _crossable(out, []):
+            ranks.cross({"op": "everywhere"}, 0, what)
+            self._unhosted()
+            return out
+        ranks.cross({"op": "done", "out": out}, 0, what)
+        return out
+
+    def _unhosted(self) -> None:
+        _UNHOSTED.add(self.stage)
+        _EVERYWHERE[self.what] = "its sharded call's output cannot cross"
+        self._everywhere()
+
+    def _trial(self) -> None:
+        """The third sharded call trying the group's degree: a second step slower than one GPU's
+        steady step moves the rest of the stage to one GPU, and that step is the group's record."""
+        from cozy_runtime.internal import attention_ulysses
+        from cozy_runtime.internal.parallel import degrees
+
+        step = None
+        if self.ranks.rank == 0:
+            self._mark()  # the second step's end
+            self.events[2].synchronize()
+            step = round(self.events[1].elapsed_time(self.events[2]), 2)
+            self.events.pop()  # `called` marks this call's start
+        now = _cold()
+        warm = len(self.cold) == 1 and self.cold[0] == now and not now[2]
+        rows = self.ranks.meet({"peak": _peak(), "warm": warm, "step": step}, f"trial {self.stage}")
+        second = float(cast("float", rows[0]["step"]))
+        _row(self.what)["trial_ms"] = second
+        if second <= cast("float", self.against_ms):
+            return
+        kept: dict[str, object] = {
+            "steady_ms": second,
+            "trial": True,
+            "peak_bytes": max(int(cast("int", r["peak"])) for r in rows),
+            "kernels": attention_ulysses.served(),
+        }
+        if not all(r["warm"] for r in rows):
+            kept["cold"] = True
+        if self.ranks.rank == 0:
+            degrees.record(cast("degrees.Key", self.key), self.degree, kept)
+        self.degree, self.measure = 1, False
+        self._one()
 
     def _mark(self) -> None:
         if self.measure and self.ranks.rank == 0:
@@ -1043,6 +1158,8 @@ class _Choice:
             event = torch.cuda.Event(enable_timing=True)
             event.record()
             self.events.append(event)
+            if self.degree == 1:
+                self.filled.append(_filled())
 
     def ended(self) -> None:
         """The stage's end, inside it."""
@@ -1051,16 +1168,16 @@ class _Choice:
             self.cold.append(_cold())
 
     def _steady_ms(self) -> float | None:
-        """Mean ms of steps 2 on (step 1 carries fills and compiles); None under three steps."""
+        """Mean ms of steps 2 on (step 1 carries fills and compiles); None under two steps."""
         events = self.events
-        if len(events) < 4:
+        if len(events) < 3:
             return None
         events[-1].synchronize()
         spans = [a.elapsed_time(b) for a, b in itertools.pairwise(events[1:])]
         return round(sum(spans) / len(spans), 2)
 
     def finish(self) -> None:
-        """The stage's row, and, measuring, the steady step recorded where every GPU ran it warm."""
+        """The stage's row, and, measuring, its steady step recorded, cold or not (`degrees`)."""
         from cozy_runtime.internal import attention_ulysses
         from cozy_runtime.internal.parallel import degrees
 
@@ -1076,11 +1193,19 @@ class _Choice:
         if steady is None:
             return
         row["steady_ms"] = steady
-        if not all(r["warm"] for r in rows):
-            row["cold"] = 1.0  # not recorded: its next request measures this degree again
-            return
-        peak = max(int(cast("int", r["peak"])) for r in rows)
-        kept = {"steady_ms": steady, "peak_bytes": peak, "kernels": attention_ulysses.served()}
+        # At one GPU only GPU 0 computes the stage's sharded calls.
+        timed = rows[:1] if self.hosted else rows
+        kept: dict[str, object] = {
+            "steady_ms": steady,
+            "peak_bytes": max(int(cast("int", r["peak"])) for r in timed),
+            "kernels": attention_ulysses.served(),
+        }
+        if not all(r["warm"] for r in timed):
+            row["cold"] = 1.0
+            kept["cold"] = True
+        if self.degree == 1:
+            # the weight bytes filled onto GPU 0 over its last sharded call (`degrees.choose`)
+            kept["paged_bytes"] = row["paged_bytes"] = float(self.filled[-1] - self.filled[-2])
         degrees.record(self.key, self.degree, kept)
 
 
@@ -1109,6 +1234,18 @@ def _cold() -> tuple[int, int, bool]:
         disk = sum(request.moved.get(origin, (0,))[0] for origin in ("store", "derived"))
     building = any(at in ("opening", "landed") for at in kernel_ready.pending().values())
     return disk, LANDED[0], building
+
+
+def _filled() -> int:
+    """The weight bytes filled onto this GPU so far in its request, from anywhere but its own
+    resident pages."""
+    from cozy_runtime.internal.execution import catch
+
+    request = catch.CURRENT.get()
+    if request is None or request.memory.pages is None or request.idle:
+        return 0
+    request.record_fills()
+    return sum(moved[0] for origin, moved in request.moved.items() if origin != "resident")
 
 
 def _peak() -> int:
