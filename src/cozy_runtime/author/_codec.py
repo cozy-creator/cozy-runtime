@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from av.rational import AVRational
     from av.stream import Stream
     from av.video.frame import VideoFrame
+    from av.video.reformatter import ColorRange, Colorspace, VideoReformatter
     from torch import Tensor
 
     from cozy_runtime.canonical_json import JsonValue
@@ -235,6 +236,61 @@ def even_rgb(rgb: bytes, width: int, height: int) -> bytes:
         return rgb if not height % 2 else rgb[: width * (height - 1) * 3]
     image = Image.frombuffer("RGB", (width, height), rgb, "raw", "RGB", 0, 1)
     return image.crop((0, 0, width - 1, height - height % 2)).tobytes()
+
+
+def yuv_frame(
+    av: ModuleType,
+    reformatter: VideoReformatter,
+    rgb: bytes,
+    width: int,
+    height: int,
+    *,
+    size: tuple[int, int],
+    pix_fmt: str,
+    tags: tuple[int, int, int],
+    colorspace: Colorspace,
+    color_range: ColorRange,
+) -> VideoFrame:
+    """A full-range RGB8 frame as an encoder's `pix_fmt` frame of `size`, in its colour matrix and
+    range; `tags` are its primaries, transfer and matrix."""
+    expected = width * height * 3
+    if len(rgb) != expected:
+        raise OutputError(
+            f"streaming RGB frame is {len(rgb)} bytes, expected {expected}", code="frame_shape"
+        )
+    frame = av.VideoFrame(width, height, "rgb24")
+    frame.color_primaries, frame.color_trc, frame.colorspace = tags
+    frame.color_range = 2  # immutable RGB events are full-range.
+    plane = frame.planes[0]
+    if plane.line_size == width * 3:
+        plane.update(rgb)
+    else:
+        padded = bytearray()
+        pad = b"\x00" * (plane.line_size - width * 3)
+        stride = width * 3
+        for row in range(height):
+            padded += rgb[row * stride : (row + 1) * stride] + pad
+        plane.update(bytes(padded))
+    interpolation = (
+        av.video.reformatter.Interpolation.BILINEAR
+        | av.video.reformatter.Interpolation.ACCURATE_RND
+        | av.video.reformatter.Interpolation.BITEXACT
+    )
+    converted: VideoFrame = reformatter.reformat(
+        frame,
+        width=size[0],
+        height=size[1],
+        format=pix_fmt,
+        src_colorspace=colorspace,
+        dst_colorspace=colorspace,
+        src_color_range=av.video.reformatter.ColorRange.JPEG,
+        dst_color_range=color_range,
+        dst_color_trc=tags[1],
+        dst_color_primaries=tags[0],
+        interpolation=interpolation,
+        threads=x264_threads(),
+    )
+    return converted
 
 
 def snapshot_audio(waveform: object, max_output_bytes: int) -> tuple[Planar, int]:
@@ -874,43 +930,17 @@ class StreamingMP4Encoder:
             self._worker.start()
 
     def write_video(self, rgb: bytes) -> None:
-        expected = self.width * self.height * 3
-        if len(rgb) != expected:
-            raise OutputError(
-                f"streaming RGB frame is {len(rgb)} bytes, expected {expected}",
-                code="frame_shape",
-            )
-        frame = self._av.VideoFrame(self.width, self.height, "rgb24")
-        frame.color_primaries = self.color_primaries
-        frame.color_trc = self.color_transfer
-        frame.colorspace = self.color_matrix
-        frame.color_range = 2  # immutable RGB events are full-range.
-        plane = frame.planes[0]
-        if plane.line_size == self.width * 3:
-            plane.update(rgb)
-        else:
-            padded = bytearray()
-            pad = b"\x00" * (plane.line_size - self.width * 3)
-            stride = self.width * 3
-            for row in range(self.height):
-                padded += rgb[row * stride : (row + 1) * stride] + pad
-            plane.update(bytes(padded))
-        interpolation = (
-            self._av.video.reformatter.Interpolation.BILINEAR
-            | self._av.video.reformatter.Interpolation.ACCURATE_RND
-            | self._av.video.reformatter.Interpolation.BITEXACT
-        )
-        frame = self._reformatter.reformat(
-            frame,
-            format="yuv420p",
-            src_colorspace=self._colorspace,
-            dst_colorspace=self._colorspace,
-            src_color_range=self._av.video.reformatter.ColorRange.JPEG,
-            dst_color_range=self._color_range,
-            dst_color_trc=self.color_transfer,
-            dst_color_primaries=self.color_primaries,
-            interpolation=interpolation,
-            threads=x264_threads(),
+        frame = yuv_frame(
+            self._av,
+            self._reformatter,
+            rgb,
+            self.width,
+            self.height,
+            size=(self.width, self.height),
+            pix_fmt="yuv420p",
+            tags=(self.color_primaries, self.color_transfer, self.color_matrix),
+            colorspace=self._colorspace,
+            color_range=self._color_range,
         )
         frame.pts = self.video_frames
         frame.time_base = Fraction(self.frame_rate.denominator, self.frame_rate.numerator)

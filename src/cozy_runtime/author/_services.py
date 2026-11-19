@@ -40,6 +40,7 @@ from tensorfs.executor import Answer, Publish, PublishPart
 
 import cozy_runtime.author._codec as _codec
 import cozy_runtime.author._phases as _phases
+import cozy_runtime.author._splice as _splice
 import cozy_runtime.author._stalls as _stalls
 from cozy_runtime.author._activity import settle, waited, work_clock
 from cozy_runtime.author._context import Context
@@ -406,6 +407,39 @@ class SavedVideo:
     color_range: int
     audio: SavedAudioFacts | None
     submitted_audio_samples: int
+
+
+def _saved_video(
+    asset: VideoFile, facts: _codec.EncodedVideoFacts, samples: int, *, audio: bool
+) -> SavedVideo:
+    """A committed MP4's facts as its probe read them; `samples` the sound submitted."""
+    return SavedVideo(
+        video=asset,
+        width=facts.width,
+        height=facts.height,
+        frame_count=facts.frame_count,
+        frame_rate=facts.frame_rate,
+        pixel_aspect_ratio=facts.pixel_aspect_ratio,
+        video_codec=facts.video_codec,
+        video_profile=facts.video_profile,
+        color_primaries=facts.color_primaries,
+        color_transfer=facts.color_transfer,
+        color_matrix=facts.color_matrix,
+        color_range=facts.color_range,
+        audio=(
+            SavedAudioFacts(
+                codec=facts.audio_codec,
+                profile=facts.audio_profile,
+                channels=facts.audio_channels,
+                sample_rate=facts.audio_sample_rate,
+                codec_frame_samples=facts.audio_frame_samples,
+                decoded_samples=facts.audio_decoded_samples,
+            )
+            if audio
+            else None
+        ),
+        submitted_audio_samples=samples,
+    )
 
 
 @runtime_checkable
@@ -828,11 +862,142 @@ class Outputs(_Bound):
         _codec.require_encoder()
         return VideoJoin(self, audio) if self._attempt.writes else _UnwrittenJoin(self, audio)
 
+    def splice_video(
+        self,
+        source: VideoFile,
+        start: int,
+        end: int | None = None,
+        window: Iterable[DecodedMediaEvent] = (),
+    ) -> SavedVideo:
+        """`source` with its frames `start` to before `end` (its last, by default) replaced by
+        `window`'s; every other packet of picture and sound is the source's, byte for byte.
+
+        Pictures are encoded again only between the last point before `start` that no reordered
+        frame crosses (`start` itself without B-frames) and the first IDR from `end`, at the
+        source's profile, level, pixel format, colour and frame clock; sound over the AAC frames
+        within two of each seam. `window` is a stream as `save_video_stream` takes: display-
+        oriented frames, one per source frame slot, scaled to the source's size, and sound placed
+        against its first frame, converted to the source's rate and channels and cut or padded to
+        its frames. Without frames it cuts `start`-`end` out; `start == end` inserts. A blend
+        across a seam is the caller's: put the mixed frames and sound in the window. When the
+        window changes the length, the sound after it moves with its picture to the nearest AAC
+        frame (within 512 samples). Refuses `video_copy_incompatible` unless `source` is one H.264
+        track on a fixed frame clock, no frame hidden by an edit list, with at most one mono or
+        stereo AAC-LC track.
+        """
+        self._attempt.check_open("Outputs.splice_video")
+        _codec.require_encoder()
+        events = _AuthorEvents(window)
+        header = next(events, None)
+        if header is not None and (
+            not isinstance(header, DecodedMediaHeader) or header.video is None
+        ):
+            raise OutputError("a window must begin with one video header", code="media_header")
+        sound = header.audio if header is not None else None
+        if not self._attempt.writes:
+            return self._unwritten_splice(source, start, end, events)
+        if (
+            not isinstance(source, VideoFile)
+            or source._local is None
+            or source._attempt != self._attempt.request_id
+        ):
+            raise CapabilityError(
+                "a spliced video must be a hydrated input of this attempt", code="foreign_asset"
+            )
+        source._check_file()
+        handle = self._attempt.next_handle(VideoFile.kind)
+        tail = handle.rsplit("/", 1)[-1]
+        temporary = self._attempt.spool / f".video-{tail}.partial"
+        final = self._attempt.spool / f"video-{tail}"
+        splice: _splice.VideoSplice | None = None
+        try:
+            splice = _splice.VideoSplice(
+                source._local,
+                temporary,
+                start,
+                end,
+                scratch=self._attempt.spool / f".video-{tail}.run",
+                max_bytes=self._attempt.max_output_bytes,
+            )
+            written = 0
+            for event in events:
+                self._attempt.check_open("Outputs.splice_video")
+                if isinstance(event, DecodedVideoFrame):
+                    splice.write_video(event.rgb, event.width, event.height, event.start_time)
+                elif isinstance(event, DecodedAudioChunk):
+                    planar = self._audio_planar(sound, event, written, clocked=False)
+                    splice.write_audio(planar, event.sample_rate, event.start_time)
+                    written += planar.shape[1]
+                else:
+                    raise OutputError("a window contains a second header", code="media_header")
+            done = splice.finish()
+            if splice.scaled is not None:
+                width, height = splice.scaled
+                self._attempt.warn(
+                    "video",
+                    f"the window is {width}x{height}, so it is scaled to the source's "
+                    f"{splice.size[0]}x{splice.size[1]}",
+                )
+            if written and splice.sound is None:
+                self._attempt.warn("audio", "the source has no sound, so the window's is dropped")
+            return self._commit_mp4(
+                handle, temporary, final, done.facts, done.samples, audio=splice.sound is not None
+            )
+        except Exception as exc:
+            if isinstance(exc, AuthorError) or exc is events.raised:
+                raise
+            raise OutputError(
+                f"video splice failed: {type(exc).__name__}: {exc}", code="output_encode"
+            ) from exc
+        finally:
+            if splice is not None:
+                splice.close()
+            temporary.unlink(missing_ok=True)
+            if handle not in self._attempt.pending:
+                final.unlink(missing_ok=True)
+
+    def _unwritten_splice(
+        self,
+        source: VideoFile,
+        start: int,
+        end: int | None,
+        events: Iterator[DecodedMediaEvent],
+    ) -> SavedVideo:
+        """`splice_video` on a group's other GPU: the window runs, nothing is read or written."""
+        shape = self._shape(source)
+        frames = sum(isinstance(event, DecodedVideoFrame) for event in events)
+        end = shape.frame_count if end is None else end
+        sound = (
+            shape.audio
+            if isinstance(shape, SavedVideo)
+            else SavedAudioFacts(
+                shape.audio_codec,
+                shape.audio_profile,
+                shape.audio_channels,
+                shape.audio_sample_rate,
+                shape.audio_frame_samples,
+                shape.audio_decoded_samples,
+            )
+            if shape.audio_codec
+            else None
+        )
+        samples = 0
+        if sound is not None:
+            moved = round(
+                Fraction(frames - (end - start), 1) / shape.frame_rate * sound.sample_rate
+            )
+            if end < shape.frame_count:
+                moved = _codec.AAC_FRAME_SAMPLES * round(Fraction(moved, _codec.AAC_FRAME_SAMPLES))
+            samples = sound.decoded_samples + moved
+        handle = self._attempt.next_handle(VideoFile.kind)
+        count = shape.frame_count - (end - start) + frames
+        return self._unwritten(handle, _Picture.of(shape), sound, count, samples)
+
     def _unwritten(
         self,
         handle: str,
         picture: _Picture,
-        audio: DecodedAudioFormat | None,
+        audio: DecodedAudioFormat | SavedAudioFacts | None,
         frames: int,
         samples: int,
     ) -> SavedVideo:
@@ -998,52 +1163,11 @@ class Outputs(_Bound):
                     code="output_probe",
                 )
 
-            size, digest = self._measure_file(temporary)
-            if self._pending_bytes() + size > self._attempt.max_output_bytes:
-                raise OutputError(
-                    "streaming output would cross the attempt aggregate output limit",
-                    code="output_too_large",
-                )
-            os.link(temporary, final)
-            self._fsync_directory(final.parent)
-            temporary.unlink()
-            asset = VideoFile(
-                handle,
-                media_type="video/mp4",
-                size_bytes=size,
-                digest=digest,
-                local=final,
-                attempt=self._attempt.request_id,
+            saved = self._commit_mp4(
+                handle, temporary, final, facts, audio_samples, audio=audio_format is not None
             )
-            self._attempt.pending[handle] = asset
             registered = True
-            return SavedVideo(
-                video=asset,
-                width=facts.width,
-                height=facts.height,
-                frame_count=facts.frame_count,
-                frame_rate=facts.frame_rate,
-                pixel_aspect_ratio=facts.pixel_aspect_ratio,
-                video_codec=facts.video_codec,
-                video_profile=facts.video_profile,
-                color_primaries=facts.color_primaries,
-                color_transfer=facts.color_transfer,
-                color_matrix=facts.color_matrix,
-                color_range=facts.color_range,
-                audio=(
-                    SavedAudioFacts(
-                        codec=facts.audio_codec,
-                        profile=facts.audio_profile,
-                        channels=facts.audio_channels,
-                        sample_rate=facts.audio_sample_rate,
-                        codec_frame_samples=facts.audio_frame_samples,
-                        decoded_samples=facts.audio_decoded_samples,
-                    )
-                    if audio_format is not None
-                    else None
-                ),
-                submitted_audio_samples=audio_samples,
-            )
+            return saved
         except Exception as exc:
             if isinstance(exc, AuthorError) or exc is source.raised:
                 raise
@@ -1059,6 +1183,37 @@ class Outputs(_Bound):
                     temporary.unlink(missing_ok=True)
             if not registered:
                 final.unlink(missing_ok=True)
+
+    def _commit_mp4(
+        self,
+        handle: str,
+        temporary: Path,
+        final: Path,
+        facts: _codec.EncodedVideoFacts,
+        samples: int,
+        *,
+        audio: bool,
+    ) -> SavedVideo:
+        """Register a written, probed MP4 as this attempt's output `handle`, atomically."""
+        size, digest = self._measure_file(temporary)
+        if self._pending_bytes() + size > self._attempt.max_output_bytes:
+            raise OutputError(
+                "streaming output would cross the attempt aggregate output limit",
+                code="output_too_large",
+            )
+        os.link(temporary, final)
+        self._fsync_directory(final.parent)
+        temporary.unlink()
+        asset = VideoFile(
+            handle,
+            media_type="video/mp4",
+            size_bytes=size,
+            digest=digest,
+            local=final,
+            attempt=self._attempt.request_id,
+        )
+        self._attempt.pending[handle] = asset
+        return _saved_video(asset, facts, samples, audio=audio)
 
     @staticmethod
     def _check_rate(sample_rate: object) -> None:
