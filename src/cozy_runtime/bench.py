@@ -153,6 +153,15 @@ def gemm_tiles(payload: GemmTilesRequest, ctx: Context, tel: Telemetry) -> Measu
         return _run(lambda: gemm.tiles(seed, ctx))
 
 
+def lm_opening_kernel(payload: EmptyRequest, ctx: Context) -> Measured:
+    """A cold decode whose first steps meet a kernel still opening on the card completes, its first steps eager
+    (`internal/bench/lm_opening.py`, xs-213): a probe that takes 20 s is primed, then a small random-weight Qwen3.5 built
+    in the call decodes 32 tokens. Needs Transformers in the caller's environment. Raises where the decode fails."""
+    from cozy_runtime.internal.bench import lm_opening
+
+    return Measured(json.dumps(lm_opening.measure(), sort_keys=True))
+
+
 def kernels_inventory(payload: EmptyRequest, ctx: Context) -> Measured:
     """Every kernel this card claims, read from the Runtime's code: the names `kernel_check` takes, each Triton set's
     entries and each module's jit functions."""
