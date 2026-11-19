@@ -2983,14 +2983,25 @@ class SplitRefusal(TypedDict):
     pure: bool
 
 
+class SplitProbe(TypedDict):
+    """A function's first call of a shape, proved row-local or not (`cuts._probe`): what it is, the
+    verdict, and what the probe cost on the call's path."""
+
+    function: str
+    local: bool
+    ms: float
+    bytes: int
+
+
 class SplitRecord(TypedDict):
     """One split site's calls this request, for the run record: calls per level, each level's last
-    choice, and the level whose allocation was refused last, if one was."""
+    choice, the level whose allocation was refused last, if one was, and its probe, if one ran."""
 
     site: str
     levels: dict[str, int]
     chosen: dict[str, SplitChoice]
     refused: NotRequired[SplitRefusal]
+    probe: NotRequired[SplitProbe]
 
 
 class TorchStats(TypedDict):
