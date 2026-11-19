@@ -204,8 +204,8 @@ class Decoder:
         #: the rows' decoding, at fixed addresses a graph holds; each call fills them
         self.decoding = tuple(full(t) for t in (torch.float32, torch.float32, torch.int64, torch.float32,
                                                     torch.float32, torch.float32, torch.float32, torch.int64))  # fmt: skip
-        #: a bucket's step and its graph, by (rows, drafted, sampled, top_k kept, host extent)
-        self.steps: dict[tuple[int, bool, bool, int, int], tuple[Step, torch.cuda.CUDAGraph | None]] = {}
+        #: a bucket's step and its graph, by (rows, drafted, sampled, host extent)
+        self.steps: dict[tuple[int, bool, bool, int], tuple[Step, torch.cuda.CUDAGraph | None]] = {}
         #: the step's weights, retained from the model's placement where it has one, and the
         #: identity the graphs above were recorded against
         self.binding: object | None = None
@@ -214,7 +214,7 @@ class Decoder:
         self.launcher = launcher and not NO_ENGINE
         self.ring = _Ring(LAUNCH_STEPS + 2 * SEGMENT, self.rows.report.nbytes) if self.launcher else None
         #: a bucket's launcher over its step's graph, by the key of `steps`
-        self.segments: dict[tuple[int, bool, bool, int, int], object] = {}
+        self.segments: dict[tuple[int, bool, bool, int], object] = {}
 
     # ------------------------------------------------------------------ a call
 
@@ -249,8 +249,6 @@ class Decoder:
 
     def _sampling(self, request: Request, size: int) -> Sampling:
         sampled = request.temperature > 0
-        # Every row of a call samples alike, so a top-k bounds every sampling row's draw.
-        kept = request.top_k if sampled and request.top_k > 0 else 0
         penalized = bool(request.presence or request.frequency or request.repetition != 1.0)
         values = (request.temperature, request.top_p, request.top_k if sampled else 0, request.min_p,
                   request.presence, request.frequency, request.repetition, request.seed)  # fmt: skip
@@ -258,7 +256,7 @@ class Decoder:
             tensor.fill_(value)
         temperature, top_p, top_k, min_p, presence, frequency, repetition, seed = self.decoding
         return Sampling(temperature, top_p, top_k, min_p, presence, frequency, repetition, seed,
-                        kept=kept, sampled=sampled, penalized=penalized)  # fmt: skip
+                        sampled=sampled, penalized=penalized)  # fmt: skip
 
     # ------------------------------------------------------------------ prefill
 
@@ -406,7 +404,7 @@ class Decoder:
             return
         kv, r = self.kv, self.rows
         # A graph's copies ahead move the host blocks in use when it was recorded: keyed by their extent.
-        key = (size, drafted, sampling.sampled, sampling.kept, self.kv.host_extent())
+        key = (size, drafted, sampling.sampled, self.kv.host_extent())
         step, graph = self.steps.get(key) or (Step(self.qwen, r, sampling, size, drafted, self.ring), None)
         made.captured = graph is not None  # a graph an earlier call recorded serves this one
         reach = (step.span + 1) if drafted else 1
@@ -462,7 +460,7 @@ class Decoder:
 
         kv, r, ring = self.kv, self.rows, cast("_Ring", self.ring)
         # A graph's copies ahead move the host blocks in use when it was recorded: keyed by their extent.
-        key = (size, drafted, sampling.sampled, sampling.kept, self.kv.host_extent())
+        key = (size, drafted, sampling.sampled, self.kv.host_extent())
         step, graph = self.steps.get(key) or (Step(self.qwen, r, sampling, size, drafted, ring), None)
         made.captured = graph is not None
         reach = (step.span + 1) if drafted else 1
