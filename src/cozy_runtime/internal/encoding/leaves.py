@@ -37,7 +37,6 @@ from cozy_runtime.accel.kernels import (
 )
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.internal import (
-    decode_kernels,
     fp8_linear,
     ggml_linear,
     int8_linear,
@@ -226,10 +225,9 @@ def prime(torch: ModuleType, index: int) -> None:
     """Opens every kernel the encoded leaves serve on cuda:`index`, each on its own thread, at
     device init beside the weight fill (`kernel_ready.prime`): a first ask waits for its kernel
     rather than serve a fallback through a request's first step (cr-241: H3's nvfp4 step 1 on an
-    RTX 5090, 79 s against 29 s). The decode cores' set too, for the decoded-float route."""
+    RTX 5090, 79 s against 29 s)."""
     for module in dict.fromkeys(_MODULES.values()):
         module.prime(torch, index)
-    decode_kernels.prime(torch, index)
 
 
 class _Installed(Protocol):

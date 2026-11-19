@@ -1,7 +1,7 @@
 """The decode cores (cozytensors/1 spec §6, building blocks): affine, table and block structs,
 each one generic Triton kernel and one eager torch reference that agree bit for bit with the
 spec's f32 arithmetic and with TensorFS's Rust decoder. The kernels launch only through their
-declared set (`decode_kernels`), so a decode never compiles one.
+declared sets, one per scheme (`decode_kernels`), so a decode never compiles one.
 
 A scheme is an `Adapter` (`decode_schemes.py`) that maps its parts and params onto core calls:
 - `affine`: `b`-bit codes unpacked from words (`Packing`), then `(q - z) x s`, `q x s + c` or
