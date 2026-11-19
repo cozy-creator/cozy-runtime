@@ -660,9 +660,10 @@ _DETERMINISTIC_SCOPE: contextvars.ContextVar[bool] = contextvars.ContextVar(
 DETERMINISTIC: list[Callable[[], AbstractContextManager[None]]] = [nullcontext]
 
 
-#: What a seal's `enter` hands its `leave`: the refusal count, finer splits and shared-scope count
-#: at entry, or None when nothing reads refusals (`internal/contract._Scopes`).
-type Sealing = tuple[int, int, int] | None
+#: What a seal's `enter` hands its `leave`: at entry, the refusal count, those a cheaper step
+#: answered, those a capture's regrowth answered and the shared-scope count, or None when nothing
+#: reads refusals (`internal/contract._Scopes`).
+type Sealing = tuple[int, int, int, int] | None
 
 
 class Sealed(Protocol):
