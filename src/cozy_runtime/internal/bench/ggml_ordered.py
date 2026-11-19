@@ -16,14 +16,12 @@ from types import ModuleType
 
 import torch
 
-from cozy_runtime.internal import ggml_linear
+from cozy_runtime.internal import ggml_linear, kernel_ready
 
 #: (site, out, in): the 9B's MLP up and down projections.
 SITES = (("up", 12288, 4096), ("down", 4096, 12288))
 SCHEMES = ("ggml.q8_0", "ggml.q4_k")
 GROUPS = (("decode", (1, 2, 4, 8, 13, 16)), ("prefill", (640, 1500, 4096)))
-#: The longest it waits for the card's ggml kernels to be verified.
-VERIFY_S = 900.0
 
 type Row = dict[str, int | float | str]
 
@@ -71,15 +69,15 @@ def _rows(ops: ModuleType, raced: bool) -> dict[str, Row]:
 
 
 def measure() -> dict[str, object]:
-    # A fresh executor verifies the card's ggml kernels before it serves them: over 2 min on an A40 and an RTX PRO 4500
-    # (44500040933, 44503599563, 44503589534). This cell judges ordering, not cold start, so it waits for them.
-    deadline = time.monotonic() + VERIFY_S
-    while (ops := ggml_linear.native(torch, 0)) is None:
-        if why := ggml_linear.why(0) or ggml_linear.carried(ggml_linear.capability(torch, 0)):
-            return {"served": False, "why": why}
-        if time.monotonic() > deadline:
-            return {"served": False, "why": f"the card's ggml kernels were not verified in {VERIFY_S:.0f} s"}
-        time.sleep(0.1)
+    if why := ggml_linear.carried(ggml_linear.capability(torch, 0)):
+        return {"served": False, "why": why}
+    # This runs inside a request: a kernel the request opens lands, and turns ready only at the next quiet boundary
+    # (`kernel_ready.ready`), so polling `native` here sees None for good (44536379975 waited 900 s). A request that names
+    # its kernel waits for it on its own thread instead, and the leaf then serves it for every call that follows.
+    try:
+        ops = kernel_ready.wait(f"{ggml_linear.OP} cuda:0", partial(ggml_linear._verified, torch, 0))
+    except Exception as exc:  # refused on this card: told, and the session judges it
+        return {"served": False, "why": f"{type(exc).__name__}: {exc}"[:300]}
     raced, settled = _rows(ops, raced=True), _rows(ops, raced=False)
     differs = [key for key, value in raced.items() if settled.get(key) != value]
     return {
