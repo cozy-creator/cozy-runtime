@@ -20,6 +20,7 @@ EXPORTS = {
         "kernels_inventory",
         "kernel_check",
         "kernel_ready",
+        "lm_opening_kernel",
         "child_wire",
         "varena_core",
         "offload_in_executor",

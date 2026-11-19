@@ -41,6 +41,7 @@ from cozy_runtime.bench import (
     kernel_check,
     kernel_ready,
     kernels_inventory,
+    lm_opening_kernel,
     lora_overlay_refill,
     offload_in_executor,
     overlay_replay,
@@ -336,6 +337,7 @@ app.entrypoint(ggml_batch_shapes, accelerator=True)
 app.entrypoint(kernels_inventory, accelerator=True)
 app.entrypoint(kernel_check, accelerator=True)
 app.entrypoint(kernel_ready, accelerator=False)
+app.entrypoint(lm_opening_kernel, accelerator=True)
 app.entrypoint(child_wire, accelerator=False)
 app.entrypoint(varena_core, accelerator=True)
 app.entrypoint(offload_in_executor, accelerator=True)
