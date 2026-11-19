@@ -241,7 +241,11 @@ class Decoder:
         drafted = self.drafting
         made = Made(tokens=[[] for _ in range(rows)], kept=[[] for _ in range(rows)])
         admitted: list[int] = []
+        caller = torch.cuda.current_stream(self.device)
         with torch.cuda.stream(self.stream), torch.inference_mode(), ExitStack() as call:
+            # What the caller's stream made before the call (the decoding values just filled, a row's
+            # embeddings) is read after it: the call runs on the decoder's own stream.
+            self.stream.wait_stream(caller)
             began = time.perf_counter()
             try:
                 try:
