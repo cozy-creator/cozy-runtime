@@ -6,14 +6,15 @@ A plain step decodes a row's token. A drafted step (depth 2) drafts two tokens w
 multi-token-prediction head, verifies the row's token and both drafts in one pass of the model
 (one attention call a layer for the span), keeps each row's tokens up to its first disagreement
 or its stop, writes the next step's token, the head's state and the kept recurrent state, and
-reports what it made. Whether another step follows is the step's own answer (`go`): some row is
-still decoding, and no row's next step would write past the K/V its host committed (`budget`).
+reports what it made (`report`, and into the decoder's host ring as its last op). Whether another
+step follows is the step's own answer (`go`): some row is still decoding, and no row's next step
+would write past the K/V its host committed (`budget`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -24,6 +25,12 @@ if TYPE_CHECKING:
 
     from cozy_runtime.engine.qwen35 import Qwen35
     from cozy_runtime.engine.sampling import Sampling
+
+
+class Ring(Protocol):
+    """Where a step's report goes as its last op (the decoder's host ring)."""
+
+    def report(self, src: Tensor, /) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -76,9 +83,11 @@ def rows_for(max_rows: int, span: int, hidden: int, vocab: int, stops: int, devi
 class Step:
     """The step of a bucket of `rows`, drafted or plain, over `model` and its `KvManager`."""
 
-    def __init__(self, model: Qwen35, rows: Rows, sampling: Sampling, size: int, drafted: bool) -> None:
+    def __init__(
+        self, model: Qwen35, rows: Rows, sampling: Sampling, size: int, drafted: bool, ring: Ring | None = None
+    ) -> None:
         self.model, self.rows, self.sampling, self.size = model, rows, sampling, size
-        self.drafted = drafted
+        self.drafted, self.ring = drafted, ring
         kv = model.kv
         self.span = kv.layout.span if drafted else 1
         device = kv.device
@@ -118,6 +127,8 @@ class Step:
             self._drafted()
         else:
             self._plain()
+        if self.ring is not None:
+            self.ring.report(self.rows.report[: self.size])
 
     def _plain(self) -> None:
         m, r, s, kv = self.model, self.rows, self.size, self.model.kv
