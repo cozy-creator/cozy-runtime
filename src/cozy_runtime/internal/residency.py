@@ -16,6 +16,7 @@ import threading
 import time
 import warnings
 import weakref
+from collections import deque
 from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
@@ -3168,15 +3169,31 @@ class SplitProbe(TypedDict):
     bytes: int
 
 
+class SplitTime(TypedDict):
+    """A level's calls, summed: `device_ms` between two events on the call's stream (the GPU's
+    span, idle time inside it included, and the sites inside its windows), `host_ms` on the
+    calling thread."""
+
+    device_ms: float
+    host_ms: float
+
+
 class SplitRecord(TypedDict):
     """One split site's calls this request, for the run record: calls per level, each level's last
-    choice, the level whose allocation was refused last, if one was, and its probe, if one ran."""
+    choice and time, the level whose allocation was refused last, if one was, and its probe, if
+    one ran. Its reader: what a capped run's windows cost each site against the same request
+    uncapped (var-030)."""
 
     site: str
     levels: dict[str, int]
     chosen: dict[str, SplitChoice]
+    time: NotRequired[dict[str, SplitTime]]
     refused: NotRequired[SplitRefusal]
     probe: NotRequired[SplitProbe]
+
+
+#: A split call's span: its key, level, start and stop events, and host nanoseconds.
+type SplitSpan = tuple[str, str, torch.cuda.Event, torch.cuda.Event, int]
 
 
 class TorchStats(TypedDict):
@@ -3356,6 +3373,8 @@ class Request:
         self.working_phases: list[WorkingPhase] = []
         self.working_phase_keys: set[str] = set()
         self.working_splits: dict[str, SplitRecord] = {}
+        #: split calls whose events `stats` has not read yet (`execution.catch.timed`)
+        self.split_spans: deque[SplitSpan] = deque()
         #: each loop's record of what its passes left live outside any owner (`vt.escapes_take`);
         #: the models whose forwards mark their passes, and of the others, the blocks each entered
         #: this pass, in order
@@ -3503,11 +3522,25 @@ class Request:
             device += on_device or 0
         return {"blocks": len(self.bakes), "host_ns": host, "device_ns": device}
 
+    def split_times(self) -> None:
+        """Finished split calls' spans into their sites' `time`, oldest first, up to the first the
+        GPU has not passed: it never waits on the GPU, and only calls in flight stay held."""
+        spans = self.split_spans
+        while spans and spans[0][3].query():
+            key, level, start, stop, host_ns = spans.popleft()
+            record = self.working_splits.get(key)
+            if record is not None:
+                times = record.setdefault("time", {})
+                spent = times.setdefault(level, {"device_ms": 0.0, "host_ms": 0.0})
+                spent["device_ms"] += float(start.elapsed_time(stop))
+                spent["host_ms"] += host_ns / 1e6
+
     def stats(self) -> RequestStats:
         if self.ended is not None:
             return self.ended
         trace = self.trace
         self.sample()
+        self.split_times()
         allocated, reserved = self.memory._figures()
         out: RequestStats = {
             "request": self.id,

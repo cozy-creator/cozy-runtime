@@ -296,6 +296,23 @@ def note(
         }
 
 
+@contextmanager
+def timed(request: Request, key: str, level: int, device: int) -> Iterator[None]:
+    """A call's span, for its site's `time` in the run record (`Request.split_spans`): two events on
+    its stream, read once the GPU passed them, and the calling thread's nanoseconds. A refused try
+    counts at its level too: its work was spent."""
+    stream = torch.cuda.current_stream(device)
+    start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record(stream)
+    began = time.perf_counter_ns()
+    try:
+        yield
+    finally:
+        stop.record(stream)
+        request.split_spans.append((key, str(level), start, stop, time.perf_counter_ns() - began))
+        request.split_times()
+
+
 def cut[T](
     name: str,
     finest: int,
@@ -338,7 +355,8 @@ def cut[T](
             LEVELS[key] = level
             note(request, key, name, level, selection)
             try:
-                result = _attempt(run, level, level + 1 < len(menu), pure)
+                with timed(request, key, level, device):
+                    result = _attempt(run, level, level + 1 < len(menu), pure)
             except BaseException as exc:
                 again = retry(device, key, name, menu, level, token, stream, exc, pure, behind)
                 if again is None:
@@ -376,7 +394,8 @@ def nested[T](
         LEVELS[key] = level
         note(request, key, name, level)
         try:
-            return _attempt(run, level, level + 1 < len(menu), pure)
+            with timed(request, key, level, request.memory.device.index or 0):
+                return _attempt(run, level, level + 1 < len(menu), pure)
         except BaseException as exc:
             if not (pure and is_capacity(exc)) or level + 1 >= len(menu):
                 raise
