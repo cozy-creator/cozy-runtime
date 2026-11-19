@@ -5,9 +5,10 @@ call's start, before anything is told). Once a token is told nothing falls back.
 which engine served it, and why not this one, in the run record's `<model>.engine` note.
 
 It serves a CUDA Qwen3.5 text call: text-only questions, at most `ROWS` rows, no repeat-n-gram cut,
-on a dense model whose step linears are all of `LANES`. The questions are read as Transformers'
-engine reads them (its chat template and tokenizer), each row's text is handed on as it comes (at
-most every `STREAM_S`), and stops are cut as `VisionLM.ask` cuts them.
+on a dense model whose step linears are all of `LANES`, with a TensorFS that has the K/V cache. The
+questions are read as Transformers' engine reads them (its chat template and tokenizer), each row's
+text is handed on as it comes (at most every `STREAM_S`), and stops are cut as `VisionLM.ask` cuts
+them.
 """
 
 from __future__ import annotations
@@ -52,8 +53,12 @@ def serves(model: torch.nn.Module) -> str:
 
     if not torch.cuda.is_available():
         return "the engine decodes on CUDA"
+    from tensorfs.varena import _runtime as varena
+
     if TRITON_ABSENT:
         return f"the engine's kernels need Triton: {TRITON_ABSENT}"
+    if not hasattr(varena.Device, "cache"):
+        return "this TensorFS has no K/V cache (varena's Device.cache)"
     try:
         text = text_of(model)
     except (AttributeError, KeyError, TypeError) as exc:
@@ -178,7 +183,8 @@ class CozyEngine:
 
         request = Request(
             prompts=prompts, max_new=params.max_new_tokens, stops=stops, temperature=params.temperature,
-            top_p=params.top_p, top_k=params.top_k, presence=params.presence_penalty, seed=params.seed,
+            top_p=params.top_p, top_k=params.top_k, min_p=params.min_p, presence=params.presence_penalty,
+            frequency=params.frequency_penalty, repetition=params.repetition_penalty, seed=params.seed,
         )  # fmt: skip
         out = self.decoder(request, told=tokens)
         reasons: list[str] = []
