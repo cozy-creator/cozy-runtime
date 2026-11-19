@@ -12,7 +12,9 @@ whole and in two strips, must give the same rows. A block that reads across rows
 fails it and runs whole from then on. A strip reads its rows of each cache entry and writes its
 own rows of the entry's next value; the entries go to host memory once a block cuts (they are
 saved inputs, read back a strip at a time). Nothing is committed until every strip is done, so a
-refused strip runs again finer. PAN2's 5 s decode at a 6 GiB cap ran out in a causal pad
+refused strip runs again finer. A block that keeps tensors on itself between calls (a causal conv
+holding its last frames as an attribute) runs whole: strips see only the caches handed to them.
+PAN2's 5 s decode at a 6 GiB cap ran out in a causal pad
 (`up_blocks.3.resnets.0.conv1`, 1.36 GB beside 3.2 GiB, pod-session 44426689158).
 """
 
@@ -21,6 +23,7 @@ from __future__ import annotations
 import inspect
 import sys
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Protocol, cast
 
@@ -159,6 +162,21 @@ def _factor(size: int, height: int) -> int:
 
 #: a block's probe verdict by (site, shape without its rows)
 _VERDICTS: dict[tuple[str, tuple[int, ...], torch.dtype], bool] = {}
+#: sites whose module keeps tensors on itself between calls: they run whole
+_STATEFUL: set[str] = set()
+
+
+def _state(module: nn.Module) -> dict[str, Tensor]:
+    """The tensors `module` keeps as its own attributes: not its parameters or buffers, nor the
+    Runtime's `_cozy_*` marks."""
+    return {
+        k: v for k, v in vars(module).items() if isinstance(v, Tensor) and not k.startswith("_cozy")
+    }
+
+
+def _keeps(site: str, names: Iterable[str]) -> str:
+    _STATEFUL.add(site)
+    return f"it keeps {', '.join(sorted(names))} on itself between calls"
 
 
 def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) -> catch.Forward:
@@ -177,7 +195,11 @@ def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) 
             or torch.is_grad_enabled()
             or module.training
             or getattr(type(module), "_cozy_fused", None)
+            or site in _STATEFUL
         ):
+            return forward(*args, **kwargs)
+        if held := _state(module):
+            print(f"cozy-runtime: {site} runs whole: {_keeps(site, held)}", file=sys.stderr)
             return forward(*args, **kwargs)
         height = int(x.shape[-2])
         reach = max(block.rows, 1)
@@ -274,7 +296,15 @@ class _Call:
             arguments["feat_cache"] = rows
             arguments["feat_idx"] = index
         call = inspect.BoundArguments(self.signature, OrderedDict(arguments))
+        before = dict(vars(self.module))
         y = self.forward(*call.args[1:], **call.kwargs)
+        if kept := _state(self.module):
+            for name in kept:  # undone: the call runs again whole from the state it began with
+                if name in before:
+                    vars(self.module)[name] = before[name]
+                else:
+                    del vars(self.module)[name]
+            raise _Mismatch(_keeps(self.site, kept))
         if not isinstance(y, Tensor):
             raise _Mismatch(f"returned {type(y).__name__}")
         span = (hi - lo) * self.block.scale
