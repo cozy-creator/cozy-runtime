@@ -3198,10 +3198,10 @@ class Request:
         #: the package's estimate of it or its measure (`execution.cuts._hosted`)
         self.hosted: dict[str, str] = {}
         #: per block stack and the key of its first hostable whole: the keys of the wholes its
-        #: passes keep in host memory (`execution.cuts`), chosen from one pass's measured wholes;
-        #: None where a planned card whole was refused, so its passes run as before. It dies with
-        #: the request.
-        self.host_plans: dict[tuple[str, str], frozenset[str] | None] = {}
+        #: passes keep in host memory and of all the wholes the plan places (`execution.cuts`),
+        #: chosen from one pass's measured wholes; None where a planned card whole was refused, so
+        #: its passes run as before. It dies with the request.
+        self.host_plans: dict[tuple[str, str], tuple[frozenset[str], frozenset[str]] | None] = {}
         #: refusals a CUDA graph capture answered by recording again with room for them
         #: (`graphs.capture`): what runs is the same
         self.regrown = 0
