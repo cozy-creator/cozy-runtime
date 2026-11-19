@@ -46,7 +46,8 @@ def paged_attention(
     """Each row's `q` (`[rows, heads, head_dim]`) attended over its cached tokens of `layer`:
     `card` is the card tier (`[card_blocks, layers, 2, block_tokens, kv_heads, head_dim]`),
     `block_table` and `lengths` the manager's device tables. A row is read in `parts` parts at
-    once, a fixed number whatever its length. Returns `[rows, heads, head_dim]`, q's dtype."""
+    once, a fixed number whatever its length; a row of no tokens attends to nothing, and its
+    output is zero, as `paged_step`'s. Returns `[rows, heads, head_dim]`, q's dtype."""
     rows, heads, dim = (int(n) for n in q.shape)
     kvh = layout.kv_heads
     group = heads // kvh
@@ -61,10 +62,12 @@ def paged_attention(
         L=layout.attn_layers, T=layout.block_tokens, KVH=kvh, G=group, D=dim, P=parts,
         num_warps=4,
     )  # fmt: skip
-    # Join the parts: each is weighted by exp(its maximum - the row's).
-    weight = torch.exp(part_m - part_m.amax(1, keepdim=True))
+    # Join the parts: each is weighted by exp(its maximum - the row's). An empty row's maximum is
+    # -inf and its total 0: guarded as `paged_step`'s join is, so it is zero, never NaN.
+    best = part_m.amax(1, keepdim=True)
+    weight = torch.exp(part_m - torch.where(best.isinf(), 0.0, best))
     total = (part_l * weight).sum(1)
-    out: Tensor = (part_acc * weight[..., None]).sum(1) / total[..., None]
+    out: Tensor = (part_acc * weight[..., None]).sum(1) / total.clamp(min=1e-30)[..., None]
     return out.view(rows, heads, dim).to(q.dtype)
 
 

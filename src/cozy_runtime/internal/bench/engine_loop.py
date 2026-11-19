@@ -318,7 +318,8 @@ def _against_eager(
 
 
 def _attention(wrong: list[str]) -> dict[str, JSON]:
-    """Paged decode attention on a card-only K/V: 1 row, 8 heads over 2 K/V heads of 128, 1024 tokens."""
+    """Paged decode attention on a card-only K/V: 8 heads over 2 K/V heads of 128, a row of 1024 tokens and an
+    empty one (a free slot in its bucket), whose output must be zero."""
     layout = KvLayout(attn_layers=2, kv_heads=2, head_dim=128, dtype=torch.bfloat16)
     heads, tokens, parts = 8, 1024, 8
     blocks = tokens // layout.block_tokens
@@ -327,16 +328,21 @@ def _attention(wrong: list[str]) -> dict[str, JSON]:
     card = torch.randn((blocks, layout.attn_layers, *tile), generator=made, device="cuda")
     card = card.mul_(0.25).to(layout.dtype)
     host = HostTier(torch.zeros((1, 1, *tile), dtype=layout.dtype, device="cuda"), 0)  # never read
-    table = torch.arange(blocks, dtype=torch.int32, device="cuda")[None].contiguous()
-    lengths = torch.full((1,), tokens, dtype=torch.int32, device="cuda")
-    base = torch.randn((1, heads, layout.head_dim), generator=made, device="cuda").mul_(4).to(layout.dtype)
+    table = torch.arange(blocks, dtype=torch.int32, device="cuda")[None].repeat(2, 1).contiguous()
+    lengths = torch.tensor([tokens, 0], dtype=torch.int32, device="cuda")
+    base = torch.randn((2, heads, layout.head_dim), generator=made, device="cuda").mul_(4).to(layout.dtype)
     q = torch.empty_like(base)
 
     def compute(n: torch.Tensor) -> torch.Tensor:
         q.copy_(base + n * 0.05)
         return paged_attention(q, card, host, table, lengths, layout, 1, parts, layout.head_dim**-0.5)
 
-    return _against_eager("attention", compute, wrong)
+    row = _against_eager("attention", compute, wrong)
+    empty = compute(torch.zeros((), device="cuda"))[1]
+    row["empty_row_zero"] = bool(torch.equal(empty, torch.zeros_like(empty)))
+    if not row["empty_row_zero"]:
+        wrong.append(f"attention: an empty row's output is not zero ({int(empty.isnan().sum())} NaN)")
+    return row
 
 
 def _ggml(wrong: list[str]) -> dict[str, JSON]:
