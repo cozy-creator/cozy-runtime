@@ -1,0 +1,1 @@
+Under a memory cap, any norm-like module (a leaf whose own weights are vectors, as wide as its input's last axis: torch's, Diffusers', Transformers', a package's) runs in pieces of rows where its class's first call of that shape proves its forward row-local; the Runtime no longer matches `nn.RMSNorm` and Diffusers' `RMSNorm` by class (var-031).
