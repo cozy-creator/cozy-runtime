@@ -232,6 +232,8 @@ class Decoder:
         if not 0 < rows <= self.max_rows:
             raise ValueError(f"{rows} rows: this decoder holds 1 to {self.max_rows}")
         size = next(b for b in BUCKETS if b >= rows) if rows <= BUCKETS[-1] else rows
+        if (longest := max(len(p) for p in request.prompts)) + request.max_new > self.kv.ceiling:
+            raise ValueError(f"a row of {longest} + {request.max_new} tokens: it holds {self.kv.ceiling}")
         sampling = self._sampling(request, size)
         drafted = self.drafting
         made = Made(tokens=[[] for _ in range(rows)], kept=[[] for _ in range(rows)])
