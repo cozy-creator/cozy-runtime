@@ -267,10 +267,13 @@ class Decoder:
         return made
 
     def _admit(self, row: int, length: int, request: Request, drafted: bool) -> None:
-        """`row`'s blocks for its prompt, its state slot and the first steps' K/V, committed."""
+        """`row`'s blocks for its prompt and every token it may make (its most new tokens, the
+        head's position P and a drafted step's reach past them, up to the row's ceiling), its state
+        slot: the call's whole K/V, committed before anything runs, so a refusal for room is the
+        call's `Short` at its start, never a failure after a token is told."""
         kv = self.kv
         kv.admit(row, length, drafted=drafted, host_tokens=self._host_tokens(length, request))
-        kv.reserve_ahead(row, (SEGMENT + 1) * (kv.layout.span + 1))  # the head's position P, and the first steps
+        kv.reserve_ahead(row, request.max_new + (SEGMENT + 1) * (kv.layout.span + 1))
 
     def _sampling(self, request: Request, size: int) -> Sampling:
         sampled = request.temperature > 0
