@@ -107,6 +107,9 @@ def measure() -> dict[str, JSON]:
         # The step's small ops as torch's (the reference the fused kernels are held against).
         unfused = Decoder(model, max_rows=4, max_tokens=1024, fused=False)
         runs[f"{name}-unfused"] = unfused(Request(prompts=prompts, max_new=NEW, stops=[])).tokens
+        # The prompts prefilled 64 tokens a forward (two of them span chunks), against Transformers too.
+        chunked = Decoder(model, max_rows=4, max_tokens=1024, prefill_chunk=64)
+        runs[f"{name}-chunked"] = chunked(Request(prompts=prompts, max_new=NEW, stops=[])).tokens
         row[name]["launcher"] = decoder.launcher  # type: ignore[index]  # the dict just made
     checks: dict[str, JSON] = {}
     wrong: list[str] = []
@@ -129,16 +132,21 @@ def measure() -> dict[str, JSON]:
         plain = runs["plain"][i]
         clear, agreed, first_wrong = forced(prompt, plain)
         _, unfused_agreed, unfused_wrong = forced(prompt, runs["plain-unfused"][i])
+        _, chunked_agreed, chunked_wrong = forced(prompt, runs["plain-chunked"][i])
         same_drafted = runs["drafted"][i] == plain
         checks[f"row{i}"] = {
             "prompt": len(prompt), "clear": clear, "agreed": agreed, "first_wrong": first_wrong,
             "drafted_equal": same_drafted, "unfused_agreed": unfused_agreed, "unfused_first_wrong": unfused_wrong,
             "unfused_equal": runs["plain-unfused"][i] == plain,
+            "chunked_agreed": chunked_agreed, "chunked_first_wrong": chunked_wrong,
+            "chunked_equal": runs["plain-chunked"][i] == plain,
             "drafted_first_diff": next((t for t, (a, b) in enumerate(zip(plain, runs["drafted"][i], strict=False)) if a != b), None),
         }  # fmt: skip
         if first_wrong is not None:
             wrong.append(f"row {i}: plain token {first_wrong} is not Transformers' clear choice "
                          f"(unfused: first wrong {unfused_wrong})")
+        if chunked_wrong is not None:
+            wrong.append(f"row {i}: prefilled 64 tokens a forward, plain token {chunked_wrong} is not Transformers' clear choice")
     checks["sampled_drafted_equal"] = runs["drafted-sampled"] == runs["plain-sampled"]
     checks["sampled_repeat_equal"] = runs["plain-sampled-again"] == runs["plain-sampled"]
     checks["sampled_differs_from_greedy"] = runs["plain-sampled"][0] != runs["plain"][0]
