@@ -113,6 +113,7 @@ ignore_missing_imports = true
 module = [
     "cozy_runtime.accel.kernels",
     "cozy_runtime.accel.moe._kernels",
+    "cozy_runtime.engine._kernels",
     "cozy_runtime.internal.attention_fp8",
     "cozy_runtime.internal.attention_sage2_fixed_mean",
     "cozy_runtime.internal.attention_sage3_fixed",

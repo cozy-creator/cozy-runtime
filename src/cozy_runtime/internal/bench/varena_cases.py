@@ -551,6 +551,179 @@ def capture_refuses_a_fill() -> Row:
     return {"refused": True}
 
 
+@case
+def runtime_cache() -> Row:
+    """cr-336 V2, the card half: the Runtime's Cache maps exact pages at a base that never moves,
+    a view of the whole reservation exists before any page does, a commit over a mapped page
+    changes nothing, a release goes behind its stream, and it closes only with no page and no
+    tensor of it alive. A Region's Use export still reads its bytes (it shares the capsule)."""
+    gpu = varena.Device(0)
+    stream = torch.cuda.Stream()
+    page = gpu.granularity
+    cache = gpu.cache(64 * page)
+    assert cache.granularity == page and cache.reserved_bytes == 64 * page, cache.stats()
+    whole = cache.tensor(torch.uint8, (64 * page,))
+    assert whole.data_ptr() == cache.base and cache.stats()["mapped_bytes"] == 0
+    assert [(first, end) for first, end, _ in varena.cache_ranges(0)] == [
+        (cache.base, cache.base + 64 * page)
+    ]
+    cache.commit(0, 2 * page)
+    cache.commit(8 * page, page)  # holes are fine
+    with torch.cuda.stream(stream):
+        whole[: 2 * page].fill_(7)
+        whole[8 * page : 9 * page].fill_(9)
+        read = int(whole[2 * page - 1]) + int(whole[8 * page])
+    assert read == 16 and cache.stats()["live_bytes"] == 3 * page, (read, cache.stats())
+    refused = []
+    try:
+        cache.commit(page, 2 * page)  # over a mapped page
+    except RuntimeError as exc:
+        refused.append(type(exc).__name__)
+    try:
+        cache.close()  # with live pages
+    except RuntimeError as exc:
+        refused.append(type(exc).__name__)
+    assert len(refused) == 2 and cache.stats()["live_bytes"] == 3 * page, (refused, cache.stats())
+    region = filled(gpu, 8 * MIB, 41)
+    use = region.pin()
+    assert use is not None and int(use.tensor[0]) == int(use.tensor[-1]) == 41
+    use.consume_on(torch.cuda.current_stream().cuda_stream)
+    del use
+    cache.release(0, 2 * page, stream.cuda_stream)
+    cache.release(8 * page, page, stream.cuda_stream)
+    stream.synchronize()
+    deadline = time.monotonic() + 10
+    while cache.stats()["mapped_bytes"]:
+        assert time.monotonic() < deadline, cache.stats()
+        time.sleep(0.001)
+    try:
+        cache.close()
+    except RuntimeError as exc:  # a tensor of it is alive
+        refused.append(type(exc).__name__)
+    del whole
+    gc.collect()
+    cache.close()
+    assert len(refused) == 3 and not varena.cache_ranges(0), (refused, varena.cache_ranges(0))
+
+    calls: list[int] = []
+    owned: list[varena.Cache] = []
+
+    def shrink(bytes: int) -> bool:
+        calls.append(bytes)
+        owned[0].release(0, owned[0].reserved_bytes, stream.cuda_stream)
+        return True
+
+    owned.append(gpu.cache(256 * MIB, shrink))
+    owned[0].commit(0, owned[0].reserved_bytes)
+    torch.cuda.synchronize()
+    cap(vt.stats(0)["mapped_bytes"] + 16 * MIB, gpu)
+    began = time.monotonic()
+    value = torch.empty(192 * MIB, dtype=torch.uint8, device="cuda").fill_(5)
+    waited = time.monotonic() - began
+    assert calls and int(value[-1]) == 5, calls
+    del value
+    clear(gpu)
+    owned[0].close()
+    return {"refused": refused, "shrink_calls": len(calls), "waited_s": waited}
+
+
+@case
+def host_cache() -> Row:
+    """cr-336 V2, the host half: what this GPU answers about registered host memory
+    (`host_addressing`: `supported`, the tier exists; `in_place`, a kernel may read it at the host's
+    address), and where the tier exists: a window committed, written on the host and copied to the
+    card; where `in_place`, also read and written by a kernel through the device's view, and where
+    not, that view refused. Then released."""
+    probe = varena.host_addressing(0)
+    row: dict[str, JSON] = {"probe": cast("JSON", dict(probe))}
+    if not probe["supported"]:
+        return row
+    tier = varena.Pages(0, cap=1 << 34)
+    cache = tier.cache(3 * (64 * MIB))
+    window = cache.granularity
+    assert cache.reserved_bytes == 3 * window and cache.stats()["mapped_bytes"] == 0
+    if not cache.commit(window, window):
+        return {**row, "host": "the host tier has no room for one window now"}
+    host = cache.host(torch.int32, (window // 4,), byte_offset=window)
+    host.copy_(torch.arange(window // 4, dtype=torch.int32))
+    copied = torch.empty(window // 4, dtype=torch.int32, device="cuda").copy_(host)
+    want = (window // 4) * (window // 4 - 1) // 2
+    assert int(copied.sum(dtype=torch.int64)) == want
+    seen: torch.Tensor | None = None
+    if dict(probe).get("in_place", True):  # an older TensorFS: in place wherever supported
+        seen = cache.tensor(torch.int32, (window // 4,), byte_offset=window)
+        assert seen.is_cuda and seen.data_ptr() == host.data_ptr() == cache.base + window
+        in_place = int(seen.sum(dtype=torch.int64))  # a kernel reading host memory through the device
+        assert in_place == want, (in_place, want)
+        seen[:8].fill_(-1)  # and writing it
+        torch.cuda.synchronize()
+        assert host[:9].tolist() == [-1] * 8 + [8], host[:9].tolist()
+    else:
+        try:
+            cache.tensor(torch.int32, (window // 4,), byte_offset=window)
+        except ValueError:
+            row["device_view"] = "refused"
+        else:
+            raise AssertionError("a device view of host memory this GPU can't read in place")
+    refused = 0
+    try:
+        cache.close()
+    except RuntimeError:
+        refused += 1
+    del host, seen, copied
+    gc.collect()
+    cache.release(window, window)
+    cache.close()
+    assert refused == 1 and cache.stats()["mapped_bytes"] == 0
+    return row
+
+
+@case
+def use_export() -> Row:
+    """A Region exported as typed tensors through varena's public API (`Region.tensor`, then
+    `Use.tensor` and `_ext._varena_public_use_dlpack`: the capsule helper V2 shares with the Cache,
+    and the path `vt.offload` takes): the bytes read back as filled, whole as bytes and at an offset
+    as int32, and a tensor outlives its Region and its Use."""
+    from tensorfs.varena import api
+
+    data = bytes(range(256)) * 4096
+    want = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+    gpu = api.open(0)
+    region = gpu.region(data)
+    stream = torch.cuda.Stream()
+    whole = region.tensor(dtype=torch.uint8, shape=(len(data),), stream=stream.cuda_stream)
+    words = region.tensor(dtype=torch.int32, shape=(1024,), byte_offset=4096, stream=stream.cuda_stream)
+    stream.synchronize()
+    assert whole.is_cuda and torch.equal(whole.cpu(), want)
+    assert torch.equal(words.cpu(), want[4096 : 4096 + 4096].view(torch.int32))
+    region.close()
+    with torch.cuda.stream(stream):
+        kept = bool(torch.equal(whole.cpu(), want))  # its storage holds its own pin
+    assert kept
+    del whole, words
+    gc.collect()
+    gpu.close()
+    return {"bytes": len(data), "outlives_region": kept}
+
+
+@case
+def kv_tiers() -> Row:
+    """cr-336's open measurement: decode attention with none, a quarter, half and all of a row's
+    K/V off the card, read in place against copied through a window (`bench/kv_tiers.py`)."""
+    from cozy_runtime.internal.bench import kv_tiers as bench
+
+    return bench.measure()
+
+
+@case
+def batch_shapes() -> Row:
+    """Whether a ggml linear's row depends on how many rows share its launch: the same rows in
+    batches of 1 to 16 and in prefills of three sizes (`bench/batch_shapes.py`)."""
+    from cozy_runtime.internal.bench import batch_shapes as bench
+
+    return bench.measure()
+
+
 def main(name: str) -> None:
     function = CASES.get(name)
     if function is None:
