@@ -367,6 +367,8 @@ def _ggml(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
         blocks = torch.randint(0, 256, (s.n, s.k // n, size), generator=g, device="cuda:0", dtype=torch.uint8)
         matmul = partial(ggml_linear.matmul, ops, torch, rows, blocks, scheme, s.n)
         rules[f"ordered:{name}"] = _ordered(matmul)
+        # The leaf's production path: bf16 rows, quantized to q8_1 as they are (`matmul`'s other branches).
+        rules[f"ordered-linear:{name}"] = _ordered(partial(ggml_linear.matmul, ops, torch, x, blocks, scheme, s.n))
         calls[f"ggml-matmul{GGML_GRAPHED}:{name}"] = _graphed(matmul)
         calls[f"ggml-linear{GGML_GRAPHED}:{name}"] = _graphed(partial(_ggml_linear, ops, x, blocks, scheme, s.n))
         rules[f"kernel:{name}"] = ggml_linear.kernel(torch, 0, scheme, s.k, s.n, s.m, blocks)
@@ -410,13 +412,26 @@ def _replay(graph: torch.cuda.CUDAGraph, held: list[object]) -> None:
 
 def _ordered(call: Call) -> str:
     """Whether a read on torch's default stream queued right after `call`, with no sync, sees its output bit for bit
-    (xs-213: ggml launched on a stream of its own when the caller's was the legacy default one)."""
+    (xs-213: ggml launched on a stream of its own when the caller's was the legacy default one). The reference is read
+    after a sync, and every output is overwritten with NaN before it is freed: the allocator hands the next call the
+    same block, so a read that beats the kernel sees NaN, never the last call's identical answer."""
     with torch.cuda.stream(torch.cuda.default_stream()):
-        want = cast("torch.Tensor", call()).clone()
+        first = cast("torch.Tensor", call())
+        torch.cuda.synchronize()
+        want = first.clone()
+        first.fill_(float("nan"))
+        del first
         torch.cuda.synchronize()
         for _ in range(4):
-            got = cast("torch.Tensor", call()).clone()
-            if not torch.equal(got.view(torch.int32), want.view(torch.int32)):
+            out = cast("torch.Tensor", call())
+            got = out.clone()
+            torch.cuda.synchronize()
+            same = torch.equal(got.view(torch.int32), want.view(torch.int32))
+            out.fill_(float("nan"))
+            got.fill_(float("nan"))
+            del out, got
+            torch.cuda.synchronize()
+            if not same:
                 return "false"
     return "true"
 
