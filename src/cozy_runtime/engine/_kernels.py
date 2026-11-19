@@ -366,6 +366,152 @@ if not TRITON_ABSENT:
             tl.store(words_out + slot.to(tl.int64) * slot_stride + w, tl.load(src + w, mask=ok), mask=ok)
 
     @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
+    def paged_join_kernel(  # type: ignore[no-untyped-def]
+        part_m_ptr,
+        part_l_ptr,
+        part_acc_ptr,
+        gate_ptr,
+        out_ptr,
+        heads,
+        gate_stride,
+        gate_head,
+        S: tl.constexpr,
+        KVH: tl.constexpr,
+        G: tl.constexpr,
+        D: tl.constexpr,
+        P: tl.constexpr,
+        GATED: tl.constexpr,
+    ):
+        """`paged_step_kernel`'s parts of one query head joined (each weighted by exp(its maximum
+        - the row's)), rounded to the output's dtype as attention's output is; then, `GATED`, times
+        the sigmoid of the head's gate (`[rows, S, heads, D]`, a query every `gate_stride`, a head
+        every `gate_head`), each
+        rounded as Transformers' Qwen3.5 rounds them. out is `[rows, S, heads, D]`."""
+        rk = tl.program_id(0)
+        qi = tl.program_id(1)
+        row = rk // KVH
+        kvh = rk % KVH
+        s = qi // G
+        h = kvh * G + qi % G
+        p = tl.arange(0, P)
+        d = tl.arange(0, D)
+        at = (rk * P + p) * (S * G) + qi
+        m = tl.load(part_m_ptr + at)
+        best = tl.max(m, axis=0)
+        weight = tl.exp(m - tl.where(best == float("-inf"), 0.0, best))
+        total = tl.maximum(tl.sum(tl.load(part_l_ptr + at) * weight, axis=0), 1e-30)
+        acc = tl.load(part_acc_ptr + at[:, None] * D + d[None, :])
+        joined = tl.sum(acc * weight[:, None], axis=0) / total
+        y = joined.to(out_ptr.dtype.element_ty)
+        if GATED:
+            raw = tl.load(gate_ptr + (row * S + s).to(tl.int64) * gate_stride + h * gate_head + d)
+            sig = tl.sigmoid(raw.to(tl.float32)).to(raw.dtype)
+            y = (y.to(tl.float32) * sig.to(tl.float32)).to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + ((row * S + s).to(tl.int64) * heads + h) * D + d, y)
+
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
+    def _normed_rotated(src, w_ptr, pos, inv_ptr, eps, D: tl.constexpr, R: tl.constexpr):  # type: ignore[no-untyped-def]
+        """`Qwen3_5RMSNorm` of one head (`D` at `src`), rounded to its dtype, then the split-half
+        RoPE of its first `R` at text position `pos`: each product and the sum rounded to that
+        dtype, cos and sin of position * inverse frequency rounded to it first, as Transformers'
+        `apply_rotary_pos_emb` computes them in the model's dtype."""
+        c = tl.arange(0, D)
+        raw = tl.load(src + c)
+        dtype = raw.dtype
+        x = raw.to(tl.float32)
+        rms = tl.rsqrt(tl.sum(x * x, axis=0) / D + eps)
+        n = (x * rms * (1.0 + tl.load(w_ptr + c).to(tl.float32))).to(dtype)
+        rotary = c < R
+        half = R // 2
+        partner = tl.where(c < half, c + half, c - half)
+        xp = tl.load(src + partner, mask=rotary, other=0.0).to(tl.float32)
+        wp = tl.load(w_ptr + partner, mask=rotary, other=0.0).to(tl.float32)
+        np_ = (xp * rms * (1.0 + wp)).to(dtype).to(tl.float32)
+        turned = tl.where(c < half, -np_, np_)
+        f = pos * tl.load(inv_ptr + c % half, mask=rotary, other=0.0)
+        cos = libdevice.cos(f).to(dtype).to(tl.float32)
+        sin = libdevice.sin(f).to(dtype).to(tl.float32)
+        a = (n.to(tl.float32) * cos).to(dtype).to(tl.float32)
+        b = (turned * sin).to(dtype).to(tl.float32)
+        return tl.where(rotary, (a + b).to(dtype), n)
+
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
+    def qk_norm_rope_kernel(  # type: ignore[no-untyped-def]
+        q_ptr,
+        k_ptr,
+        q_w_ptr,
+        k_w_ptr,
+        positions_ptr,
+        inv_ptr,
+        q_out_ptr,
+        k_out_ptr,
+        eps,
+        heads,
+        kv_heads,
+        q_stride,
+        D: tl.constexpr,
+        R: tl.constexpr,
+    ):
+        """Qwen3.5 attention's q and k, one launch for both: each head's `q_norm` or `k_norm` and
+        RoPE (`_normed_rotated`) for a row's query `program_id(0)` (`positions` its text position).
+        q is read from `q_proj`'s output, a head's query in the first `D` of every `q_stride`
+        (its gate after it); k from `k_proj`'s. Out: contiguous `[rows, S, heads | kv_heads, D]`."""
+        rs = tl.program_id(0).to(tl.int64)
+        h = tl.program_id(1)
+        c = tl.arange(0, D)
+        pos = tl.load(positions_ptr + rs).to(tl.float32)
+        if h < heads:
+            y = _normed_rotated(q_ptr + (rs * heads + h) * q_stride, q_w_ptr, pos, inv_ptr, eps, D, R)
+            tl.store(q_out_ptr + (rs * heads + h) * D + c, y)
+        else:
+            kh = h - heads
+            y = _normed_rotated(k_ptr + (rs * kv_heads + kh) * D, k_w_ptr, pos, inv_ptr, eps, D, R)
+            tl.store(k_out_ptr + (rs * kv_heads + kh) * D + c, y)
+
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
+    def silu_mul_kernel(  # type: ignore[no-untyped-def]
+        gate_ptr,
+        up_ptr,
+        out_ptr,
+        width,
+        BLOCK: tl.constexpr,
+    ):
+        """An MLP's SiLU(gate) * up, one launch: SiLU rounded to the gate's dtype, the product to
+        the output's, as Transformers computes `act_fn(gate_proj(x)) * up_proj(x)`."""
+        row = tl.program_id(0).to(tl.int64)
+        c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        ok = c < width
+        raw = tl.load(gate_ptr + row * width + c, mask=ok, other=0.0)
+        g = raw.to(tl.float32)
+        act = (g / (1.0 + tl.exp(-g))).to(raw.dtype).to(tl.float32)
+        up = tl.load(up_ptr + row * width + c, mask=ok, other=0.0).to(tl.float32)
+        tl.store(out_ptr + row * width + c, (act * up).to(out_ptr.dtype.element_ty), mask=ok)
+
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
+    def add_norm_kernel(  # type: ignore[no-untyped-def]
+        x_ptr,
+        h_ptr,
+        w_ptr,
+        sum_ptr,
+        out_ptr,
+        width,
+        eps,
+        BLOCK: tl.constexpr,
+    ):
+        """A residual add and the next `Qwen3_5RMSNorm`, one launch for every row: x + h rounded
+        to x's dtype (the residual stream, into `sum`), then its norm as `rms_norm_kernel`'s."""
+        row = tl.program_id(0).to(tl.int64)
+        c = tl.arange(0, BLOCK)
+        ok = c < width
+        raw = tl.load(x_ptr + row * width + c, mask=ok, other=0.0)
+        y = (raw.to(tl.float32) + tl.load(h_ptr + row * width + c, mask=ok, other=0.0).to(tl.float32)).to(raw.dtype)
+        tl.store(sum_ptr + row * width + c, y, mask=ok)
+        x = y.to(tl.float32)
+        rms = tl.rsqrt(tl.sum(x * x, axis=0) / width + eps)
+        w = tl.load(w_ptr + c, mask=ok, other=0.0).to(tl.float32)
+        tl.store(out_ptr + row * width + c, (x * rms * (1.0 + w)).to(out_ptr.dtype.element_ty), mask=ok)
+
+    @triton.jit  # type: ignore[untyped-decorator]  # Triton is unannotated
     def gated_norm_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         gate_ptr,
