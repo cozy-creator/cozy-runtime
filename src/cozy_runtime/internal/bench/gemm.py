@@ -385,6 +385,13 @@ def _ggml(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
 GGML_GRAPHED = 16
 
 
+def _said(exc: BaseException) -> str:
+    """A refusal as recorded: its head and its tail. A ggml call's error carries its callback's whole traceback, whose last
+    line is the exception (44536379975 kept 400 characters of the head and lost it)."""
+    said = f"{type(exc).__name__}: {exc}"
+    return said if len(said) <= 400 else f"{said[:150]} … {said[-250:]}"
+
+
 def _graphed(call: Call) -> Call:
     first = call()  # its kernels verified and their shared memory raised, before the recording
     torch.cuda.synchronize()
@@ -526,7 +533,7 @@ def speed(lanes: list[str], wanted: list[str], seed: int, ctx: Context) -> Speed
             try:
                 found, rules[lane] = BUILDERS[lane](x, s, g, card)
             except Exception as exc:  # noqa: BLE001 - a lane that cannot build here is this card's finding
-                refused[lane] = f"{type(exc).__name__}: {exc}"[:400]
+                refused[lane] = _said(exc)
                 continue
             calls |= found
         # The first call of each: a tile the card's table does not hold, or a shape it refuses, leaves the set.
@@ -538,7 +545,7 @@ def speed(lanes: list[str], wanted: list[str], seed: int, ctx: Context) -> Speed
                 out = call()
                 torch.cuda.synchronize()
             except Exception as exc:  # noqa: BLE001 - recorded, and the set goes on without it
-                refused[name] = f"{type(exc).__name__}: {exc}"[:300]
+                refused[name] = _said(exc)
                 continue
             live[name] = call
             lane = name.split("-", 1)[0]
@@ -687,7 +694,7 @@ def _tile_set(kernel: str, n: int, k: int, m: int, default: str, configs: dict[s
             got = configs[name]()
             torch.cuda.synchronize()
         except Exception as exc:  # noqa: BLE001 - a tile this kernel cannot take here is recorded
-            refused[name] = f"{type(exc).__name__}: {exc}"[:300]
+            refused[name] = _said(exc)
             continue
         live[name] = configs[name]
         if isinstance(got, torch.Tensor):
