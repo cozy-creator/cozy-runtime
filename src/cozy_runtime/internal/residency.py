@@ -1336,8 +1336,7 @@ class Memory:
                 elif size and region is not None:
                     regions.append(region)
         try:
-            # The type check pins an older TensorFS stub, which has no `fits` (var-023).
-            self.native.fits(regions, more)  # type: ignore[attr-defined]
+            self.native.fits(regions, more)
         except Exhausted as refused:
             raise Exhausted(
                 f"{groups[0].model.component}: {_gib(refused.requested_bytes)} of weights to hold "
