@@ -38,6 +38,7 @@ from cozy_runtime.internal.encoding.formats import (
     refuse,
 )
 from cozy_runtime.internal.encoding.leaves import (
+    GgmlNativeLeaf,
     Int8ConvRotConvLeaf,
     Int8ConvRotNativeLeaf,
     MicroScaledNativeLeaf,
@@ -223,7 +224,7 @@ def admit(provider: Provider, device: DeviceFacts, output_dtype: str, encoded: E
                 f"{device.predicate} ({row.name}) has no {'/'.join(lacking)} tensor cores for "
                 f"{provider.name}"
             )
-        return ""
+        return provider.wheel_refuses(device.sm)
     if device.kind == "mps" and any(part.dtype.startswith("f8_") for part in encoded.parts):
         return f"{provider.name}: MPS has no float8, and this tensor stores float8 parts"
     return ""
@@ -266,6 +267,7 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         W4a8NativeLeaf,
         MicroScaledDequant,
         MicroScaledNativeLeaf,
+        GgmlNativeLeaf,
         ComfyDequant,
     )
     for build in builds:
