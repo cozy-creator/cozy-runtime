@@ -13,7 +13,9 @@ import math
 import weakref
 from collections.abc import Sequence
 
+import tensorfs
 import torch
+from tensorfs.varena.api import Exhausted
 from torch import Tensor
 
 
@@ -22,6 +24,11 @@ class _Buffer:
     tensor made over it holds this until its storage goes."""
 
     def __init__(self, nbytes: int) -> None:
+        # The machine's one host admission first, so a whole host memory can't hold is refused in
+        # one line, never killed by the kernel (var-030 W5).
+        admit = getattr(tensorfs._ext, "_varena_host_admit", None)
+        if admit is not None and (why := admit(nbytes)) is not None:
+            raise Exhausted(f"a {nbytes / 2**30:.2f} GiB whole in pinned host memory: {why}", nbytes)
         self.host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
         self.address = self.host.data_ptr()
         self.__cuda_array_interface__ = {

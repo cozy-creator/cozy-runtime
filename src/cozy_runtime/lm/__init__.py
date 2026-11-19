@@ -2438,7 +2438,8 @@ class _Engine:
         if not occupied:
             self._drop()  # the idle slots go before the new ones come
         try:
-            self._grow(size, capacity, stops, position, device)
+            with _fallback():  # refused, it undrafts or decodes through Transformers' loop
+                self._grow(size, capacity, stops, position, device)
         except Exception as exc:
             if not (placed and _short_of_room(exc)):
                 raise
@@ -3164,14 +3165,15 @@ class _Engine:
                         )
                     pool = self.pool
                     try:
-                        graph, why = capture(
-                            torch,
-                            step,
-                            pool,
-                            domain,
-                            reserve,
-                            alone=not self.graphs,
-                        )
+                        with _fallback():  # refused, this token decodes eagerly
+                            graph, why = capture(
+                                torch,
+                                step,
+                                pool,
+                                domain,
+                                reserve,
+                                alone=not self.graphs,
+                            )
                         if graph is not None and pool.prepared > reserve:
                             self.regrown.append((reserve, pool.prepared))
                     except Exception as exc:  # no room for its pool, or short outside it
@@ -3276,12 +3278,13 @@ class _Engine:
         replayed: list[torch.Tensor] = []
         try:
             try:
-                at = self.length[:size].clone()
-                start = self._before(state, writes, at)
-                vt.replay(graph, stream=stream)  # its pool is held since its capture
-                replayed = [*(value.clone() for value in state), *self._written(size, at)]
-                start.restore()
-                self._advance(size)
+                with _fallback():  # refused, the graph goes and the token decodes eagerly
+                    at = self.length[:size].clone()
+                    start = self._before(state, writes, at)
+                    vt.replay(graph, stream=stream)  # its pool is held since its capture
+                    replayed = [*(value.clone() for value in state), *self._written(size, at)]
+                    start.restore()
+                    self._advance(size)
             except Exception as exc:
                 if not _short_of_room(exc):
                     raise
@@ -3382,13 +3385,14 @@ class _Engine:
         mode, written = observe.trace(torch)
         served = False
         try:
-            start.restore()
-            vt.replay(graph, stream=torch.cuda.current_stream())
-            twice = [*(value.clone() for value in state), *self._written(size, at)]
-            again = run(False, mode)
-            on_stream = run(True)
-            run(False)
-            served = True
+            with _fallback():  # refused, the explanation stops short
+                start.restore()
+                vt.replay(graph, stream=torch.cuda.current_stream())
+                twice = [*(value.clone() for value in state), *self._written(size, at)]
+                again = run(False, mode)
+                on_stream = run(True)
+                run(False)
+                served = True
         except Exception as exc:
             if not _short_of_room(exc):
                 raise
@@ -3852,6 +3856,14 @@ def _short_of_room(exc: BaseException) -> bool:
     path gives up, so each is that path's cue, never the call's end (cr-331: an edit's vision tower
     refused beside 21.4 GiB leased on a 4090 failed the call)."""
     return is_capacity(exc) or isinstance(exc, DoesNotFit)
+
+
+def _fallback() -> AbstractContextManager[object]:
+    """What the engine runs with a slower path behind a refusal (eager, undrafted, Transformers'
+    loop): its allocations are refused, never given varena's last resort."""
+    from cozy_runtime.internal.execution import catch
+
+    return catch.fallback(True)
 
 
 def _answered(exc: BaseException) -> None:

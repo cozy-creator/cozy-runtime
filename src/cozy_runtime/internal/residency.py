@@ -3397,12 +3397,16 @@ def _allocator(memory: Memory) -> dict[str, int]:
     """Cumulative native working-allocator counters; live/backing gauges are separate."""
     if not memory.cuda or memory.native is None:
         return {}
-    stats = vt.stats(memory.device.index or 0)
+    stats = cast("Mapping[str, int]", vt.stats(memory.device.index or 0))
     return {
-        key: int(stats[key])
+        key: int(stats.get(key, 0))  # a TensorFS before the last resort has none of its counters
         for key in (
             "allocations", "frees", "ooms", "driver_memory_calls",
             "event_queries", "event_records", "event_waits", "context_joins",
+            # refusals a cheaper step answered, and varena's last resort: host segments pinned,
+            # allocations served there and their bytes, and those host memory refused too
+            "answered_ooms", "host_working_allocs", "host_working_served",
+            "host_working_served_bytes", "host_working_refusals",
         )
     }
 

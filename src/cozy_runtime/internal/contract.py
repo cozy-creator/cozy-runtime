@@ -376,15 +376,16 @@ REFUSALS: list[Callable[[], tuple[int, Request | None] | None] | None] = [None]
 
 
 def _answered(request: object) -> int:
-    """The refusals `request`'s Runtime answered: by running again another way, or by a capture
-    recording again with room for them."""
-    return int(getattr(request, "retries", 0)) + int(getattr(request, "regrown", 0))
+    """The refusals `request`'s Runtime answered by a capture recording again with room for them.
+    Those a cheaper step answered (a finer level, a host whole, a library's own choice) the
+    refusal count already leaves out (`catch.refusals`)."""
+    return int(getattr(request, "regrown", 0))
 
 
 class _Scopes:
     """Each local component scope (`author/_model.py`): at its exit the flags are put back and
     checked, and a refusal varena counted while it ran (`vt.ooms`) that the scope returned past,
-    and that no Runtime Retry answered (`retries`, `regrown`), is a swallowed OOM: a run warning
+    and that nothing answered (`catch.refusals`, `regrown`), is a swallowed OOM: a run warning
     (`oom_swallowed`) and the request's `swallowed_ooms`. Scopes overlapping on two threads are
     not judged for it: varena's count is the device's. A scope that ran on a thread the package
     started is a run warning (`contract_thread`): a package's thread launches no device work."""
