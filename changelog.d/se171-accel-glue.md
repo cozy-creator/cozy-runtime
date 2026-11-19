@@ -1,0 +1,1 @@
+`cozy_runtime.accel.glue`: the fused row kernels a block runs between its GEMMs (norm + modulate, gated residual, SwiGLU, per-head RMSNorm + RoPE), for a package that writes its own fused forward, with fp8 epilogues that write the rowwise fp8 leaf's operand. They are `fusion`'s kernels; the MiniMax-H3 family's three copies of them move here.

@@ -48,6 +48,16 @@ plain pre-norm block whose gates are layer scales; with `compose` Runtime compos
 block's attention from its projections, as it does a parallel block's. qwen-image-2, flux-3-klein and MiniMax-H3's
 video VAE decoder are the users.
 
+## Row kernels — `cozy_runtime.accel.glue`
+
+For a block whose fused forward the package writes itself (its own memory windows, an attention it composes):
+`fusion`'s kernels, one call each. A `Glue` declares the widths and the model's rounding at module scope;
+`plan.load(GLUE.kernels(plan.device))` gives the launcher. Norm + modulate, gated residual + norm + modulate, gated
+residual, SwiGLU, per-head RMSNorm + RoPE in place; a norm or SwiGLU can write the rowwise fp8 leaf's operand
+(`fp8=True`, sm89+). Outputs can go `into` the caller's rows. `checked` tries each entry against float64 on the
+card, and `warm` launches each once. MiniMax-H3's DiT glue (`minimax_h3/glue.py`, shared by the H3 image packages)
+is the user.
+
 ## Step caching — `cozy_runtime.accel.stepcache`
 
 A package declares its DiT's block stack once (`Stack`: the transformer class, the blocks' list,

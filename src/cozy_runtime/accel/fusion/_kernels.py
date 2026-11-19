@@ -341,6 +341,14 @@ def _dense(x: torch.Tensor, width: int) -> torch.Tensor:
     return _aligned(rows if rows.is_contiguous() else rows.contiguous())
 
 
+def _destination(t: torch.Tensor, width: int, dtype: torch.dtype, numel: int) -> torch.Tensor:
+    """A caller's output rows, written in place: contiguous, 16-byte aligned, `dtype`, as many
+    elements as the rows it takes."""
+    if t.dtype is not dtype or t.numel() != numel or not t.is_contiguous() or t.data_ptr() % 16:
+        raise ValueError(f"an output must be {numel} contiguous, 16-byte aligned {dtype} elements")
+    return t.view(-1, width)
+
+
 def _tables(*tables: torch.Tensor | None) -> list[torch.Tensor]:
     """Modulation tables as one kernel addresses them: aligned, sharing one row stride."""
     found = [_aligned(t) for t in tables if t is not None]
@@ -362,16 +370,24 @@ def norm_modulate(
     branch: torch.Tensor | None = None,
     other: torch.Tensor | None = None,
     gate: torch.Tensor | None = None,
+    into: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """`entry`'s chain over rows of `x`: `(hidden, out)`. `hidden` is `x + act(gate) * (branch
     [+ other])` (or `x` without a residual); `out` the [modulated] norm (None for a residual
-    alone). Tables are `[rows, width]` views (any row stride) read at `index[token]`."""
+    alone). Tables are `[rows, width]` views (any row stride) read at `index[token]`. `into`:
+    where `hidden` is written (`_destination`), which may be `x`'s or `branch`'s own rows: a
+    program reads its row whole before it writes it."""
     width = int(x.shape[-1])
     rows = _dense(x, width)
     n = int(rows.shape[0])
     c = {**entry.constexprs, "X16": int(entry.constexprs["F16"] and x.dtype is torch.float16)}
     residual, row = (torch.float32, torch.float16) if c["F16"] else (rows.dtype, rows.dtype)
-    hidden = rows.new_empty(rows.shape, dtype=residual) if c["BRANCHES"] else rows
+    if not c["BRANCHES"]:
+        hidden = rows
+    elif into is None:
+        hidden = rows.new_empty(rows.shape, dtype=residual)
+    else:
+        hidden = _destination(into, width, residual, rows.numel())
     normed = c["NORM"] != NONE
     out = rows.new_empty(rows.shape, dtype=row) if normed else hidden
     # A residual entry (`BRANCHES`) is launched with its branch [and the other].
@@ -464,12 +480,18 @@ def head_norm_rope(
     eps: float,
     tables: RopeTables,
     dtype: torch.dtype,
+    *,
+    into: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-head RMSNorm of `[batch, seq, heads, head_dim]` `x`, then `entry`'s RoPE by
-    `tables` (`rope_tables`), in `dtype`."""
+    `tables` (`rope_tables`), in `dtype`, written `into` where given (`x` itself may be it: a
+    program reads its heads whole before it writes them)."""
     batch, seq, heads, head_dim = (int(d) for d in x.shape)
     flat = _aligned(x.reshape(batch * seq, heads * head_dim))
-    out = torch.empty(flat.shape, dtype=dtype, device=flat.device)
+    if into is None:
+        out = torch.empty(flat.shape, dtype=dtype, device=flat.device)
+    else:
+        out = _destination(into, heads * head_dim, dtype, flat.numel())
     cos, sin, stride_token, stride_channel = tables
     c = {**entry.constexprs, "X32": int(x.dtype is torch.float32)}
     launch(
@@ -642,3 +664,259 @@ def entries(
         rope(False),
         tuple(e for e in variants if e is not None),
     )
+
+
+# ---------------------------------------------------------------------------- fp8 epilogues
+# Below every kernel above, so their lines, which key their builds, stay where they are.
+
+#: `norm_modulate_fp8_kernel`'s constexprs, in its parameter order.
+FP8_ROW_CONSTEXPRS = ("NORM", "WEIGHT", "OFFSET", "ONCE", "MODULATE", "BRANCHES", "TANH", "BLOCK")
+
+if not TRITON_ABSENT:
+
+    @triton.jit
+    def _e4m3(value, scale):  # type: ignore[no-untyped-def]
+        # The rowwise fp8 leaf's own cast: IEEE divide, clamp, round to nearest even.
+        return tl.clamp(tl.div_rn(value, scale), -448.0, 448.0).to(
+            tl.float8e4nv, fp_downcast_rounding="rtne"
+        )
+
+    @jit
+    def norm_modulate_fp8_kernel(  # type: ignore[no-untyped-def]
+        x_ptr,
+        branch_ptr,
+        gate_ptr,
+        hidden_ptr,
+        out_ptr,
+        scale_out_ptr,
+        weight_ptr,
+        scale_ptr,
+        shift_ptr,
+        index_ptr,
+        n_cols,
+        n_index,
+        stride_table,
+        eps,
+        NORM: tl.constexpr,
+        WEIGHT: tl.constexpr,
+        OFFSET: tl.constexpr,
+        ONCE: tl.constexpr,
+        MODULATE: tl.constexpr,
+        BRANCHES: tl.constexpr,
+        TANH: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        # `norm_modulate_kernel`'s chain on bf16 rows, its norm written as the rowwise fp8 leaf's
+        # operand: E4M3 and the row's scale (amax / 448), from the registers that hold the row.
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.arange(0, BLOCK)
+        mask = cols < n_cols
+        offset = row * n_cols + cols
+        table = tl.load(index_ptr + row % n_index).to(tl.int64) * stride_table + cols
+        x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+        if BRANCHES > 0:
+            branch = tl.load(branch_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+            gate = tl.load(gate_ptr + table, mask=mask, other=0.0).to(tl.float32)
+            if TANH:
+                gate = _round(libdevice.tanh(gate), 1)
+            product = _round(libdevice.mul_rn(gate, branch), 1)
+            x = _round(libdevice.add_rn(x, product), 1)
+            tl.store(hidden_ptr + offset, x.to(hidden_ptr.dtype.element_ty), mask=mask)
+        if NORM == 1:
+            mean = tl.sum(x, axis=0) / n_cols
+            x = tl.where(mask, x - mean, 0.0)
+        inv = tl.math.rsqrt(tl.sum(x * x, axis=0) / n_cols + eps)
+        if WEIGHT:
+            weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32) + OFFSET
+        else:
+            weight = inv
+        out = _normed(x, inv, weight, WEIGHT, ONCE, 1)
+        if MODULATE > 0:
+            scale = tl.load(scale_ptr + table, mask=mask, other=0.0).to(tl.float32)
+            out = _round(out * _round(1.0 + scale, 1), 1)
+        if MODULATE == 2:
+            shift = tl.load(shift_ptr + table, mask=mask, other=0.0).to(tl.float32)
+            out = _round(out + shift, 1)
+        row_scale = tl.maximum(tl.max(tl.abs(out), axis=0) / 448.0, 1e-12)
+        tl.store(scale_out_ptr + row, row_scale)
+        tl.store(out_ptr + offset, _e4m3(out, row_scale), mask=mask)
+
+    @triton.jit
+    def _silu_product(gate_ptr, up_ptr, gate_row, up_row, cols, mask):  # type: ignore[no-untyped-def]
+        # `swiglu_kernel`'s `silu(gate) * up`, rounded as it rounds bf16 rows.
+        gate = tl.load(gate_ptr + gate_row + cols, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(up_ptr + up_row + cols, mask=mask, other=0.0).to(tl.float32)
+        return _round(_round(tl.div_rn(gate, 1.0 + libdevice.exp(-gate)), 1) * up, 1)
+
+    @jit
+    def swiglu_fp8_kernel(  # type: ignore[no-untyped-def]
+        gate_ptr,
+        up_ptr,
+        out_ptr,
+        scale_out_ptr,
+        n_cols,
+        stride_gate,
+        stride_up,
+        stride_out,
+        BLOCK: tl.constexpr,
+    ):
+        # One row per program, chunked: the row's amax first, then each chunk again, from a row by
+        # then L2-resident, written E4M3 at that scale (a wide product held twice would spill).
+        row = tl.program_id(0).to(tl.int64)
+        gate_row, up_row = row * stride_gate, row * stride_up
+        offsets = tl.arange(0, BLOCK)
+        amax = tl.zeros((BLOCK,), dtype=tl.float32)
+        for start in range(0, n_cols, BLOCK):
+            cols = start + offsets
+            product = _silu_product(gate_ptr, up_ptr, gate_row, up_row, cols, cols < n_cols)
+            amax = tl.maximum(amax, tl.abs(product))
+        row_scale = tl.maximum(tl.max(amax, axis=0) / 448.0, 1e-12)
+        tl.store(scale_out_ptr + row, row_scale)
+        for start in range(0, n_cols, BLOCK):
+            cols = start + offsets
+            product = _silu_product(gate_ptr, up_ptr, gate_row, up_row, cols, cols < n_cols)
+            fp8 = _e4m3(product, row_scale)
+            tl.store(out_ptr + row * stride_out + cols, fp8, mask=cols < n_cols)
+
+
+_SWIGLU_FP8_WARPS = 8
+
+
+@dataclass(frozen=True, slots=True)
+class Fp8Entries:
+    """The fp8-epilogue entries beside a layout's bf16 ones: its first norm, its gated residual then
+    second norm, and SwiGLU, each writing the rowwise fp8 leaf's operand."""
+
+    first: TritonEntry
+    second: TritonEntry
+    swiglu: TritonEntry
+
+    def all(self) -> tuple[TritonEntry, ...]:
+        return (self.first, self.second, self.swiglu)
+
+
+def fp8_entries(
+    width: int, *, norm: int, weight: bool, offset: int, once: bool, modulate: int, tanh: bool
+) -> Fp8Entries:
+    """A bf16 layout's fp8 entries (`entries`' arguments of the same names)."""
+    block = _next_pow2(width)
+
+    def entry(branches: int) -> TritonEntry:
+        constexprs = {
+            "NORM": norm,
+            "WEIGHT": int(weight),
+            "OFFSET": offset if weight else 0,
+            "ONCE": int(once and weight),
+            "MODULATE": modulate,
+            "BRANCHES": branches,
+            "TANH": int(tanh and branches > 0),
+            "BLOCK": block,
+        }
+        rows = ("x_ptr", "branch_ptr", "gate_ptr", "hidden_ptr")
+        aligned = (*rows, "out_ptr", "scale_ptr", "shift_ptr")
+        return _entry(
+            norm_modulate_fp8_kernel,
+            constexprs,
+            16 if block >= 8192 else 8,
+            (*aligned, "n_cols", "stride_table"),
+            out_ptr="*fp8e4nv",
+            scale_out_ptr="*fp32",
+            index_ptr="*i64",
+            eps="fp32",
+            **dict.fromkeys((*rows, "weight_ptr", "scale_ptr", "shift_ptr"), "*bf16"),
+        )
+
+    swiglu = ("gate_ptr", "up_ptr", "out_ptr", "n_cols", "stride_gate", "stride_up", "stride_out")
+    return Fp8Entries(
+        entry(0),
+        entry(1),
+        _entry(
+            swiglu_fp8_kernel,
+            {"BLOCK": SWIGLU_BLOCK},
+            _SWIGLU_FP8_WARPS,
+            swiglu,
+            gate_ptr="*bf16",
+            up_ptr="*bf16",
+            out_ptr="*fp8e4nv",
+            scale_out_ptr="*fp32",
+        ),
+    )
+
+
+def norm_modulate_fp8(
+    launch: Launch,
+    entry: TritonEntry,
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    scale: torch.Tensor | None,
+    shift: torch.Tensor | None,
+    index: torch.Tensor,
+    eps: float,
+    *,
+    branch: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
+    into: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`norm_modulate` with an fp8 entry (`fp8_entries`): `(hidden, payload, scales)`, the norm as
+    an E4M3 `[rows, width]` payload and its fp32 `[rows, 1]` row scales."""
+    width = int(x.shape[-1])
+    rows = _dense(x, width)
+    n = int(rows.shape[0])
+    c = entry.constexprs
+    if not c["BRANCHES"]:
+        hidden = rows
+    elif into is None:
+        hidden = torch.empty_like(rows)
+    else:
+        hidden = _destination(into, width, rows.dtype, rows.numel())
+    branch = _dense(cast("torch.Tensor", branch), width) if c["BRANCHES"] else rows
+    payload = torch.empty(n, width, dtype=torch.float8_e4m3fn, device=rows.device)
+    scales = torch.empty(n, 1, dtype=torch.float32, device=rows.device)
+    tables = iter(_tables(gate, scale, shift))
+    gate, scale, shift = (next(tables) if t is not None else None for t in (gate, scale, shift))
+    first = next((t for t in (scale, gate) if t is not None), rows)
+    launch(
+        norm_modulate_fp8_kernel,
+        (n, 1, 1),
+        rows,
+        branch,
+        gate if gate is not None else first,
+        hidden,
+        payload,
+        scales,
+        weight if weight is not None else first,
+        first,
+        shift if shift is not None else first,
+        index,
+        width,
+        int(index.numel()),
+        int(first.stride(0)),
+        float(eps),
+        *(c[k] for k in FP8_ROW_CONSTEXPRS),
+    )
+    return hidden.view_as(x), payload, scales
+
+
+def swiglu_fp8(
+    launch: Launch, entry: TritonEntry, gate: torch.Tensor, up: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`silu(gate) * up` as an E4M3 `[rows, width]` payload and its fp32 `[rows, 1]` row scales."""
+    width = int(gate.shape[-1])
+    gate_rows, up_rows = _rows(gate, width), _rows(up, width)
+    n = int(gate_rows.shape[0])
+    payload = torch.empty(n, width, dtype=torch.float8_e4m3fn, device=gate.device)
+    scales = torch.empty(n, 1, dtype=torch.float32, device=gate.device)
+    launch(
+        swiglu_fp8_kernel,
+        (n, 1, 1),
+        gate_rows,
+        up_rows,
+        payload,
+        scales,
+        width,
+        int(gate_rows.stride(0)),
+        int(up_rows.stride(0)),
+        width,
+        entry.constexprs["BLOCK"],
+    )
+    return payload, scales
