@@ -48,12 +48,12 @@ from cozy_runtime.bench import (
 )
 from cozy_runtime.weights_store import Checkpoint, Derivation
 
-from . import facade, native_quantization, svdq
+from . import facade, ggml, native_quantization, svdq
 from .quantization import (
-    _ENCODINGS,
     ArtifactQuantizationPlan,
     QuantizationTensor,
     column_block,
+    known,
     prepare_source_quantization,
     refuse_quantized,
     source_rows,
@@ -83,7 +83,7 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
         or (plan.keys and plan.include)
         or len(set(plan.include)) != len(plan.include)
         or len({rule.pattern for rule in plan.encodings}) != len(plan.encodings)
-        or any(rule.encoding not in _ENCODINGS for rule in plan.encodings)
+        or any(not known(rule.encoding) or rule.encoding in ggml.MIXES for rule in plan.encodings)
     ):
         raise UnsupportedInput(
             "quantization plan has invalid or repeated selections", code="quantization_plan"

@@ -20,6 +20,7 @@ from functools import partial
 from types import ModuleType
 from typing import TypedDict
 
+import tensorfs.varena.torch as vt
 import torch
 
 import cozy_runtime
@@ -382,18 +383,28 @@ GGML_GRAPHED = 16
 
 
 def _graphed(call: Call) -> Call:
-    call()  # its kernels verified and their shared memory raised, before the recording
+    first = call()  # its kernels verified and their shared memory raised, before the recording
     torch.cuda.synchronize()
+    # Its pool holds the recorded calls' outputs and temporaries: sized by them, not by the process's peak, so a shape's
+    # graphs don't each reserve the largest weight's room (44433805701: "CUDA capacity exhausted allocating 3.7 GB").
+    out = first.numel() * first.element_size() if isinstance(first, torch.Tensor) else 0
+    del first
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         call()
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for _ in range(GGML_GRAPHED):
-            call()
-    return graph.replay
+    with vt.graph(graph, reserve_bytes=(GGML_GRAPHED + 1) * out + (256 << 20)):  # varena refuses a raw torch.cuda.graph
+        outs = [call() for _ in range(GGML_GRAPHED)]
+    # The replay reads `call`'s inputs and writes its outputs by raw pointer: both live as long as it does. Dropped, varena
+    # unmapped their pages and the replay faulted (Xid 31: 44416217064, 44420479065).
+    return partial(_replay, graph, [call, outs])
+
+
+def _replay(graph: torch.cuda.CUDAGraph, held: list[object]) -> None:
+    """`graph` replayed; `held`, what it reads and writes, kept alive with it."""
+    graph.replay()
 
 
 def _ggml_linear(ops: ModuleType, x: torch.Tensor, blocks: torch.Tensor, scheme: str, n: int) -> torch.Tensor:
