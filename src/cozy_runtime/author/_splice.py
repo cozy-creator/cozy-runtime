@@ -3,10 +3,12 @@
 Pictures: the source's packets are copied as they are up to the last point before the window that
 no reordered frame crosses, and again from the first such IDR after it. Between those, the source's
 own frames (decoded) and the window's are encoded by x264 at the source's profile, level, pixel
-format, colour and frame clock, without B-frames, under an SPS and PPS of an id the source does not
-use. Both join the source's in the track's avcC, so each copied packet decodes against its own
-parameter sets and each IDR switches between them, as H.264 allows. A source without B-frames
-re-encodes none of its frames before the window; after it, those up to the next IDR.
+format, aspect, colour and frame clock, without B-frames. When x264 writes the source's own SPS and
+PPS byte for byte (a take this Runtime encoded), the run uses them and the avcC stays the source's,
+so the output still joins its sibling shots by packet copy. Otherwise the run's SPS and PPS take an
+id the source does not use and join the source's in the avcC, so each copied packet decodes against
+its own parameter sets and each IDR switches between them, as H.264 allows. A source without
+B-frames re-encodes none of its frames before the window; after it, those up to the next IDR.
 
 Sound: an AAC frame overlaps each neighbour by half, so a copied frame beside an encoded one must
 hold only kept sound. The encoded run starts two frames before the window and ends two after it
@@ -41,6 +43,7 @@ if TYPE_CHECKING:
     from av.container import InputContainer
     from av.packet import Packet
     from av.stream import Stream
+    from av.video.codeccontext import VideoCodecContext
     from av.video.frame import VideoFrame
     from av.video.stream import VideoStream
 
@@ -163,9 +166,13 @@ class _Pictures:
     avcc: _AvcC
     #: Every SPS and PPS id the track uses, in its avcC or its packets.
     ids: frozenset[int]
+    #: Whether its packets carry parameter sets of their own.
+    inband: bool
     width: int
     height: int
     pix_fmt: str
+    #: Its pixel aspect ratio; 0 where it states none.
+    sar: Fraction
     #: Primaries, transfer, matrix and range as the track tags them.
     tags: tuple[int, int, int, int]
     #: The quarter turn its display matrix shows it at (`_decode`'s reading).
@@ -187,6 +194,7 @@ def _pictures(av: ModuleType, path: Path) -> _Pictures:
         context = stream.codec_context
         avcc = _AvcC.read(bytes(context.extradata or b""))
         ids = {_set_id(nal) for nal in (*avcc.sps, *avcc.pps)}
+        inband = False
         pts: list[int] = []
         dts: list[int] = []
         idr: list[bool] = []
@@ -195,11 +203,14 @@ def _pictures(av: ModuleType, path: Path) -> _Pictures:
                 continue
             if packet.pts is None or packet.dts is None:
                 raise _refuse("a picture has no clock")
+            if packet.is_discard:
+                raise _refuse("an edit list hides some of its frames")
             data = bytes(packet)
             kinds = set()
             for kind, at in _nal_types(data, avcc.length):
                 kinds.add(kind)
                 if kind in (7, 8):
+                    inband = True
                     ids.add(_set_id(data[at : at + 16]))
             pts.append(int(packet.pts))
             dts.append(int(packet.dts))
@@ -214,6 +225,7 @@ def _pictures(av: ModuleType, path: Path) -> _Pictures:
             int(context.color_range),
         )
         width, height, pix_fmt = int(context.width), int(context.height), str(context.pix_fmt)
+        sar = Fraction(context.sample_aspect_ratio or 0)
     order = sorted(pts)
     steps = {later - earlier for earlier, later in pairwise(order)}
     if not order or not time_base or len(steps) > 1 or 0 in steps or not (steps or rate):
@@ -240,9 +252,11 @@ def _pictures(av: ModuleType, path: Path) -> _Pictures:
         time_base,
         avcc,
         frozenset(ids),
+        inband,
         width,
         height,
         pix_fmt,
+        sar,
         tags,
         _matrix_rotation(bytes(matrix))[0] if matrix is not None else 0,
     )
@@ -341,47 +355,62 @@ def _source_sound(av: ModuleType, path: Path, sound: _Sound, lo: int, hi: int) -
     return planes
 
 
+def _x264(
+    av: ModuleType, pictures: _Pictures, sps_id: int
+) -> tuple[VideoCodecContext, bytes, bytes]:
+    """An open x264 encoder for the source's track, its SPS and PPS of id `sps_id`, and those."""
+    profile = pictures.avcc.head[1]
+    if profile not in _PROFILES:
+        raise _refuse(f"x264 writes no H.264 profile {profile}")
+    rate = 1 / (pictures.step * pictures.time_base)
+    encoder = av.CodecContext.create("libx264", "w")
+    encoder.width, encoder.height = pictures.width, pictures.height
+    encoder.pix_fmt = pictures.pix_fmt
+    encoder.sample_aspect_ratio = pictures.sar
+    encoder.time_base = 1 / rate
+    encoder.framerate = rate
+    encoder.thread_count = _codec.x264_threads()
+    encoder.gop_size = max(1, round(rate))
+    encoder.max_b_frames = 0
+    (
+        encoder.color_primaries,
+        encoder.color_trc,
+        encoder.colorspace,
+        encoder.color_range,
+    ) = pictures.tags
+    encoder.flags |= av.codec.context.Flags.global_header
+    encoder.options = {
+        **_codec._X264,
+        "profile": _PROFILES[profile],
+        "level": str(pictures.avcc.head[3]),
+        "x264-params": f"sps-id={sps_id}",
+    }
+    encoder.open()
+    sets = _annexb(bytes(encoder.extradata or b""))
+    sps = [nal for nal in sets if nal[0] & 31 == 7]
+    pps = [nal for nal in sets if nal[0] & 31 == 8]
+    if len(sps) != 1 or len(pps) != 1 or sps[0][1] != profile:
+        raise _refuse(f"x264 cannot encode its H.264 profile {profile}")
+    return encoder, sps[0], pps[0]
+
+
 class _Run:
     """The pictures between the copied ones, encoded by x264 as the source's track was encoded:
-    same profile, level, pixel format, colour and clock, no B-frames, parameter sets of a free id.
+    same profile, level, pixel format, aspect, colour and clock, no B-frames, under the source's
+    parameter sets when x264 writes them byte for byte, else under its own of a free id.
     Its packets wait in a scratch file in decode order, length-prefixed as the source's are."""
 
     def __init__(self, av: ModuleType, pictures: _Pictures, scratch: Path, max_bytes: int) -> None:
-        profile = pictures.avcc.head[1]
-        if profile not in _PROFILES:
-            raise _refuse(f"x264 writes no H.264 profile {profile}")
-        free = next((i for i in range(32) if i not in pictures.ids), None)
-        if free is None:
-            raise _refuse("it uses every parameter-set id")
-        rate = 1 / (pictures.step * pictures.time_base)
-        encoder = av.CodecContext.create("libx264", "w")
-        encoder.width, encoder.height = pictures.width, pictures.height
-        encoder.pix_fmt = pictures.pix_fmt
-        encoder.time_base = 1 / rate
-        encoder.framerate = rate
-        encoder.thread_count = _codec.x264_threads()
-        encoder.gop_size = max(1, round(rate))
-        encoder.max_b_frames = 0
-        (
-            encoder.color_primaries,
-            encoder.color_trc,
-            encoder.colorspace,
-            encoder.color_range,
-        ) = pictures.tags
-        encoder.flags |= av.codec.context.Flags.global_header
-        encoder.options = {
-            **_codec._X264,
-            "profile": _PROFILES[profile],
-            "level": str(pictures.avcc.head[3]),
-            "x264-params": f"sps-id={free}",
-        }
-        encoder.open()
-        sets = _annexb(bytes(encoder.extradata or b""))
-        sps = [nal for nal in sets if nal[0] & 31 == 7]
-        pps = [nal for nal in sets if nal[0] & 31 == 8]
-        if len(sps) != 1 or len(pps) != 1 or sps[0][1] != profile:
-            raise _refuse(f"x264 cannot encode its H.264 profile {profile}")
-        self.extradata = pictures.avcc.joined(sps[0], pps[0])
+        avcc = pictures.avcc
+        encoder, sps, pps = _x264(av, pictures, _set_id(avcc.sps[0]))
+        #: The track's avcC with the run's parameter sets added; None when they are the source's.
+        self.extradata: bytes | None = None
+        if pictures.inband or sps not in avcc.sps or pps not in avcc.pps:
+            free = next((i for i in range(32) if i not in pictures.ids), None)
+            if free is None:
+                raise _refuse("it uses every parameter-set id")
+            encoder, sps, pps = _x264(av, pictures, free)
+            self.extradata = avcc.joined(sps, pps)
         self.frames = 0
         #: Each packet's offset and size in the scratch file, and whether it is an IDR.
         self.packets: list[tuple[int, int, bool]] = []
@@ -595,7 +624,7 @@ class VideoSplice:
                 )
                 try:
                     track = out.add_stream_from_template(pictures.streams.video[0])
-                    if self._run is not None:
+                    if self._run is not None and self._run.extradata is not None:
                         track.codec_context.extradata = self._run.extradata
                     tracks: list[Iterator[_Muxed]] = [self._pictures_out(pictures, track)]
                     if self.sound is not None:

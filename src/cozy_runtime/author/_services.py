@@ -882,7 +882,8 @@ class Outputs(_Bound):
         across a seam is the caller's: put the mixed frames and sound in the window. When the
         window changes the length, the sound after it moves with its picture to the nearest AAC
         frame (within 512 samples). Refuses `video_copy_incompatible` unless `source` is one H.264
-        track on a fixed frame clock with at most one mono or stereo AAC-LC track.
+        track on a fixed frame clock, no frame hidden by an edit list, with at most one mono or
+        stereo AAC-LC track.
         """
         self._attempt.check_open("Outputs.splice_video")
         _codec.require_encoder()
