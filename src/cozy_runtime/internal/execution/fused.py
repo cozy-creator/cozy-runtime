@@ -452,8 +452,8 @@ class _Site:
             return self.inner(x)  # its comparison is still on the card: as written until it lands
         if self.proven:
             return _rows(_Pending(self, launch, x))
-        if self.left:
-            return self.inner(x)
+        if vars(self.module).get(_SITE) is not self:
+            return self.inner(x)  # its comparison just landed outside the law: left as written
         if self.asked is not None and self.asked() is None:
             self.left_checked(0.0, "its rows were read where they cannot wait", key=self.key(x))
             return self.inner(x)
