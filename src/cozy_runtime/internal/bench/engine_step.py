@@ -7,8 +7,9 @@ attention layer, a multi-token-prediction head), against Transformers' own forwa
 - Drafted: the decoder's drafted greedy tokens against its plain ones (a draft only changes how
   many tokens a step keeps, never which).
 - Rows: four prompts of different lengths in one bucket, each row against itself alone.
-- Sampled (temperature 0.7, top-k 20, top-p 0.95, a seed): drafted against plain, which must give the
-  same tokens (each draw is hashed from the seed and the token's index), and plain against itself.
+- Sampled (temperature 0.7, top-k 20, top-p 0.95, a seed): drafted against plain and plain against
+  itself, reported (each draw's noise is hashed from the seed and the token's index; a near tie in the
+  scores can still turn a draw, so equality is told, not required of the real model).
 - The step's graph: recorded once and replayed (or why not).
 
 The head is scaled so greedy choices are decisive with random weights. It reports and fails on a
@@ -103,15 +104,18 @@ def measure() -> dict[str, JSON]:
         # The same step replayed by the host, in place of the launcher's WHILE node: the same tokens.
         replayed = Decoder(model, max_rows=4, max_tokens=1024, launcher=False)
         runs[f"{name}-replayed"] = replayed(Request(prompts=prompts, max_new=NEW, stops=[])).tokens
+        # The step's small ops as torch's (the reference the fused kernels are held against).
+        unfused = Decoder(model, max_rows=4, max_tokens=1024, fused=False)
+        runs[f"{name}-unfused"] = unfused(Request(prompts=prompts, max_new=NEW, stops=[])).tokens
         row[name]["launcher"] = decoder.launcher  # type: ignore[index]  # the dict just made
     checks: dict[str, JSON] = {}
     wrong: list[str] = []
-    for i, prompt in enumerate(prompts):
-        plain = runs["plain"][i]
-        choice, lead = _forced(model, list(prompt) + plain[:-1])
+
+    def forced(prompt: list[int], made: list[int]) -> tuple[int, int, int | None]:
+        choice, lead = _forced(model, list(prompt) + made[:-1])
         clear = agreed = 0
         first_wrong: int | None = None
-        for t, token in enumerate(plain):
+        for t, token in enumerate(made):
             at = len(prompt) - 1 + t
             if lead[at] >= MARGIN:
                 clear += 1
@@ -119,14 +123,22 @@ def measure() -> dict[str, JSON]:
                     agreed += 1
                 elif first_wrong is None:
                     first_wrong = t
+        return clear, agreed, first_wrong
+
+    for i, prompt in enumerate(prompts):
+        plain = runs["plain"][i]
+        clear, agreed, first_wrong = forced(prompt, plain)
+        _, unfused_agreed, unfused_wrong = forced(prompt, runs["plain-unfused"][i])
         same_drafted = runs["drafted"][i] == plain
         checks[f"row{i}"] = {
             "prompt": len(prompt), "clear": clear, "agreed": agreed, "first_wrong": first_wrong,
-            "drafted_equal": same_drafted,
+            "drafted_equal": same_drafted, "unfused_agreed": unfused_agreed, "unfused_first_wrong": unfused_wrong,
+            "unfused_equal": runs["plain-unfused"][i] == plain,
             "drafted_first_diff": next((t for t, (a, b) in enumerate(zip(plain, runs["drafted"][i], strict=False)) if a != b), None),
         }  # fmt: skip
         if first_wrong is not None:
-            wrong.append(f"row {i}: plain token {first_wrong} is not Transformers' clear choice")
+            wrong.append(f"row {i}: plain token {first_wrong} is not Transformers' clear choice "
+                         f"(unfused: first wrong {unfused_wrong})")
     checks["sampled_drafted_equal"] = runs["drafted-sampled"] == runs["plain-sampled"]
     checks["sampled_repeat_equal"] = runs["plain-sampled-again"] == runs["plain-sampled"]
     checks["sampled_differs_from_greedy"] = runs["plain-sampled"][0] != runs["plain"][0]

@@ -295,6 +295,7 @@ if not TRITON_ABSENT:
         DK: tl.constexpr,
         DV: tl.constexpr,
         BV: tl.constexpr,
+        GIVEN: tl.constexpr,
     ):
         """The gated delta rule for a row's `S` tokens in turn, of one value head and `BV` value
         columns, from the state in the row's slot (`[heads, DK, DV]` f32, a slot every
@@ -304,6 +305,7 @@ if not TRITON_ABSENT:
         (q then divided by `scale`), the state decayed by exp(g), corrected toward v by beta, then
         read by q, as `lm`'s kernel computes it. g and beta are Transformers' own, computed here:
         beta = sigmoid(b) rounded to b's dtype, g = -exp(A_log) * softplus(a + dt_bias) in f32.
+        `GIVEN`: g (f32) and beta are given in a's and b's places, computed by torch (the reference).
         One token: the state goes back to the slot. A span: the state after each token goes to
         the row's scratch for the step to keep one."""
         bh = tl.program_id(0)
@@ -326,10 +328,14 @@ if not TRITON_ABSENT:
                 q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1e-6) / scale
                 k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1e-6)
                 v = tl.load(v_ptr + at * v_stride + h * DV + rv).to(tl.float32)
-                raw = tl.load(b_ptr + at * heads + h)
-                beta = tl.sigmoid(raw.to(tl.float32)).to(raw.dtype).to(tl.float32)
-                a = tl.load(a_ptr + at * heads + h).to(tl.float32) + bias
-                g = decay * tl.where(a > 20.0, a, libdevice.log1p(tl.exp(a)))  # softplus, torch's threshold
+                if GIVEN:
+                    g = tl.load(a_ptr + at * heads + h).to(tl.float32)
+                    beta = tl.load(b_ptr + at * heads + h).to(tl.float32)
+                else:
+                    raw = tl.load(b_ptr + at * heads + h)
+                    beta = tl.sigmoid(raw.to(tl.float32)).to(raw.dtype).to(tl.float32)
+                    a = tl.load(a_ptr + at * heads + h).to(tl.float32) + bias
+                    g = decay * tl.where(a > 20.0, a, libdevice.log1p(tl.exp(a)))  # softplus, torch's threshold
                 state = state * tl.exp(g)
                 delta = (v - tl.sum(state * k[:, None], axis=0)) * beta
                 state = state + k[:, None] * delta[None, :]

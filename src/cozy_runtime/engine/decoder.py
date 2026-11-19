@@ -148,7 +148,13 @@ class Decoder:
     """`model`'s engine on its GPU, for at most `max_rows` rows of at most `max_tokens` tokens."""
 
     def __init__(
-        self, model: torch.nn.Module, *, max_rows: int = 16, max_tokens: int = 32768, launcher: bool = True
+        self,
+        model: torch.nn.Module,
+        *,
+        max_rows: int = 16,
+        max_tokens: int = 32768,
+        launcher: bool = True,
+        fused: bool = True,
     ) -> None:
         from tensorfs.varena import _runtime as varena
 
@@ -166,7 +172,7 @@ class Decoder:
             self.kv = KvManager(varena.Device(device.index or 0), layout, max_rows, -(-max_tokens // layout.block_tokens))
         nothing = torch.zeros((1, 1, 2, layout.block_tokens, layout.kv_heads, layout.head_dim),
                               dtype=layout.dtype, device=device)  # fmt: skip
-        self.qwen = Qwen35(model, self.kv, HostTier(nothing, 0))
+        self.qwen = Qwen35(model, self.kv, HostTier(nothing, 0), fused=fused)
         self.hf = cast("_Model", model)
         vocab = int(self.hf.config.get_text_config(decoder=True).vocab_size)
         self.rows: Rows = rows_for(max_rows, layout.span, self.text.hidden, vocab, STOPS, device)
@@ -292,8 +298,8 @@ class Decoder:
         eps = text.eps
         from cozy_runtime.engine.qwen35 import _norm
 
-        e = _norm(qwen.embed(tokens[None]), mtp.pre_fc_norm_embedding.weight, eps)
-        h = _norm(y[None], mtp.pre_fc_norm_hidden.weight, eps)
+        e = _norm(qwen.embed(tokens[None]), mtp.pre_fc_norm_embedding.weight, eps, qwen.fused)
+        h = _norm(y[None], mtp.pre_fc_norm_hidden.weight, eps, qwen.fused)
         x = mtp.fc(torch.cat([e, h], -1))
         positions = torch.arange(1, length + 1, device=self.device)
         rope = hf.get_decoder().rotary_emb(x, positions.view(1, 1, -1).expand(3, 1, -1))
