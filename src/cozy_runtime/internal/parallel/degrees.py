@@ -3,13 +3,15 @@ whichever was measured faster for its key, never estimated. Ulysses halves a ste
 not its host work, so no figure taken at one degree predicts the other where the host bounds the
 step (LTX-2.5's base stage: 1.67 s a step on two GPUs, 0.925 s on one).
 
-A key is the package and its build, the function, the stage, its shape class (its tensors' shapes
-and its integer and boolean arguments), the card, the group's degree and the Runtime build: a new
-release measures again. A key with no steady step time at a degree runs there and records it
-(steps 2 on: step 1 carries fills and compiles); once both are known, the faster is the key's for
-good, so a request's bytes stop changing with its runs. The record keeps the attention kernels each
-degree served, so a reviewer can tell a degree's head-group numerics from a bug. Records live in
-the machine's kernel cache, beside its link measurements.
+A key is the package and its build, the function, the stage, its shape class (the tensor shapes
+of the stage's first sharded call, where the degree is chosen: no seed or other value), the card,
+the group's degree and the Runtime build: a new release measures again. A key with no steady step
+time at a degree runs there and records it (steps 2 on: step 1 carries fills and compiles; and
+only steps no GPU read weights from disk or saw a kernel build in, else the next request measures
+again); once both are known, the faster is the key's for good, so a request's bytes stop changing
+with its runs. The record keeps the attention kernels each degree served, so a reviewer can tell a
+degree's head-group numerics from a bug. Records live in the machine's kernel cache, beside its
+link measurements.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from cozy_runtime.internal import filelock, kernel_cache
 
@@ -34,6 +37,22 @@ class Key:
     card: str
     world: int
     runtime: str
+
+    @classmethod
+    def of(cls, document: Mapping[str, object]) -> Key:
+        return cls(
+            str(document["package"]),
+            str(document["function"]),
+            str(document["stage"]),
+            str(document["shape"]),
+            str(document["card"]),
+            int(cast("int", document["world"])),
+            str(document["runtime"]),
+        )
+
+    def digest(self) -> str:
+        """Its record's name on this machine."""
+        return hashlib.sha256(json.dumps(self.document(), sort_keys=True).encode()).hexdigest()[:32]
 
     def document(self) -> dict[str, object]:
         return {
@@ -56,8 +75,7 @@ def _path(key: Key) -> Path | None:
     directory = _directory()
     if directory is None:
         return None
-    digest = hashlib.sha256(json.dumps(key.document(), sort_keys=True).encode()).hexdigest()
-    return directory / f"{digest[:32]}.json"
+    return directory / f"{key.digest()}.json"
 
 
 def known(key: Key) -> dict[int, dict[str, object]]:

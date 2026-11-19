@@ -1509,12 +1509,12 @@ class Executor:
         facts = self.facts
         transport = self.host.transport
         crossing: Reply = {}
-        if transport is not None:
+        if transport is not None or self.group is not None:  # a CPU group has no measured links
             from cozy_runtime.internal.parallel import ulysses
 
             crossing = {
                 "transport": {
-                    **transport.document(),
+                    **(transport.document() if transport is not None else {}),
                     "exchange": ulysses.taken(),
                     "stages": spmd.taken(),
                 }
