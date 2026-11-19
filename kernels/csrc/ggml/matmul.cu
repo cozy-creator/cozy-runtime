@@ -277,6 +277,9 @@ int matmul(int device, int type, const void* w, const void* x, int x_type, float
            int64_t M, void* (*allocate)(size_t, void*), void* context, cudaStream_t stream) {
     if (!runs(type) || K <= 0 || N <= 0 || M <= 0 || K % MATRIX_ROW_PADDING) return cudaErrorInvalidValue;
     if (x_type != kF32 && x_type != kBF16 && x_type != kF16) return cudaErrorInvalidValue;
+    // Torch's default stream is the legacy NULL stream: ggml's context reads a null stream as "none yet" and launches on
+    // a non-blocking stream of its own, unordered with the caller's, so every launch here names the legacy stream.
+    if (stream == nullptr) stream = cudaStreamLegacy;
     try {
         Allocate temporaries{allocate, context};
         Call call(device, stream, &temporaries);

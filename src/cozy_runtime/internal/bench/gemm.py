@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from types import ModuleType
-from typing import TypedDict
+from typing import TypedDict, cast
 
 import tensorfs.varena.torch as vt
 import torch
@@ -366,6 +366,9 @@ def _ggml(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
         n, size = ggml_types.STRUCTS[name]
         blocks = torch.randint(0, 256, (s.n, s.k // n, size), generator=g, device="cuda:0", dtype=torch.uint8)
         matmul = partial(ggml_linear.matmul, ops, torch, rows, blocks, scheme, s.n)
+        rules[f"ordered:{name}"] = _ordered(matmul)
+        # The leaf's production path: bf16 rows, quantized to q8_1 as they are (`matmul`'s other branches).
+        rules[f"ordered-linear:{name}"] = _ordered(partial(ggml_linear.matmul, ops, torch, x, blocks, scheme, s.n))
         calls[f"ggml-matmul{GGML_GRAPHED}:{name}"] = _graphed(matmul)
         calls[f"ggml-linear{GGML_GRAPHED}:{name}"] = _graphed(partial(_ggml_linear, ops, x, blocks, scheme, s.n))
         rules[f"kernel:{name}"] = ggml_linear.kernel(torch, 0, scheme, s.k, s.n, s.m, blocks)
@@ -380,6 +383,13 @@ def _ggml(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
 #: A ggml call is this many back-to-back matmuls replayed from one CUDA graph, as test-backend-ops times one op back
 #: to back in one graph: what is timed is the GPU's, not Python's launch.
 GGML_GRAPHED = 16
+
+
+def _said(exc: BaseException) -> str:
+    """A refusal as recorded: its head and its tail. A ggml call's error carries its callback's whole traceback, whose last
+    line is the exception (44536379975 kept 400 characters of the head and lost it)."""
+    said = f"{type(exc).__name__}: {exc}"
+    return said if len(said) <= 400 else f"{said[:150]} … {said[-250:]}"
 
 
 def _graphed(call: Call) -> Call:
@@ -405,6 +415,32 @@ def _graphed(call: Call) -> Call:
 def _replay(graph: torch.cuda.CUDAGraph, held: list[object]) -> None:
     """`graph` replayed; `held`, what it reads and writes, kept alive with it."""
     graph.replay()
+
+
+def _ordered(call: Call) -> str:
+    """Whether a read on torch's default stream queued right after `call`, with no sync, sees its output bit for bit
+    (xs-213: ggml launched on a stream of its own when the caller's was the legacy default one). The reference is read
+    after a sync, and every output is overwritten with NaN before it is freed: the allocator hands the next call the
+    same block, so a read that beats the kernel sees NaN, never the last call's identical answer."""
+    with torch.cuda.stream(torch.cuda.default_stream()):
+        first = cast("torch.Tensor", call())
+        torch.cuda.synchronize()
+        want = first.clone()
+        first.fill_(float("nan"))
+        del first
+        torch.cuda.synchronize()
+        for _ in range(4):
+            out = cast("torch.Tensor", call())
+            got = out.clone()
+            torch.cuda.synchronize()
+            same = torch.equal(got.view(torch.int32), want.view(torch.int32))
+            out.fill_(float("nan"))
+            got.fill_(float("nan"))
+            del out, got
+            torch.cuda.synchronize()
+            if not same:
+                return "false"
+    return "true"
 
 
 def _ggml_linear(ops: ModuleType, x: torch.Tensor, blocks: torch.Tensor, scheme: str, n: int) -> torch.Tensor:
@@ -497,7 +533,7 @@ def speed(lanes: list[str], wanted: list[str], seed: int, ctx: Context) -> Speed
             try:
                 found, rules[lane] = BUILDERS[lane](x, s, g, card)
             except Exception as exc:  # noqa: BLE001 - a lane that cannot build here is this card's finding
-                refused[lane] = f"{type(exc).__name__}: {exc}"[:400]
+                refused[lane] = _said(exc)
                 continue
             calls |= found
         # The first call of each: a tile the card's table does not hold, or a shape it refuses, leaves the set.
@@ -509,7 +545,7 @@ def speed(lanes: list[str], wanted: list[str], seed: int, ctx: Context) -> Speed
                 out = call()
                 torch.cuda.synchronize()
             except Exception as exc:  # noqa: BLE001 - recorded, and the set goes on without it
-                refused[name] = f"{type(exc).__name__}: {exc}"[:300]
+                refused[name] = _said(exc)
                 continue
             live[name] = call
             lane = name.split("-", 1)[0]
@@ -658,7 +694,7 @@ def _tile_set(kernel: str, n: int, k: int, m: int, default: str, configs: dict[s
             got = configs[name]()
             torch.cuda.synchronize()
         except Exception as exc:  # noqa: BLE001 - a tile this kernel cannot take here is recorded
-            refused[name] = f"{type(exc).__name__}: {exc}"[:300]
+            refused[name] = _said(exc)
             continue
         live[name] = configs[name]
         if isinstance(got, torch.Tensor):

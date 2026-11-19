@@ -36,6 +36,7 @@ from cozy_runtime.bench import (
     child_wire,
     gemm_speed,
     gemm_tiles,
+    ggml_batch_shapes,
     host_calibrate,
     kernel_check,
     kernel_ready,
@@ -331,6 +332,7 @@ app.entrypoint(attention_quality, accelerator=True)
 app.entrypoint(host_calibrate, accelerator=True)
 app.entrypoint(gemm_speed, accelerator=True)
 app.entrypoint(gemm_tiles, accelerator=True)
+app.entrypoint(ggml_batch_shapes, accelerator=True)
 app.entrypoint(kernels_inventory, accelerator=True)
 app.entrypoint(kernel_check, accelerator=True)
 app.entrypoint(kernel_ready, accelerator=False)

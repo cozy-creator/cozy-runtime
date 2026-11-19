@@ -153,6 +153,15 @@ def gemm_tiles(payload: GemmTilesRequest, ctx: Context, tel: Telemetry) -> Measu
         return _run(lambda: gemm.tiles(seed, ctx))
 
 
+def ggml_batch_shapes(payload: EmptyRequest, ctx: Context) -> Measured:
+    """batch-shapes run as it first ran, raced on torch's default stream with no sync, beside the same cases settled:
+    whether the ggml path orders itself there (`internal/bench/ggml_ordered.py`, xs-213). Every raced row equals its
+    settled one where it does."""
+    from cozy_runtime.internal.bench import ggml_ordered
+
+    return _run(ggml_ordered.measure)
+
+
 def kernels_inventory(payload: EmptyRequest, ctx: Context) -> Measured:
     """Every kernel this card claims, read from the Runtime's code: the names `kernel_check` takes, each Triton set's
     entries and each module's jit functions."""

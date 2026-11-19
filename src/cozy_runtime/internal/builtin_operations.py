@@ -15,6 +15,7 @@ EXPORTS = {
         "attention_quality",
         "gemm_speed",
         "gemm_tiles",
+        "ggml_batch_shapes",
         "host_calibrate",
         "kernels_inventory",
         "kernel_check",
