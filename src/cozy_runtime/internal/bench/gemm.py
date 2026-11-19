@@ -20,6 +20,7 @@ from functools import partial
 from types import ModuleType
 from typing import TypedDict
 
+import tensorfs.varena.torch as vt
 import torch
 
 import cozy_runtime
@@ -376,21 +377,30 @@ def _ggml(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
     return calls, rules
 
 
-#: A ggml call is this many back-to-back matmuls, launched eagerly one after another: their time is the GPU's wherever
-#: a matmul outlasts its launch (every weight larger than L2), and above it where one does not. Not a graph: under varena
-#: a bench-captured graph faulted on replay (Xid 31: 44416217064 on an RTX 4080, 44420479065 on an L4, its outputs held).
+#: A ggml call is this many back-to-back matmuls replayed from one CUDA graph, as test-backend-ops times one op back
+#: to back in one graph: what is timed is the GPU's, not Python's launch.
 GGML_GRAPHED = 16
 
 
 def _graphed(call: Call) -> Call:
-    call()  # its kernels verified and their shared memory raised, before any timing
+    call()  # its kernels verified and their shared memory raised, before the recording
     torch.cuda.synchronize()
-    return partial(_back_to_back, call)
-
-
-def _back_to_back(call: Call) -> None:
-    for _ in range(GGML_GRAPHED):
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
         call()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with vt.graph(graph):  # varena refuses a raw torch.cuda.graph (44400509329: every ggml case unmeasured)
+        outs = [call() for _ in range(GGML_GRAPHED)]
+    # The replay reads `call`'s inputs and writes its outputs by raw pointer: both live as long as it does. Dropped, varena
+    # unmapped their pages and the replay faulted (Xid 31: 44416217064, 44420479065).
+    return partial(_replay, graph, [call, outs])
+
+
+def _replay(graph: torch.cuda.CUDAGraph, held: list[object]) -> None:
+    """`graph` replayed; `held`, what it reads and writes, kept alive with it."""
+    graph.replay()
 
 
 def _ggml_linear(ops: ModuleType, x: torch.Tensor, blocks: torch.Tensor, scheme: str, n: int) -> torch.Tensor:
