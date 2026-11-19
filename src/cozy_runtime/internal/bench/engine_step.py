@@ -100,6 +100,10 @@ def measure() -> dict[str, JSON]:
         row[name]["kept_a_step"] = sum(kept) / max(len(kept), 1)  # type: ignore[index]  # the dict just made
         if not drafting:
             runs["plain-sampled-again"] = decoder(sampled).tokens
+        # The same step replayed by the host, in place of the launcher's WHILE node: the same tokens.
+        replayed = Decoder(model, max_rows=4, max_tokens=1024, launcher=False)
+        runs[f"{name}-replayed"] = replayed(Request(prompts=prompts, max_new=NEW, stops=[])).tokens
+        row[name]["launcher"] = decoder.launcher  # type: ignore[index]  # the dict just made
     checks: dict[str, JSON] = {}
     wrong: list[str] = []
     for i, prompt in enumerate(prompts):
@@ -128,6 +132,10 @@ def measure() -> dict[str, JSON]:
     checks["sampled_differs_from_greedy"] = runs["plain-sampled"][0] != runs["plain"][0]
     checks["alone_plain_equal"] = runs["plain-alone"][0] == runs["plain"][0]
     checks["alone_drafted_equal"] = runs["drafted-alone"][0] == runs["drafted"][0]
+    for name in ("plain", "drafted"):
+        checks[f"{name}_replayed_equal"] = runs[f"{name}-replayed"] == runs[name]
+        if runs[f"{name}-replayed"] != runs[name]:
+            wrong.append(f"{name}: the launcher's tokens are not the host's replays' for the same step")
     row["checks"] = checks
     assert not wrong, wrong
     return row
