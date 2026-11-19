@@ -1222,6 +1222,10 @@ def _transformers(
     _pieced(cast("torch.nn.Module", _lm(model).get_decoder()))
     rows, device = int(inputs["input_ids"].shape[0]), inputs["input_ids"].device
     paged = _paged(model, device, rows, prompt + max_new_tokens)
+    if paged:
+        row = recovered("keys and values kept on the host", why=paged)
+        if row not in WARNINGS:
+            WARNINGS.append(row)
     cache = {"past_key_values": DynamicCache(config=model.config, offloading=True)} if paged else {}
     with _PLANE, torch.inference_mode(), ExitStack() as held:
         cancel = _Cancel(context, tell, _Keeper(model, held, why), prompt)
@@ -1240,20 +1244,21 @@ def _transformers(
     return out[:, prompt:]
 
 
-def _paged(model: PreTrainedModel, device: torch.device, rows: int, tokens: int) -> bool:
-    """Whether Transformers' loop keeps a call's keys and values on the host (its offloaded
-    cache, cr-344): they would outgrow the room the card has now, its capacity less what is
-    live and pinned. Each attention layer's come to the card for its own attention, the next
-    one's on their way meanwhile (`Cache.prefetch`), so a decode step reads them a layer at a
-    time; a linear-attention layer's state stays."""
+def _paged(model: PreTrainedModel, device: torch.device, rows: int, tokens: int) -> str:
+    """Why Transformers' loop keeps a call's keys and values on the host (its offloaded cache,
+    cr-344), "" where it doesn't: they would outgrow the room the card has now, its capacity less
+    what is live and pinned. Each attention layer's come to the card for its own attention, the
+    next one's on their way meanwhile (`Cache.prefetch`), so a decode step reads them a layer at
+    a time; a linear-attention layer's state stays."""
     shapes, why = _shapes(model)
     if device.type != "cuda" or why:
-        return False
+        return ""
     itemsize = model.dtype.itemsize
     each = sum(s[1] * (s[2] + s[3]) * itemsize for s in shapes if s[0] == "keys")
     room = vt.room(device.index or 0)
     left = int(room["capacity"]) - int(room["working_live"]) - int(room["pinned"])
-    return rows * tokens * each > left
+    need = rows * tokens * each
+    return f"{_gib(need)} of them beside {_gib(left)} of room" if need > left else ""
 
 
 #: What a streamed decode step needs beyond its kept weights and live memory (its cache's growth,
