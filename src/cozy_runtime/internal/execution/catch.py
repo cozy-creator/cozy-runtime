@@ -417,16 +417,17 @@ def retry(
     return again
 
 
-def refusals(device: int) -> Callable[[], tuple[int, Request | None]]:
-    """varena's count of allocations it refused on `device` that no cheaper step answered (those
-    inside `fallback` were: `vt.answered`), with the request, for the package contract's scopes."""
+def refusals(device: int) -> Callable[[], tuple[int, int, Request | None]]:
+    """varena's count of allocations it refused on `device`, of them those a cheaper step answered
+    (inside `fallback`: `vt.answered`; on a TensorFS without that count, the Runtime's retries), and
+    the request, for the package contract's scopes."""
     answered = getattr(vt, "answered", None)  # a TensorFS that counts them
 
-    def read() -> tuple[int, Request | None]:
+    def read() -> tuple[int, int, Request | None]:
         request = CURRENT.get()
         if answered is not None:
-            return vt.ooms(device) - answered(device), request
-        return vt.ooms(device) - (request.retries if request is not None else 0), request
+            return vt.ooms(device), answered(device), request
+        return vt.ooms(device), request.retries if request is not None else 0, request
 
     return read
 

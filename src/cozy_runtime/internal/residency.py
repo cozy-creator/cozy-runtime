@@ -2919,6 +2919,8 @@ class RequestStats(TypedDict):
     first_blocks: list[FirstBlock]
     regrown: int
     swallowed_ooms: int
+    #: refusals a cheaper step answered, by the package scope they came in (`contract._Scopes`)
+    answered: dict[str, int]
     retained_bytes: int
     gathered: int
     host: None
@@ -3196,6 +3198,8 @@ class Request:
         self.first_blocks: list[FirstBlock] = []
         #: refusals a package scope returned past (`contract._Scopes`): zero in a conforming run
         self.swallowed_ooms = 0
+        #: refusals a cheaper step answered, by the package scope they came in (`contract._Scopes`)
+        self.answered: dict[str, int] = {}
         #: cross-step state its loops declared (`author.retained`)
         self.retained_bytes = 0
         #: Working allocation peak over the whole request, kept across cut-site resets. Weights
@@ -3345,6 +3349,7 @@ class Request:
             "first_blocks": list(self.first_blocks),
             "regrown": self.regrown,
             "swallowed_ooms": self.swallowed_ooms,
+            "answered": dict(self.answered),
             "retained_bytes": self.retained_bytes,
             "gathered": self.gathered,
             "host": None,
