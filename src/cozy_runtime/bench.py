@@ -10,6 +10,7 @@ varena and execution suites' Runtime cells (xs-174)."""
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -205,8 +206,10 @@ def varena_core(payload: VarenaCoreRequest, ctx: Context) -> Measured:
     rows = [json.loads(line) for line in lines if line.startswith("{")]
     found = {"case": case, "exit": code, "rows": rows, "tail": lines[-40:] if code else []}
     if code:
-        # The exception first: a run's record keeps a message's start, and warnings fill a tail's.
-        error = " | ".join(line.strip() for line in lines[-8:] if line.strip())
+        # The exception first, then the frames innermost first, each path from its package: a run's
+        # record keeps only a message's start (a traceback's first lines are long paths).
+        tail = [re.sub(r'File "[^"]*/site-packages/', 'File "', line.strip()) for line in lines[-12:] if line.strip()]
+        error = " | ".join(reversed(tail))
         raise RuntimeError(f"varena case {case} failed: {error[-1500:]} :: {json.dumps(found)[-2500:]}")
     return Measured(json.dumps(found, sort_keys=True))
 
