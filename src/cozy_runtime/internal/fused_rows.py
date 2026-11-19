@@ -157,11 +157,13 @@ if not TRITON_ABSENT:
         wide,
         HEAD: tl.constexpr,
         ROWS: tl.constexpr,
+        ROUND: tl.constexpr,
     ):
-        # ROWS rows of one head's HEAD values a program. Row n of the call (`first` on) is
-        # (n // (size_1 * size_2), n // size_2 % size_1, n % size_2) over x's row axes, and its
-        # tables' entry is those times their strides. split: value j pairs with j +- HEAD / 2,
-        # else 2i with 2i + 1; wide: the tables hold a column a value, else one a pair.
+        # ROWS rows of one head's HEAD values a program, each rounded once to ROUND's dtype. Row
+        # n of the call (`first` on) is (n // (size_1 * size_2), n // size_2 % size_1, n % size_2)
+        # over x's row axes, and its tables' entry is those times their strides. split: value j
+        # pairs with j +- HEAD / 2, else 2i with 2i + 1; wide: the tables hold a column a value,
+        # else one a pair.
         rows = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)[:, None]
         cols = tl.arange(0, HEAD)[None, :]
         live = rows < n_rows
@@ -178,7 +180,7 @@ if not TRITON_ABSENT:
         table = entry + column * stride_col
         cos = tl.load(cos_ptr + table, mask=live, other=1.0)
         sin = tl.load(sin_ptr + table, mask=live, other=0.0)
-        out = x * cos + paired * sin
+        out = _round(x * cos + paired * sin, ROUND)
         tl.store(out_ptr + rows * HEAD + cols, out.to(out_ptr.dtype.element_ty), mask=live)
 
 
@@ -203,14 +205,14 @@ def _entries() -> tuple[TritonEntry, ...]:
                 norm_rows_kernel, signature, constexprs, ("x_ptr", "out_ptr", "n_cols"), _WARPS
             )
         )
-    for (pointer, _), head in itertools.product(_DTYPES.values(), HEADS):
+    for (pointer, rounding), head in itertools.product(_DTYPES.values(), HEADS):
         types = {"x_ptr": pointer, "out_ptr": pointer, "cos_ptr": "*fp32", "sin_ptr": "*fp32"}
         types |= {"split": "i32", "wide": "i32"}
         signature = {
             name: "constexpr" if name.isupper() else types.get(name, "i64")
             for name in turn_rows_kernel.arg_names
         }
-        constexprs = {"HEAD": head, "ROWS": _TURNED // head}
+        constexprs = {"HEAD": head, "ROWS": _TURNED // head, "ROUND": rounding}
         # x's rows are addressed at `row * HEAD`, from an aligned start (`turns_take`).
         found.append(TritonEntry(turn_rows_kernel, signature, constexprs, ("x_ptr", "out_ptr")))
     return tuple(found)
@@ -490,6 +492,7 @@ def turned(
             int(turn.wide),
             turn.head,
             _TURNED // turn.head,
+            _DTYPES[x.dtype][1],
         )
     return out
 
