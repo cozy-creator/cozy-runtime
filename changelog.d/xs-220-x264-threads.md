@@ -1,0 +1,1 @@
+A video save encodes with every CPU the process may use (its affinity and cgroup quota), no longer at most 8 x264 threads: a pod with 16 or more vCPUs saves faster. Hosts with different CPU counts encode different container bytes, as hosts under 8 already did; nothing reads a container digest as a gate (xs-220, hack audit runtime #8).

@@ -8,15 +8,14 @@ same typed `encoder_unavailable` refusal this release always had.
 Determinism is a pinned property, not a hope: every encoder runs with fixed settings, a
 fixed thread count and `fflags +bitexact` on the container, so one (input, wheel version,
 settings, x264 threads) tuple produces one byte sequence, held across machines by the
-locked wheel. x264's thread count is `x264_threads()`: the CPUs this process may use, under
-`X264_THREAD_CEILING`. Frame-threaded x264 restricts motion search to what earlier threads
-have finished, so the bitstream — and therefore the DECODED pixels of a lossy codec — is a
-function of the thread count. The ceiling is what makes that a plan fact rather than
-drift: every qualified pod has at least that many vCPUs and so encodes identically; a
-smaller host (a laptop, a CI runner) encodes with fewer threads and a different digest.
-Any test that pins a container digest is pinned to a thread count and must be updated
-deliberately with it. The PRE-ENCODE tensors remain the cross-platform bit-grade
-artifacts (H3 banks those digests itself); the container digest is not an output identity.
+locked wheel. x264's thread count is `x264_threads()`: the CPUs this process may use, so a
+host encodes with all of them (x264 bounds its own frame threads). Frame-threaded x264
+restricts motion search to what earlier threads have finished, so the bitstream — and
+therefore the DECODED pixels of a lossy codec — is a function of the thread count: hosts
+with different CPU counts encode different bytes. Byte identity across hosts is desirable,
+not required (Paul, 11-06), and nothing reads a container digest as a gate. The PRE-ENCODE
+tensors remain the cross-platform bit-grade artifacts (H3 banks those digests itself); the
+container digest is not an output identity.
 
 Tensor input is duck-typed — a torch tensor is drained through `.detach().cpu().numpy()`
 and an ndarray through the buffer protocol — so this module imports neither torch nor
@@ -77,12 +76,6 @@ SNAPSHOT_FACTOR = 16
 #: changes every banked container digest, so a change here is deliberate, never drift.
 _X264 = {"crf": "14", "preset": "veryfast"}
 
-#: The most x264 frame threads any host gets. It is the smallest vCPU count of a qualified
-#: H3 pod class (h3a-017), so every pod encodes with the same count and the same bytes; it
-#: also bounds x264's per-thread frame contexts on a host whose CPU count is large. Raising
-#: it changes every pod's container digest — deliberate, never drift.
-X264_THREAD_CEILING = 8
-
 #: Pinned AAC bitrate — set explicitly so a wheel-default change cannot move the output.
 _AAC_BIT_RATE = 192_000
 
@@ -100,8 +93,8 @@ _ENCODE_QUEUE_FRAMES = 16
 
 
 def x264_threads() -> int:
-    """The x264 thread count on THIS host: the CPUs this process may use, under the ceiling."""
-    return min(X264_THREAD_CEILING, cpus())
+    """The x264 thread count on THIS host: the CPUs this process may use."""
+    return cpus()
 
 
 @dataclass(frozen=True, slots=True)
