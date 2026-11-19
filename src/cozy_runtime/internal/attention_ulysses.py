@@ -85,7 +85,7 @@ type Exchange = Callable[
         ProcessGroup,
         Callable[[Tensor, Tensor, Tensor], Tensor],
         str,
-        bool | Callable[[int], bool],
+        bool | Callable[[int, int], bool],
     ],
     Tensor,
 ]
@@ -272,18 +272,19 @@ def _dispatch(backend: str, local: Local) -> BackendCall:
     return attention
 
 
-def _narrow(local: Local, query: Tensor, options: Options) -> Callable[[int], bool]:
-    """Whether a Ulysses call of `total` tokens crosses as int8: the kernel it takes (a ladder's
-    rung for `total`, the full sequence) quantizes Q, K and V itself, and so does whichever of
-    its `instead` serves the call when it refuses it (`_call`)."""
+def _narrow(local: Local, query: Tensor, options: Options) -> Callable[[int, int], bool]:
+    """Whether a Ulysses call of `total` query and `keys` key tokens crosses as int8: the kernel
+    it takes (a ladder's rung for the shorter, as `_call` picks it) quantizes Q, K and V itself,
+    and so does whichever of its `instead` serves the call when it refuses it (`_call`)."""
 
-    def narrow(total: int) -> bool:
-        taken = _rung(local, total)[1] if local.rungs else local
+    def narrow(total: int, keys: int) -> bool:
+        taken = _rung(local, min(total, keys))[1] if local.rungs else local
         if not taken.narrow:
             return False
-        whole = query.new_empty((query.shape[0], total, 1, query.shape[3]), device="meta")
+        q = query.new_empty((query.shape[0], total, 1, query.shape[3]), device="meta")
+        k = query.new_empty((query.shape[0], keys, 1, query.shape[3]), device="meta")
         while taken.refusal is not None and taken.instead is not None:
-            if not taken.refusal(whole, whole, options):
+            if not taken.refusal(q, k, options):
                 break
             taken = taken.instead[1]
         return taken.narrow
@@ -367,7 +368,7 @@ def exchange(
     handle: ProcessGroup,
     compute: Callable[[Tensor, Tensor, Tensor], Tensor],
     site: str = "",
-    narrow: bool | Callable[[int], bool] = False,
+    narrow: bool | Callable[[int, int], bool] = False,
 ) -> Tensor:
     """Sequence shards -> full sequence per head subset -> `compute` -> back
     (`internal.parallel.ulysses.exchange`)."""

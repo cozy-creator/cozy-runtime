@@ -23,13 +23,18 @@ group, so a GPU that fails between them ends its peers' wait when the group inte
 (`RankGroup.interrupt`) instead of leaving them spinning (run 13108). `start` runs an exchange on
 the exchange's own streams, ordered after the caller's work so far, and returns the event that
 ends it: Ulysses overlaps it with the attention of the head group before (`ulysses.exchange`).
+
+Each tensor of a crossing has its own send matrix (a cross-attention's queries and keys have
+different rows), so what one GPU sends another is a payload of byte segments, one a tensor
+(`_plan`), and a round moves a window of every pair's payload. A GPU's own rows never leave it.
 """
 
 from __future__ import annotations
 
 import ctypes
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from types import ModuleType
 from typing import TYPE_CHECKING
 
@@ -43,6 +48,9 @@ if TYPE_CHECKING:
     from torch import device as Device
     from torch._C._distributed_c10d import ProcessGroup, Store, _SymmetricMemory
     from torch.cuda import Event, Stream
+
+#: GPU s sends `matrix[s][d]` rows of a tensor to GPU d.
+type Matrix = Sequence[Sequence[int]]
 
 #: The exchange the group formed with, by process group; absent: NCCL.
 _BY_GROUP: dict[int, Exchange] = {}
@@ -72,11 +80,68 @@ def _drop(keep: Exchange | None = None) -> None:
     _BY_GROUP.clear()
 
 
+@dataclass(frozen=True, slots=True)
+class _Segment:
+    """One tensor's rows a GPU sends another: bytes `at` of the sender's tensor, landing at bytes
+    `into` of the receiver's, `begins` bytes into the pair's payload."""
+
+    tensor: int
+    at: int
+    into: int
+    bytes: int
+    begins: int
+
+
+def _plan(
+    widths: Sequence[int], matrices: Sequence[Matrix], world: int
+) -> list[list[list[_Segment]]]:
+    """`plan[s][d]`: GPU s's payload for GPU d, its segments in tensor order. `widths[t]`: bytes a
+    row of tensor t. Every GPU computes the same plan from the same matrices."""
+    plan: list[list[list[_Segment]]] = [[[] for _ in range(world)] for _ in range(world)]
+    for s in range(world):
+        for d in range(world):
+            begins = 0
+            for t, (width, matrix) in enumerate(zip(widths, matrices, strict=True)):
+                size = matrix[s][d] * width
+                if size:
+                    at = sum(matrix[s][:d]) * width
+                    into = sum(matrix[q][d] for q in range(s)) * width
+                    plan[s][d].append(_Segment(t, at, into, size, begins))
+                begins += size
+    return plan
+
+
+def _window(
+    segments: Sequence[_Segment], start: int, size: int
+) -> Iterator[tuple[_Segment, int, int, int]]:
+    """The parts of a payload's `segments` in its bytes [start, start + size): each segment, the
+    offset into it, the bytes, and where they sit in the window."""
+    for segment in segments:
+        low = max(segment.begins, start)
+        high = min(segment.begins + segment.bytes, start + size)
+        if low < high:
+            yield segment, low - segment.begins, high - low, low - start
+
+
+def _longest(plan: Sequence[Sequence[Sequence[_Segment]]]) -> int:
+    """The largest payload between two GPUs: every GPU takes the rounds it needs."""
+    world = len(plan)
+    return max(
+        (sum(s.bytes for s in plan[a][b]) for a in range(world) for b in range(world) if a != b),
+        default=0,
+    )
+
+
+def _bytes(tensors: Sequence[Tensor], torch: ModuleType) -> list[Tensor]:
+    return [tensor.reshape(-1).view(torch.uint8) for tensor in tensors]
+
+
 class Exchange:
-    """All-to-all over dimension 0 for a list of tensors at once, by an agreed send matrix:
-    `sends[t]` is (rows, ...) contiguous; this GPU sends `matrix[rank][p]` rows of each to GPU p,
-    in p order, and receives `matrix[s][rank]` from each s, stacked in s order. Every GPU passes
-    the same matrix and tensors of the same row shapes, so every GPU takes the same rounds."""
+    """All-to-all over dimension 0 for a list of tensors at once, each by its agreed send matrix:
+    `sends[t]` is (rows, ...) contiguous; this GPU sends `matrices[t][rank][p]` rows of it to GPU
+    p, in p order, and receives `matrices[t][s][rank]` from each s, stacked in s order. Every GPU
+    passes the same matrices and tensors of the same row shapes, so every GPU takes the same
+    rounds."""
 
     name = ""
     torch: ModuleType
@@ -87,50 +152,64 @@ class Exchange:
     def start(
         self,
         sends: Sequence[Tensor],
-        matrix: Sequence[Sequence[int]],
+        matrices: Sequence[Matrix],
         out: Sequence[Tensor],
         chunk: int = 0,
     ) -> Event:
         """The crossing on this exchange's streams after the caller's work so far; its end event.
-        `chunk` caps each round's rows per pair (0: as many as a buffer holds)."""
+        `chunk` caps each round's bytes per pair (0: as many as a buffer holds)."""
         raise NotImplementedError
 
     def close(self) -> None:
         return None
 
     def all_to_all(
-        self, sends: Sequence[Tensor], matrix: Sequence[Sequence[int]], chunk: int = 0
+        self, sends: Sequence[Tensor], matrices: Sequence[Matrix], chunk: int = 0
     ) -> list[Tensor]:
-        out = [t.new_empty((sum(row[self.rank] for row in matrix), *t.shape[1:])) for t in sends]
-        self.all_to_all_into(sends, matrix, out, chunk)
+        out = [
+            t.new_empty((sum(row[self.rank] for row in m), *t.shape[1:]))
+            for t, m in zip(sends, matrices, strict=True)
+        ]
+        self.all_to_all_into(sends, matrices, out, chunk)
         return out
 
     def all_to_all_into(
         self,
         sends: Sequence[Tensor],
-        matrix: Sequence[Sequence[int]],
+        matrices: Sequence[Matrix],
         out: Sequence[Tensor],
         chunk: int = 0,
     ) -> None:
         """The same crossing into actual preallocated receivers, on the current stream's order."""
-        done = self.start(sends, matrix, out, chunk)
+        done = self.start(sends, matrices, out, chunk)
         self.torch.cuda.current_stream(self.device).wait_event(done)
 
     def _check(
-        self, sends: Sequence[Tensor], matrix: Sequence[Sequence[int]], out: Sequence[Tensor]
+        self, sends: Sequence[Tensor], matrices: Sequence[Matrix], out: Sequence[Tensor]
     ) -> list[int]:
-        if len(out) != len(sends):
-            raise ValueError("exchange receiver count differs from its sends")
-        for tensor, target in zip(sends, out, strict=True):
+        if not len(out) == len(sends) == len(matrices):
+            raise ValueError("exchange receivers or matrices differ in count from its sends")
+        for tensor, target, matrix in zip(sends, out, matrices, strict=True):
             if (
                 not tensor.is_contiguous()
                 or not target.is_contiguous()
+                or tensor.shape[0] != sum(matrix[self.rank])
                 or target.shape != (sum(row[self.rank] for row in matrix), *tensor.shape[1:])
                 or target.dtype != tensor.dtype
                 or target.device != tensor.device
             ):
                 raise ValueError("exchange receiver differs from its declared layout")
         return [tensor.element_size() * math.prod(tensor.shape[1:]) for tensor in sends]
+
+    def _own(
+        self,
+        plan: Sequence[Sequence[Sequence[_Segment]]],
+        into: Sequence[Tensor],
+        sent: Sequence[Tensor],
+    ) -> None:
+        """This GPU's rows for itself, on the current stream."""
+        for s in plan[self.rank][self.rank]:
+            into[s.tensor][s.into : s.into + s.bytes].copy_(sent[s.tensor][s.at : s.at + s.bytes])
 
 
 class CopyEngineExchange(Exchange):
@@ -171,17 +250,17 @@ class CopyEngineExchange(Exchange):
     def start(
         self,
         sends: Sequence[Tensor],
-        matrix: Sequence[Sequence[int]],
+        matrices: Sequence[Matrix],
         out: Sequence[Tensor],
         chunk: int = 0,
     ) -> Event:
         torch = self.torch
-        widths = self._check(sends, matrix, out)
+        widths = self._check(sends, matrices, out)
         ready = torch.cuda.Event()
         ready.record(torch.cuda.current_stream(self.device))
         self.side.wait_event(ready)
         with torch.cuda.stream(self.side):
-            self._rounds(sends, matrix, out, widths, chunk)
+            self._rounds(sends, matrices, out, widths, chunk)
             done: Event = torch.cuda.Event()
             done.record(self.side)
         return done
@@ -189,65 +268,61 @@ class CopyEngineExchange(Exchange):
     def _rounds(
         self,
         sends: Sequence[Tensor],
-        matrix: Sequence[Sequence[int]],
+        matrices: Sequence[Matrix],
         out: Sequence[Tensor],
         widths: Sequence[int],
         chunk: int,
     ) -> None:
+        """Each GPU's buffer holds a region per source GPU; a round moves a window of every pair's
+        payload into its region there, between two barriers, and each GPU copies its own out."""
         torch, world, rank = self.torch, self.world, self.rank
-        chunk = min(chunk or self.buffer.numel(), self.buffer.numel() // (world * sum(widths)))
-        if chunk < 1:
-            raise ValueError(f"one row of {sum(widths)} B per GPU exceeds the exchange buffer")
-        firsts = [sum(matrix[s][rank] for s in range(q)) for q in range(world)]
+        region = self.buffer.numel() // world // 4096 * 4096
+        size = min(chunk or region, region)
+        plan = _plan(widths, matrices, world)
+        sent, into = _bytes(sends, torch), _bytes(out, torch)
         current = torch.cuda.current_stream(self.device)
-        for start in range(0, max(max(row) for row in matrix), chunk):
-            counts = [[min(max(n - start, 0), chunk) for n in row] for row in matrix]
+        self._own(plan, into, sent)
+        for start in range(0, _longest(plan), size):
             self._barrier()
             issued = torch.cuda.Event()
             issued.record(current)
             # The receive buffers are scratch: their copies bypass Python dispatch, so the
             # memory's catch never takes a block that writes them for one that writes its inputs.
             with torch._C._DisableTorchDispatch():
-                self._issue(sends, matrix, counts, start, widths, issued, current)
+                self._issue(plan, sent, start, size, region, issued, current)
             self._barrier()
-            base = 0
-            for tensor, width, into in zip(sends, widths, out, strict=True):
-                for s in range(world):
-                    rows, first = counts[s][rank], firsts[s] + start
-                    region = self.buffer[base : base + rows * width].view(tensor.dtype)
-                    into[first : first + rows].copy_(region.view(rows, *tensor.shape[1:]))
-                    base += rows * width
+            for source in range(world):
+                if source == rank:
+                    continue
+                base = source * region
+                for s, offset, n, at in _window(plan[source][rank], start, size):
+                    begin = s.into + offset
+                    into[s.tensor][begin : begin + n].copy_(self.buffer[base + at : base + at + n])
 
     def _issue(
         self,
-        sends: Sequence[Tensor],
-        matrix: Sequence[Sequence[int]],
-        counts: Sequence[Sequence[int]],
+        plan: Sequence[Sequence[Sequence[_Segment]]],
+        sent: Sequence[Tensor],
         start: int,
-        widths: Sequence[int],
+        size: int,
+        region: int,
         issued: Event,
         current: Stream,
     ) -> None:
-        """One copy-engine copy per tensor per peer for this round, each peer on its own stream."""
+        """This round's window of each peer's payload into this GPU's region of that peer's
+        buffer, each peer on its own stream."""
         torch, world, rank = self.torch, self.world, self.rank
-        for step in range(world):
+        base = rank * region
+        for step in range(1, world):
             peer = (rank + step) % world
-            rows = counts[rank][peer]
-            sent = sum(matrix[rank][:peer]) + start
-            offset = sum(counts[s][peer] for s in range(rank))
-            landing = sum(counts[s][peer] for s in range(world))
             stream = self.streams[peer]
             stream.wait_event(issued)
             with torch.cuda.stream(stream):
-                base = 0
-                for tensor, width in zip(sends, widths, strict=True):
-                    if rows:
-                        source = tensor[sent : sent + rows].reshape(-1).view(torch.uint8)
-                        begin = base + offset * width
-                        self.peers[peer][begin : begin + rows * width].copy_(
-                            source, non_blocking=True
-                        )
-                    base += landing * width
+                for s, offset, n, at in _window(plan[rank][peer], start, size):
+                    begin = s.at + offset
+                    self.peers[peer][base + at : base + at + n].copy_(
+                        sent[s.tensor][begin : begin + n], non_blocking=True
+                    )
             current.wait_stream(stream)
 
 
@@ -333,45 +408,35 @@ class HostStagedExchange(Exchange):
     def start(
         self,
         sends: Sequence[Tensor],
-        matrix: Sequence[Sequence[int]],
+        matrices: Sequence[Matrix],
         out: Sequence[Tensor],
         chunk: int = 0,
     ) -> Event:
         torch, world, rank = self.torch, self.world, self.rank
-        widths = self._check(sends, matrix, out)
-        chunk = min(chunk or self.slot, self.slot // sum(widths))
-        if chunk < 1:
-            raise ValueError(f"one row of {sum(widths)} B per GPU exceeds the exchange inbox")
-        firsts = [sum(matrix[s][rank] for s in range(q)) for q in range(world)]
-        sent = [sum(matrix[rank][:p]) for p in range(world)]
+        widths = self._check(sends, matrices, out)
+        plan = _plan(widths, matrices, world)
+        longest = _longest(plan)
+        size = min(chunk or self.slot, self.slot)
+        sent, into = _bytes(sends, torch), _bytes(out, torch)
         ready = torch.cuda.Event()
         ready.record(torch.cuda.current_stream(self.device))
         self.writes.wait_event(ready)
         self.reads.wait_event(ready)
         with torch.cuda.stream(self.reads):
-            rows = matrix[rank][rank]
-            for tensor, into in zip(sends, out, strict=True):
-                if rows:
-                    into[firsts[rank] : firsts[rank] + rows].copy_(
-                        tensor[sent[rank] : sent[rank] + rows]
-                    )
-        for start in range(0, max(max(row) for row in matrix), chunk):
-            counts = [[min(max(n - start, 0), chunk) for n in row] for row in matrix]
+            self._own(plan, into, sent)
+        for start in range(0, longest, size):
             half, self.half = self.half, self.half ^ 1
             self.writes.wait_event(self.free[half])
             # The inboxes are scratch: their writes bypass Python dispatch (`CopyEngineExchange`).
             with torch.cuda.stream(self.writes), torch._C._DisableTorchDispatch():
                 for peer in range(world):
-                    if peer != rank:
-                        region, base = self._region(self.inboxes[peer], half, rank), 0
-                        n = counts[rank][peer]
-                        for tensor, width in zip(sends, widths, strict=True):
-                            if n:
-                                rows_out = tensor[sent[peer] + start : sent[peer] + start + n]
-                                region[base : base + n * width].copy_(
-                                    rows_out.reshape(-1).view(torch.uint8), non_blocking=True
-                                )
-                            base += n * width
+                    if peer == rank:
+                        continue
+                    region = self._region(self.inboxes[peer], half, rank)
+                    for s, offset, n, at in _window(plan[rank][peer], start, size):
+                        begin = s.at + offset
+                        piece = sent[s.tensor][begin : begin + n]
+                        region[at : at + n].copy_(piece, non_blocking=True)
                 written = torch.cuda.Event()
                 written.record(self.writes)
             self.reads.wait_event(written)
@@ -379,15 +444,13 @@ class HostStagedExchange(Exchange):
                 self._barrier()
                 self.free[half ^ 1].record(self.reads)
                 for source in range(world):
-                    if source != rank:
-                        region, base = self._region(self.inboxes[rank], half, source), 0
-                        n, first = counts[source][rank], firsts[source] + start
-                        for width, into in zip(widths, out, strict=True):
-                            if n:
-                                into[first : first + n].reshape(-1).view(torch.uint8).copy_(
-                                    region[base : base + n * width], non_blocking=True
-                                )
-                            base += n * width
+                    if source == rank:
+                        continue
+                    region = self._region(self.inboxes[rank], half, source)
+                    for s, offset, n, at in _window(plan[source][rank], start, size):
+                        begin = s.into + offset
+                        landing = into[s.tensor][begin : begin + n]
+                        landing.copy_(region[at : at + n], non_blocking=True)
         done: Event = torch.cuda.Event()
         done.record(self.reads)
         return done
@@ -438,7 +501,8 @@ def form(
     matrix = [[rows // world] * world for _ in range(world)]
     try:
         # Two rounds, the second short.
-        landed = exchange.all_to_all([send], matrix, rows // world // 2 + 1)[0]
+        row = send[0].numel() * send.element_size()
+        landed = exchange.all_to_all([send], [matrix], (rows // world // 2 + 1) * row)[0]
         exact = bool(torch.equal(received, landed))
     except Exception:  # the whole group then drops it, every GPU alike
         exact = False

@@ -505,7 +505,9 @@ def _group(torch: ModuleType, rank: int, world: int, store: str, level: str) -> 
         exchange = copy_engine.CopyEngineExchange(torch, symm, dist.group.WORLD, rank, world)
         exchange.map()
         matrix = [[rows // world] * world for _ in range(world)]
-        report["copy_engines"] = bool(torch.equal(exchange.all_to_all([send], matrix)[0], expected))
+        report["copy_engines"] = bool(
+            torch.equal(exchange.all_to_all([send], [matrix])[0], expected)
+        )
     except Exception as exc:  # its first line is why the group keeps the conservative route
         report["detail"] = f"{type(exc).__name__}: {str(exc).strip().splitlines()[0][:300]}"
     agreed = torch.tensor([report["nccl_peer"], report["copy_engines"]], dtype=torch.int32).to(
