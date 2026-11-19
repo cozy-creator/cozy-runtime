@@ -4244,6 +4244,7 @@ class Executor:
                 self._emit_gemm(record, member)
                 self._emit_lora(record, member)
                 self._emit_compute(record, member)
+            self._emit_fused(record)
             for feature, instead in accel.unavailable(self.device_kind) if self.models else ():
                 record.emit(
                     "log", f"{feature} unavailable on {self.device_kind}", "info", instead=instead
@@ -4463,6 +4464,23 @@ class Executor:
                     "confession", "gemm.lora", bakes.serving, how=bakes.how or "",
                     component=prefix + component, linears=len(bakes.bakes),
                 )  # fmt: skip
+
+    @staticmethod
+    def _emit_fused(record: AuthorAttempt) -> None:
+        """`kernel.fused_rows`: each law's first-call checks this attempt ran (`execution.fused`):
+        per kind (norm or rotation) and law, the sites the kernel serves after theirs and those left
+        as written with the first reason, the worst difference seen as a share of rounding's
+        allowance (1 or less is the same computation), the values compared and the checks' time.
+        A `kernel.` name, so TensorD keeps it in the run's measurements."""
+        from cozy_runtime.internal.execution import fused
+
+        for kind, law, check in fused.taken():
+            record.emit(
+                "confession", "kernel.fused_rows", "left" if check.left else "served",
+                kind=kind, law=law, served=check.served, left=check.left,
+                worst=round(check.worst, 4), values=check.values, ms=round(check.ms, 1),
+                why=check.why,
+            )  # fmt: skip
 
     @staticmethod
     def _emit_compute(record: AuthorAttempt, member: Executor) -> None:
