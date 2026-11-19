@@ -28,7 +28,9 @@ computes them: one kernel reads `x` and writes the result. Anything else that re
 (a projection, a shape other than a scale's) computes them as they stand, the norm alone or with
 its scale, and runs as written on the result. On its proving call a norm's rows hold the eager
 values, so a reader that bypasses torch still reads the right ones; such a reader never computes
-them, and a norm whose proving rows are gone uncomputed is left as written at its next call.
+them, and a norm whose proving rows are gone uncomputed is left as written at its next call. A
+norm whose block joined no scale to its proving call's rows returns its kernel's rows computed
+from then on: deferred, they would only cost each of its readers `Rows`' dispatch.
 
 Rotations: a function an attention processor calls on its queries and keys with one `(cos, sin)`
 pair of fp32 tables (`cuts.rows` hands each call here). Its first call of each shape runs as
@@ -417,6 +419,10 @@ class _Site:
     recall: bool = False
     #: its weight is zero-centred (`fused_rows.law`'s `centred`), as its comparison found
     centred: bool = False
+    #: its block joined a scale to its rows on the proving call: later calls return them not yet
+    #: computed (`Rows`) for the block's ops to join; else computed at once, so its readers (an
+    #: LM's projections, a token a call) never pay `Rows`' dispatch
+    joined: bool = False
 
     def weight(self) -> Tensor | None:
         return None if self.weight_name is None else getattr(self.module, self.weight_name)
@@ -455,7 +461,8 @@ class _Site:
         if self.waiting is not None and not self.landed():
             return self.inner(x)  # its comparison is still on the card: as written until it lands
         if self.proven:
-            return _rows(_Pending(self, launch, x))
+            pending = _Pending(self, launch, x)
+            return _rows(pending) if self.joined else self.rows(pending)
         if vars(self.module).get(_SITE) is not self:
             return self.inner(x)  # its comparison just landed outside the law: left as written
         if self.asked is not None and self.asked() is None:
@@ -513,11 +520,12 @@ class _Site:
 
     def rows(self, pending: _Pending) -> Tensor:
         """The rows `pending` stands for. On the proving call, the eager ones, the kernel's
-        compared with them."""
+        compared with them; whether its block joined a scale to them there says whether later
+        calls defer their rows (`joined`)."""
         x, scale, shift = pending.x, pending.scale, pending.shift
         if pending.eager is not None:
             if not self.proven and not self.left and self.waiting is None:
-                self.asked = None
+                self.asked, self.joined = None, scale is not None
                 if self.recall:
                     self.proven = True
                     _checked("norm", _name(self.module), 0.0, 0.0, 0, recalled=True)
