@@ -140,7 +140,9 @@ models a request needs, from the request alone, on every machine it might send i
 })
 ```
 
-- `size`: each variable a request's cost depends on, named freely, one CEL number over `request`.
+- `size`: each variable a request's cost depends on, named freely, one CEL number over `request`,
+  0 or more: 0 is a switch off (`"rewrite": "request.prompt_upsampling ? 1.0 : 0.0"`), which
+  `measured` matches before any other variable and no ratio scales by.
   A run's record keeps them as its size; `cozy package benchmarks` writes them as its rows'
   `request`. One that gives no number for a request is left out, and the run says so once.
 - `ms`, `cold_ms`, `peak_device_bytes`, `peak_host_bytes`: optional CEL numbers over `request`,
