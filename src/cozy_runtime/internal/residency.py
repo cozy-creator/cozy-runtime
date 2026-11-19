@@ -2894,6 +2894,7 @@ class Memory:
         refused = vt.pass_mark(device, model.escape_site, shape, floor)
         self._born(model.escape_site)
         if refused is not None:
+            _census(self, model, request, device, refused)
             raise DoesNotFit(_does_not_fit(model.component, refused))
 
     @contextmanager
@@ -4015,6 +4016,166 @@ def _does_not_fit(component: str, refused: Verdict) -> str:
         f"weights), and this card has {_gib(refused['room_bytes'])}: run it smaller, or rent a "
         "larger card: `cozy run … --on new`"
     )
+
+
+def _census(memory: Memory, model: Model, request: Request, device: int, refused: Verdict) -> None:
+    """Proof only (ltx-hardest-6g, never merged): what is live and pinned on `device` as a pass is
+    refused, one `census:` line each to stderr: varena's room, each model's blocks in use, and every
+    CUDA storage a Python object reaches, largest first, with what holds it."""
+    import gc
+    import json
+    import os
+    import types
+
+    out: list[str] = []
+    say = out.append
+    began = time.monotonic()
+    try:
+        room, stats = dict(vt.room(device)), dict(vt.stats(device))
+        say("verdict " + json.dumps({k: v for k, v in dict(refused).items() if k != "sites"}))
+        say("room " + json.dumps(room))
+        keys = ("allocated_bytes", "mapped_bytes", "pending_bytes", "free_bytes", "pools_bytes",
+                "cache_mapped_bytes", "weights_resident", "unassigned_bytes", "reclaimable_bytes",
+                "host_working_bytes", "driver_reservation")
+        say("stats " + json.dumps({k: stats.get(k) for k in keys}))
+        say(f"current {sorted(request.current)} executing {[m.component for m in memory._executing]}")
+        names: dict[int, str] = {}
+        for m in list(memory.models.values()):
+            for path, sub in m.module.named_modules():
+                names[id(sub)] = f"{m.component}.{path}" if path else m.component
+            used = [b for b in m.groups() if b.count or b.retained]
+            resident = sum(
+                b.allocation_bytes for b in m.groups() if b.region is not None and b.region.resident
+            )
+            say(
+                f"model {m.component} depth={getattr(m.local, 'depth', 0)} "
+                f"running={getattr(m.local, 'running', 0)} read_held={getattr(m.local, 'held', False)} "
+                f"resident={resident} in_use={sum(b.allocation_bytes for b in used)} "
+                f"computed={sum(t.untyped_storage().nbytes() for b in m.groups() for t in b.computed())} "
+                + " ".join(f"{b.path or '<common>'}={b.allocation_bytes}/c{b.count}/r{b.retained}" for b in used[:16])
+            )
+
+        def items(value: object, depth: int = 0) -> list[Tensor]:
+            if isinstance(value, Tensor):
+                return [value]
+            if depth < 2 and isinstance(value, (tuple, list)):
+                return [t for v in value[:64] for t in items(v, depth + 1)]
+            if depth < 2 and isinstance(value, dict):
+                return [t for v in list(value.values())[:64] for t in items(v, depth + 1)]
+            return []
+
+        def ours(f: types.FrameType) -> bool:
+            return f.f_code.co_filename == __file__ and f.f_code.co_qualname.startswith("_census")
+
+        held_by: dict[int, list[str]] = {}
+        frames: list[types.FrameType] = []
+        snapshots: list[object] = []
+        for frame in sys._current_frames().values():
+            f: types.FrameType | None = frame
+            while f is not None and len(frames) < 400:
+                if not ours(f):
+                    frames.append(f)
+                    where = f"{f.f_code.co_qualname}@{os.path.basename(f.f_code.co_filename)}:{f.f_lineno}"
+                    local = f.f_locals
+                    snapshots.append(local)
+                    for name, value in list(local.items()):
+                        for t in items(value):
+                            held_by.setdefault(id(t), []).append(f"local {where}.{name}")
+                f = f.f_back
+        storages: dict[int, tuple[int, list[Tensor]]] = {}
+        for obj in gc.get_objects():
+            if not isinstance(obj, Tensor):
+                continue
+            try:
+                if obj.device.type != "cuda" or (obj.device.index or 0) != device:
+                    continue
+                storage = obj.untyped_storage()
+                ptr, nbytes = storage.data_ptr(), storage.nbytes()
+            except Exception:
+                continue
+            if ptr:
+                storages.setdefault(ptr, (nbytes, []))[1].append(obj)
+        eager = set(tensorfs._ext._varena_working_eager_blocks(device, list(storages)))
+        rows = sorted(storages.items(), key=lambda kv: -kv[1][0])
+        total = {"eager": 0, "other": 0}
+        for ptr, (nbytes, _) in rows:
+            total["eager" if ptr in eager else "other"] += nbytes
+        say(f"visible eager {total['eager']} other {total['other']} storages {len(rows)}; "
+            f"working_live {room.get('working_live')} unseen {room.get('working_live', 0) - total['eager']}")
+        big = [row for row in rows[:48] if row[1][0] >= 4 << 20]
+        targets: dict[int, object] = {id(t): t for _, (_, views) in big for t in views[:6]}
+        mine = {id(x) for x in (out, storages, held_by, frames, names, snapshots, rows, big, targets)}
+        mine.update(id(views) for _, views in storages.values())
+        mine.update(id(local) for local in snapshots)
+
+        def index(wanted: dict[int, object]) -> dict[int, list[object]]:
+            found: dict[int, list[object]] = {}
+            mine.add(id(found))
+            for o in gc.get_objects():
+                if id(o) in mine or (isinstance(o, types.FrameType) and ours(o)):
+                    continue
+                for r in gc.get_referents(o):
+                    if id(r) in wanted:
+                        found.setdefault(id(r), []).append(o)
+            return found
+
+        level1 = index(targets)
+        boxes: dict[int, object] = {
+            id(r): r for refs in level1.values() for r in refs if isinstance(r, (dict, list, tuple))
+        }
+        mine.update({id(level1), id(boxes)})
+        mine.update(id(refs) for refs in level1.values())
+        level2 = index(boxes)
+        mine.add(id(level2))
+
+        def named(o: object, ref: object) -> str | None:
+            attrs = getattr(o, "__dict__", None)
+            if isinstance(o, types.ModuleType) and attrs is ref:
+                return f"module {o.__name__}"
+            if attrs is ref:
+                return names.get(id(o), type(o).__qualname__)
+            if isinstance(attrs, dict):
+                for attr, v in attrs.items():
+                    if v is ref:
+                        return f"{names.get(id(o), type(o).__qualname__)}.{attr}"
+            return None
+
+        def owner(ref: object, t: object) -> str:
+            if isinstance(ref, types.FrameType):
+                return f"frame {ref.f_code.co_qualname}:{ref.f_lineno}"
+            up = level2.get(id(ref), [])
+            where = next((n for o in up if (n := named(o, ref)) is not None), None)
+            if isinstance(ref, dict):
+                key = next((k for k, v in ref.items() if v is t), "?")
+                return f"{where}[{key!r}]" if where else f"dict({len(ref)})[{key!r}] in {[type(o).__qualname__ for o in up[:3]]}"
+            if isinstance(ref, (list, tuple)):
+                at = next((i for i, v in enumerate(ref) if v is t), "?")
+                inside = where or str([names.get(id(o), type(o).__qualname__) for o in up[:3]])
+                return f"{type(ref).__name__}({len(ref)})[{at}] in {inside}"
+            label = names.get(id(ref), type(ref).__qualname__)
+            attrs = getattr(ref, "__dict__", None)
+            if isinstance(attrs, dict):
+                key = next((k for k, v in attrs.items() if v is t), None)
+                if key is not None:
+                    return f"{label}.{key}"
+            return label
+
+        for ptr, (nbytes, views) in big:
+            seen: list[str] = []
+            for t in views[:6]:
+                seen.extend(held_by.get(id(t), []))
+                seen.extend(owner(ref, t) for ref in level1.get(id(t), []))
+            shapes = sorted({(tuple(t.shape), str(t.dtype).removeprefix("torch.")) for t in views[:6]})
+            uniq = list(dict.fromkeys(seen))[:8]
+            say(
+                f"{'eager' if ptr in eager else 'other'} {nbytes} {shapes[:3]} views={len(views)} "
+                f"held: {' | '.join(uniq) or 'no Python holder found'}"
+            )
+    except Exception as exc:
+        say(f"failed: {type(exc).__name__}: {exc}")
+    say(f"took {time.monotonic() - began:.1f} s")
+    sys.stderr.write("".join(f"census: {line[:600]}\n" for line in out))
+    sys.stderr.flush()
 
 
 def _escaped_warnings(records: list[EscapeRecord]) -> None:
