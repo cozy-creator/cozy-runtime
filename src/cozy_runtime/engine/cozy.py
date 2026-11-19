@@ -6,7 +6,9 @@ which engine served it, and why not this one, in the run record's `<model>.engin
 
 It serves a CUDA Qwen3.5 text call: text-only questions, at most `ROWS` rows, no repeat-n-gram cut,
 on a dense model whose step linears are all of `LANES`, with a TensorFS that has the K/V cache, once
-the model's kernel set has landed (`install`: built while it loads, never on a request). The
+the model's kernel set has landed (`install`: built while it loads, never on a request) and this
+driver's launch path is known (`engine.launcher`: the WHILE-node launcher, else the host replaying
+the step's graph, else none, checked in a child process). The
 questions are read as Transformers' engine reads them (its chat template and tokenizer), each row's
 text is handed on as it comes (at most every `STREAM_S`), and stops are cut as `VisionLM.ask` cuts
 them.
@@ -20,6 +22,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 
+from cozy_runtime.engine import launcher
 from cozy_runtime.engine.decoder import Decoder, Request, Short, answered, short_of_room
 from cozy_runtime.engine.launch import Run
 from cozy_runtime.engine.qwen35 import text_of
@@ -110,6 +113,8 @@ class CozyEngine:
         self.run: Run | None = None
         #: that set's name, while it builds
         self.building = ""
+        #: the model's card (its plan's)
+        self.index = 0
 
     def install(self, plan: Plan) -> str:
         """The model's kernel set (`engine.kernels`), built while the model loads: the engine serves
@@ -121,6 +126,8 @@ class CozyEngine:
         self.unserved = serves(self.model)
         if self.unserved:
             return ""
+        self.index = torch.device(plan.device).index or 0
+        launcher.judge(self.index)  # which launch path this driver runs, in a child process, beside the load
         try:
             shapes = kernels.shapes_of(self.model)
             made = kernels.kernels_for(shapes)
@@ -150,6 +157,11 @@ class CozyEngine:
             return self.unserved
         if self.run is None:
             return f"the engine's kernels ({self.building}) are building"
+        paths = launcher.judged(self.index)
+        if paths is None:
+            return "the engine's launcher is being checked on this driver"
+        if paths.launcher and paths.replayed:
+            return f"this driver runs neither of the engine's launch paths: {paths.launcher}; {paths.replayed}"
         if any(not isinstance(p, str) for q in questions for p in q.everything()):
             return "the engine's prefill reads text only"
         if params.allowed is not None:
@@ -199,7 +211,8 @@ class CozyEngine:
         if self.decoder is None:
             assert self.run is not None  # `_why` serves no call before the set lands
             try:
-                self.decoder = Decoder(self.model, max_rows=ROWS, run=self.run)
+                paths = cast("launcher.Paths", launcher.judged(self.index))  # `_why`: judged, one serves
+                self.decoder = Decoder(self.model, max_rows=ROWS, run=self.run, launcher=not paths.launcher)
             except Exception as exc:
                 if not short_of_room(exc):
                     raise
@@ -245,7 +258,7 @@ class CozyEngine:
         self._note(
             f"{made_tokens} tokens after {sum(len(p) for p in prompts)} by the engine: prefill {out.prefill_s:.3f} s, "
             f"then {1000 * out.decode_s / max(out.steps, 1):.2f} ms a step over {out.steps} steps "
-            f"({sum(kept) / max(len(kept), 1):.2f} tokens a step a row, {'captured' if out.captured else 'eager'})"
+            f"({sum(kept) / max(len(kept), 1):.2f} tokens a step a row, {'captured' if out.captured else 'eager'}, {self._path()})"
         )
         return Final(
             texts=[t.answer for t in told],
@@ -254,6 +267,13 @@ class CozyEngine:
             usage=Usage(sum(len(p) for p in prompts), made_tokens),
             timings={"prefill": out.prefill_s, "decode": out.decode_s, "steps": float(out.steps), "captured": float(out.captured)},
         )
+
+    def _path(self) -> str:
+        """The launch path the decoder serves on, and why where it is not the launcher."""
+        if self.decoder is None or self.decoder.launcher:
+            return "launched"
+        paths = launcher.judged(self.index)
+        return f"host-replayed: the launcher {paths.launcher if paths is not None else 'unchecked'}"
 
     def _note(self, text: str) -> None:
         """The call's engine in the run record, beside lm's `<model>.lm`, and the executor's log."""

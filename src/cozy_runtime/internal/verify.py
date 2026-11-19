@@ -115,6 +115,36 @@ def verified(kernel: str, artifact: str, sm: int, probe: Callable[[], Verdict]) 
     return known
 
 
+@contextmanager
+def guarded(kernel: str, artifact: str, sm: int) -> Iterator[None]:
+    """A block that may crash its process outside any probe (a kernel's first real launch): its
+    marker is held while it runs, so a crash refuses `kernel` in this boot's next processes of this
+    Runtime build here (`crashed`), as a probe's does."""
+    key = (kernel, artifact, sm, accel.driver_version(), RUNTIME)
+    path = _path(key)
+    if path is not None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            path = None
+    if path is None:
+        yield
+        return
+    with _armed(path.parent) as crash:
+        _write(path, key, Verdict(False, CRASHED), crash)
+        try:
+            yield
+        finally:
+            path.unlink(missing_ok=True)
+
+
+def crashed(kernel: str, artifact: str, sm: int) -> bool:
+    """Whether a probe or a `guarded` block of `kernel` crashed an earlier process of this Runtime
+    build here, this boot."""
+    path = _path((kernel, artifact, sm, accel.driver_version(), RUNTIME))
+    return path is not None and _crashed(path)
+
+
 def _probed(key: Key, probe: Callable[[], Verdict]) -> Verdict:
     path = _path(key)
     if path is None:
