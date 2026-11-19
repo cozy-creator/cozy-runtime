@@ -106,8 +106,8 @@ if TYPE_CHECKING:
     from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
 
     from cozy_runtime.author._model import Residency, WarningRow
-    from cozy_runtime.internal.execution import sizing
     from cozy_runtime.graphs.domain import Domain
+    from cozy_runtime.internal.execution import sizing
     from cozy_runtime.internal.residency import Binding, Region
 
 try:
@@ -1562,7 +1562,7 @@ def _pieced(decoder: torch.nn.Module) -> None:
     cache. A call it can't cut (a row padded, an input not one per token) runs whole."""
     if vars(decoder).get("_cozy_pieced"):
         return
-    forward, config = decoder.forward, getattr(decoder, "config", None)
+    forward = decoder.forward
     site = f"{type(decoder).__name__}:prefill"
 
     def cut(*args: Any, **kwargs: Any) -> Any:  # the decoder's own signature
@@ -1581,7 +1581,8 @@ def _pieced(decoder: torch.nn.Module) -> None:
             return forward(*args, **kwargs)
         rows, length = (int(n) for n in tokens.shape[:2])
         chunks = -(-length // PREFILL_ALIGN)
-        if not _cuttable(kwargs, (rows, length)) or not _empty(cache):
+        config = getattr(decoder, "config", None)  # read as Transformers reads it, at each call
+        if not _cuttable(kwargs, (rows, length), config) or not _empty(cache):
             return forward(**kwargs)
         from cozy_runtime.internal.execution import catch, sizing  # it imports the Runtime's own
 
@@ -1635,10 +1636,10 @@ def _prefill_level(
     return out
 
 
-#: The tensors of the `generate` call running now (`_given`): a prefill's pieces never write
-#: over them.
-_GIVEN: contextvars.ContextVar[tuple[torch.Tensor, ...]] = contextvars.ContextVar(
-    "cozy_lm_given", default=()
+#: The tensors of the Runtime `generate` call running now (`_given`), none outside one: a
+#: prefill's pieces never write over them.
+_GIVEN: contextvars.ContextVar[tuple[torch.Tensor, ...] | None] = contextvars.ContextVar(
+    "cozy_lm_given", default=None
 )
 
 
@@ -1652,9 +1653,15 @@ def _given(inputs: Mapping[str, object]) -> Iterator[None]:
 
 
 def _caller(tensor: torch.Tensor) -> bool:
-    """Whether `tensor` shares its storage with one of the running call's own inputs."""
+    """Whether a tensor handed to the decoder is a caller's own. In a Runtime `generate` call
+    Transformers made it for that call (a wrapper's embeddings, `prepare_inputs_for_generation`'s
+    clone of given ones), unless it shares its storage with one of the call's inputs. Outside
+    one an author's own code called the model, and may read what it gave again."""
+    given = _GIVEN.get()
+    if given is None:
+        return True
     at = tensor.untyped_storage().data_ptr()
-    return any(given.untyped_storage().data_ptr() == at for given in _GIVEN.get())
+    return any(one.untyped_storage().data_ptr() == at for one in given)
 
 
 def _prefill_need(
@@ -1723,17 +1730,23 @@ def _emptied(cache: Cache) -> None:
                 layer.cumulative_length = 0
 
 
-def _cuttable(kwargs: Mapping[str, object], shape: tuple[int, int]) -> bool:
+def _cuttable(kwargs: Mapping[str, object], shape: tuple[int, int], config: object) -> bool:
     """Whether a decoder call can go in pieces: it returns its outputs as a dict, keeps no
-    per-layer outputs, no row is padded (a linear-attention layer masks padding in a prompt's
-    first call only), and every tensor of it is one per token or a position."""
+    per-layer outputs (by the call's own word, else its decoder's config's, as Transformers'
+    output capture takes them), no row is padded (a linear-attention layer masks padding in a
+    prompt's first call only), and every tensor of it is one per token or a position."""
+
+    def said(name: str) -> object:
+        own = kwargs.get(name)
+        return getattr(config, name, None) if own is None else own
+
     mask = kwargs.get("attention_mask")
     flat = isinstance(mask, torch.Tensor) and mask.ndim == 2
     unpadded = mask is None or (flat and bool(cast("torch.Tensor", mask).all()))
     return (
-        kwargs.get("return_dict") is not False
-        and not kwargs.get("output_hidden_states")
-        and not kwargs.get("output_attentions")
+        said("return_dict") is not False
+        and not said("output_hidden_states")
+        and not said("output_attentions")
         and unpadded
         and all(
             not isinstance(value, torch.Tensor)
