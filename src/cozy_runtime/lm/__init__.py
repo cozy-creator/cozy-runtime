@@ -9,15 +9,19 @@ The prompt prefills through the model's own forward into a static cache: keys an
 buffers, and a linear-attention layer's conv and recurrent state, which are fixed already. Every
 later token is one replay of a CUDA graph of the one-token step, captured per (batch, window):
 the window is the attention length, a power of two that grows with the sequence. The step picks
-its token on the GPU (greedy, or sampled at a temperature and top-p from a seed, with an optional
-presence penalty), writes it where the next step reads it and advances its own positions, so
+its token on the GPU, writes it where the next step reads it and advances its own positions, so
 replays queue back to back and the host reads the stop flag a few steps behind.
 
-A sampled token is a Gumbel-max draw: the argmax, over the top-p nucleus, of the scores over the
-temperature plus Gumbel noise hashed from (seed, the token's index, the vocabulary entry). A
-draw depends only on its own row's scores, seed and position, so it replays inside a graph, does
-not depend on what else is in the batch, and a drafted token is verified exactly as a greedy
-one. Temperature 0 is the plain argmax.
+A token is picked as vLLM 0.19.1's sampler picks it (`cozy_runtime.sampling`): bans (`allowed`,
+`no_repeat_ngram`), then the penalties, then the argmax at temperature 0, else a draw after the
+temperature, min-p, top-k and top-p from noise hashed from (seed, the token's index, the vocabulary
+entry). A draw depends only on its own row's scores, seed and position, so it replays inside a
+graph and does not depend on what else is in the batch; a drafted token is kept only where it is
+the token the model draws there with the same noise, so a drafted call draws from the same
+distribution as a plain one. Neither repeats bit for bit on every GPU: the verify pass rounds
+otherwise than the one-token step, which can turn a near tie (greedy Qwen3.5-9B split at a margin of
+0.125), and two plain sampled calls at one seed have split on a 4090 while greedy calls and eager
+forwards repeated exactly (cr-346).
 
 A cached graph keeps only its weights' addresses; a driver's lease (`_hold`) brings their pages
 back. Offload retires the graph before those addresses change; a later call can refill and capture
@@ -43,7 +47,8 @@ the mask after it is written.
 
 With a `draft` (a model's multi-token-prediction head) a step drafts `DEPTH` tokens, the model
 verifies them and the token after them in one pass, and the step keeps the prefix the model
-agrees with and the model's own token after it: the greedy tokens the model alone gives, one to
+agrees with and the model's own token after it: the tokens the model alone gives, greedy or drawn
+(each draft is drawn with the noise the model's token at its index is drawn with), one to
 `DEPTH + 1` of them a replay. Keys past the kept prefix are masked and overwritten, and every
 linear-attention layer's state goes back to the kept prefix's end (the pass keeps its state
 after each token).
@@ -74,6 +79,7 @@ from cozy_runtime.author._errors import Cancelled, DoesNotFit, Fault, fault, is_
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded, recovered
 from cozy_runtime.author._services import counting, stage_tokens
 from cozy_runtime import graphs as _graphs
+from cozy_runtime import sampling as sampler
 from cozy_runtime.graphs import (
     BYPASS,
     DECODERS,
@@ -286,9 +292,12 @@ def generate(
     stop: Sequence[int],
     pad: int | None = None,
     presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
     temperature: float = 0.0,
     top_p: float = 1.0,
     top_k: int = 0,
+    min_p: float = 0.0,
     seed: int = 0,
     draft: torch.nn.Module | None = None,
     allowed: Constraint | None = None,
@@ -298,18 +307,23 @@ def generate(
 ) -> torch.Tensor:
     """Tokens after the prompt, `[batch, n]` (`model.generate(...)`'s tail): `inputs` as the
     processor returned them, generation ends at a `stop` token or after `max_new_tokens`, and a
-    row that stopped early continues as `pad` (default: the first stop). `presence_penalty`
-    subtracts that much from every token already generated (vLLM's). `temperature` 0 is greedy;
-    above it, each token is drawn from the `top_p` nucleus at that temperature, from `seed`: the
-    same prompt and seed give the same tokens. `top_k` above 0 first keeps a sampling row's `top_k`
-    largest logits, before the presence penalty; greedy decoding ignores it.
+    row that stopped early continues as `pad` (default: the first stop).
+    Each token is picked as vLLM 0.19.1 picks it, each setting as its `SamplingParams` defines
+    it: bans first (`allowed`, `no_repeat_ngram`); then the penalties, greedy or sampled:
+    `repetition_penalty` divides a positive logit and multiplies a negative one of every token in
+    the prompt or generated so far (1 is none), `frequency_penalty` subtracts that much for each
+    time a token was generated, `presence_penalty` that much from every token generated (both in
+    [-2, 2]). `temperature` 0 is then the argmax; above it, the logits over `temperature`, less
+    every token below `min_p` times the likeliest's probability (0 is none), outside the `top_k`
+    largest (0 is all) and outside the `top_p` nucleus of what is left, and a draw from what
+    remains from `seed`: the same logits and seed give the same token (on a GPU, sampled calls
+    are not reproducible bit for bit run to run; greedy ones have been). A drafted step draws as an
+    undrafted one.
     `allowed` (`Constraint`) constrains every row: each token outside
-    `allowed.allowed(its tokens so far)` is out before `top_k`, the presence penalty, temperature
-    and top-p, greedy or sampled, drafted or not. The host asks it between steps, so a
+    `allowed.allowed(its tokens so far)` is out. The host asks it between steps, so a
     constrained batch's steps do not queue ahead of it.
     `no_repeat_ngram` n bans, in each row, every token that would complete an n-gram the row
-    already holds, its prompt included (Transformers' `no_repeat_ngram_size`), as `allowed`'s
-    bans come: before `top_k`, the presence penalty and sampling, drafted or not.
+    already holds, its prompt included (Transformers' `no_repeat_ngram_size`).
     `draft(embeds, hidden, position_ids, past_key_values, attention_mask, rotary) -> hidden` is
     the model's multi-token-prediction head (`Draft`): from a token's embedding and the state the
     model's head read before it, the state the head reads for the token after; `rotary` is the
@@ -328,16 +342,23 @@ def generate(
         if named is not None:
             draft = named
             break
-    if not (temperature >= 0 and 0 < top_p <= 1 and 0 <= seed < 1 << 63 and top_k >= 0):
-        raise ValueError(
-            f"temperature {temperature}, top_p {top_p}, top_k {top_k}, seed {seed}: out of range"
-        )
+    sampling = _Sampling(
+        float(temperature),
+        float(top_p),
+        int(seed),
+        0 if top_k == -1 else int(top_k),  # vLLM's -1 is 0: all
+        float(min_p),
+        float(presence_penalty),
+        float(frequency_penalty),
+        float(repetition_penalty),
+    )
+    if why := sampling.out_of_range():
+        raise ValueError(why)
     ngram = int(no_repeat_ngram or 0)
     if ngram < 0:
         raise ValueError(f"no_repeat_ngram {no_repeat_ngram}: none, or at least 1")
     if progress is None and (stage := stage_tokens()) is not None:
         progress = partial(_share, stage, max_new_tokens)
-    sampling = _Sampling(float(temperature), float(top_p), int(seed), int(top_k))
     tell = _Tell(progress, streamed)
     stops = [int(token) for token in stop]
     filler = stops[0] if pad is None else int(pad)
@@ -350,15 +371,13 @@ def generate(
         if row not in WARNINGS:
             WARNINGS.append(row)
         with contract.owned():  # the Runtime's own use of Transformers' loop and caches
-            said = (model, inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell)
+            said = (model, inputs, max_new_tokens, stops, filler, sampling, tell)
             return _transformers(*said, allowed, ngram)
     with _ENGINES_LOCK:
         engine = _ENGINES.get(model)
         if engine is None:
             engine = _ENGINES[model] = _Engine(model)
-    request = _Request(
-        inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell, allowed, ngram
-    )
+    request = _Request(inputs, max_new_tokens, stops, filler, sampling, tell, allowed, ngram)
     token = BYPASS.set(True)  # the component's calls are this loop's, its graphs its own
     try:
         with torch.inference_mode(), contract.owned():
@@ -915,23 +934,45 @@ type _Shape = (
 
 
 class _Sampling(NamedTuple):
-    """A call's sampling: greedy at temperature 0."""
+    """A call's sampling (`generate`), each setting as vLLM's `SamplingParams` defines it:
+    greedy at temperature 0, which then ignores `top_p`, `top_k` and `min_p` (vLLM's too)."""
 
     temperature: float
     top_p: float
     seed: int
     top_k: int = 0
+    min_p: float = 0.0
+    presence: float = 0.0
+    frequency: float = 0.0
+    repetition: float = 1.0
+
+    def out_of_range(self) -> str:
+        """Why vLLM's `SamplingParams._verify_args` would refuse it, "" if it would not."""
+        if (
+            self.temperature >= 0
+            and 0 < self.top_p <= 1
+            and 0 <= self.seed < 1 << 63
+            and self.top_k >= 0
+            and 0 <= self.min_p <= 1
+            and -2 <= self.presence <= 2
+            and -2 <= self.frequency <= 2
+            and self.repetition > 0
+        ):
+            return ""
+        return (
+            f"temperature {self.temperature}, top_p {self.top_p}, top_k {self.top_k}, min_p "
+            f"{self.min_p}, presence_penalty {self.presence}, frequency_penalty {self.frequency}, "
+            f"repetition_penalty {self.repetition}, seed {self.seed}: out of range"
+        )
+
+    def kept(self) -> tuple[float, int, float]:
+        """`top_p`, `top_k` and `min_p` as a row samples them: none cut a greedy row."""
+        return (self.top_p, self.top_k, self.min_p) if self.temperature > 0 else (1.0, 0, 0.0)
 
 
-#: A step's graph: (rows, window, drafted, sampled, the most logits a sampling row keeps,
-#: constrained, and a constrained drafted step's part: each draft, then the verify; else -1).
-_Key = tuple[int, int, bool, bool, int, bool, int]
-
-
-def _top_k(scores: torch.Tensor, k: int) -> torch.Tensor:
-    """`scores` (`[..., vocab]`) with all but each row's `k` largest at -inf (ties kept)."""
-    kth = scores.topk(min(k, scores.shape[-1]), dim=-1).values[..., -1:]
-    return scores.masked_fill(scores < kth, float("-inf"))
+#: A step's graph: (rows, window, drafted, sampled, constrained, and a constrained drafted step's
+#: part: each draft, then the verify; else -1).
+_Key = tuple[int, int, bool, bool, bool, int]
 
 
 def _ids(constraint: Constraint, tokens: Sequence[int], vocab: int) -> torch.Tensor:
@@ -977,75 +1018,58 @@ def _pack(ids: torch.Tensor, out: torch.Tensor) -> None:
     out.copy_((bits.view(-1, 8) << torch.arange(8, dtype=torch.uint8)).sum(-1, dtype=torch.uint8))
 
 
-_LOW32 = 0xFFFFFFFF
-
-
-def _times(x: torch.Tensor, constant: int) -> torch.Tensor:
-    """`x * constant` mod 2**32 for 32-bit values held in int64, with no int64 overflow."""
-    return (x * (constant & 0xFFFF) + (((x * (constant >> 16)) & 0xFFFF) << 16)) & _LOW32
-
-
-def _mix(x: torch.Tensor) -> torch.Tensor:
-    """A 32-bit integer hash (Wellons' lowbias32): the same bits on every device."""
-    x = x ^ (x >> 16)
-    x = _times(x, 0x7FEB352D)
-    x = x ^ (x >> 15)
-    x = _times(x, 0x846CA68B)
-    return x ^ (x >> 16)
-
-
-def _draw(
-    scores: torch.Tensor,
-    temperature: torch.Tensor,
-    top_p: torch.Tensor,
-    seed: torch.Tensor,
-    index: torch.Tensor,
-) -> torch.Tensor:
-    """Each row's sampled token from `scores` (`[rows, ..., vocab]`, float32): the argmax over the
-    `top_p` nucleus of scores / `temperature` plus Gumbel noise hashed from (`seed`, `index`, the
-    vocabulary entry). `temperature`, `top_p` and `seed` are per row; `index` is the token's
-    position in the row's output, shaped as `scores` without its vocabulary."""
-    lead = (-1, *[1] * (scores.dim() - 1))
-    z = scores / temperature.clamp(min=1e-6).view(lead)
-    ordered, order = z.sort(-1, descending=True)
-    probabilities = ordered.softmax(-1)
-    cut = (probabilities.cumsum(-1) - probabilities >= top_p.view(lead)) & (top_p.view(lead) < 1)
-    outside = torch.zeros_like(cut).scatter_(-1, order, cut)
-    base = _mix(_mix(seed & _LOW32) ^ ((seed >> 32) & _LOW32)).view(lead)
-    key = _mix(base ^ _mix(index[..., None] & _LOW32))
-    entry = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.long)
-    bits = _mix(key ^ _mix(entry))
-    # Below 1: float32 rounds the top hash value to 1, whose noise is +inf (that entry would win
-    # at any score, or give NaN, which argmax takes, on a score at -inf).
-    uniform = (((bits >> 8).float() + 0.5) * (1.0 / (1 << 24))).clamp_(max=1 - 2**-24)
-    noise = -torch.log(-torch.log(uniform))
-    return (z + noise).masked_fill_(outside, float("-inf")).argmax(-1)
-
-
-class _Draw:
-    """Sampling as a Transformers logits processor, for `_transformers`: every score but the
-    drawn token's is -inf, so its greedy loop takes the draw."""
-
-    def __init__(self, prompt: int, sampling: _Sampling) -> None:
-        self.prompt, self.sampling = prompt, sampling
-
-    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
-        rows, device = int(scores.shape[0]), scores.device
-        at = int(input_ids.shape[1]) - self.prompt
-        index = torch.full((rows,), at, dtype=torch.long, device=device)
-        token = _draw(scores.float(), *_per_row(self.sampling, rows, device), index)
-        return torch.full_like(scores, float("-inf")).scatter_(1, token[:, None], 0.0)
+type _Picking = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 def _per_row(
     sampling: _Sampling, rows: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """`sampling` as `_draw`'s per-row temperature, top-p and seed."""
-    return (
-        torch.full((rows,), sampling.temperature, dtype=torch.float32, device=device),
-        torch.full((rows,), sampling.top_p, dtype=torch.float32, device=device),
-        torch.full((rows,), sampling.seed, dtype=torch.long, device=device),
+) -> tuple[_Picking, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """`sampling` as per-row tensors: `sampler.pick`'s temperature, top-p, top-k, min-p and seed,
+    and `sampler.penalized`'s presence, frequency and repetition penalties."""
+    f32, long = torch.float32, torch.long
+    top_p, top_k, min_p = sampling.kept()
+
+    def full(value: float, dtype: torch.dtype) -> torch.Tensor:
+        return torch.full((rows,), value, dtype=dtype, device=device)
+
+    picking: _Picking = (
+        full(sampling.temperature, f32),
+        full(top_p, f32),
+        full(top_k, long),
+        full(min_p, f32),
+        full(sampling.seed, long),
     )
+    penalties = (
+        full(sampling.presence, f32),
+        full(sampling.frequency, f32),
+        full(sampling.repetition, f32),
+    )
+    return picking, penalties
+
+
+class _Pick:
+    """Penalties and sampling as one Transformers logits processor, for `_transformers`, after
+    its bans: every score but the picked token's is -inf, so its greedy loop takes the pick."""
+
+    def __init__(self, inputs: Mapping[str, torch.Tensor], sampling: _Sampling) -> None:
+        ids = inputs["input_ids"]
+        mask = inputs.get("attention_mask")
+        self.prompt, self.sampling = int(ids.shape[1]), sampling
+        self.ids, self.mask = ids, torch.ones_like(ids) if mask is None else mask
+        self.prompted: torch.Tensor | None = None
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        rows, vocab, device = int(scores.shape[0]), int(scores.shape[-1]), scores.device
+        if self.prompted is None:
+            self.prompted = sampler.prompted(self.ids.to(device), self.mask.to(device), vocab)
+        generated = input_ids[:, self.prompt :].to(device)
+        counts = torch.zeros((rows, vocab + 1), dtype=torch.float32, device=device)
+        counts.scatter_add_(1, generated.clamp(max=vocab), torch.ones_like(generated).float())
+        picking, penalties = _per_row(self.sampling, rows, device)
+        scores = sampler.penalized(scores.float(), counts[:, :vocab], self.prompted, *penalties)
+        index = torch.full((rows,), int(generated.shape[1]), dtype=torch.long, device=device)
+        token = sampler.pick(scores, *picking, index, self.sampling.temperature > 0)
+        return torch.full_like(scores, float("-inf")).scatter_(1, token[:, None], 0.0)
 
 
 class _Allowed:
@@ -1064,56 +1088,29 @@ class _Allowed:
         return scores.masked_fill(~keep.to(scores.device), float("-inf"))
 
 
-class _TopK:
-    """`top_k` as a Transformers logits processor, for `_transformers`."""
-
-    def __init__(self, k: int) -> None:
-        self.k = k
-
-    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
-        return _top_k(scores, self.k)
-
-
-class _Presence:
-    """`presence_penalty` as a Transformers logits processor, for `_transformers`."""
-
-    def __init__(self, prompt: int, penalty: float) -> None:
-        self.prompt, self.penalty = prompt, penalty
-
-    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
-        generated = input_ids[:, self.prompt :]
-        if not generated.shape[1]:
-            return scores
-        seen = torch.zeros_like(scores).scatter_(1, generated, 1.0)
-        return scores - self.penalty * seen
-
-
 def _transformers(
     model: PreTrainedModel,
     inputs: Mapping[str, torch.Tensor],
     max_new_tokens: int,
     stops: list[int],
     pad: int,
-    penalty: float,
-    sampling: _Sampling,
+    picking: _Sampling,
     tell: _Tell,
     allowed: Constraint | None = None,
     ngram: int = 0,
     why: str = "",
 ) -> torch.Tensor:
-    """`why`: what sent the call here, said with its tokens a second in the run record."""
+    """`why`: what sent the call here, said with its tokens a second in the run record. A
+    repetition penalty of the call's own replaces its generation config's, as a vLLM request's
+    replaces the checkpoint's default."""
     prompt = int(inputs["input_ids"].shape[1])
-    processors: list[_Allowed | _TopK | _Presence | _Draw | NoRepeatNGramLogitsProcessor] = (
+    processors: list[_Allowed | _Pick | NoRepeatNGramLogitsProcessor] = (
         [] if allowed is None else [_Allowed(prompt, allowed, stops)]
     )
     if ngram:
         processors.append(NoRepeatNGramLogitsProcessor(ngram))
-    if sampling.temperature > 0 and sampling.top_k:
-        processors.append(_TopK(sampling.top_k))
-    if penalty:
-        processors.append(_Presence(prompt, penalty))
-    if sampling.temperature > 0:
-        processors.append(_Draw(prompt, sampling))
+    processors.append(_Pick(inputs, picking))
+    own: dict[str, float] = {} if picking.repetition == 1 else {"repetition_penalty": 1.0}
     context = CURRENT.get()
     with _PLANE, torch.inference_mode(), ExitStack() as held:
         cancel = _Cancel(context, tell, _Keeper(model, held, why), prompt)
@@ -1125,6 +1122,7 @@ def _transformers(
             pad_token_id=pad,
             logits_processor=LogitsProcessorList(processors),
             stopping_criteria=StoppingCriteriaList([cancel]),
+            **own,
         )
         cancel.keeper.report(prompt, cancel.steps)
     return out[:, prompt:]
@@ -1687,7 +1685,8 @@ def _like[L: (_Keys, _State)](mine: L, theirs: _Keys | _State) -> L:
 
 class _Prefill:
     """A call's prompt through the model: its own cache, mask and positions, each row's first
-    token and, drafting, the head's keys for the prompt and its state after it."""
+    token, its prompt's tokens (`sampler.prompted`) and, drafting, the head's keys for the prompt
+    and its state after it."""
 
     def __init__(
         self,
@@ -1695,13 +1694,15 @@ class _Prefill:
         mask: torch.Tensor,
         position: torch.Tensor | None,
         token: torch.Tensor,
+        prompted: torch.Tensor,
         drafted: tuple[_Keys, torch.Tensor] | None,
     ) -> None:
-        self.cache, self.mask, self.position, self.token, self.drafted = (
+        self.cache, self.mask, self.position, self.token, self.prompted, self.drafted = (
             cache,
             mask,
             position,
             token,
+            prompted,
             drafted,
         )
 
@@ -1731,7 +1732,6 @@ class _Request:
         max_new: int,
         stops: list[int],
         pad: int,
-        penalty: float,
         sampling: _Sampling,
         tell: _Tell,
         allowed: Constraint | None = None,
@@ -1744,12 +1744,11 @@ class _Request:
         self.prompts: list[list[int]] = inputs["input_ids"].tolist() if ngram else []
         #: each row's first token's bans, from its prompt alone
         self.banned: list[list[int]] = []
-        self.inputs, self.max_new, self.stops, self.pad, self.penalty, self.sampling = (
+        self.inputs, self.max_new, self.stops, self.pad, self.sampling = (
             inputs,
             max_new,
             stops,
             pad,
-            penalty,
             sampling,
         )
         self.tell = tell
@@ -1833,12 +1832,16 @@ class _Engine:
     limit: torch.Tensor
     stops: torch.Tensor
     pad: torch.Tensor
-    penalty: torch.Tensor
+    presence: torch.Tensor
+    frequency: torch.Tensor
+    repetition: torch.Tensor
     temperature: torch.Tensor
     top_p: torch.Tensor
     top_k: torch.Tensor
+    min_p: torch.Tensor
     seed: torch.Tensor
-    seen: torch.Tensor
+    counts: torch.Tensor
+    prompted: torch.Tensor
     position: torch.Tensor
     dmask: torch.Tensor
     hidden: torch.Tensor
@@ -1972,7 +1975,6 @@ class _Engine:
                 request.max_new,
                 request.stops,
                 request.pad,
-                request.penalty,
                 request.sampling,
                 request.tell,
                 request.allowed,
@@ -2315,8 +2317,9 @@ class _Engine:
                 yield from (s for s in layer.conv_states.values() if s is not None)
                 yield from (s for s in layer.recurrent_states.values() if s is not None)
         yield from (self.ids, self.length, self.mask, self.out, self.n, self.done, self.limit)
-        yield from (self.stops, self.pad, self.penalty, self.seen, self.position)
-        yield from (self.temperature, self.top_p, self.seed, self.top_k)
+        yield from (self.stops, self.pad, self.counts, self.prompted, self.position)
+        yield from (self.presence, self.frequency, self.repetition)
+        yield from (self.temperature, self.top_p, self.seed, self.top_k, self.min_p)
         if self.draft is not None:
             yield from (self.dkeys.keys, self.dkeys.values, self.dmask, self.hidden)
 
@@ -2563,18 +2566,20 @@ class _Engine:
                 scores[row, torch.tensor(banned, dtype=torch.long, device=scores.device)] = float(
                     "-inf"
                 )
-            token = scores.argmax(-1)
-            if request.sampling.temperature > 0:
-                if request.sampling.top_k:
-                    scores = _top_k(scores, request.sampling.top_k)
-                rows = int(ids.shape[0])
-                first = torch.zeros((rows,), dtype=torch.long, device=ids.device)
-                token = _draw(scores, *_per_row(request.sampling, rows, ids.device), first)
+            # Nothing is generated yet: of the penalties only repetition's prompt part reads.
+            rows, vocab = int(ids.shape[0]), int(scores.shape[-1])
+            prompted = sampler.prompted(ids, mask.to(ids.device), vocab)
+            picking, penalties = _per_row(request.sampling, rows, scores.device)
+            nothing = torch.zeros((1, vocab), dtype=torch.float32, device=scores.device)
+            scores = sampler.penalized(scores, nothing, prompted.to(scores.device), *penalties)
+            first = torch.zeros((rows,), dtype=torch.long, device=scores.device)
+            token = sampler.pick(scores, *picking, first, request.sampling.temperature > 0)
+            token = token.to(ids.device)
             drafted: tuple[_Keys, torch.Tensor] | None = None
             if self.draft is not None:
                 drafted = self._drafted_prompt(ids, token, hidden, position)
         request.prefill_s += time.perf_counter() - started
-        return _Prefill(fresh, mask, position, token, drafted)
+        return _Prefill(fresh, mask, position, token, prompted, drafted)
 
     def _drafted_prompt(
         self,
@@ -2654,13 +2659,16 @@ class _Engine:
                 self.limit[slot] = request.max_new
                 self.stops[slot].copy_(stops)
                 self.pad[slot] = request.pad
-                self.penalty[slot] = request.penalty
-                self.temperature[slot] = request.sampling.temperature
-                self.top_p[slot] = request.sampling.top_p
-                self.top_k[slot] = request.sampling.top_k if request.sampling.temperature > 0 else 0
-                self.seed[slot] = request.sampling.seed
-                self.seen[slot].zero_()
-                self.seen[slot, token] = 1.0
+                sampling = request.sampling
+                self.presence[slot] = sampling.presence
+                self.frequency[slot] = sampling.frequency
+                self.repetition[slot] = sampling.repetition
+                self.temperature[slot] = sampling.temperature
+                self.top_p[slot], self.top_k[slot], self.min_p[slot] = sampling.kept()
+                self.seed[slot] = sampling.seed
+                self.counts[slot].zero_()
+                self.counts[slot, token] = 1.0
+                self.prompted[slot].copy_(fresh.prompted[row])
                 self.done[slot] = bool((self.stops[slot] == token).any()) or request.max_new <= 1
                 if self.draft is not None:
                     keys, last = _set(fresh.drafted)
@@ -2723,12 +2731,17 @@ class _Engine:
             "limit": ((size,), long, 0),
             "stops": ((size, stops), long, -1),
             "pad": ((size,), long, 0),
-            "penalty": ((size,), f32, 0),
+            "presence": ((size,), f32, 0),
+            "frequency": ((size,), f32, 0),
+            "repetition": ((size,), f32, 1),
             "temperature": ((size,), f32, 0),
             "top_p": ((size,), f32, 1),
             "top_k": ((size,), long, 0),
+            "min_p": ((size,), f32, 0),
             "seed": ((size,), long, 0),
-            "seen": ((size, self.vocab), f32, 0),
+            # each token's count in the row's output, and its prompt's tokens (the penalties')
+            "counts": ((size, self.vocab), f32, 0),
+            "prompted": ((size, self.vocab), torch.bool, False),
             "position": ((size, *lead, 1), long, 0),
             # each step position's allowed tokens, as bits the host writes (`_fill`)
             "allow": ((DEPTH + 1, size, -(-self.vocab // 8)), torch.uint8, 255),
@@ -3078,7 +3091,7 @@ class _Engine:
         constrained = self._constrained()
         part = self.part if drafted else -1
         window_ = _set(self.cache).window
-        key = (size, window_, drafted, self._sampled(), self._kept(), constrained, part)
+        key = (size, window_, drafted, self._sampled(), constrained, part)
         placed = PLACED.get(self.model)
         unaccounted = (
             cuda
@@ -3205,7 +3218,7 @@ class _Engine:
     def _token_state(self, drafted: bool) -> list[torch.Tensor]:
         """What a step writes but its keys, each slot of which it writes before reading; a drafted
         step's head state, mask and key count too."""
-        state = [self.ids, self.mask, self.out, self.n, self.done, self.seen, self.length]
+        state = [self.ids, self.mask, self.out, self.n, self.done, self.counts, self.length]
         state.append(self.position)
         if drafted:
             state += [self.hidden, self.dmask, self.dkeys.cumulative_length]
@@ -3492,34 +3505,28 @@ class _Engine:
             allowed = allowed.movedim(0, 1)
         return scores.masked_fill(~allowed, float("-inf"))
 
-    def _kept(self) -> int:
-        """The most logits a held sampling row keeps (`top_k`), 0 when none cuts: a step's
-        constant, so its graph takes `topk` of that many."""
-        rows = [row.request.sampling for row in self.slots if row is not None]
-        return min(max((s.top_k for s in rows if s.temperature > 0), default=0), self.vocab)
-
-    def _keep(self, scores: torch.Tensor, size: int) -> torch.Tensor:
-        """`scores` (`[size, ..., vocab]`, before the presence penalty) with each sampling row's
-        logits below its `top_k`th largest at -inf; a greedy row's (`top_k` 0) as they are."""
-        if not (most := self._kept()):
-            return scores
-        lead = (-1, *[1] * (scores.dim() - 1))
-        rows = self.top_k[:size]
-        at = (rows - 1).clamp(0, most - 1).view(lead).expand(*scores.shape[:-1], 1)
-        kth = scores.topk(most, dim=-1).values.gather(-1, at)
-        return scores.masked_fill((rows > 0).view(lead) & (scores < kth), float("-inf"))
+    def _penalized(
+        self, scores: torch.Tensor, size: int, ahead: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """`scores` (`[size, vocab]`, or a verify pass's `[size, span, vocab]`) after each row's
+        penalties (`sampler.penalized`), counting its output so far and `ahead`: the drafts before
+        each position, shaped as `scores`."""
+        counts, prompted = self.counts[:size], self.prompted[:size]
+        if scores.dim() == 3:
+            counts, prompted = counts[:, None], prompted[:, None]
+        if ahead is not None:
+            counts = counts + ahead
+        penalties = (self.presence[:size], self.frequency[:size], self.repetition[:size])
+        return sampler.penalized(scores, counts, prompted, *penalties)
 
     def _pick(
         self, scores: torch.Tensor, size: int, index: torch.Tensor, sampled: bool
     ) -> torch.Tensor:
-        """Each row's token from `scores` (`[size, ..., vocab]`): its argmax, or a sampling row's
-        draw (`_draw`) for the token at `index`."""
-        best = scores.argmax(-1)
-        if not sampled:
-            return best
-        temperature = self.temperature[:size]
-        drawn = _draw(scores, temperature, self.top_p[:size], self.seed[:size], index)
-        return torch.where((temperature > 0).view(-1, *[1] * (best.dim() - 1)), drawn, best)
+        """Each row's token from its penalized `scores` (`[size, ..., vocab]`) for the token at
+        `index` (`sampler.pick`)."""
+        temperature, top_p, top_k = self.temperature[:size], self.top_p[:size], self.top_k[:size]
+        min_p, seed = self.min_p[:size], self.seed[:size]
+        return sampler.pick(scores, temperature, top_p, top_k, min_p, seed, index, sampled)
 
     def _advance(self, size: int) -> None:
         if self._drafting(size):
@@ -3530,8 +3537,7 @@ class _Engine:
     def _select(self, logits: torch.Tensor, size: int) -> torch.Tensor:
         """Each live row's next token, on the device, in `ids` and `out`; a row that stops (a
         stop token, or its limit) is done. Returns the rows live before it."""
-        scores = self._keep(self._allowed(logits.float(), size, 0), size)
-        scores = scores - self.penalty[:size, None] * self.seen[:size]
+        scores = self._penalized(self._allowed(logits.float(), size, 0), size)
         done = self.done[:size]
         live = ~done
         n = self.n[:size]
@@ -3544,7 +3550,7 @@ class _Engine:
         stopped = (token[:, None] == self.stops[:size]).any(-1) | (n >= self.limit[:size])
         done |= stopped
         self.ids[:size].copy_(token[:, None])
-        self.seen[:size].scatter_reduce_(1, token[:, None], live.float()[:, None], "amax")
+        self.counts[:size].scatter_add_(1, token[:, None], live.float()[:, None])
         self.flag[:size].copy_(done, non_blocking=True)
         return live
 
@@ -3621,12 +3627,12 @@ class _Engine:
             hidden = _set(self.draft)(embed(token), before, at, view.draft, mask, rotary)
             if i + 1 < DEPTH:
                 self.dhidden[:size].copy_(hidden)
-        seen = self.seen[:size]
-        if i:  # and the drafts before it
-            seen = seen.scatter(1, self.drafts[:size, :i], 1.0)
         logits = _lm(model).get_output_embeddings()(hidden)[:, -1].float()
-        scores = self._keep(self._allowed(logits, size, i), size)
-        scores = scores - self.penalty[:size, None] * seen
+        drafted: torch.Tensor | None = None
+        if i:  # the drafts before it count as generated
+            drafts, ones = self.drafts[:size, :i], torch.ones_like(logits[:, :i])
+            drafted = torch.zeros_like(logits).scatter_add_(1, drafts, ones)
+        scores = self._penalized(self._allowed(logits, size, i), size, drafted)
         token = self._pick(scores, size, self.n[:size] + i, self._sampled())
         self.drafts[:size, i].copy_(token)
         if self._constrained():  # the host's, for what may follow it
@@ -3670,15 +3676,13 @@ class _Engine:
         try:
             with _taking(model) as taken, _RowByRow():
                 scores: torch.Tensor = model(**kwargs).logits[:, -span:].float()
-            scores = self._keep(self._allowed(scores, size, slice(0, span)), size)
+            scores = self._allowed(scores, size, slice(0, span))
         finally:
             _VERIFY.reset(reset)
-        # row j has seen the drafts before it
+        # position j counts the drafts before it as generated
         ahead = torch.zeros_like(scores).scatter_(2, drafted[..., None], 1.0).cumsum(1)
         ahead = torch.cat([torch.zeros_like(ahead[:, :1]), ahead[:, :-1]], dim=1)
-        scores = scores - self.penalty[:size, None, None] * torch.maximum(
-            self.seen[:size, None], ahead.clamp(max=1)
-        )
+        scores = self._penalized(scores, size, ahead)
         best = self._pick(scores, size, n[:, None] + steps[None], sampled)
         kept = (best[:, :depth] == drafted).long().cumprod(-1).sum(-1)
         valid = (steps[None] <= kept[:, None]) & live[:, None]
@@ -3692,7 +3696,7 @@ class _Engine:
         width = self.out.shape[1]
         at = at.clamp(max=width - 1)
         self.out[:size].scatter_(1, at, torch.where(keep, tokens, self.out[:size].gather(1, at)))
-        self.seen[:size].scatter_reduce_(1, best, keep.float(), "amax")
+        self.counts[:size].scatter_add_(1, best, keep.float())
         last = (made - 1).clamp(min=0)
         self.ids[:size].copy_(
             torch.where(live[:, None], best.gather(1, last[:, None]), self.pad[:size, None])
