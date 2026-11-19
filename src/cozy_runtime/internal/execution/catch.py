@@ -109,11 +109,12 @@ def _capturing() -> bool:
 
 
 def useful(sizes: Sequence[Sequence[int]]) -> list[Sequence[int]]:
-    """The levels worth listing: down to the first within 1/64 of the finest's bytes (the whole
-    output is the need by then) or at 1/64 of the whole's. Finer only adds launches."""
-    least, whole = sum(sizes[-1]), sum(sizes[0])
-    floor = max(least + least // 64, whole // 64)
-    return list(sizes[: next(n for n, row in enumerate(sizes) if sum(row) <= floor) + 1])
+    """The levels worth listing: every one down to the site's finest, except past the first
+    within 1/64 of the finest's bytes, where a whole output is the need and finer only adds
+    launches. A site whose need is its windows lists them down to one."""
+    least = sum(sizes[-1])
+    last = next(n for n, row in enumerate(sizes) if sum(row) <= least + least // 64)
+    return list(sizes[: last + 1])
 
 
 def owners(request: Request) -> tuple[Model | Request, ...]:
