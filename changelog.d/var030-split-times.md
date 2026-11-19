@@ -1,0 +1,1 @@
+A run record's `working_splits` gives each split site's time per level (`time`: `device_ms`, the GPU's span between two events on the call's stream, and `host_ms`), so a capped run says what each site's windows cost against the same request uncapped. Reading them never waits on the GPU.
