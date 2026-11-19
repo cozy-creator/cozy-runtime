@@ -81,7 +81,6 @@ class Ranks:
         gpu: Callable[[int], str],
         stage: Callable[[str], None] | None = None,
         call: tuple[str, str] = ("", ""),
-        route: str = "",
     ) -> None:
         import torch.distributed as dist
         from torch._C._distributed_c10d import PrefixStore
@@ -90,8 +89,6 @@ class Ranks:
         self.rank, self.world, self.pg, self.device, self.gpu = rank, world, pg, device, gpu
         #: the generation and the function this attempt runs: a stage's degree key (`degrees`)
         self.call = call
-        #: the route the group's exchange takes (`links.Transport.route`; GPU 0's, which chooses)
-        self.route = route
         #: each sharded stage's calls so far in this attempt: a record row a call (`_degree`)
         self.calls: dict[str, int] = {}
         #: tells the machine a long meeting's wait as the call's stage (GPU 0's; None elsewhere)
@@ -238,6 +235,7 @@ def formed() -> None:
     that came back meets one that kept nothing either (`_WRITES`), and files of processes that
     ended are swept from /dev/shm (a crossing's mapping, a board)."""
     _WRITES.clear()
+    _UNHOSTED.clear()
     sweep()
 
 
@@ -768,12 +766,9 @@ def taken() -> dict[str, dict[str, float | str]]:
         found.setdefault(name, {})["everywhere"] = why or "its result cannot cross"
     for name, digest in _CHOSEN.items():
         found.setdefault(name, {})["key"] = digest
-    for name, why in _SKIPPED.items():
-        found.setdefault(name, {})["skipped_degree"] = why
     _CROSSED.clear()
     _EVERYWHERE.clear()
     _CHOSEN.clear()
-    _SKIPPED.clear()
     return found
 
 
@@ -944,8 +939,6 @@ def _runtime() -> str:
 _CHOICE = threading.local()
 #: By stage row, this attempt: its degree key's digest (`degrees.Key.digest`), its record's name.
 _CHOSEN: dict[str, str] = {}
-#: By stage row, this attempt: why its group's degree was not tried (`degrees.Decision.skipped`).
-_SKIPPED: dict[str, str] = {}
 #: Sharded stages whose sharded call's output once could not cross: at one GPU every GPU runs them.
 _UNHOSTED: set[str] = set()
 
@@ -982,17 +975,17 @@ class _Choice:
     could not cross runs unsharded on every GPU where it fits there (`_fits`), else at the group's.
 
     Measuring, the GPU running them times each sharded call (steps 2 on: step 1 carries fills and
-    compiles); a
-    step in which a GPU read weights from disk or saw a kernel build or land makes the record cold
-    (`_cold`). Trying the group's degree, its second step is compared with one GPU's steady step at
-    the third call, and a slower one moves the rest of the stage to one GPU (`_trial`)."""
+    compiles); a step in which a GPU loaded weights, saw a kernel build or land, or recorded a
+    graph makes the record cold (`_cold`). Trying the group's degree where one GPU is known, its
+    second step is compared with one GPU's at the third call, and one more than the noise slower
+    moves the rest of the stage to one GPU (`_trial`)."""
 
     def __init__(self, ranks: Ranks, stages: Stages, stage: str, what: str) -> None:
         self.ranks, self.stages, self.stage, self.what = ranks, stages, stage, what
         self.key: object = None
         self.degree = ranks.world
         self.measure = False
-        #: one GPU's steady step the group's degree is tried against (`degrees.Decision`)
+        #: one GPU's second step the group's degree is tried against (`degrees.Decision`)
         self.against_ms: float | None = None
         #: at one GPU: the GPU `home` runs each sharded call and its output crosses
         self.hosted = False
@@ -1002,8 +995,6 @@ class _Choice:
         #: the timing GPU's (`_timer`), measuring: an event at each sharded call's start, then the
         #: stage's end
         self.events: list[torch.cuda.Event] = []
-        #: the timing GPU's, measuring one GPU: the weight bytes filled onto it at each event
-        self.filled: list[int] = []
         self.calls = 0
         #: this GPU's `_cold` at the steady steps' start and at the stage's end
         self.cold: list[tuple[int, int, bool, int]] = []
@@ -1039,16 +1030,13 @@ class _Choice:
             key = degrees.Key(*ranks.call, self.stage, shape, card, ranks.world, _runtime())
             # Nothing is measured on a CPU: its group's degree throughout.
             decision = (
-                degrees.choose(key, ranks.route)
-                if torch.cuda.is_available()
-                else degrees.Decision(ranks.world)
+                degrees.choose(key) if torch.cuda.is_available() else degrees.Decision(ranks.world)
             )
             told = {
                 "key": cast("dict[str, Json]", key.document()),
                 "degree": decision.degree,
                 "measure": decision.measure,
                 "against_ms": decision.against_ms,
-                "skipped": decision.skipped,
             }
         told = dict(ranks.told(told, f"degree {self.stage}"))
         key = degrees.Key.of(cast("dict[str, Json]", told["key"]))
@@ -1060,8 +1048,6 @@ class _Choice:
         against = told.get("against_ms")
         self.against_ms = None if against is None else float(cast("float", against))
         _CHOSEN[self.what] = key.digest()
-        if told.get("skipped"):
-            _SKIPPED[self.what] = str(told["skipped"])
         if self.degree == 1 < ranks.world:
             self._one()
 
@@ -1155,8 +1141,9 @@ class _Choice:
         self._everywhere()
 
     def _trial(self) -> None:
-        """The third sharded call trying the group's degree: a second step slower than one GPU's
-        steady step moves the rest of the stage to one GPU, and that step is the group's record."""
+        """The third sharded call trying the group's degree: a second step more than the noise
+        slower than one GPU's moves the rest of the stage to one GPU, and that step is the group's
+        record (cold where its steps loaded weights: measured once more, `degrees.choose`)."""
         from cozy_runtime.internal import attention_ulysses
         from cozy_runtime.internal.parallel import degrees
 
@@ -1171,7 +1158,7 @@ class _Choice:
         rows = self.ranks.meet({"peak": _peak(), "warm": warm, "step": step}, f"trial {self.stage}")
         second = float(cast("float", rows[0]["step"]))
         _row(self.what)["trial_ms"] = second
-        if second <= cast("float", self.against_ms):
+        if second <= cast("float", self.against_ms) * (1 + degrees.NOISE):
             return
         kept: dict[str, object] = {
             "steady_ms": second,
@@ -1193,8 +1180,6 @@ class _Choice:
             event = torch.cuda.Event(enable_timing=True)
             event.record()
             self.events.append(event)
-            if self.degree == 1:
-                self.filled.append(_filled())
 
     def ended(self) -> None:
         """The stage's end, inside it."""
@@ -1225,10 +1210,14 @@ class _Choice:
         timer = self._timer()
         mine = self.ranks.rank == timer
         steady = self._steady_ms() if mine else None
-        # the weight bytes filled onto the timing GPU over its last sharded call (`degrees.choose`)
-        paged = self.filled[-1] - self.filled[-2] if mine and len(self.filled) > 1 else None
+        # its second step, which a trial of the group's degree compares with its own (`_trial`)
+        second = (
+            round(self.events[1].elapsed_time(self.events[2]), 2)
+            if mine and steady is not None
+            else None
+        )
         warm = len(self.cold) == 2 and self.cold[0] == self.cold[1] and not self.cold[1][2]
-        told = {"peak": _peak(), "warm": warm, "steady": steady, "paged": paged, "kernels": None}
+        told = {"peak": _peak(), "warm": warm, "steady": steady, "second": second, "kernels": None}
         if mine:
             told["kernels"] = cast("dict[str, Json]", attention_ulysses.served())
         rows = self.ranks.meet(told, f"peak {self.stage}")
@@ -1239,14 +1228,13 @@ class _Choice:
         timed = [rows[timer]] if self.hosted else rows
         kept: dict[str, object] = {
             "steady_ms": steady,
+            "second_ms": rows[timer]["second"],
             "peak_bytes": max(int(cast("int", r["peak"])) for r in timed),
             "kernels": rows[timer]["kernels"],
         }
         if not all(r["warm"] for r in timed):
             row["cold"] = 1.0
             kept["cold"] = True
-        if self.degree == 1 and rows[timer]["paged"] is not None:
-            kept["paged_bytes"] = row["paged_bytes"] = float(cast("float", rows[timer]["paged"]))
         if self.ranks.rank == 0:
             degrees.record(self.key, self.degree, kept)
 
@@ -1261,20 +1249,16 @@ def _unsharded() -> Iterator[None]:
 
 
 def _cold(stages: Stages) -> tuple[int, int, bool, int]:
-    """What makes a step not steady on this GPU, so far in its request: the weight bytes read
-    from disk (the store, a derived page; a page kept in host memory is a tight card's steady
-    paging), the kernels' changes (`LANDED`), whether a kernel is still building or landed and
-    not serving yet, and the graphs its sharded components tried to record."""
+    """What makes a step not steady on this GPU, so far in its request: the weight bytes it
+    loaded (`_filled`: from disk or host memory, a tight card's paging too, whose cold record is
+    measured once more and then kept), the kernels' changes (`LANDED`), whether a kernel is still
+    building or landed and not serving yet, and the graphs its sharded components tried to
+    record."""
     from cozy_runtime import graphs
     from cozy_runtime.author._model import LANDED
     from cozy_runtime.internal import kernel_ready
-    from cozy_runtime.internal.execution import catch
 
-    disk = 0
-    request = catch.CURRENT.get()
-    if request is not None and request.memory.pages is not None and not request.idle:
-        request.record_fills()
-        disk = sum(request.moved.get(origin, (0,))[0] for origin in ("store", "derived"))
+    disk = _filled()
     building = any(at in ("opening", "landed") for at in kernel_ready.pending().values())
     roots = (stages.roots[name] for name in sorted(stages.sharded))
     captured = sum(graphs.capture_attempts(cast("torch.nn.Module", root)) for root in roots)

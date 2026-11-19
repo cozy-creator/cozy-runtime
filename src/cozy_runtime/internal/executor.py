@@ -1944,7 +1944,6 @@ class Executor:
             # its long meeting waits are the run's stage; a follower's attempt tells nothing
             stage=request_path.told,
             call=(self.construction or "", asked.entrypoint),
-            route=self.host.transport.route if self.host.transport is not None else "",
         )
         group.broadcast(
             {

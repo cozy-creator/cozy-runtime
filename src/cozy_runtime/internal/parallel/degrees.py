@@ -8,17 +8,17 @@ sharded call, where the degree is chosen: its video's exact shape, its other ten
 to the next power of two, no seed or other value: `spmd._shape_class`), the card, the group's
 degree and the Runtime build: a new release measures again.
 
-One GPU is measured first: GPU 0 runs each sharded call and its output crosses (`spmd`), so it
-costs a request what one GPU does. A cold record (a step read weights from disk or saw a kernel
-build) is measured once more, as that costs nothing, and kept after that: a measurement that stays
-cold must not hold the group's degree off. The group's degree is then tried
-once against it, and the trial moves the rest of its stage to one GPU after a slower second step
-(`spmd._Choice`); its record, cold or not, is never measured again. It is not tried at all where
-one GPU's last sharded call paged weights onto the card and the group crosses through host
-memory: Ulysses splits the sequence, not the weights, so every GPU pages them at once through the
-path the exchange takes. Once both are known the faster is the key's for good. The record keeps
-the attention kernels each degree served, so a reviewer can tell a degree's head-group numerics
-from a bug. Records live in the machine's kernel cache, beside its link measurements.
+Two GPUs should simply be faster (Paul 11-19), so a key runs at its group's degree until measured
+otherwise, and wherever nothing can be measured (no kernel cache to keep records in, a stage of
+one sharded call). The group's degree is measured first, then one GPU (one GPU runs each sharded
+call and its output crosses, `spmd`). A measurement whose steps loaded weights or saw a kernel
+build or a graph recorded is cold, and is measured once more, warm, then kept (`measured`). Where
+one GPU is known first, the group's degree is tried against its second step, and a slower one
+moves the rest of that stage to one GPU (`spmd._Choice._trial`). Once both are known, one GPU is
+the key's only where it is more than the ledger's noise faster (Paul 11-15: within 5% is a tie),
+and for good. The record keeps the attention kernels each degree served, so a reviewer can tell a
+degree's head-group numerics from a bug. Records live in the machine's kernel cache, beside its
+link measurements.
 """
 
 from __future__ import annotations
@@ -97,38 +97,44 @@ def known(key: Key) -> dict[int, dict[str, object]]:
     return {int(degree): row for degree, row in document.get("degrees", {}).items()}
 
 
+#: Paul 11-15: a difference within 5% is a tie; a tie goes to the group's degree.
+NOISE = 0.05
+
+
 @dataclass(frozen=True, slots=True)
 class Decision:
     degree: int
     measure: bool = False
-    #: trying the group's degree: one GPU's steady step its second step must not exceed
+    #: trying the group's degree: one GPU's second step, which its own must not exceed by NOISE
     against_ms: float | None = None
-    #: why the group's degree is not tried
-    skipped: str = ""
 
 
-def choose(key: Key, route: str) -> Decision:
-    """How a stage of `key` runs where its group's exchange takes `route` (`Transport.route`)."""
+def _open(row: Mapping[str, object] | None) -> bool:
+    """No record, or a cold one not yet measured again."""
+    return row is None or (bool(row.get("cold")) and int(cast("int", row.get("measured", 1))) < 2)
+
+
+def choose(key: Key) -> Decision:
+    """How a stage of `key` runs."""
+    if _directory() is None:  # nothing can be recorded: the group's degree
+        return Decision(key.world)
     times = known(key)
-    one = times.get(1)
-    if one is None:
+    group, one = times.get(key.world), times.get(1)
+    if _open(group):
+        settled = one is not None and not _open(one)
+        against = float(str(one.get("second_ms", one["steady_ms"]))) if settled else None
+        return Decision(key.world, measure=True, against_ms=against)
+    if _open(one):
         return Decision(1, measure=True)
-    # A first group request is cold; one more measurement shows whether it stays so.
-    cold = bool(one.get("cold")) and int(cast("int", one.get("measured", 1))) < 2
-    if key.world not in times:
-        if route == "host-staged" and int(cast("int", one.get("paged_bytes", 0))):
-            why = "one GPU's last sharded call paged weights, and the exchange crosses host memory"
-            return Decision(1, measure=cold, skipped=why)
-        if cold:  # a steady step to try the group's degree against
-            return Decision(1, measure=True)
-        return Decision(key.world, measure=True, against_ms=float(str(one["steady_ms"])))
-    return Decision(min((1, key.world), key=lambda d: float(str(times[d]["steady_ms"]))))
+    assert group is not None and one is not None
+    faster = float(str(one["steady_ms"])) * (1 + NOISE) < float(str(group["steady_ms"]))
+    return Decision(1 if faster else key.world)
 
 
 def record(key: Key, degree: int, row: Mapping[str, object]) -> None:
     """`degree`'s steady step time and the kernels it served, for `key`. A degree already known
-    keeps its record (its choice must not move), except one GPU's cold record, which its next
-    measurement replaces once (`measured`)."""
+    keeps its record (its choice must not move), except a cold one, which its next measurement
+    replaces once (`measured`)."""
     path = _path(key)
     if path is None:
         return
@@ -139,7 +145,7 @@ def record(key: Key, degree: int, row: Mapping[str, object]) -> None:
             document = json.loads(path.read_text()) if path.exists() else {"key": key.document()}
             degrees = document.setdefault("degrees", {})
             held = degrees.get(str(degree))
-            if held is not None and not (degree == 1 and held.get("cold")):
+            if not _open(held):
                 return
             measured = 1 + (int(held.get("measured", 1)) if held is not None else 0)
             degrees[str(degree)] = {**row, "measured": measured}
