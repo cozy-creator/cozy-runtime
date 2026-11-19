@@ -36,10 +36,12 @@ from cozy_runtime.author._loader import (
     canonical_dtype,
 )
 from cozy_runtime.author._model import PLACED, LoRAServing
-from cozy_runtime.internal import execution, lora_bake
+from cozy_runtime.internal import decode_kernels, execution, lora_bake
 from cozy_runtime.internal.accel import ResidencyError, StaleBinding
 from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding.formats import TORCH_DTYPES, Leaf, LeafProvider, is_conv_declared
+from cozy_runtime.internal.encoding.adapters import CoreDequant
+from cozy_runtime.internal.encoding.leaves import GgmlNativeLeaf
 from cozy_runtime.internal.encoding.leaves import sites as leaf_sites
 from cozy_runtime.internal.encoding.selection import (
     DeviceFacts,
@@ -158,6 +160,15 @@ class Backend:
         self.selected: dict[str, Selection] = {
             key: self._select(key, row) for key, row in self.plan.items()
         }
+        if device.type == "cuda":
+            # The decode cores' sets this load decodes with build beside its fill: each decoded
+            # float tensor's, and each ggml leaf's (its token-table lookup and fallback decode).
+            cores = {
+                s.provider.encoding
+                for s in self.selected.values()
+                if isinstance(s.provider, (CoreDequant, GgmlNativeLeaf))
+            }
+            decode_kernels.prime(torch, device.index or 0, cores)
         self.encoded_leaves = "refuse"
         #: contract key -> (installed leaf, replaced module, derived roles)
         self.leaves: dict[str, tuple[Leaf, object, tuple[str, ...]]] = {}
