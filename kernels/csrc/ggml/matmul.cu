@@ -277,9 +277,6 @@ int matmul(int device, int type, const void* w, const void* x, int x_type, float
            int64_t M, void* (*allocate)(size_t, void*), void* context, cudaStream_t stream) {
     if (!runs(type) || K <= 0 || N <= 0 || M <= 0 || K % MATRIX_ROW_PADDING) return cudaErrorInvalidValue;
     if (x_type != kF32 && x_type != kBF16 && x_type != kF16) return cudaErrorInvalidValue;
-    // Torch's default stream is the legacy NULL stream: ggml's context reads a null stream as "none yet" and launches on
-    // a non-blocking stream of its own, unordered with the caller's, so every launch here names the legacy stream.
-    if (stream == nullptr) stream = cudaStreamLegacy;
     try {
         Allocate temporaries{allocate, context};
         Call call(device, stream, &temporaries);
@@ -300,17 +297,17 @@ int matmul(int device, int type, const void* w, const void* x, int x_type, float
             ggml_cuda_pool_alloc<char> q8_1(ctx.pool(), M * K_padded / QK8_1 * sizeof(block_q8_1));
             const dim3 blocks((K_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE, M, 1);
             rows.as([&](auto r) {
-                quantize_q8_1_rows<<<blocks, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>(r, (block_q8_1*)q8_1.get(), K,
-                                                                                    K_padded);
+                quantize_q8_1_rows<<<blocks, CUDA_QUANTIZE_BLOCK_SIZE, 0, call.stream()>>>(
+                    r, (block_q8_1*)q8_1.get(), K, K_padded);
             });
             CUDA_CHECK(cudaGetLastError());
             ggml_cuda_op_mul_mat_vec_q(ctx, &node.w, &node.x, &node.out, static_cast<const char*>(w), nullptr,
-                                       q8_1.get(), out, 0, N, M, K_padded, stream);
+                                       q8_1.get(), out, 0, N, M, K_padded, call.stream());
         } else if (kernel == kMmqFew) {
             // Few rows: widened to f32 (a few rows' bytes), then ggml's own few-row MMQ.
             ggml_cuda_pool_alloc<float> wide(ctx.pool(), M * K);
             rows.as([&](auto r) {
-                widen_rows<<<(M * K + 255) / 256, 256, 0, stream>>>(r, wide.get(), M * K);
+                widen_rows<<<(M * K + 255) / 256, 256, 0, call.stream()>>>(r, wide.get(), M * K);
             });
             CUDA_CHECK(cudaGetLastError());
             node.x.data = wide.get();
@@ -338,7 +335,8 @@ int quantize(int device, const void* x, int x_type, void* q8_1, int64_t K, int64
     const dim3 blocks((K_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE, M, 1);
     const Rows rows{x, x_type};
     rows.as([&](auto r) {
-        quantize_q8_1_rows<<<blocks, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>(r, (block_q8_1*)q8_1, K, K_padded);
+        quantize_q8_1_rows<<<blocks, CUDA_QUANTIZE_BLOCK_SIZE, 0, launch_stream(stream)>>>(r, (block_q8_1*)q8_1, K,
+                                                                                           K_padded);
     });
     return cudaGetLastError();
 }
@@ -357,7 +355,7 @@ int matmul_quantized(int device, int type, const void* w, const void* q8_1, floa
         // 16-bit branch launches it after quantizing.
         ggml_cuda_op_mul_mat_vec_q(ctx, &node.w, &node.x, &node.out, static_cast<const char*>(w), nullptr,
                                    static_cast<const char*>(q8_1), out, 0, N, M, GGML_PAD(K, MATRIX_ROW_PADDING),
-                                   stream);
+                                   call.stream());
         return cudaGetLastError();
     } catch (const std::bad_alloc&) {
         return cudaErrorMemoryAllocation;

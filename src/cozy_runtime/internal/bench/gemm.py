@@ -34,6 +34,7 @@ from cozy_runtime.internal import (
     attention,
     ggml_linear,
     int8_linear,
+    kernel_ready,
     nvfp4_linear,
     prebuilt,
     triton_kernels,
@@ -371,6 +372,9 @@ def _ggml(x: torch.Tensor, s: Shape, g: torch.Generator, card: Card) -> tuple[di
         rules[f"ordered:{name}"] = _ordered(matmul)
         # The leaf's production path: bf16 rows, quantized to q8_1 as they are (`matmul`'s other branches).
         rules[f"ordered-linear:{name}"] = _ordered(partial(ggml_linear.matmul, ops, torch, x, blocks, scheme, s.n))
+        if ggml_linear.kernel(torch, 0, scheme, s.k, s.n, s.m, blocks) == "mmvq":
+            # Sibling linears' path: one q8_1 quantize of the bf16 rows, then MMVQ over it.
+            rules[f"ordered-quantized:{name}"] = _ordered_quantized(x, blocks, scheme, s.n)
         if (threaded := _threads(ops, scheme, s.n, s.k)) is not None:
             rules[f"ordered-threads:{name}"] = threaded
         calls[f"ggml-matmul{GGML_GRAPHED}:{name}"] = _graphed(matmul)
@@ -445,6 +449,24 @@ def _ordered(call: Call) -> str:
             if not same:
                 return "false"
     return "true"
+
+
+def _ordered_quantized(x: torch.Tensor, blocks: torch.Tensor, scheme: str, n: int) -> str:
+    """`_ordered` over the leaf's shared q8_1 path (`ggml_linear.products`: `_ggml.quantize`, then `matmul_quantized`)
+    from bf16 rows. Its module is the leaf's, waited for here as a request that names its kernel waits for it
+    (`bench.ggml_ordered`)."""
+    try:
+        kernel_ready.wait(f"{ggml_linear.OP} cuda:0", partial(ggml_linear._verified, torch, 0))
+        return _ordered(partial(_shared_q8_1, x, blocks, scheme, n))
+    except Exception as exc:  # recorded: the release gate fails any ordered row that is not true
+        return f"false: {_said(exc)}"
+
+
+def _shared_q8_1(x: torch.Tensor, blocks: torch.Tensor, scheme: str, n: int) -> torch.Tensor:
+    made = ggml_linear.products(torch, x, [(blocks, scheme, n)])
+    if made is None:
+        raise RuntimeError(f"ggml_linear.products declined {scheme} at {x.shape[0]} rows")
+    return made[0]
 
 
 #: The two-thread cell: rounds of calls a thread, at most, and the bytes it holds, at most (both threads' inputs and
