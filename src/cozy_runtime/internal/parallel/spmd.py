@@ -455,10 +455,12 @@ def _run_alone(
         # The others run it as this GPU did, from the streams' same state, and so does every GPU
         # next time.
         _WRITES.add(key)
+        _EVERYWHERE[what] = left
         ranks.cross({"op": "everywhere", "left": left}, home, what)
         return result
     tensors: list[torch.Tensor] = []
     if not _crossable(result, tensors):
+        _EVERYWHERE[what] = ""
         ranks.cross({"op": "everywhere", "left": ""}, home, what)
         return result
     written = {
@@ -623,6 +625,8 @@ def _left(before: Mapping[str, object], after: Mapping[str, object]) -> str:
 #: holding them took to share them and each other GPU to map them, and the ms a GPU waited for a
 #: stage another GPU ran alone (`place`).
 _CROSSED: dict[str, dict[str, float]] = {}
+#: Stages every GPU ran after one ran alone, and why (`_left`): what they left beside their result.
+_EVERYWHERE: dict[str, str] = {}
 
 
 def _row(what: str) -> dict[str, float]:
@@ -630,10 +634,16 @@ def _row(what: str) -> dict[str, float]:
     return _CROSSED.setdefault(what, dict.fromkeys(fields, 0.0))
 
 
-def taken() -> dict[str, dict[str, float]]:
-    """This GPU's crossings since the last take (`cozy run show`: `transport.stages`)."""
-    found = {name: {k: v for k, v in row.items() if v} for name, row in _CROSSED.items()}
+def taken() -> dict[str, dict[str, float | str]]:
+    """This GPU's crossings since the last take (`cozy run show`: `transport.stages`), and each
+    stage that fell back to every GPU, with what it left (`everywhere`)."""
+    found: dict[str, dict[str, float | str]] = {
+        name: {k: v for k, v in row.items() if v} for name, row in _CROSSED.items()
+    }
+    for name, why in _EVERYWHERE.items():
+        found.setdefault(name, {})["everywhere"] = why or "its result cannot cross"
     _CROSSED.clear()
+    _EVERYWHERE.clear()
     return found
 
 

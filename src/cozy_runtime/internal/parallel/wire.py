@@ -190,4 +190,4 @@ class RunReply(msgspec.Struct, frozen=True):
     steps: dict[str, list[tuple[int, float]]] = {}
     stages: dict[str, float] = {}
     #: its crossings of stages one GPU ran (`spmd.taken`): bytes mapped, ms waited and mapping
-    crossed: dict[str, dict[str, float]] = {}
+    crossed: dict[str, dict[str, float | str]] = {}
