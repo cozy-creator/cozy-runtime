@@ -423,7 +423,39 @@ def _copies(wrong: list[str]) -> dict[str, JSON]:
     return row
 
 
-def measure() -> dict[str, JSON]:
+def _replayed(wrong: list[str]) -> dict[str, JSON]:
+    """The engine's host-replayed path (`Decoder(launcher=False)`): a counted step captured once and
+    replayed from the host `ITERATIONS` times, each output copied out on the card, against eager: no
+    WHILE node, no host ring."""
+    counted = _Counted(ITERATIONS)
+    base = torch.arange(4096, dtype=torch.float32, device="cuda")
+    eager = []
+    for _ in range(ITERATIONS):
+        counted.tick()
+        eager.append((base * counted.n.float() + 1.0).clone())
+    out = torch.empty_like(base)
+
+    def step() -> None:
+        counted.tick()
+        out.copy_(base * counted.n.float() + 1.0)
+
+    counted.n.zero_()
+    graph = _capture(step)
+    counted.n.zero_()
+    made = torch.empty((ITERATIONS, *base.shape), dtype=base.dtype, device="cuda")
+    for k in range(ITERATIONS):
+        graph.replay()
+        made[k].copy_(out)
+    torch.cuda.synchronize()
+    bitwise = sum(int(torch.equal(got, want)) for got, want in zip(made, eager, strict=True))
+    if bitwise != ITERATIONS:
+        wrong.append(f"replayed: {bitwise} of {ITERATIONS} steps equal eager")
+    return {"iterations": ITERATIONS, "bitwise": bitwise}
+
+
+def measure(only: str = "") -> dict[str, JSON]:
+    """Every section, or `only` that one (the varena suite's `engine-loop-<section>`, each its own process,
+    so one that crashes names itself)."""
     if NO_ENGINE:
         raise AssertionError(NO_ENGINE)
     major, minor = torch.cuda.get_device_capability(0)
@@ -432,7 +464,10 @@ def measure() -> dict[str, JSON]:
     wrong: list[str] = []
     sections: dict[str, Callable[[list[str]], dict[str, JSON]]] = {
         "loop": _loop, "polled": _polled, "attention": _attention, "ggml": _ggml, "copies": _copies,
+        "replayed": _replayed,
     }  # fmt: skip
+    if only:
+        sections = {only: sections[only]}
     for name, section in sections.items():
         try:
             row[name] = section(wrong)
