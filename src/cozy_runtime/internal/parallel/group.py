@@ -21,15 +21,19 @@ from __future__ import annotations
 
 import contextlib
 import faulthandler
+import mmap
 import os
 import queue
+import secrets
 import shutil
 import signal
 import socket
+import struct
 import sys
 import tempfile
 import threading
 import time
+import zlib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -93,8 +97,8 @@ _REPLY_STEPS = frozenset({"join", "proof"})
 STACKS = b"\2"
 #: Steps whose stall is the GPUs' link failing them: NCCL connects and moves its first bytes here.
 LINK_STEPS = frozenset({"barrier", "warm", "exchange", "proof"})
-#: How often a store meeting looks again: at first within 0.1 ms, as GPUs in step arrive together
-#: (Ulysses meets at every attention call), then backing off to 10 ms (a file store has no wakeup).
+#: How often a store meeting looks again: at first within 0.1 ms, as GPUs in step arrive together,
+#: then backing off to 10 ms (a file store has no wakeup). A board meeting looks every 0.1 ms.
 _POLL = (0.0001, 0.01)
 #: How often a store meeting asks whether a missing GPU already ended.
 _SLICE = timedelta(seconds=1)
@@ -339,6 +343,101 @@ def gather(
                 told([rank for rank, key in enumerate(keys) if not store.check([key])])
         time.sleep(pause)
         pause = min(pause * 2, _POLL[1])
+
+
+class Board:
+    """A meeting of every GPU of a group on one page of shared memory, for meetings at every call
+    (Ulysses meets at each attention): a word is set and read in microseconds, where the store's
+    file takes a lock and a read a call and its poll backs off well past a late GPU's arrival.
+    Each GPU has two slots, by the meeting's parity: it writes meeting n+1 only once it has read
+    every GPU's meeting n, so no GPU still reads the slot it overwrites. A word is its meeting's
+    number, its length and its CRC-32, then its bytes; a reader takes one whose number and CRC
+    match, so a word read while it is written is read again. One host's GPUs only (`LOOPBACK`)."""
+
+    SLOT = mmap.PAGESIZE
+    _HEAD = struct.Struct("<QII")
+    #: the bytes a word may hold
+    ROOM = SLOT - _HEAD.size
+
+    def __init__(self, page: mmap.mmap, rank: int, world: int) -> None:
+        self.page, self.rank, self.world = page, rank, world
+        self.view = memoryview(page)
+
+    @classmethod
+    def open(cls, store: Store, rank: int, world: int, what: str) -> Board | None:
+        """Collective, once per process group: GPU 0 makes the page and names it in `store`, every
+        GPU maps it, and its name goes once all have. None on every GPU alike where any could not
+        (no shared memory): the group meets on its store."""
+        size, page = 2 * world * cls.SLOT, None
+        if rank == 0:
+            name = f"/dev/shm/cozy-board-{os.getpid()}-{secrets.token_hex(8)}"
+            try:
+                fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                try:
+                    os.ftruncate(fd, size)
+                    page = mmap.mmap(fd, size)
+                finally:
+                    os.close(fd)
+            except OSError:
+                name = ""
+            store.set("board", name)
+        name = gather(store, ["board"], what)[0].decode()
+        if rank != 0 and name:
+            try:
+                fd = os.open(name, os.O_RDWR)
+                try:
+                    page = mmap.mmap(fd, size)
+                finally:
+                    os.close(fd)
+            except OSError:
+                page = None
+        store.set(f"board/{rank}", "1" if page is not None else "")
+        agreed = all(gather(store, [f"board/{r}" for r in range(world)], what))
+        if rank == 0 and name:
+            with contextlib.suppress(OSError):
+                os.unlink(name)
+        if not agreed:
+            if page is not None:
+                page.close()
+            return None
+        assert page is not None  # every GPU mapped it
+        return cls(page, rank, world)
+
+    def _slot(self, rank: int, n: int) -> memoryview:
+        at = ((n % 2) * self.world + rank) * self.SLOT
+        return self.view[at : at + self.SLOT]
+
+    def _read(self, rank: int, n: int) -> bytes | None:
+        slot = self._slot(rank, n)
+        number, length, crc = self._HEAD.unpack_from(slot)
+        if number != n or length > self.ROOM:
+            return None
+        word = bytes(slot[self._HEAD.size : self._HEAD.size + length])
+        return word if zlib.crc32(word) == crc else None
+
+    def meet(self, n: int, word: bytes, what: str) -> list[bytes]:
+        """Every GPU's word at meeting `n` (numbered from 1, one after another on every GPU). A
+        wait ends as a store meeting's does when the formation ends (`abort_process_group`)."""
+        if len(word) > self.ROOM:
+            raise ValueError(f"{what}: a {len(word)} B word exceeds the board's {self.ROOM} B")
+        slot = self._slot(self.rank, n)
+        slot[self._HEAD.size : self._HEAD.size + len(word)] = word
+        self._HEAD.pack_into(slot, 0, n, len(word), zlib.crc32(word))
+        words: list[bytes | None] = [None] * self.world
+        words[self.rank] = word
+        while True:
+            for rank, found in enumerate(words):
+                if found is None:
+                    words[rank] = self._read(rank, n)
+            if all(found is not None for found in words):
+                return cast("list[bytes]", words)
+            if _ENDED.is_set():
+                raise GroupRefusal(f"{what}: another GPU ended this call", code=ENDED)
+            time.sleep(_POLL[0])
+
+    def close(self) -> None:
+        self.view.release()
+        self.page.close()
 
 
 def rejoined() -> None:

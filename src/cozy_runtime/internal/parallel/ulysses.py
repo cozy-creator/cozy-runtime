@@ -43,7 +43,7 @@ from cozy_runtime.graphs import streams
 from cozy_runtime.internal import attention_ulysses
 from cozy_runtime.internal.execution import catch, sizing
 from cozy_runtime.internal.parallel import copy_engine, turn
-from cozy_runtime.internal.parallel.group import abort_process_group, gather
+from cozy_runtime.internal.parallel.group import Board, abort_process_group, gather
 
 if TYPE_CHECKING:
     from torch._C._distributed_c10d import Work
@@ -89,7 +89,8 @@ def group(config: object) -> ProcessGroup:
 
 
 class _Rendezvous:
-    """Metadata rounds over the group's store; no tensor crosses here."""
+    """Metadata rounds on the group's board (`group.Board`, mapped at the first call), else its
+    store; no tensor crosses here."""
 
     def __init__(self, handle: ProcessGroup) -> None:
         self.store = PrefixStore(
@@ -101,18 +102,27 @@ class _Rendezvous:
         #: the level an exchange's geometry pipelines from, as the last agreed rows made it: the
         #: same on every rank, so every rank's menu starts there
         self.floors: dict[tuple[int, ...], int] = {}
+        self.board: Board | None = None
+        self.mapped = False
 
     def gather(self, value: _Proposal) -> list[_Proposal]:
-        """Every rank's `value` for this sequence: four store calls a rank. Each rank has read
-        the last sequence's values before it proposes this one, so its own of them goes. A rank
-        that failed or died ends the wait (`group.gather`); ranks whose values name different
-        sites made different calls, and each of them says so."""
-        keys = [f"{self.sequence}/{rank}" for rank in range(self.world)]
-        self.store.set(keys[self.rank], json.dumps(value))
+        """Every rank's `value` for this sequence: on the board, microseconds; on the store, four
+        calls a rank (each rank has read the last sequence's values before it proposes this one,
+        so its own of them goes). A rank that failed or died ends the wait (`group.gather`); ranks
+        whose values name different sites made different calls, and each of them says so."""
         what = f"Ulysses call {self.sequence} at {value['site']}"
-        rows = [json.loads(data) for data in gather(self.store, keys, what)]
-        if self.sequence > 1:
-            self.store.delete_key(f"{self.sequence - 1}/{self.rank}")
+        if not self.mapped:  # every rank's first call is the same one
+            self.mapped = True
+            self.board = Board.open(self.store, self.rank, self.world, what)
+        if self.board is not None:
+            words = self.board.meet(self.sequence, json.dumps(value).encode(), what)
+            rows = [json.loads(word) for word in words]
+        else:
+            keys = [f"{self.sequence}/{rank}" for rank in range(self.world)]
+            self.store.set(keys[self.rank], json.dumps(value))
+            rows = [json.loads(data) for data in gather(self.store, keys, what)]
+            if self.sequence > 1:
+                self.store.delete_key(f"{self.sequence - 1}/{self.rank}")
         sites = [row["site"] for row in rows]
         if len(set(sites)) > 1:
             raise RuntimeError(
@@ -220,7 +230,8 @@ def _refusal(rows: Sequence[_Proposal]) -> None:
 
 def _failure(exc: BaseException) -> _Proposal:
     kind = "fit" if isinstance(exc, DoesNotFit) else "oom" if fault(exc) is Fault.OOM else ""
-    return {"error": f"{type(exc).__name__}: {exc}", "kind": kind}
+    # Within a board's word however JSON escapes it (at most 6 bytes a character).
+    return {"error": f"{type(exc).__name__}: {exc}"[: Board.ROOM // 8], "kind": kind}
 
 
 def _start(

@@ -414,8 +414,11 @@ class HostStagedExchange(Exchange):
     ) -> Event:
         torch, world, rank = self.torch, self.world, self.rank
         widths = self._check(sends, matrices, out)
-        size = min(chunk or self.slot, self.slot)
         plan = _plan(widths, matrices, world)
+        longest = _longest(plan)
+        # Two rounds at least: one round's reads overlap the next one's writes, so a crossing
+        # smaller than a slot is not its writes and then its reads in series.
+        size = max(min(chunk or -(-longest // 2), self.slot), 1)
         sent, into = _bytes(sends, torch), _bytes(out, torch)
         ready = torch.cuda.Event()
         ready.record(torch.cuda.current_stream(self.device))
@@ -423,7 +426,7 @@ class HostStagedExchange(Exchange):
         self.reads.wait_event(ready)
         with torch.cuda.stream(self.reads):
             self._own(plan, into, sent)
-        for start in range(0, _longest(plan), size):
+        for start in range(0, longest, size):
             half, self.half = self.half, self.half ^ 1
             self.writes.wait_event(self.free[half])
             # The inboxes are scratch: their writes bypass Python dispatch (`CopyEngineExchange`).

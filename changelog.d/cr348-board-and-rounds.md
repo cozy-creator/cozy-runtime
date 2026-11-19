@@ -1,0 +1,1 @@
+A Ulysses call's meeting of the group's GPUs is a page of shared memory they all map, not the group's file store: microseconds a call, where the store took 0.22 ms in step and its backing-off poll up to 1.6 ms more past a GPU 2 ms late (2x RTX 4090, cr-348). A host-staged crossing runs in two rounds at least, so even one smaller than its slot overlaps its reads with its writes.
