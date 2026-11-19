@@ -742,6 +742,14 @@ def engine_loop() -> Row:
     return bench.measure()
 
 
+@case
+def engine_parts() -> Row:
+    """A bisect of the engine's step against Transformers (proof only, `bench/engine_parts.py`)."""
+    from cozy_runtime.internal.bench import engine_parts as bench
+
+    return bench.measure()
+
+
 def main(name: str) -> None:
     function = CASES.get(name)
     if function is None:
