@@ -328,6 +328,7 @@ def capture(
     *,
     alone: bool,
     fits: Callable[[int], str] | None = None,
+    keep_graph: bool = False,
 ) -> tuple[CUDAGraph | None, str]:
     """Record a pure computation into Varena's capture pool, `reserve` bytes of it prepared first:
     refused there (`varena.Exhausted`), nothing is captured. `fits(bytes)` says why a pool of that
@@ -346,6 +347,7 @@ def capture(
     capture finds no room for outside its pool fails it, as a device fault does.
 
     Bindings and outputs remain caller-owned; `step` runs again after a short attempt.
+    `keep_graph`: the graph keeps its `cudaGraph_t` for a launcher (`domain.cuda_graph`).
     """
     from cozy_runtime.internal.execution.catch import CURRENT as REQUEST
 
@@ -364,7 +366,7 @@ def capture(
             raise
         refused = vt.ooms(owner.device)
         try:
-            return _capture(torch, step, pool, owner, reserve)
+            return _capture(torch, step, pool, owner, reserve, keep_graph)
         except Exception as exc:
             short = 0
             if is_capacity(exc) and not isinstance(exc, varena.Exhausted):
@@ -388,9 +390,10 @@ def _capture(
     pool: domain.Pool,
     owner: domain.Domain,
     reserve: int,
+    keep_graph: bool = False,
 ) -> tuple[CUDAGraph | None, str]:
     """One capture into `pool`, prepared with `reserve`."""
-    graph = domain.cuda_graph()
+    graph = domain.cuda_graph(keep_graph=keep_graph)
     current: Stream = torch.cuda.current_stream()
     # cast: an initialized domain's streams and events (`Domain.initialize`), as each capture's
     stream, work = cast("Stream", owner.control), cast("Stream", owner.stream)
