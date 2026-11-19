@@ -108,8 +108,10 @@ class CozyEngine:
             self.unserved = serves(self.model)
         if self.unserved:
             return self.unserved
-        if any(not isinstance(p, str) for q in questions for p in q.read()):
+        if any(not isinstance(p, str) for q in questions for p in q.everything()):
             return "the engine's prefill reads text only"
+        if params.allowed is not None:
+            return "the engine has no grammar-constrained decode"
         if len(questions) > ROWS:
             return f"the engine decodes at most {ROWS} rows at once"
         if params.no_repeat_ngram:
