@@ -203,11 +203,70 @@ _PROCESSORS: dict[str, tuple[object, ...]] = {
 class Constraint(Protocol):
     """What may follow a row's tokens (`generate`'s `allowed`), an outlines Guide's shape."""
 
-    def allowed(self, tokens: Sequence[int]) -> Sequence[int]:
-        """The ids that may follow `tokens`, one row's generated ids (its prompt excluded); once
-        the grammar is complete, its stop token. Pure in `tokens`: a draft is checked as
-        `allowed(prefix + draft[:k])` for each k, with nothing to undo."""
+    def allowed(self, tokens: Sequence[int]) -> Sequence[int] | None:
+        """The ids that may follow `tokens`, one row's generated ids (its prompt excluded), or
+        None for any token; once the grammar is complete, its stop token. Pure in `tokens`: a
+        draft is checked as `allowed(prefix + draft[:k])` for each k, with nothing to undo."""
         ...
+
+
+class After:
+    """`then`, from just after a row's first `marker` (a token id, or ids in a row) on, asked about
+    the tokens after it; any token before it (a thinking model's thought free, its answer held to
+    a grammar: vLLM's structured output under a reasoning parser)."""
+
+    def __init__(self, marker: int | Sequence[int], then: Constraint) -> None:
+        self.marker = [marker] if isinstance(marker, int) else [int(t) for t in marker]
+        self.then = then
+
+    def allowed(self, tokens: Sequence[int]) -> Sequence[int] | None:
+        held, first, n = list(tokens), self.marker[0], len(self.marker)
+        at = 0
+        while True:
+            try:
+                at = held.index(first, at)
+            except ValueError:
+                return None
+            if held[at : at + n] == self.marker:
+                return self.then.allowed(held[at + n :])
+            at += 1
+
+
+class Index(Protocol):
+    """An outlines-core `Index`'s shape (it ships no types): a language compiled over a
+    vocabulary, as states and the tokens each may take."""
+
+    def get_initial_state(self) -> int: ...
+
+    def get_next_state(self, state: int, token: int) -> int | None: ...
+
+    def get_allowed_tokens(self, state: int) -> Sequence[int] | None: ...
+
+
+class Grammar:
+    """An outlines-core `Index` (a JSON schema or regex compiled over a tokenizer's vocabulary) as
+    a `Constraint`: the tokens its language may take after `tokens`. It keeps the state of the
+    last prefix it was asked about, so a decode's next token costs one transition."""
+
+    def __init__(self, index: Index) -> None:
+        self.index = index
+        self.last: tuple[tuple[int, ...], int] = ((), index.get_initial_state())
+
+    def allowed(self, tokens: Sequence[int]) -> Sequence[int]:
+        held = tuple(tokens)
+        done, state = self.last
+        if held[: len(done)] != done:
+            done, state = (), self.index.get_initial_state()
+        for token in held[len(done) :]:
+            following = self.index.get_next_state(state, token)
+            if following is None:
+                raise ValueError(f"token {token} is outside the grammar")
+            state = following
+        self.last = (held, state)
+        ids = self.index.get_allowed_tokens(state)
+        if ids is None:
+            raise ValueError(f"state {state} is outside the grammar")
+        return list(ids)
 
 
 class _Decoder(Protocol):
@@ -975,9 +1034,13 @@ class _Sampling(NamedTuple):
 _Key = tuple[int, int, bool, bool, bool, int]
 
 
-def _ids(constraint: Constraint, tokens: Sequence[int], vocab: int) -> torch.Tensor:
-    """`constraint.allowed(tokens)` as a host index tensor: some, each in the vocabulary."""
-    ids = torch.as_tensor(constraint.allowed(tokens)).to("cpu", torch.long).reshape(-1)
+def _ids(constraint: Constraint, tokens: Sequence[int], vocab: int) -> torch.Tensor | None:
+    """`constraint.allowed(tokens)` as a host index tensor: some, each in the vocabulary; None
+    where it allows any token."""
+    said = constraint.allowed(tokens)
+    if said is None:
+        return None
+    ids = torch.as_tensor(said).to("cpu", torch.long).reshape(-1)
     if not ids.numel() or int(ids.min()) < 0 or int(ids.max()) >= vocab:
         raise ValueError(
             f"allowed() after {len(tokens)} tokens gave {ids.numel()} ids: it gives at least one, "
@@ -1082,9 +1145,11 @@ class _Allowed:
     def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         keep = torch.ones(scores.shape, dtype=torch.bool)
         for row, tokens in enumerate(input_ids[:, self.prompt :].tolist()):
-            if not self.stops.intersection(tokens):  # a finished row continues as padding
+            vocab = int(scores.shape[-1])
+            ids = None if self.stops.intersection(tokens) else _ids(self.constraint, tokens, vocab)
+            if ids is not None:  # a finished row continues as padding; None allows any
                 keep[row] = False
-                keep[row, _ids(self.constraint, tokens, int(scores.shape[-1]))] = True
+                keep[row, ids] = True
         return scores.masked_fill(~keep.to(scores.device), float("-inf"))
 
 
@@ -2983,8 +3048,9 @@ class _Engine:
         """`out` (`_pack`'s bits): what `row` may take after `tokens`, by its call's constraint
         (any without one) less the tokens that would repeat one of its n-grams."""
         request = row.request
-        if request.allowed is not None:
-            _pack(_ids(request.allowed, tokens, self.vocab), out)
+        ids = None if request.allowed is None else _ids(request.allowed, tokens, self.vocab)
+        if ids is not None:
+            _pack(ids, out)
         else:
             out.fill_(255)
         if request.ngram:
