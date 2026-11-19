@@ -432,14 +432,14 @@ def _run[W](
         return window if runtime is None else runtime.read(window)
 
     if into is not None:  # each window writes its own rows of `into` (`split(out=)`)
-        write = cast("Callable[[W, Tensor], object]", fn)  # `out`: the second overload
+        fill = cast("Callable[[W, Tensor], object]", fn)  # `out`: the second overload
         for window in windows:
             index = [slice(None)] * ndim
             for d, (a, b) in zip(dims, window, strict=True):
                 index[d] = slice(a, b)
             if runtime is not None:
                 runtime.piece()
-            write(at(index), into[tuple(index)])
+            fill(at(index), into[tuple(index)])
         return into
     fn = cast("Callable[[W], Tensor]", fn)  # no `out`: the first overload
     if len(windows) == 1 and not progress.done:
