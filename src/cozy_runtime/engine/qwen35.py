@@ -235,7 +235,7 @@ def _gated(x: Tensor, gate: Tensor, weight: Tensor, eps: float) -> Tensor:
     """`Qwen3_5RMSNormGated`: the norm before the gate, SiLU of the gate in f32: one launch for
     every row on CUDA (`_kernels.gated_norm_kernel`), else torch's ops."""
     width = int(x.shape[-1])
-    if x.is_cuda and not _kernels.TRITON_ABSENT and width & (width - 1) == 0 and width <= NORM_WIDEST:
+    if x.is_cuda and not _kernels.TRITON_ABSENT and (width & (width - 1)) == 0 and width <= NORM_WIDEST:
         rows = x.reshape(-1, width).contiguous()
         out = torch.empty_like(rows)
         _kernels.gated_norm_kernel[(int(rows.shape[0]),)](
@@ -373,7 +373,6 @@ class Qwen35:
             out.reshape(-1, text.dv), z.reshape(-1, text.dv), block.norm.weight, block.norm.variance_epsilon
         )
         return block.out_proj(normed.reshape(rows, span, -1))
-
 
     # ------------------------------------------------------------------ what a step calls
 
