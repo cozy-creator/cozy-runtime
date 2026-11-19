@@ -63,7 +63,7 @@ import sys
 import threading
 import time
 import weakref
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from functools import partial
@@ -203,10 +203,12 @@ _PROCESSORS: dict[str, tuple[object, ...]] = {
 class Constraint(Protocol):
     """What may follow a row's tokens (`generate`'s `allowed`), an outlines Guide's shape."""
 
-    def allowed(self, tokens: Sequence[int]) -> Sequence[int] | None:
+    def allowed(self, tokens: Sequence[int]) -> Sequence[int] | torch.Tensor | None:
         """The ids that may follow `tokens`, one row's generated ids (its prompt excluded), or
-        None for any token; once the grammar is complete, its stop token. Pure in `tokens`: a
-        draft is checked as `allowed(prefix + draft[:k])` for each k, with nothing to undo."""
+        None for any token; once the grammar is complete, its stop token. Ids as a sequence or a
+        1-d host tensor; one returned again for the same tokens is read once (`_Engine._permit`).
+        Pure in `tokens`: a draft is checked as `allowed(prefix + draft[:k])` for each k, with
+        nothing to undo."""
         ...
 
 
@@ -219,7 +221,7 @@ class After:
         self.marker = [marker] if isinstance(marker, int) else [int(t) for t in marker]
         self.then = then
 
-    def allowed(self, tokens: Sequence[int]) -> Sequence[int] | None:
+    def allowed(self, tokens: Sequence[int]) -> Sequence[int] | torch.Tensor | None:
         held, first, n = list(tokens), self.marker[0], len(self.marker)
         at = 0
         while True:
@@ -245,28 +247,53 @@ class Index(Protocol):
 
 class Grammar:
     """An outlines-core `Index` (a JSON schema or regex compiled over a tokenizer's vocabulary) as
-    a `Constraint`: the tokens its language may take after `tokens`. It keeps the state of the
-    last prefix it was asked about, so a decode's next token costs one transition."""
+    a `Constraint`: the tokens its language may take after `tokens`. It keeps the states of the
+    prefixes it was asked about lately (`PREFIXES`: every row's that shares it, and their drafts'),
+    so a row's next token costs one transition, and the allowed ids of the states it met lately
+    (`STATES`) as one host tensor each, so a step builds none."""
+
+    #: prefixes whose state it keeps, the latest asked
+    PREFIXES = 256
+    #: states whose allowed ids it keeps, the latest asked
+    STATES = 32
+    #: how many tokens back from a prefix it looks for a kept one before reading it from the start
+    BACK = 16
 
     def __init__(self, index: Index) -> None:
         self.index = index
-        self.last: tuple[tuple[int, ...], int] = ((), index.get_initial_state())
+        self.states: OrderedDict[tuple[int, ...], int] = OrderedDict()
+        self.ids: OrderedDict[int, torch.Tensor] = OrderedDict()
 
-    def allowed(self, tokens: Sequence[int]) -> Sequence[int]:
+    def allowed(self, tokens: Sequence[int]) -> torch.Tensor:
         held = tuple(tokens)
-        done, state = self.last
-        if held[: len(done)] != done:
-            done, state = (), self.index.get_initial_state()
-        for token in held[len(done) :]:
+        done, state = 0, self.index.get_initial_state()
+        for cut in range(len(held), max(len(held) - self.BACK, 0), -1):
+            kept = self.states.get(held[:cut])
+            if kept is not None:
+                done, state = cut, kept
+                break
+        for token in held[done:]:
             following = self.index.get_next_state(state, token)
             if following is None:
                 raise ValueError(f"token {token} is outside the grammar")
             state = following
-        self.last = (held, state)
-        ids = self.index.get_allowed_tokens(state)
+        _keep(self.states, held, state, self.PREFIXES)
+        ids = self.ids.get(state)
         if ids is None:
-            raise ValueError(f"state {state} is outside the grammar")
-        return list(ids)
+            said = self.index.get_allowed_tokens(state)
+            if said is None:
+                raise ValueError(f"state {state} is outside the grammar")
+            ids = torch.tensor(list(said), dtype=torch.long)
+        _keep(self.ids, state, ids, self.STATES)
+        return ids
+
+
+def _keep[K, V](kept: OrderedDict[K, V], key: K, value: V, most: int) -> None:
+    """`key` as `kept`'s latest, at most `most` of them."""
+    kept[key] = value
+    kept.move_to_end(key)
+    while len(kept) > most:
+        kept.popitem(last=False)
 
 
 class _Decoder(Protocol):
@@ -1038,12 +1065,16 @@ def _ids(constraint: Constraint, tokens: Sequence[int], vocab: int) -> torch.Ten
     """`constraint.allowed(tokens)` as a host index tensor: some, each in the vocabulary; None
     where it allows any token."""
     said = constraint.allowed(tokens)
-    if said is None:
-        return None
+    return None if said is None else _checked(said, len(tokens), vocab)
+
+
+def _checked(said: Sequence[int] | torch.Tensor, after: int, vocab: int) -> torch.Tensor:
+    """A constraint's ids (`allowed` after `after` tokens) as a host index tensor, each checked to
+    be in the vocabulary."""
     ids = torch.as_tensor(said).to("cpu", torch.long).reshape(-1)
     if not ids.numel() or int(ids.min()) < 0 or int(ids.max()) >= vocab:
         raise ValueError(
-            f"allowed() after {len(tokens)} tokens gave {ids.numel()} ids: it gives at least one, "
+            f"allowed() after {after} tokens gave {ids.numel()} ids: it gives at least one, "
             f"each below the vocabulary's {vocab} (a complete grammar, its stop token)"
         )
     return ids
@@ -1983,6 +2014,8 @@ class _Engine:
         self.cache_device: torch.device | None = None
         # an int8 head: no .weight
         self.vocab = int(_lm(model).get_output_embeddings().out_features)
+        #: the bits of each host tensor of ids a constraint returned lately (a grammar's state), by its identity
+        self.packed: OrderedDict[int, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
         #: the device bytes of the slot buffers (`_need`), and whether the graphs' pool is held
         #: mapped for the rows decoding (`_pool`)
         self.held = 0
@@ -3047,13 +3080,19 @@ class _Engine:
 
     def _permit(self, row: _Row, tokens: list[int], out: torch.Tensor) -> None:
         """`out` (`_pack`'s bits): what `row` may take after `tokens`, by its call's constraint
-        (any without one) less the tokens that would repeat one of its n-grams."""
+        (any without one) less the tokens that would repeat one of its n-grams. Ids a constraint
+        returns again (a grammar's state met again) are packed once (`packed`)."""
         request = row.request
-        ids = None if request.allowed is None else _ids(request.allowed, tokens, self.vocab)
-        if ids is not None:
-            _pack(ids, out)
-        else:
+        said = None if request.allowed is None else request.allowed.allowed(tokens)
+        if said is None:
             out.fill_(255)
+        elif (kept := self.packed.get(id(said))) is not None and kept[0] is said:
+            _keep(self.packed, id(said), kept, Grammar.STATES)
+            out.copy_(kept[1])
+        else:
+            _pack(_checked(said, len(tokens), self.vocab), out)
+            if isinstance(said, torch.Tensor):  # one kept and returned again; a sequence is new each time
+                _keep(self.packed, id(said), (said, out.clone()), Grammar.STATES)
         if request.ngram:
             n, held = request.ngram, [*request.prompts[row.row], *_set(row.generated)]
             row.counted = _grams(held, n, row.grams, row.counted)
