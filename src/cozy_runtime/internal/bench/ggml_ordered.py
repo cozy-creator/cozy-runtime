@@ -22,6 +22,8 @@ from cozy_runtime.internal import ggml_linear
 SITES = (("up", 12288, 4096), ("down", 4096, 12288))
 SCHEMES = ("ggml.q8_0", "ggml.q4_k")
 GROUPS = (("decode", (1, 2, 4, 8, 13, 16)), ("prefill", (640, 1500, 4096)))
+#: The longest it waits for the card's ggml kernels to be verified.
+VERIFY_S = 900.0
 
 type Row = dict[str, int | float | str]
 
@@ -69,12 +71,14 @@ def _rows(ops: ModuleType, raced: bool) -> dict[str, Row]:
 
 
 def measure() -> dict[str, object]:
-    deadline = time.monotonic() + 120
+    # A fresh executor verifies the card's ggml kernels before it serves them: over 2 min on an A40 and an RTX PRO 4500
+    # (44500040933, 44503599563, 44503589534). This cell judges ordering, not cold start, so it waits for them.
+    deadline = time.monotonic() + VERIFY_S
     while (ops := ggml_linear.native(torch, 0)) is None:
         if why := ggml_linear.why(0) or ggml_linear.carried(ggml_linear.capability(torch, 0)):
             return {"served": False, "why": why}
         if time.monotonic() > deadline:
-            return {"served": False, "why": "the card's ggml kernels were not verified in 120 s"}
+            return {"served": False, "why": f"the card's ggml kernels were not verified in {VERIFY_S:.0f} s"}
         time.sleep(0.1)
     raced, settled = _rows(ops, raced=True), _rows(ops, raced=False)
     differs = [key for key, value in raced.items() if settled.get(key) != value]
