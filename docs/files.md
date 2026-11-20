@@ -48,7 +48,7 @@ async def render(ctx: Context, *, shot: Shot, refs: References) -> Done:
 |---|---|
 | `image.read()` | RGB `PIL.Image.Image`, EXIF orientation and `ImagePreparation` applied |
 | `image.probe()` | `ImageProbe`: `width`/`height` as `read()` returns them, and the source's |
-| `video.probe()` / `audio.probe()` | `VideoProbe` / `AudioProbe`: display-oriented size, `duration`, `source_duration`, frame rate, `variable_frame_rate`, pixel aspect, soundtrack format |
+| `video.probe()` / `audio.probe()` | `VideoProbe` / `AudioProbe`: display-oriented size, `duration`, `source_duration`, frame rate, pixel aspect, soundtrack format |
 | `video.read(*, end=None, fps=None, audio=True)` | `DecodedVideo`: frames starting before `end`, soundtrack cut at `end` |
 | `video.stream(*, end=None, audio=True, pictures=True)` | `DecodedMediaStream` bounded by `end`; `pictures=False` reads only the soundtrack |
 | `audio.read(*, end=None)` / `audio.stream(*, end=None)` | native-rate `DecodedAudio` / stream cut at `end` |
@@ -68,8 +68,8 @@ async def render(ctx: Context, *, shot: Shot, refs: References) -> Done:
 - `probe()` decodes nothing. Its `frame_rate` is the clock the video's packets keep, not the
   header's average: a join copied by ffmpeg can average 24.06 with every frame 1/24 long. A
   time base too coarse for the rate (Matroska's milliseconds) keeps the stated rate its frames
-  are within a tick of. Frames on no clock set `variable_frame_rate`, and `frame_rate` is the
-  average. A container without a recorded duration (live WebM) is measured from its packets.
+  are within a tick of. Frames on no clock give their average. A container without a recorded
+  duration (live WebM) is measured from its packets.
 - Reads refuse inside an active component-use scope and after the attempt closes. Each
   `read()` decodes again; keep the value. A refused read returns what it charged, so a
   shorter `end` can follow. `read_bytes()` still returns the whole file.

@@ -334,8 +334,8 @@ class AudioProbe:
 class VideoProbe:
     """Header facts of a video input: display-oriented geometry, clock and soundtrack.
 
-    `frame_rate` is the frame clock its packets' times keep (`frame_clock`); with
-    `variable_frame_rate` they keep none, and it is the average rate.
+    `frame_rate` is the frame clock its packets' times keep (`frame_clock`); on none, their
+    average rate.
     """
 
     width: int
@@ -343,7 +343,6 @@ class VideoProbe:
     duration: Fraction
     source_duration: Fraction
     frame_rate: Fraction | None
-    variable_frame_rate: bool
     pixel_aspect_ratio: Fraction
     soundtrack: DecodedAudioFormat | None
 
@@ -352,12 +351,10 @@ class VideoProbe:
 class FrameClock:
     """A video track's frame clock, as `frame_clock` reads it from its packets."""
 
-    #: Each frame lasts 1/rate; with `variable`, the average. None: no rate known.
+    #: Each frame lasts 1/rate, or on average when they keep no one clock. None: no rate known.
     rate: Fraction | None
     #: Time-base ticks per frame when every frame lasts exactly that: the clock packet copy keeps.
     step: int | None
-    #: The frames keep no one rate.
-    variable: bool
 
 
 def frame_clock(stream: VideoStream, times: Iterable[int]) -> FrameClock:
@@ -381,20 +378,20 @@ def frame_clock(stream: VideoStream, times: Iterable[int]) -> FrameClock:
     if len(order) < 2 or base <= 0:
         rate = stated[0] if stated else None
         slot = 1 / (rate * base) if rate and base > 0 else None
-        return FrameClock(rate, int(slot) if slot and slot.denominator == 1 else None, False)
+        return FrameClock(rate, int(slot) if slot and slot.denominator == 1 else None)
     steps = {later - earlier for earlier, later in pairwise(order)}
     if len(steps) == 1 and (step := steps.pop()) > 0:
-        return FrameClock(1 / (step * base), step, False)
+        return FrameClock(1 / (step * base), step)
     first, span = order[0], order[-1] - order[0]
     for rate in stated:
         slot = 1 / (rate * base)
         ticks, per = slot.numerator, slot.denominator
         if all(abs(per * (t - first) - i * ticks) < per for i, t in enumerate(order)):
-            return FrameClock(rate, None, False)
+            return FrameClock(rate, None)
     average = _fraction(stream.average_rate, "video frame rate") if stream.average_rate else None
     if not (average and average > 0):
         average = (len(order) - 1) / (span * base) if span > 0 else None
-    return FrameClock(average, None, True)
+    return FrameClock(average, None)
 
 
 def _packet_times(container: InputContainer, stream: VideoStream) -> list[int]:
@@ -1741,7 +1738,6 @@ def _probe_video(av: ModuleType, path: Path, limits: DecodeLimits) -> VideoProbe
         duration=duration,
         source_duration=duration,
         frame_rate=clock.rate,
-        variable_frame_rate=clock.variable,
         pixel_aspect_ratio=aspect,
         soundtrack=audio_format,
     )
