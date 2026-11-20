@@ -1,0 +1,1 @@
+Attention reads no operand in place from host memory the card addresses: `cuts.attend` copies a piece's K/V (once a head group) and its queries onto the card first, counted in the level it takes, where a kernel would have read K/V across the link once a query block.
