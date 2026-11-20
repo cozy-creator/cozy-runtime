@@ -97,13 +97,6 @@ class RoutedExpert(nn.Module):
         return out
 
 
-class _Int8Leaf(Protocol):
-    """An int8.convrot leaf's stored operands (`_kind` "int8")."""
-
-    data: torch.Tensor
-    scale: torch.Tensor
-
-
 class _GgmlLeaf(Protocol):
     """A ggml leaf's stored blocks (`_kind` "ggml")."""
 
@@ -155,6 +148,8 @@ class Experts(nn.ModuleList):
         self._aligned = False
         #: ggml's: the block types of gate-and-up and of down, every expert's alike
         self._schemes: tuple[str, str] = ("", "")
+        #: the first expert's gate-and-up module and the experts' `_layout_of`, read once for it
+        self._layout: tuple[nn.Module, tuple[str, tuple[str, str], list[list[tuple[nn.Module, str]]]] | str] | None = None
 
     def forward(
         self, hidden: torch.Tensor, index: torch.Tensor, weights: torch.Tensor
@@ -216,22 +211,25 @@ class Experts(nn.ModuleList):
         kind, the GEMM's reads not aligned, ggml's kernels not verified or too many tokens)."""
         if not hidden.is_cuda or hidden.dtype != torch.bfloat16:
             return f"the grouped kernels take bf16 on a GPU, not {hidden.dtype} on {hidden.device}"
-        found = self._operands(hidden.device)
-        if isinstance(found, str):
-            return found
-        kind, table = found
-        if kind == "ggml":
+        # What refuses without reading every expert's operands first.
+        launcher = _LAUNCH[0] if launch is None else launch
+        if kind(self) == "ggml":
             if index.shape[0] > GGML_TOKENS:
                 return f"{index.shape[0]} tokens: MUL_MAT_ID's MMVQ takes up to {GGML_TOKENS} a layer"
             if why := ggml_linear.ids_unserved(torch, hidden.get_device()):
                 return why
-            return self._ggml(table, hidden, index)
-        launcher = _LAUNCH[0] if launch is None else launch
-        if isinstance(launcher, str):
+        elif isinstance(launcher, str):
             return launcher
+        found = self._operands(hidden.device)
+        if isinstance(found, str):
+            return found
+        grouped, table = found
+        if grouped == "ggml":
+            return self._ggml(table, hidden, index)
+        assert not isinstance(launcher, str)  # refused above for every other kind
         if index.numel() > GROUPED and not self._aligned:
             return "an expert's operand or width is not 16-byte aligned, as the grouped GEMM reads"
-        return self._run(launcher, kind, table, hidden, index)
+        return self._run(launcher, grouped, table, hidden, index)
 
     def _ggml(self, table: torch.Tensor, hidden: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
         """`[pairs, H]` f32 by llama.cpp's MUL_MAT_ID over f32 rows (as llama.cpp's activations
@@ -362,32 +360,24 @@ class Experts(nn.ModuleList):
         bound, contiguous and of that kind on `device`; else why not. Outside a capture a changed
         address set is written to the table; inside one it is a refusal."""
         first = cast("RoutedExpert", self[0])  # an Experts holds RoutedExperts
-        kind = _kind(first.gate_and_up_proj)
-        if kind is None:
-            return unserved(self)
-        schemes = (_scheme(first.gate_and_up_proj), _scheme(first.down_proj))
+        if self._layout is None or self._layout[0] is not first.gate_and_up_proj:
+            self._layout = (first.gate_and_up_proj, self._layout_of())
+        layout = self._layout[1]
+        if isinstance(layout, str):
+            return layout
+        kind, schemes, reads = layout
         if kind == "ggml":
             for linear in (first.gate_and_up_proj, first.down_proj):
                 if why := ggml_linear.unserved(cast("_GgmlLeaf", linear).blocks, linear.in_features):
                     return why
-        rows: list[list[int]] = [[] for _ in range(4 if kind == "int8" else 2)]
-        for expert in cast("Iterable[RoutedExpert]", self):  # an Experts holds RoutedExperts
-            for which, linear in enumerate((expert.gate_and_up_proj, expert.down_proj)):
-                if _kind(linear) != kind or (kind == "ggml" and _scheme(linear) != schemes[which]):
-                    return "its experts are not all of one kind"
-                leaf = cast("_Int8Leaf", linear)  # read only when `_kind` found an int8 leaf
-                operands: tuple[torch.Tensor, ...]
-                if kind == "bf16":
-                    operands = (linear.weight,)
-                elif kind == "int8":
-                    operands = (leaf.data, leaf.scale)
-                else:
-                    operands = (cast("_GgmlLeaf", linear).blocks,)  # `_kind` found a ggml leaf
-                for role, tensor in enumerate(operands):
-                    address = _address(tensor, device)
-                    if not address:
-                        return f"an expert's operand is not bound, contiguous and on {device}"
-                    rows[len(operands) * which + role].append(address)
+        rows: list[list[int]] = []
+        for row in reads:  # each operand's address, read now: varena may have moved it
+            rows.append([])
+            for module, name in row:
+                address = _address(getattr(module, name), device)
+                if not address:
+                    return f"an expert's operand is not bound, contiguous and on {device}"
+                rows[-1].append(address)
         addresses = [a for row in rows for a in row]
         if addresses != self._addresses:
             if torch.cuda.is_current_stream_capturing():
@@ -402,6 +392,25 @@ class Experts(nn.ModuleList):
             return "ggml's kernels read a weight 16-byte aligned, and an expert's is not"
         assert self._table is not None
         return kind, self._table
+
+    def _layout_of(self) -> tuple[str, tuple[str, str], list[list[tuple[nn.Module, str]]]] | str:
+        """The experts' kind, the block types of their projections (ggml's) and the address table's
+        rows as (module, operand name), read once: a leaf's kind is fixed when it is made. Or why the
+        grouped kernels can't run them."""
+        first = cast("RoutedExpert", self[0])  # an Experts holds RoutedExperts
+        kind = _kind(first.gate_and_up_proj)
+        if kind is None:
+            return unserved(self)
+        names = {"bf16": ("weight",), "int8": ("data", "scale"), "ggml": ("blocks",)}[kind]
+        schemes = (_scheme(first.gate_and_up_proj), _scheme(first.down_proj))
+        reads: list[list[tuple[nn.Module, str]]] = [[] for _ in range(2 * len(names))]
+        for expert in cast("Iterable[RoutedExpert]", self):  # an Experts holds RoutedExperts
+            for which, linear in enumerate((expert.gate_and_up_proj, expert.down_proj)):
+                if _kind(linear) != kind or (kind == "ggml" and _scheme(linear) != schemes[which]):
+                    return "its experts are not all of one kind"
+                for role, name in enumerate(names):
+                    reads[len(names) * which + role].append((linear, name))
+        return kind, schemes, reads
 
 
 def install(plan: Plan, model: nn.Module) -> str:
