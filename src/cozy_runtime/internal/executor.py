@@ -1814,7 +1814,7 @@ class Executor:
             self.residency.open_attempt()
         try:
             with (
-                self._request(command.request_id) as rows,
+                self._request(command.request_id, command.entrypoint) as rows,
                 attention_sol.observing(held=states) as sol,
                 attention_ulysses.observing() as served,
                 spmd.attempt(ranks, entropy),
@@ -1850,6 +1850,9 @@ class Executor:
                 finally:
                     with contextlib.suppress(Exception):
                         ranks.end(outcome is not None and outcome.terminal == "succeeded")
+                memory = self.host.requests.get(command.request_id)
+                if outcome is not None and memory is not None:
+                    memory.completed = outcome.terminal == "succeeded"
                 if self.host.memory is not None:
                     working = accel.allocator_peak(self.host.memory, command.request_id)
                 exchange = ulysses.taken()
@@ -4158,7 +4161,7 @@ class Executor:
             with (
                 WARNINGS.attempt() as warnings,
                 request_path.serving() as blocking,
-                self._request(command.request_id) as own_memory,
+                self._request(command.request_id, command.entrypoint) as own_memory,
                 attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
                 if pin
                 else contextlib.nullcontext(
@@ -4233,6 +4236,7 @@ class Executor:
                 if (memory := self.host.requests.get(command.request_id)) is not None:
                     # A call that ran out of memory: what its memory learns from.
                     memory.failed = outcome.code in CAPACITY_CODES
+                    memory.completed = outcome.terminal == "succeeded"
         except Exception as exc:
             envelope, outcome = None, classify(exc)
             unwind(exc)
@@ -5198,9 +5202,10 @@ class Executor:
         return Device(cast("DeviceType", placed.type), placed.index)  # torch names cuda/cpu/mps
 
     @contextlib.contextmanager
-    def _request(self, request_id: str) -> Iterator[list[GpuMemory]]:
-        """The request's residency scopes and pure cuts. Tensor ownership determines lifetime;
-        its recorded allocator figures are process-wide, not exact per-request allocations."""
+    def _request(self, request_id: str, work: str) -> Iterator[list[GpuMemory]]:
+        """The request's residency scopes and pure cuts, for the function `work`. Tensor ownership
+        determines lifetime; its recorded allocator figures are process-wide, not exact per-request
+        allocations."""
         host, rows = self.host, list[GpuMemory]()
         if host.memory is None or host.execution is None:
             yield rows
@@ -5211,7 +5216,7 @@ class Executor:
         peak: int | None = None
         try:
             with (
-                host.memory.request(request_id) as request,
+                host.memory.request(request_id, work=work) as request,
                 host.execution.serving(request),
             ):
                 host.requests[request_id] = request

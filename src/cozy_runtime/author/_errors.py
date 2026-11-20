@@ -242,10 +242,12 @@ _ALLOC_FAILED = (
 )
 #: NCCL reports the CUDA code its own allocation returned.
 _NCCL_OOM = "Cuda failure 2 'out of memory'"
+#: Triton's launcher, which prints CUDA's out-of-memory code by its name.
+_TRITON_OOM = "Triton Error [CUDA]: out of memory"
 #: The libraries that give no code, by their message's prefix: Triton's launcher, and torch's
 #: MPS allocator (a pool past its limit, and one buffer larger than Metal allows).
 _OOM_PREFIXES = (
-    "Triton Error [CUDA]: out of memory",
+    _TRITON_OOM,
     "MPS backend out of memory",
     "Invalid buffer size",
 )
@@ -286,6 +288,21 @@ def fault(exc: BaseException) -> Fault:
         if text.startswith(_OOM_PREFIXES) or any(status in text for status in _ALLOC_FAILED):
             return Fault.OOM
     return Fault.OTHER
+
+
+def outside_books(exc: BaseException) -> bool:
+    """The driver or a CUDA library refused its own device allocation, which varena never saw,
+    by its out-of-memory code: CUDA's (a kernel's code at its first launch, local memory), a
+    library's alloc-failed status, Triton's launch. Not varena's refusal (`OutOfMemoryError`),
+    and not a collective's: one GPU running it again alone would wait for the others. A status a
+    real bug also returns (`CUFFT_INTERNAL_ERROR`, cuDNN finding no engine) is none (var-040)."""
+    kind, module = type(exc).__name__, type(exc).__module__
+    if module.partition(".")[0] == "torch" and kind == "AcceleratorError":
+        return getattr(exc, "error_code", None) == _CUDA_OOM
+    if not isinstance(exc, RuntimeError) or kind == "OutOfMemoryError" or _collective(exc):
+        return False
+    text = str(exc)
+    return text.startswith(_TRITON_OOM) or any(status in text for status in _ALLOC_FAILED)
 
 
 def _collective(exc: BaseException) -> bool:
