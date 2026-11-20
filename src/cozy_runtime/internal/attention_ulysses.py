@@ -380,6 +380,12 @@ def exchange(
 _UNSERVED = "Ulysses runs where torch does: nothing imported internal.parallel.ulysses"
 
 
+def served() -> dict[str, list[str]]:
+    """Each backend's implementations served in the observed scope so far (`observing`)."""
+    scope = _SEEN.get()
+    return {backend: sorted(impls) for backend, impls in scope[0].items()} if scope else {}
+
+
 def describe(seen: dict[str, set[str]], names: dict[str, str]) -> str:
     """One implementation line: the bare implementation when one kernel served, else
     `kernel:impl` per kernel."""

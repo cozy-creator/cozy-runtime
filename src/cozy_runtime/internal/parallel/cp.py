@@ -7,8 +7,9 @@ accelerate wrappers on sharded components are refused.
 
 from __future__ import annotations
 
+import contextlib
 import re
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -202,13 +203,40 @@ def _install_on_component(component: nn.Module, *, degree: int, comms: CpComms) 
     # A stand-in with the members `setup` and Diffusers' hooks read (`_GroupMesh`).
     config.setup(int(comms.rank), int(degree), device, mesh=cast("DeviceMesh", mesh))
     vars(component)["_parallel_config"] = config  # as Module.__setattr__ stores a plain value
+    processors: list[object] = []
     for module in attention_modules:
         if not isinstance(module, attention_classes):
             continue
         processor = getattr(module, "processor", None)
         if processor is not None and hasattr(processor, "_parallel_config"):
             processor._parallel_config = config
-    apply_context_parallel(component, cp_config, getattr(component, _CP_PLAN_ATTR))
+            processors.append(processor)
+    plan = getattr(component, _CP_PLAN_ATTR)
+    apply_context_parallel(component, cp_config, plan)
+    # What `unsharded` takes off a call and puts back.
+    vars(component)["_cozy_cp"] = (config, cp_config, plan, processors)
+
+
+@contextlib.contextmanager
+def unsharded(components: Iterable[nn.Module]) -> Iterator[None]:
+    """`components` as one GPU runs them, for a stage at degree 1 (`degrees`): their CP hooks off
+    and their attention local, put back after."""
+    from diffusers.hooks.context_parallel import apply_context_parallel, remove_context_parallel
+
+    held = [(c, vars(c)["_cozy_cp"]) for c in components if "_cozy_cp" in vars(c)]
+    for component, (_, _, plan, processors) in held:
+        remove_context_parallel(component, plan)
+        vars(component)["_parallel_config"] = None
+        for processor in processors:
+            processor._parallel_config = None  # type: ignore[attr-defined]  # read above
+    try:
+        yield
+    finally:
+        for component, (config, cp_config, plan, processors) in held:
+            vars(component)["_parallel_config"] = config
+            for processor in processors:
+                processor._parallel_config = config  # type: ignore[attr-defined]  # read above
+            apply_context_parallel(component, cp_config, plan)
 
 
 def _sharded_modules(component: nn.Module) -> list[nn.Module]:

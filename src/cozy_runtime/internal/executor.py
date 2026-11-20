@@ -1509,12 +1509,12 @@ class Executor:
         facts = self.facts
         transport = self.host.transport
         crossing: Reply = {}
-        if transport is not None:
+        if transport is not None or self.group is not None:  # a CPU group has no measured links
             from cozy_runtime.internal.parallel import ulysses
 
             crossing = {
                 "transport": {
-                    **transport.document(),
+                    **(transport.document() if transport is not None else {}),
                     "exchange": ulysses.taken(),
                     "stages": spmd.taken(),
                 }
@@ -1791,6 +1791,7 @@ class Executor:
             device=self._rank_device(self.torch),
             tag=tag,
             gpu=_gpu,
+            call=(self.construction or "", asked.entrypoint),
         )
         held = attention.observed(self._attention_roots())
         hold = self.host._producer_hold
@@ -1942,6 +1943,7 @@ class Executor:
             gpu=_gpu,
             # its long meeting waits are the run's stage; a follower's attempt tells nothing
             stage=request_path.told,
+            call=(self.construction or "", asked.entrypoint),
         )
         group.broadcast(
             {
