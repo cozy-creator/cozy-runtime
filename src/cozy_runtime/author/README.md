@@ -131,7 +131,8 @@ def generate(ctx: Context, payload: Request, model: Flow, upsampler: Upsampler, 
       return await call(control, payload, models={"model": ModelChoice(lora=(Lora(depth.ref),))})
   ```
 
-  A string field of another package's request takes `depth.ref` too.
+  A string field of another package's request takes `depth.ref` too. A request its rule rules out
+  binds it nothing and starts all the same; reading it then refuses (`model_ruled_out`).
 - Err toward true: a rule that is true for a request that doesn't read the model only fetches
   too much. One that is false for a request that does read it makes that request wait for the
   download when it reads it, and the run warns.
