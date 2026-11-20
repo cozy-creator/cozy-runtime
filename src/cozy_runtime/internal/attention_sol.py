@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 
 from cozy_runtime.accel.attention import _ACTIVE_LAYOUT, AttentionLayout, _request
 from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author._errors import CudaStatusError
 from cozy_runtime.author._observations import Scalar
 from cozy_runtime.internal import (
     accel,
@@ -598,6 +599,9 @@ class Loaded:
             message = str(error)
             if message in {"CUDA Error Code: 1", "CUDA Error: cudaErrorInvalidValue"}:
                 raise _LaunchRefused(message) from error
+            status = message.removeprefix("CUDA Error Code: ")
+            if status != message and status.isascii() and status.isdecimal():
+                raise CudaStatusError(int(status), message) from error
             raise
 
 

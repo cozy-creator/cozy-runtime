@@ -223,6 +223,14 @@ class Fault(Enum):
     OTHER = "other"
 
 
+class CudaStatusError(RuntimeError):
+    """A CUDA status reported through a native binding without a typed exception."""
+
+    def __init__(self, error_code: int, message: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
 #: cudaErrorMemoryAllocation
 _CUDA_OOM = 2
 #: cudaError_t stream-capture codes: an operation the graph being recorded cannot hold.
@@ -258,6 +266,10 @@ def fault(exc: BaseException) -> Fault:
     launch, MPS's allocator), NCCL's `DistBackendError` (out of memory by the CUDA code it
     reports, else a device error), varena's `Exhausted` and device errors (out of memory
     by their CUDA code), and TensorFS's `DeviceMemoryError`."""
+    if isinstance(exc, CudaStatusError):
+        if exc.error_code == _CUDA_OOM:
+            return Fault.OOM
+        return Fault.STICKY if exc.error_code in _STICKY else Fault.DEVICE
     kind, module = type(exc).__name__, type(exc).__module__
     if module.partition(".")[0] == "torch":
         if kind == "OutOfMemoryError":

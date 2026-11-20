@@ -9,6 +9,7 @@ from torch import Tensor
 from torch.nn.functional import scaled_dot_product_attention
 
 from cozy_runtime.accel.attention import AttentionLayout
+from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal import attention_sol as sol
 
 
@@ -80,6 +81,7 @@ def check() -> None:
             )
         except RuntimeError as error:
             assert str(error) == "CUDA Error Code: 700"
+            assert fault(error) is Fault.STICKY
         else:
             raise AssertionError("a device fault cannot be treated as an unsupported launch")
 
