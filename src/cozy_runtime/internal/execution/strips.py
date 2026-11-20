@@ -154,7 +154,7 @@ def _block(module: nn.Module) -> Block | None:
         ):
             return None  # an asymmetric pad ahead of a strided conv: the encoder's downsample
     composite = any(sub is not module and _candidate(sub) is not None for sub in module.modules())
-    return Block(rows, columns, scale, signature, composite)
+    return Block(max(rows - 1, 0), columns, scale, signature, composite)  # PROOF ONLY: a row short
 
 
 def _reach(conv: nn.Conv2d | nn.Conv3d) -> tuple[int, int]:
