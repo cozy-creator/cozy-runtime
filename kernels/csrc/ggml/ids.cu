@@ -20,10 +20,11 @@ int ids_batch(int device, int type) {
     return std::min(MMVQ_MAX_BATCH_SIZE, get_mmvq_mmid_max_batch(ggml_type(type), cc));
 }
 
-int matmul_ids(int device, int type, const void* table, const float* x, int64_t rows, const int32_t* ids, float* out,
-               int64_t K, int64_t N, int64_t T, int64_t k, void* (*allocate)(size_t, void*), void* context,
-               cudaStream_t stream) {
+int matmul_ids(int device, int type, const void* table, int64_t stride, const float* x, int64_t rows,
+               const int32_t* ids, float* out, int64_t K, int64_t N, int64_t T, int64_t k,
+               void* (*allocate)(size_t, void*), void* context, cudaStream_t stream) {
     if (!runs(type) || K <= 0 || N <= 0 || T <= 0 || k <= 0 || K % MATRIX_ROW_PADDING) return cudaErrorInvalidValue;
+    if (stride < 0 || stride % ggml_type_size(ggml_type(type))) return cudaErrorInvalidValue;
     if (rows != 1 && rows != k) return cudaErrorInvalidValue;
     try {
         Allocate temporaries{allocate, context};
@@ -33,13 +34,13 @@ int matmul_ids(int device, int type, const void* table, const float* x, int64_t 
         for (int64_t t0 = 0; t0 < T; t0 += batch) {
             const int64_t n = std::min(batch, T - t0);
             // MUL_MAT_ID's tensors (ggml.c `ggml_mul_mat_id`): weights [K, N, experts], x [K, rows, n], ids [k, n],
-            // out [N, k, n]. The weights' data is the table; their channel stride 0 says so.
+            // out [N, k, n]. The weights' data is the table, which their channel stride 0 says; or one stack.
             ggml_tensor w{}, src1{}, chosen{}, dst{};
             w.type = ggml_type(type);
             w.ne[0] = K, w.ne[1] = N, w.ne[2] = 1, w.ne[3] = 1;
             w.nb[0] = ggml_type_size(w.type);
             w.nb[1] = ggml_row_size(w.type, K);
-            w.nb[2] = w.nb[3] = 0;
+            w.nb[2] = size_t(stride), w.nb[3] = 0;
             w.data = const_cast<void*>(table);
             src1.type = GGML_TYPE_F32;
             src1.ne[0] = K, src1.ne[1] = rows, src1.ne[2] = n, src1.ne[3] = 1;

@@ -46,6 +46,7 @@ def matmul_ids(
     device: int,
     type: int,
     table: int,
+    stride: int,
     x: int,
     rows: int,
     ids: int,
