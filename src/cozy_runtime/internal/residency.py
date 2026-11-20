@@ -4160,9 +4160,23 @@ def _streaming(module: nn.Module, path: str, block: _Block, memory: Memory) -> N
     )
 
     def forward(x: Tensor, *args: object, **kwargs: object) -> object:
-        if block.gathered is None or args or kwargs or not isinstance(x, Tensor):
+        if args or kwargs or not isinstance(x, Tensor):
             return previous(x, *args, **kwargs)
-        return memory._streamed(block, module, path, x)
+        # Entered as its block's forward would enter it: a layer called outside that forward
+        # (RelayVSR's keyframe calls a block's FFN itself) is otherwise entered by its weight's
+        # read inside the op, after this choice, and multiplied by its host copy.
+        model = block.model
+        model._claim()
+        try:
+            memory._enter(block)
+            try:
+                if block.gathered is None:
+                    return previous(x)
+                return memory._streamed(block, module, path, x)
+            finally:
+                memory._exit(block)
+        finally:
+            model._release()
 
     vars(forward)[TRANSPARENT] = True
     module.forward = forward
