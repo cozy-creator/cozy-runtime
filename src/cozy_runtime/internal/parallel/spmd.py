@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from types import ModuleType
 
     import torch
+    from torch import Tensor
     from torch.distributed import ProcessGroup
     from torch.utils.hooks import RemovableHandle
 
@@ -605,11 +606,11 @@ class _Alone:
         # Here, one after another: no GPU waits for it, or its arguments cannot cross to them.
         if name is None or not self.served or not _crossable(calls, []):
             return (method(*call) for call in calls)
-        told = {
+        told: dict[str, object] = {
             "op": "spread",
             "component": name,
             "method": getattr(method, "__name__", ""),
-            "arguments": [list(call) for call in calls],
+            "arguments": [list(cast("tuple[object, ...]", call)) for call in calls],
         }
         self.ranks.cross(told, self.home, self.what)
         return self.ranks.spread(method, calls)
@@ -632,9 +633,9 @@ def _streams(torch: ModuleType) -> dict[str, object]:
 
 
 def _set_streams(torch: ModuleType, states: Mapping[str, object]) -> None:
-    torch.random.set_rng_state(cast("torch.Tensor", states["torch"]).cpu())
+    torch.random.set_rng_state(cast("Tensor", states["torch"]).cpu())
     if "cuda" in states:
-        torch.cuda.set_rng_state(cast("torch.Tensor", states["cuda"]).cpu())
+        torch.cuda.set_rng_state(cast("Tensor", states["cuda"]).cpu())
     version, internal, gauss = cast("list[object]", states["python"])
     random.setstate((version, tuple(cast("list[int]", internal)), gauss))
     numpy = sys.modules.get("numpy")

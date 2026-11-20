@@ -66,7 +66,7 @@ def marshal(value: object, tensors: list[torch.Tensor], *, path: str = "") -> Js
         return value
     numpy = sys.modules.get("numpy")
     array = numpy is not None and isinstance(value, numpy.ndarray)
-    if array:
+    if numpy is not None and array:
         try:
             value = torch.from_numpy(numpy.ascontiguousarray(value))
         except TypeError as exc:  # an object or other array torch has no type for
