@@ -160,7 +160,7 @@ models a request needs, from the request alone, on every machine it might send i
   `request`. One that gives no number for a request is left out, and the run says so once.
 - `ms`, `cold_ms`, `peak_device_bytes`, `peak_host_bytes`: optional CEL numbers over `request`,
   `size` and `machine` (`gpu`, `gpus`, `memory_bytes`, `lane`, `cpu`, `cores`, `threads`). They
-  call three helpers:
+  call these helpers:
   - `measured(machine)`: the package's own `benchmarks.json` row for that machine: `warm_ms`,
     `cold_ms`, `peak_device_bytes`, `peak_host_bytes`, `budget_bytes`, `request` (its size), `gpu`,
     `lane`, `scale`. The row of that card nearest the request; for a card with none, another
@@ -169,8 +169,13 @@ models a request needs, from the request alone, on every machine it might send i
     `measured(machine, "generate")` reads another function's rows; `measured(machine, "x", {...})`
     gives that map until a row of `x` exists (a placeholder).
   - `pow(x, y)`, `sum(list)`, `min(...)`, `max(...)`.
-- No `ms`: the platform's default, the nearest row scaled. No `size`: the request's
-  `megapixels` (or `width` by `height`), `frames`, `steps`, `tokens` and every `duration` summed.
+  - `words(text)`: how many words a text has, as whitespace parts them; `size` may call it too
+    (`"prompt_words": "words(request.instructions.text)"`).
+- No `ms`: the platform's default, the nearest row scaled. A machine's past runs scale to a
+  request's size as its rows do: by `ms` at both sizes, else by each variable's exponent fitted
+  over the rows. With nothing measured relating to a machine, its time there is unknown. No
+  `size`: the request's `megapixels` (or `width` by `height`), `frames`, `steps`, `tokens` and
+  every `duration` summed.
 - Every number in `size`, `machine` and a row is a double: `request.steps` is a whole number, so
   write `double(request.steps)` beside them. `cozy` checks each expression when it reads the
   package: a field that isn't there, a mixed whole number, or one that gives no number refuses it
