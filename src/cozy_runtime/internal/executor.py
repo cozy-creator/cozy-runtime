@@ -4470,10 +4470,13 @@ class Executor:
     @staticmethod
     def _emit_decode(record: AuthorAttempt) -> None:
         """`kernel.decode_cores`: the decode cores' GPU calls since the last attempt, per scheme and
-        the path that served them: `set` (its kernel set), `host` (the reference, copied in) or
-        `device` (the reference while a graph records). A `kernel.` name, so TensorD keeps it."""
-        for (scheme, path), calls in sorted(decode_kernels.served().items()):
-            record.emit("confession", "kernel.decode_cores", path, scheme=scheme, calls=calls)
+        the path that served them: `set` (its kernel set, with its probe's verdict), `host` (the
+        reference, copied in) or `device` (the reference while a graph records). A `kernel.` name,
+        so TensorD keeps it."""
+        for scheme, path, calls, probe in decode_kernels.served():
+            said = {"probe": probe} if probe else {}
+            name = "kernel.decode_cores"
+            record.emit("confession", name, path, scheme=scheme, calls=calls, **said)
 
     @staticmethod
     def _emit_fused(record: AuthorAttempt) -> None:

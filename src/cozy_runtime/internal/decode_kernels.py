@@ -38,15 +38,18 @@ _POINTERS = {"float32": "*fp32", "int32": "*i32", "int16": "*i16", "int8": "*i8"
 _ABSENT: set[str] = set()
 #: GPU decodes since the last read, by (scheme, path): `set`, `host` or `device` (`decode`).
 _SERVED: Counter[tuple[str, str]] = Counter()
+#: Each scheme's set's probe verdict, as `probe` said it.
+_PROBED: dict[str, str] = {}
 _COUNTING = threading.Lock()
 
 
-def served() -> dict[tuple[str, str], int]:
-    """GPU decodes since the last call, by (scheme, path): an attempt's `kernel.decode_cores`."""
+def served() -> list[tuple[str, str, int, str]]:
+    """GPU decodes since the last call, by scheme and path, with the set's probe verdict where its
+    set served them (else ""): an attempt's `kernel.decode_cores`."""
     with _COUNTING:
-        taken = dict(_SERVED)
+        taken = sorted(_SERVED.items())
         _SERVED.clear()
-    return taken
+        return [(s, path, n, _PROBED.get(s, "") if path == "set" else "") for (s, path), n in taken]
 
 
 def _count(scheme: str, path: str) -> None:
@@ -234,4 +237,6 @@ def probe(torch: ModuleType, device: Device, scheme: str, launch: Launch) -> ver
             wrong.append(f"{params} into {name}")
     detail = f"{len(probed)} entries, {total - len(wrong)} of {total} decodes the reference's bits"
     off = f"; first off: {wrong[0]}" if wrong else ""
+    with _COUNTING:
+        _PROBED[scheme] = detail + off
     return verify.Verdict(total > 0 and not wrong, detail + off)
