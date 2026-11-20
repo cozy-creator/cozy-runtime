@@ -505,9 +505,12 @@ class _Block:
     prefilled: varena.Use | None = None
     #: the birth site its entry replaced, back at its exit: what runs after it is not its
     born_before: int | None = None
-    #: a block that is one linear layer: refused room, it stays on the host and its forward
-    #: runs in windows of output rows copied in (`Memory._streamed`)
-    leaf: nn.Module | None = None
+    #: its linear layers, by path in the block ("" when it is one): refused room, the block stays
+    #: on the host, each of them runs in windows of its output rows copied in (`Memory._streamed`),
+    #: and its other values go to the card for its forward (`Memory._rest_on_card`)
+    leaves: tuple[tuple[str, nn.Module], ...] = ()
+    #: whether its leaves' forwards read the host copy while it is there (`_streaming`)
+    streaming: bool = False
 
     def paged(self) -> bool:
         """Whether a page a fill wrote may still serve: bound data or a native region."""
@@ -623,6 +626,8 @@ class Model:
         #: its loop's head site in the escaped-memory tally, and one block's weights with its common
         self.escape_site = 0
         self.escape_floor: int | None = None
+        #: its one block run from a host copy of its own (`Memory._gather`); the next replaces it
+        self.streamed_copy: _Block | None = None
         #: loops streaming it (`gathering`): an embedding table of it that left the device gathers
         #: its rows on the host instead of filling whole again
         self.gathers = 0
@@ -2379,9 +2384,9 @@ class Memory:
         there and moves only the rows it read (`_gathering`), so a room below the table never
         fails the call (Qwen-Image's 1.2 GB text-encoder table beside a 5 GB game on 8 GB). The
         copy is the host tier's page when it keeps one, else read once and held while the table
-        gathers; each entry tries the device first. A linear layer refused so (`_Block.leaf`)
-        stays there the same way, in pinned memory; its windows' rows are copied in
-        (`_streamed`)."""
+        gathers; each entry tries the device first. A block of linear layers refused so
+        (`_Block.leaves`) stays there the same way, in pinned memory; each layer's windows of rows
+        are copied in (`_streamed`), and its other values go to the card (`_rest_on_card`)."""
         self._retire_phase_plan("host_gathered_representation", model=block.model)
         if block.gathered is None or block.gathered[0] != overlay:
             block.gathered = None
@@ -2408,32 +2413,90 @@ class Memory:
                     for destination in finals[key].values():
                         destination.copy_(data[key]["value"])
             block.gathered = overlay, data, finals
+            if not block.table:
+                # One block of a model holds a host copy at a time: a pass streaming its layers
+                # holds one layer's bytes, and a loop streaming one layer (an LM's head) keeps it.
+                previous = model.streamed_copy
+                if previous is not None and previous is not block and previous.count == 0:
+                    previous.gathered = None
+                model.streamed_copy = block
         with self.lock:
             block.data, block.final_data, block.ready = block.gathered[1], block.gathered[2], None
         if (request := _REQUEST.get()) is not None and block.table:
             request.gathered += 1
 
     def _streams(self, block: _Block) -> bool:
-        """Whether `block`, refused room, can run from the host: one linear layer whose output
-        rows compute alone (`rows.streamed`), outside a capture and a graph's binding (whose
-        refusal tells it to run eagerly)."""
-        if block.leaf is None or not self.cuda or self.capturing() or block.retained:
+        """Whether `block`, refused room, can run from the host: a block whose linear layers'
+        output rows each compute alone (`rows.streamed`), outside a capture and a graph's binding
+        (whose refusal tells it to run eagerly). A block is split to its layers this way, never
+        refused for its size: Qwen3-VL's 488 MB decoder layer beside four 8192x1024 pictures."""
+        if not block.leaves or not self.cuda or self.capturing() or block.retained:
             return False
         from cozy_runtime.accel import rows
 
-        return rows.streamed(block.leaf, rows._slice, rows._same) is not None
+        if any(rows.streamed(leaf, rows._slice, rows._same) is None for _, leaf in block.leaves):
+            return False
+        if not block.streaming:
+            block.streaming = True
+            for path, leaf in block.leaves:
+                _streaming(leaf, path, block, self)
+        return True
 
-    def _streamed(self, block: _Block, x: Tensor) -> Tensor:
-        """`block`'s layer over `x` from its host copy (`_gather`): in windows of its output rows,
-        each window's rows copied in on this stream and computed as `rows` computes them, the
-        windows as many as the card's room takes (`catch.cut`, which goes finer on a refusal).
-        One window is the whole layer's own call. Each byte crosses the bus once a forward."""
+    @torch.inference_mode(False)
+    def _rest_on_card(
+        self, block: _Block, assigned: list[tuple[_Site, Tensor]]
+    ) -> list[tuple[_Site, Tensor]]:
+        """A block run from its host copy (`_streams`): its linear layers read their rows there
+        (`_streamed`), and each value it binds that no such layer owns (a norm's scale, a table its
+        ops read) is copied to the card for its forward, outside inference mode as `_assign` makes
+        its values: RelayVSR's `scale_shift_table[None]` failed on an inference copy."""
+        owned = {id(t) for _, leaf in block.leaves for t in (leaf._parameters, leaf._buffers)}
+        moved: dict[int, Tensor] = {}
+        placed: list[tuple[_Site, Tensor]] = []
+        for site, value in assigned:
+            if id(site.table) not in owned and value.device.type == "cpu":
+                if id(value) not in moved:
+                    copy = value.detach().to(self.device, non_blocking=True)
+                    if isinstance(value, nn.Parameter):
+                        copy = nn.Parameter(copy, requires_grad=False)
+                    moved[id(value)] = copy
+                value = moved[id(value)]
+            placed.append((site, value))
+        return placed
+
+    @contextmanager
+    def _leaf_on_card(self, leaf: nn.Module) -> Iterator[None]:
+        """`leaf`'s own values on the card for one call the row stream can't take (an operand it
+        is handed, an output view: MOSS-Image's LoRA layer passes its base layer's arguments), its
+        host copies back after."""
+        # torch types `_parameters` with Parameter; a host copy is bound there as a plain tensor too
+        tables = (cast(dict[str, Tensor | None], leaf._parameters), leaf._buffers)
+        saved = [(table, name, value) for table in tables for name, value in table.items()]
+        with torch.inference_mode(False):
+            for table, name, value in saved:
+                if value is not None and value.device.type == "cpu":
+                    copy = value.detach().to(self.device, non_blocking=True)
+                    if isinstance(value, nn.Parameter):
+                        copy = nn.Parameter(copy, requires_grad=False)
+                    table[name] = copy
+        try:
+            yield
+        finally:
+            for table, name, value in saved:
+                table[name] = value
+
+    def _streamed(self, block: _Block, leaf: nn.Module, path: str, x: Tensor) -> Tensor:
+        """`leaf`, a layer of `block`, over `x` from its host copy (`_gather`): in windows of its
+        output rows, each window's rows copied in on this stream and computed as `rows` computes
+        them, the windows as many as the card's room takes (`catch.cut`, which goes finer on a
+        refusal). One window is the whole layer's own call. Each byte crosses the bus once a
+        forward."""
         from cozy_runtime.accel import rows
         from cozy_runtime.internal.execution import catch, sizing
 
-        leaf = cast(nn.Module, block.leaf)
+        where = ".".join(p for p in (block.path, path) if p)
         if torch.cuda.is_current_stream_capturing():
-            raise Exhausted(f"{block.model.component}/{block.path} is on the host: no capture")
+            raise Exhausted(f"{block.model.component}/{where} is on the host: no capture")
         device = self.device
 
         def take(tensor: Tensor, start: int, stop: int) -> Tensor:
@@ -2444,11 +2507,12 @@ class Memory:
 
         compute = rows.streamed(leaf, take, whole)
         if compute is None:  # its hooks changed since its entry
-            raise Exhausted(f"{block.model.component}/{block.path} has no room and does not cut")
+            raise Exhausted(f"{block.model.component}/{where} has no room and does not cut")
         width = cast(int, leaf.out_features)
         tile = rows.tile(leaf)
         units = -(-width // tile)
-        per_row = block.storage_bytes // width
+        held = (*leaf._parameters.values(), *leaf._buffers.values())
+        per_row = sum(t.nbytes for t in held if t is not None) // width
         tokens = x.numel() // max(x.shape[-1], 1)
         out_bytes = tokens * width * x.element_size()
 
@@ -2472,7 +2536,7 @@ class Memory:
 
         if (request := _REQUEST.get()) is not None:
             request.streamed += 1
-        name = f"{block.model.component}.{block.path}:rows"
+        name = f"{block.model.component}.{where}:rows"
         return catch.cut(name, sizing.levels(units), need, run)
 
     def _read_into(
@@ -2553,6 +2617,8 @@ class Memory:
             if not nested:
                 if block.assigned is None:
                     assigned = _assign(block)
+                    if block.gathered is not None and not block.table:
+                        assigned = self._rest_on_card(block, assigned)
                     ready = block.ready
                     if self.cuda:
                         ready = torch.cuda.Event()
@@ -2865,7 +2931,8 @@ class Memory:
             return
         if model.escape_floor is None:
             # A block the card need not hold whole sets no floor: an embedding table gathers its
-            # rows on the host (`_gather`), and one linear layer streams its rows (`_streamed`).
+            # rows on the host (`_gather`), and a block of linear layers streams their rows
+            # (`_streamed`).
             # Counted, Qwen3.8-27B's 2.37 GiB bf16 table and head refused every decode pass at a
             # 6 GiB cap ("needs 5.4 GiB ... 2.6 GiB of weights", cr-344).
             common = model.common.allocation_bytes if model.common is not None else 0
@@ -2873,7 +2940,7 @@ class Memory:
                 (
                     b.allocation_bytes
                     for b in model.blocks.values()
-                    if not (b.table or b.leaf is not None)
+                    if not (b.table or b.leaves)
                 ),
                 default=0,
             )
@@ -2886,7 +2953,7 @@ class Memory:
                 (
                     b.allocation_bytes
                     for b in model.blocks.values()
-                    if not (b.retained or b.table or b.leaf is not None)
+                    if not (b.retained or b.table or b.leaves)
                 ),
                 default=0,
             )
@@ -4085,9 +4152,11 @@ def _hooks(model: Model) -> None:
         model.handles.extend(_paired(sub, entered, exited, model))
         if block.table:
             model.handles.extend(_gathering(sub, memory))
-        elif memory.cuda and _linear(sub):
-            block.leaf = sub
-            _streaming(sub, block, memory)
+        elif memory.cuda:
+            block.leaves = _leaves(sub, block.path, model.blocks)
+    if memory.cuda and model.common is not None:
+        # The common's own layers, outside every block: RelayVSR's, refused at a norm's read.
+        model.common.leaves = _leaves(model.module, "", model.blocks)
 
 
 def _linear(module: nn.Module) -> bool:
@@ -4097,16 +4166,44 @@ def _linear(module: nn.Module) -> bool:
     return type(module) is nn.Linear or getattr(module, "provider", None) is not None
 
 
-def _streaming(module: nn.Module, block: _Block, memory: Memory) -> None:
-    """`module`'s forward, from its host copy while it has no room on the card (`_streamed`)."""
+def _leaves(
+    module: nn.Module, path: str, blocks: Collection[str]
+) -> tuple[tuple[str, nn.Module], ...]:
+    """The linear layers of the block at `path` (`module`), by path within it, "" for itself:
+    those no deeper block holds."""
+    return tuple(
+        (name, sub)
+        for name, sub in module.named_modules()
+        if _linear(sub) and _block_of(".".join(p for p in (path, name) if p), blocks) == path
+    )
+
+
+def _streaming(module: nn.Module, path: str, block: _Block, memory: Memory) -> None:
+    """`module`'s forward, from its host copy while its block has no room on the card
+    (`_streamed`)."""
     previous = vars(module).get("forward") or (
         lambda *args, **kwargs: type(module).forward(module, *args, **kwargs)
     )
 
     def forward(x: Tensor, *args: object, **kwargs: object) -> object:
-        if block.gathered is None or args or kwargs or not isinstance(x, Tensor):
-            return previous(x, *args, **kwargs)
-        return memory._streamed(block, x)
+        # Entered as its block's forward would enter it: a layer called outside that forward
+        # (RelayVSR's keyframe calls a block's FFN itself) is otherwise entered by its weight's
+        # read inside the op, after this choice, and multiplied by its host copy.
+        model = block.model
+        model._claim()
+        try:
+            memory._enter(block)
+            try:
+                if block.gathered is None:
+                    return previous(x, *args, **kwargs)
+                if args or kwargs or not isinstance(x, Tensor):
+                    with memory._leaf_on_card(module):
+                        return previous(x, *args, **kwargs)
+                return memory._streamed(block, module, path, x)
+            finally:
+                memory._exit(block)
+        finally:
+            model._release()
 
     vars(forward)[TRANSPARENT] = True
     module.forward = forward
