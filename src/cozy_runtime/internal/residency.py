@@ -2903,7 +2903,11 @@ class Memory:
         plan: Sequence[object] = (),
         *,
         idle: bool = False,
+        work: str | None = None,
     ) -> Iterator[Request]:
+        """`work` names the call's function: its first run in this process keeps room on the card
+        for the libraries it loads (var-040); a completed one (`Request.completed`) teaches what
+        it grew."""
         request = Request(self, id, idle)
         request.plan(plan)
         with self.lock:
@@ -2918,7 +2922,7 @@ class Memory:
         # An idle period's work is no request to the core: what it records is a guess, taken from
         # free room only (pool_reserve), and peers order it among the idle.
         if self.cuda and not idle:
-            varena.request_boundary(self.device.index or 0, begin=True)
+            varena.request_boundary(self.device.index or 0, begin=True, work=work)
         try:
             yield request
         finally:
@@ -2951,7 +2955,12 @@ class Memory:
                 finally:
                     _REQUEST.reset(token)
                     if self.cuda and not idle:
-                        varena.request_boundary(self.device.index or 0, begin=False)
+                        varena.request_boundary(
+                            self.device.index or 0,
+                            begin=False,
+                            work=work,
+                            completed=request.completed,
+                        )
                         if request.ended is not None and self.native is not None:
                             # Read again once ended, as varena measures there what this process
                             # holds outside its books: the run record's `out_of_books_bytes` (var-024).
@@ -3357,6 +3366,8 @@ class Request:
         self.read_blocks: set[int] = set()
         #: the attempt failed (its executor says): a refused allocation in its last pass is learned
         self.failed = False
+        #: the attempt succeeded (its executor says): what its function grew is learned (var-040)
+        self.completed = False
         #: refusals the Runtime answered by running again another way (a pure op's finer split, an LM
         #: token decoded eagerly for a capture its pool couldn't hold): zero in a normal run
         self.retries = 0

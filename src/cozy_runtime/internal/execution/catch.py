@@ -22,10 +22,11 @@ from typing import TYPE_CHECKING, Protocol, cast
 import tensorfs.varena.torch as vt
 import torch
 from tensorfs import varena
+from tensorfs.varena import _runtime as native
 from torch import Tensor, nn
 
 from cozy_runtime.author._context import CURRENT as ATTEMPT
-from cozy_runtime.author._errors import ROOM, DoesNotFit, is_capacity
+from cozy_runtime.author._errors import ROOM, DoesNotFit, is_capacity, outside_books
 from cozy_runtime.author._model import TRANSPARENT
 from cozy_runtime.internal.execution import phase, sizing
 from cozy_runtime.internal.residency import PASS_SHAPE, Model, Request
@@ -218,13 +219,36 @@ def fallback(on: bool) -> AbstractContextManager[object]:
     return scope(on) if scope is not None else nullcontext()
 
 
-def _attempt[T](run: Callable[[int], T], level: int, finer: bool, pure: bool) -> T:
+def _attempt[T](run: Callable[[int], T], level: int, finer: bool, pure: bool, device: int) -> T:
     """`run(level)`, its cheaper ways out first. Package code runs once. A pure op with a finer level
     is refused for it (`retry`, `nested`). One at its last level first leaves a refusal to the
     libraries it calls (cuDNN's next plan, cr-324), and runs again for varena's last resort only if
-    one escapes: their own choice costs less than a workspace over the link."""
+    one escapes: their own choice costs less than a workspace over the link. One whose library or
+    the driver refused its own allocation, outside varena's books, runs once more if varena freed
+    room for the driver from what is idle (var-040: a library's first use on a full card)."""
     if not pure:
         return run(level)
+    try:
+        return _cheaper(run, level, finer)
+    except BaseException as exc:
+        if not (outside_books(exc) and _driver_room(device)):
+            raise
+        _unwind(exc)
+    print(f"cozy-runtime: a library refused its own allocation at {level}: again", file=sys.stderr)
+    if (request := CURRENT.get()) is not None:
+        request.retries += 1
+    return _cheaper(run, level, finer)
+
+
+def _driver_room(device: int) -> bool:
+    """Room for the driver freed from what is idle; False if none came free or varena can't say."""
+    try:
+        return native.make_driver_room(device)
+    except Exception:
+        return False
+
+
+def _cheaper[T](run: Callable[[int], T], level: int, finer: bool) -> T:
     if finer or getattr(vt, "fallback", None) is None:
         with fallback(finer):
             return run(level)
@@ -232,7 +256,7 @@ def _attempt[T](run: Callable[[int], T], level: int, finer: bool, pure: bool) ->
         with fallback(True):
             return run(level)
     except BaseException as exc:
-        if not is_capacity(exc):
+        if not is_capacity(exc) or outside_books(exc):
             raise
         _unwind(exc)
     return run(level)
@@ -356,7 +380,7 @@ def cut[T](
             note(request, key, name, level, selection)
             try:
                 with timed(request, key, level, device):
-                    result = _attempt(run, level, level + 1 < len(menu), pure)
+                    result = _attempt(run, level, level + 1 < len(menu), pure, device)
             except BaseException as exc:
                 again = retry(device, key, name, menu, level, token, stream, exc, pure, behind)
                 if again is None:
@@ -393,9 +417,10 @@ def nested[T](
     while True:
         LEVELS[key] = level
         note(request, key, name, level)
+        device = request.memory.device.index or 0
         try:
-            with timed(request, key, level, request.memory.device.index or 0):
-                return _attempt(run, level, level + 1 < len(menu), pure)
+            with timed(request, key, level, device):
+                return _attempt(run, level, level + 1 < len(menu), pure, device)
         except BaseException as exc:
             if not (pure and is_capacity(exc)) or level + 1 >= len(menu):
                 raise
