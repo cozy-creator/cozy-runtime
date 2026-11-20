@@ -45,8 +45,8 @@ STREAM_S = 0.1
 ROWS = 16
 #: The encodings of the step's linears the engine's GPU cells have passed (the real 9B's teacher-
 #: forced check and today's path on the same pod, sm86 and sm89); a lane joins when its cell
-#: passes (q4_k_m's `ggml.q4_k` and `ggml.q6_k` next).
-LANES = frozenset({"bf16", "ggml.q8_0", "int8.convrot"})
+#: passes. q4_k_m's `ggml.q4_k` and `ggml.q6_k`: its cell on one family (xs-213).
+LANES = frozenset({"bf16", "ggml.q4_k", "ggml.q6_k", "ggml.q8_0", "int8.convrot"})
 _DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
 
 
