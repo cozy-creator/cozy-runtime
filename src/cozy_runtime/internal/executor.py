@@ -5256,12 +5256,11 @@ class Executor:
                 # Its LoRAs merged first, at any level, the merged pages to disk (cl-1318).
                 for member in members:
                     for merged in cast("Backend", member.backend).merge_ahead():
+                        merged["level"] = command.level
                         print(f"[merge] ahead {json.dumps(merged)}", file=sys.stderr, flush=True)
                 if command.level == "ram":
                     if self.memory.pages is not None:
-                        # What it merged reaches the disk before its pages go. A newer TensorFS's,
-                        # which the pinned stubs do not know yet.
-                        getattr(self.memory.pages, "flush")()  # noqa: B009
+                        self.memory.pages.flush()  # what it merged reaches the disk before its pages go
                     # Map is ordered after every preceding invocation. Join its remaining
                     # consumer streams before retiring owners and returning allocator storage.
                     accel.drain(self.torch, self.device_kind)  # type: ignore[arg-type]  # torch is imported before a request reaches here
