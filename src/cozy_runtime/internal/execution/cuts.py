@@ -23,11 +23,13 @@ import time
 import types
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
-from typing import Protocol, cast
+from dataclasses import dataclass, field
+from typing import NamedTuple, Protocol, cast
 
 import torch
 from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves
+from torch.utils.weak import WeakIdKeyDictionary
 
 import cozy_runtime.internal.execution.catch as catch
 import cozy_runtime.internal.execution.pinned as pinned
@@ -66,6 +68,7 @@ def install(module: nn.Module) -> int:
     pictures in groups. What Diffusers' processors call on q/k cuts by rows where proven row-local
     (`_ropes`). A module of linears and activations alone, up projections from its input's width
     and one down projection (`_ffn_like`), is a feed-forward whoever wrote it, and cuts by tokens.
+    A module without parameters may hand its tables to those row cuts uncomputed (`_tables`).
     Returns how many it cut."""
     count = _ropes(module)
     for path, sub in module.named_modules():
@@ -117,7 +120,7 @@ def install(module: nn.Module) -> int:
             sub.forward = catch.transparent(_ffn(f"{path}:tokens", sub, _forward(sub)))
             vars(sub)["_cozy_cut"] = True
             count += 1
-    return count
+    return count + _tables(module)
 
 
 type Conv = Callable[[Tensor, Tensor, Tensor | None], Tensor]
@@ -724,7 +727,7 @@ def _norm(site: str, module: nn.Module, forward: Forward) -> Forward:
             whole[0] = form
             return forward(*args, **kwargs)
         assert isinstance(x, Tensor)
-        length, (out, made), size = int(x.shape[axis]), local, x.numel()
+        length, out, made, size = int(x.shape[axis]), local.out, local.made, x.numel()
         need = levelled(
             length,
             lambda n: sizing.peak(math.ceil(out * size), (math.ceil(made * size * n / length),)),
@@ -828,10 +831,21 @@ _ORIGINAL = "_cozy_rows"
 #: what a call's arguments beside its input may be: tables (tensors, or a tuple or list of them) and
 #: these; any other object (a cache, a module) may be written, so such a call runs whole
 _SCALARS = (bool, int, float, str, type(None))
-#: what the first probe of a call's shape found (`_probe`), by `_call`'s key: its output's bytes
-#: and the bytes it allocates, each an element of its input; None where it is not row-local along
-#: that axis
-_LOCAL: dict[tuple[object, ...], tuple[float, float] | None] = {}
+
+
+class _Proof(NamedTuple):
+    """A call proven row-local (`_probe`): its outputs' bytes and the bytes it allocates, each an
+    element of its input, and each output's row axis and form (its shape at two rows, its dtype)."""
+
+    out: float
+    made: float
+    axes: tuple[int, ...]
+    forms: tuple[tuple[tuple[int, ...], torch.dtype], ...]
+
+
+#: what the first probe of a call's shape found (`_probe`), by `_call`'s key; None where it is not
+#: row-local along that axis
+_LOCAL: dict[tuple[object, ...], _Proof | None] = {}
 
 
 def _ropes(module: nn.Module) -> int:
@@ -940,12 +954,18 @@ def rows(original: _Function) -> _Function:
     takes under the current block, where its first call of that shape proved it row-local
     (`_probe`): PAN2's RoPE held 0.8 GiB of fp32 temporaries a call (cr-320). Whole outside a
     named block, under autograd or compilation, and for any other call. A rotation its first call
-    of a shape proves the fused kernel's runs in one launch from then on (`fused.rotation`)."""
+    of a shape proves the fused kernel's runs in one launch from then on (`fused.rotation`). Tables
+    handed over not yet computed (`Table`, `_table`) are computed with each piece, or whole at the
+    whole level, once, and kept."""
 
     def cut(*args: object, **kwargs: object) -> object:
         from cozy_runtime.internal.execution import fused
 
-        return fused.rotation(original, eager, args, kwargs)
+        _fed(args, kwargs)
+        if _waiting(args, kwargs):
+            return eager(*args, **kwargs)  # its level decides: the tables whole, or a piece's rows
+        given, named = _computed(args, kwargs)
+        return fused.rotation(original, eager, given, named)
 
     def eager(*args: object, **kwargs: object) -> object:
         x = args[0] if args else None
@@ -973,12 +993,16 @@ def rows(original: _Function) -> _Function:
         local = _LOCAL[key]
         if local is None:
             return original(*args, **kwargs)
-        length, (out, made), size = int(x.shape[axis]), local, x.numel()
+        length, size = int(x.shape[axis]), x.numel()
+        out, made, row = local.out, local.made, _rows_bytes(args, kwargs)
         need = levelled(
             length,
-            lambda n: sizing.peak(math.ceil(out * size), (math.ceil(made * size * n / length),)),
+            lambda n: sizing.peak(
+                math.ceil(out * size), (math.ceil(made * size * n / length + row * n),)
+            ),
         )
-        run = functools.partial(_rowed, original, args, kwargs, axis, dims)
+        # Tables not yet computed (`Table`): each piece computes its rows; whole, they are kept.
+        run = functools.partial(_tabled if row else _rowed, original, args, kwargs, axis, dims)
         return catch.cut(site, levels(length), need, run)
 
     functools.update_wrapper(cut, original)
@@ -1008,13 +1032,16 @@ def _probe(
     kwargs: dict[str, object],
     axis: int,
     dims: Sequence[int | None],
-) -> tuple[tuple[float, float] | None, int]:
+    tables: bool = False,
+) -> tuple[_Proof | None, int]:
     """Whether `original` is row-local along `axis` for this shape of call, from copies of two of
     the call's middle rows: called on both together and on each alone, it must give the same bits
     a row, in rows lined up with its input's. Then (its output's bytes, the bytes it allocates),
     each an element of its input, counted as the pair ran (every fresh tensor its ops made, an upper
     bound on what it holds at once). None where it is not, or raises. Beside it, the bytes the
-    probe held: its copies of the pair's rows and what the pair's call made."""
+    probe held: its copies of the pair's rows and what the pair's call made. `tables`: its outputs
+    (a tensor, or a tuple or list of them) are tables it makes from its input, each with the one
+    axis of its own where a row's output is one long and the pair's two, every other alike."""
     from torch.utils._python_dispatch import TorchDispatchMode
 
     class Made(TorchDispatchMode):
@@ -1045,22 +1072,48 @@ def _probe(
         elements = cast(Tensor, given[0]).numel()
         with counted:
             pair = original(*given, **named)
-        if not (
-            isinstance(pair, Tensor)
-            and pair.dim() > axis
-            and pair.shape[:axis] == x.shape[:axis]
-            and pair.shape[axis] == 2
-        ):
-            return None, copied + counted.made
+        pairs = _parts(pair) if tables else [pair] if isinstance(pair, Tensor) else None
+        ones: list[Sequence[object] | None] = []
         for row in (0, 1):
             given, named = _sliced(args, kwargs, axis, dims, middle + row, 1, copy=True)
-            one = original(*given, **named)
-            if not (isinstance(one, Tensor) and torch.equal(pair.narrow(axis, row, 1), one)):
+            ones.append(
+                _parts(original(*given, **named)) if tables else [original(*given, **named)]
+            )
+        if pairs is None or any(one is None or len(one) != len(pairs) for one in ones):
+            return None, copied + counted.made
+        axes: list[int] = []
+        for at, part in enumerate(pairs):
+            single = [cast("list[object]", one)[at] for one in ones]
+            if tables:
+                differ = [
+                    d
+                    for d in range(part.dim())
+                    if part.shape[d] == 2
+                    and all(
+                        isinstance(o, Tensor) and o.dim() == part.dim() and o.shape[d] == 1
+                        for o in single
+                    )
+                ]
+                if len(differ) != 1:
+                    return None, copied + counted.made
+                row_axis = differ[0]
+            elif (
+                part.dim() > axis and part.shape[:axis] == x.shape[:axis] and part.shape[axis] == 2
+            ):
+                row_axis = axis
+            else:
                 return None, copied + counted.made
+            for row, one in enumerate(single):
+                if not (
+                    isinstance(one, Tensor) and torch.equal(part.narrow(row_axis, row, 1), one)
+                ):
+                    return None, copied + counted.made
+            axes.append(row_axis)
     except Exception:  # a call it can't take in pieces runs whole
         return None, copied + counted.made
-    made = (pair.numel() * pair.element_size() / elements, counted.made / elements)
-    return made, copied + counted.made
+    out = sum(part.numel() * part.element_size() for part in pairs) / elements
+    forms = tuple((tuple(part.shape), part.dtype) for part in pairs)
+    return _Proof(out, counted.made / elements, tuple(axes), forms), copied + counted.made
 
 
 def _sliced(
@@ -1119,6 +1172,358 @@ def _rowed(
         del part
     assert out is not None
     return out
+
+
+# --------------------------------------------------------------------------- per-token tables
+#
+# A module with no weights that makes per-token tables from its input (a RoPE's cos and sin from
+# positions), whose tables a rows cut reads (`rows`), hands them over not yet computed (`Table`):
+# the cut computes each piece's rows with that piece, so a table it reads in pieces never exists
+# whole. Where the cut runs whole (room for it), the tables are computed once and kept, as written.
+# LTX-2.5's 20 s 1080p refine made 3.2 GiB of fp32 RoPE tables before its first block, which a
+# 6 GiB card could not hold beside the forward (var-030 §17).
+
+
+def _tables(module: nn.Module) -> int:
+    """Each outermost module under `module` that holds no parameters, has a forward of its own and
+    no cut yet, whoever wrote it, as a producer of tables (`_table`). Returns how many."""
+    count, taken = 0, list[str]()
+    for path, sub in module.named_modules():
+        if not path or any(path.startswith(f"{t}.") for t in taken):
+            continue
+        own = vars(sub)
+        if "_cozy_cut" in own or "forward" in own or type(sub).forward is nn.Module.forward:
+            continue
+        if next(sub.parameters(), None) is not None:
+            continue
+        name = f"{type(sub).__module__}.{type(sub).__qualname__}"
+        sub.forward = catch.transparent(_table(name, _forward(sub)))
+        own["_cozy_cut"] = True
+        taken.append(path)
+        count += 1
+    return count
+
+
+@dataclass(eq=False)
+class _Producer:
+    """A module that may make tables (`_tables`). `never`: its calls are not that (no tensor
+    input of three axes or more with only scalars beside it, an output its input's shape, or
+    tables no rows cut read before it ran again). `feeds`: a rows cut read its tables. `pending`:
+    its last call's tables wait for one to. `axis`: its input's row axis, from its first tables."""
+
+    name: str
+    forward: _Function
+    never: bool = False
+    feeds: bool = False
+    pending: bool = False
+    axis: int = 0
+    #: its output's structure: a tensor, a tuple or a list of them
+    kind: type = tuple
+    said: bool = False
+    proofs: dict[tuple[object, ...], _Proof | None] = field(default_factory=dict)
+
+
+#: tables a producer made and no rows cut has read yet: the first read makes it a feeder (`_fed`)
+_FED: WeakIdKeyDictionary = WeakIdKeyDictionary()
+
+
+def _parts(value: object) -> list[Tensor] | None:
+    """A call's outputs as a list of plain tensors: one, or a tuple or list of them; else None."""
+    if type(value) is Tensor:
+        return [cast(Tensor, value)]
+    items = cast("Sequence[object]", value) if type(value) in (tuple, list) else ()
+    if items and all(type(v) is Tensor for v in items):
+        return [cast(Tensor, v) for v in items]
+    return None
+
+
+def _table_form(
+    x: object, args: Sequence[object], kwargs: dict[str, object]
+) -> tuple[object, ...] | None:
+    """A call's key where it may make tables: a plain tensor of three axes or more first, only
+    scalars, devices and dtypes beside it; else None."""
+    if type(x) is not Tensor or cast(Tensor, x).dim() < 3:
+        return None
+    rest = (*args[1:], *kwargs.values())
+    if not all(isinstance(v, (*_SCALARS, torch.device, torch.dtype)) for v in rest):
+        return None
+    t = cast(Tensor, x)
+    return (tuple(t.shape), t.stride(), t.dtype, tuple(kwargs), *map(str, rest))
+
+
+def _table(name: str, written: Forward) -> Forward:
+    """`forward`, a module's with no parameters, making its tables not yet computed (`Table`) once a
+    rows cut has read its tables and this shape of call proved row-local from its input's row axis
+    to each output's own (`_probe`); as written otherwise, and whole where they are small, under
+    autograd, compilation or a capture, or outside a request on a CUDA device's native memory."""
+    forward = cast("_Function", written)
+    producer = _Producer(name, forward)
+
+    def table(*args: object, **kwargs: object) -> object:
+        if producer.never:
+            return forward(*args, **kwargs)
+        x = args[0] if args else None
+        form = _table_form(x, args, kwargs)
+        if form is None:
+            producer.never = True
+            return forward(*args, **kwargs)
+        request = catch.CURRENT.get()
+        if (
+            request is None
+            or not request.memory.cuda
+            or torch.is_grad_enabled()
+            or torch.compiler.is_compiling()
+            or _capturing()
+        ):
+            return forward(*args, **kwargs)
+        x = cast(Tensor, x)
+        if not producer.feeds:
+            if producer.pending:  # its last tables reached no rows cut before it ran again
+                producer.never = True
+                return forward(*args, **kwargs)
+            made = forward(*args, **kwargs)
+            parts = _parts(made)
+            axes = [
+                a
+                for a in range(1, x.dim() - 1)
+                if int(x.shape[a]) >= 2
+                and parts is not None
+                and all(sum(size == x.shape[a] for size in p.shape) == 1 for p in parts)
+            ]
+            if parts is None or any(p.shape == x.shape for p in parts) or len(axes) != 1:
+                producer.never = True
+                return made
+            producer.axis, producer.kind, producer.pending = axes[0], type(made), True
+            for part in parts:
+                _FED[part] = producer
+            return made
+        if form not in producer.proofs:
+            began = time.perf_counter()
+            proof, held = _probe(forward, args, kwargs, producer.axis, (), tables=True)
+            producer.proofs[form] = proof
+            _probed(
+                catch.site("table") or name, name, producer.axis, proof is not None, began, held
+            )
+        proof = producer.proofs[form]
+        length = int(x.shape[producer.axis])
+        if proof is None:
+            return forward(*args, **kwargs)
+        deferred = _Deferred(forward, args, kwargs, producer, proof, length)
+        if catch.small(lambda _: (deferred.whole(),)):
+            return forward(*args, **kwargs)
+        if not producer.said:
+            producer.said = True
+            print(
+                f"cozy-runtime: {name}: its tables are computed with each piece of the rows cut "
+                f"that reads them ({deferred.whole()} B whole)",
+                file=sys.stderr,
+            )
+        made = [Table.of(deferred, at) for at in range(len(proof.axes))]
+        return made[0] if producer.kind is Tensor else producer.kind(made)
+
+    functools.update_wrapper(table, written)
+    return cast(Forward, table)
+
+
+class _Deferred:
+    """One call's tables not yet computed: its outputs' shapes whole, each one's row axis, the last
+    piece of rows computed (`rows`) and, once computed whole (`realize`), their values."""
+
+    def __init__(
+        self,
+        forward: _Function,
+        args: Sequence[object],
+        kwargs: dict[str, object],
+        producer: _Producer,
+        proof: _Proof,
+        length: int,
+    ) -> None:
+        self.forward, self.args, self.kwargs, self.producer = forward, args, kwargs, producer
+        self.axes = proof.axes
+        self.shapes = [
+            tuple(length if d == axis else size for d, size in enumerate(shape))
+            for (shape, _), axis in zip(proof.forms, proof.axes, strict=True)
+        ]
+        self.dtypes = [dtype for _, dtype in proof.forms]
+        self.device = cast(Tensor, args[0]).device
+        #: what computing a row of every table holds: its rows and its temporaries
+        self.row = (proof.out + proof.made) * cast(Tensor, args[0]).numel() / length
+        self.likes: list[Tensor | None] = [None] * len(self.shapes)
+        self.window: tuple[int, int, list[Tensor]] | None = None
+        self.value: list[Tensor] | None = None
+
+    def whole(self) -> int:
+        return sum(
+            math.prod(shape) * dtype.itemsize
+            for shape, dtype in zip(self.shapes, self.dtypes, strict=True)
+        )
+
+    def like(self, at: int) -> Tensor:
+        """A tensor of output `at`'s shape, dtype and device that holds one element."""
+        if self.value is not None:
+            return self.value[at]
+        like = self.likes[at]
+        if like is None:
+            like = self.likes[at] = torch.empty(
+                (), dtype=self.dtypes[at], device=self.device
+            ).expand(self.shapes[at])
+        return like
+
+    def rows(self, at: int, start: int, n: int) -> Tensor:
+        """Output `at`'s rows [start, start + n), computed with the others' (their next read)."""
+        if self.value is not None:
+            return self.value[at].narrow(self.axes[at], start, n)
+        if self.window is None or self.window[:2] != (start, n):
+            given, named = _sliced(self.args, self.kwargs, self.producer.axis, (), start, n)
+            parts = _parts(self.forward(*given, **named))
+            assert parts is not None and len(parts) == len(self.shapes)
+            self.window = start, n, parts
+        return self.window[2][at]
+
+    def realize(self, read: bool = False) -> list[Tensor]:
+        """Every output whole, computed once and kept. `read`: a reader that is no rows cut forced
+        it, so the producer's tables are as written from now on."""
+        if self.value is None:
+            self.window = None
+            parts = _parts(self.forward(*self.args, **self.kwargs))
+            assert parts is not None and len(parts) == len(self.shapes)
+            self.value = parts
+            if read:
+                self.producer.never = True
+        return self.value
+
+
+#: what a block may ask of a table not yet computed without computing it
+_TABLE_PROPERTIES = frozenset(
+    {"shape", "dtype", "device", "ndim", "is_cuda", "layout", "requires_grad"}
+)
+_TABLE_METHODS = frozenset(
+    {
+        "dim",
+        "ndimension",
+        "size",
+        "numel",
+        "nelement",
+        "element_size",
+        "get_device",
+        "is_floating_point",
+        "is_complex",
+        "__len__",
+    }
+)
+
+
+class Table(Tensor):
+    """A producer's table before it is computed (`_Deferred`): its shape, dtype and device are
+    known, a rows cut's narrow along its row axis computes those rows, and any other read computes
+    it whole, once, and runs on the result."""
+
+    _cozy_table: _Deferred
+    _cozy_at: int
+
+    @staticmethod
+    def of(deferred: _Deferred, at: int) -> Table:
+        empty = torch.empty(0, dtype=deferred.dtypes[at], device=deferred.device)
+        made = cast(Table, empty.as_subclass(Table))
+        made._cozy_table, made._cozy_at = deferred, at
+        return made
+
+    @classmethod
+    def __torch_function__(  # type: ignore[no-untyped-def]  # torch leaves it untyped
+        cls, func, types, args=(), kwargs=None
+    ):
+        name = getattr(func, "__name__", "")
+        if args and type(args[0]) is Table:
+            deferred, at = args[0]._cozy_table, args[0]._cozy_at
+            owner = getattr(func, "__self__", None)
+            if name == "__get__" and getattr(owner, "__name__", "") in _TABLE_PROPERTIES:
+                return func(deferred.like(at))
+            if not kwargs and name in _TABLE_METHODS:
+                return func(deferred.like(at), *args[1:])
+            if (
+                name == "narrow"
+                and not kwargs
+                and len(args) == 4
+                and isinstance(args[1], int)
+                and args[1] % len(deferred.shapes[at]) == deferred.axes[at]
+            ):
+                return deferred.rows(at, int(args[2]), int(args[3]))
+        return func(*(_whole(v) for v in args), **{k: _whole(v) for k, v in (kwargs or {}).items()})
+
+
+def _whole(value: object, read: bool = True) -> object:
+    """`value` with each `Table` in it computed whole (a tuple's or a list's too)."""
+    if type(value) is Table:
+        table = cast(Table, value)
+        return table._cozy_table.realize(read)[table._cozy_at]
+    if type(value) in (tuple, list):
+        items = [_whole(v, read) for v in cast("Sequence[object]", value)]
+        return items if type(value) is list else tuple(items)
+    return value
+
+
+def _items(args: Sequence[object], kwargs: dict[str, object]) -> list[object]:
+    """A call's arguments beside its input, a tuple's or a list's items in their place."""
+    return [
+        item
+        for value in (*args[1:], *kwargs.values())
+        for item in (cast("Sequence[object]", value) if type(value) in (tuple, list) else (value,))
+    ]
+
+
+def _fed(args: Sequence[object], kwargs: dict[str, object]) -> None:
+    """Tables a producer made, read by this rows cut: it feeds one (`_table`)."""
+    for item in _items(args, kwargs):
+        if type(item) is Tensor and (producer := _FED.get(item)) is not None:
+            producer.feeds, producer.pending = True, False
+
+
+def _waiting(args: Sequence[object], kwargs: dict[str, object]) -> bool:
+    """Whether a table among a call's arguments is not yet computed whole."""
+    return any(
+        type(t) is Table and cast(Table, t)._cozy_table.value is None for t in _items(args, kwargs)
+    )
+
+
+def _computed(
+    args: Sequence[object], kwargs: dict[str, object]
+) -> tuple[tuple[object, ...], dict[str, object]]:
+    """A call's arguments with each table computed whole, by its rows cut (not a reader's read)."""
+    return tuple(_whole(v, False) for v in args), {k: _whole(v, False) for k, v in kwargs.items()}
+
+
+def _rows_bytes(args: Sequence[object], kwargs: dict[str, object]) -> float:
+    """What computing a row of a call's tables not yet computed holds, each producer's call once."""
+    calls = {
+        id(d): d.row
+        for t in _items(args, kwargs)
+        if type(t) is Table and (d := cast(Table, t)._cozy_table).value is None
+    }
+    return sum(calls.values())
+
+
+def _tabled(
+    original: _Function,
+    args: Sequence[object],
+    kwargs: dict[str, object],
+    axis: int,
+    dims: Sequence[int | None],
+    level: int,
+) -> object:
+    """A rows cut over tables not yet computed: whole, its tables computed once and kept (a
+    rotation that the fused kernel proved runs there, `fused.rotation`); else in pieces, each
+    computing its tables' rows (`_rowed`)."""
+    if level:
+        try:
+            return _rowed(original, args, kwargs, axis, dims, level)
+        finally:
+            for item in _items(args, kwargs):
+                if type(item) is Table:
+                    cast(Table, item)._cozy_table.window = None  # its last piece's rows go
+    from cozy_runtime.internal.execution import fused
+
+    given, named = _computed(args, kwargs)
+    return fused.rotation(original, original, given, named)
 
 
 def attend(
