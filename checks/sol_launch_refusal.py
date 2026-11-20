@@ -10,6 +10,7 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from cozy_runtime.accel.attention import AttentionLayout
 from cozy_runtime.author._errors import Fault, fault
+from cozy_runtime.author._observations import Scalar
 from cozy_runtime.internal import attention_sol as sol
 
 
@@ -24,6 +25,7 @@ def check() -> None:
     layout = AttentionLayout(250, 64, 4, dense_until_step=4)
     site = sol.Site("dit", "attention")
     attempts: list[int] = []
+    kernels: list[dict[str, Scalar]] = []
 
     def refuses(*_: object) -> None:
         attempts.append(len(attempts))
@@ -47,7 +49,7 @@ def check() -> None:
         patch.object(sol, "_preprocessed", return_value=""),
         patch.object(sol, "_ready", return_value=(native, "")),
         patch.object(torch.cuda, "device", side_effect=lambda _: nullcontext()),
-        sol.observing(kernels=(kernels := [])) as counts,
+        sol.observing(kernels=kernels) as counts,
     ):
         q, k, v = inputs
         for _ in range(2):
