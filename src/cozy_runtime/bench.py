@@ -192,8 +192,8 @@ def kernel_check(payload: KernelCheckRequest, ctx: Context) -> Measured:
 
 
 def kernel_ready(payload: KernelReadyRequest, ctx: Context) -> Measured:
-    """Kernel readiness publication under two real openers of one kernel, on the CPU: `late-success`, `late-error` or
-    `dropped-slot` (`internal/bench/kernel_ready.py`). Raises when the registry publishes wrong."""
+    """Kernel readiness publication under real openers of one kernel, on the CPU: `late-success`, `late-error`,
+    `dropped-slot` or `building-error` (`internal/bench/kernel_ready.py`). Raises when the registry publishes wrong."""
     mode = payload.mode
     seed = payload.seed
     from cozy_runtime.internal.bench import kernel_ready as check

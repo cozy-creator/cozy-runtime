@@ -11,7 +11,9 @@ names its kernel waits for it (`wait`).
 A kernel a background opener produced serves from the next boundary (`boundary`): a step or
 stage of a request, the start of one, a follower's next call; with no request in flight, the
 next ask. A call never sees its kernels change, and the run records each kernel that began
-serving and where. `epoch` counts the changes (`LANDED`), for what keys on the kernels serving.
+serving and where. `epoch` counts the changes (`LANDED`), for what keys on the kernels serving:
+each kernel that began or stopped serving, and each build that ended failed, so a graph refused
+while that kernel built (`Building`) records its fallback from then on.
 
 Every opener ends in `verified`: the kernel serves once its probe agrees with the exact law on
 this card (`verify`). A call asks through `serve`, which keeps a CUDA graph's recording whole.
@@ -341,8 +343,9 @@ def _landed(name: str, slot: _Slot, value: object, state: str) -> object | None:
 
 
 def _ended(name: str, slot: _Slot, exc: Exception) -> None:
-    """A failed opener's kernel stays failed here, even one another opener made serve (the epoch
-    counts that change); one the device ran out under asks again, unless another's serves."""
+    """A failed opener's kernel stays failed here, even one another opener made serve; one the
+    device ran out under asks again, unless another's serves. The epoch counts every verdict, a
+    build that never served too: a graph it refused while opening records the fallback now."""
     with _LOCK:
         if _SLOTS.get(name) is not slot:
             return
@@ -350,7 +353,7 @@ def _ended(name: str, slot: _Slot, exc: Exception) -> None:
             if slot.state == "opening":
                 _SLOTS.pop(name)
             return
-        LANDED[0] += slot.state == "ready"
+        LANDED[0] += slot.state != "failed"
         slot.state, slot.error = "failed", exc
 
 
@@ -447,5 +450,6 @@ def _shared(name: str) -> str:
 
 
 def epoch() -> int:
-    """How many times the kernels serving in this process changed."""
+    """How many times what a call serves in this process changed: a kernel began or stopped
+    serving, or a build ended failed."""
     return LANDED[0]

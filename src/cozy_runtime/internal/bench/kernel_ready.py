@@ -9,6 +9,9 @@ product, a failure a real read of a file that does not exist, and CUDA stays uni
   `FileNotFoundError`, the epoch moves once.
 - `dropped-slot`: the waiter that opened the slot fails and drops it while a second waiter succeeds: the second's
   kernel serves, the epoch moves once.
+- `building-error`: a background build fails before it ever served. A capture asked while it built is refused
+  (`Building`), and one asked after records the fallback: the epoch moves once, so the step graphs keyed on it
+  (lm's, the engine's) record again.
 
 This proves registry publication only: not CUDA module lifetime, and not the cause of any GPU crash."""
 
@@ -26,9 +29,10 @@ import torch
 
 import cozy_runtime
 from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author._model import Building
 from cozy_runtime.internal import kernel_ready
 
-MODES = ("late-success", "late-error", "dropped-slot")
+MODES = ("late-success", "late-error", "dropped-slot", "building-error")
 
 
 class Facts(TypedDict, total=False):
@@ -47,6 +51,8 @@ class Facts(TypedDict, total=False):
     torch: str
     exact: bool
     cuda_initialized: bool
+    refused_while_building: bool
+    records_after: bool
 
 
 def _late(name: str, mode: str, product: Callable[[], torch.Tensor], missing: Path) -> Facts:
@@ -86,6 +92,53 @@ def _late(name: str, mode: str, product: Callable[[], torch.Tensor], missing: Pa
             "ready_before": True,
             "ready_after": after is not None,
             "same_kernel_after": after is explicit,
+            "failure": type(failure).__name__ if failure else None,
+            "epoch_before": before,
+            "epoch_after": kernel_ready.epoch(),
+        }
+    finally:
+        release.set()
+
+
+def _building(name: str, product: Callable[[], torch.Tensor], missing: Path) -> Facts:
+    """A background build fails before its kernel ever served, a capture asked of it before and after."""
+    entered, release = threading.Event(), threading.Event()
+    background: list[threading.Thread] = []
+
+    def opener(wait: bool) -> torch.Tensor:
+        product()
+        background.append(threading.current_thread())
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("the background opener was never released")
+        missing.read_bytes()
+        return product()
+
+    def capture() -> bool:
+        """Whether a capture asking for the kernel now records (the fallback), not refused."""
+        try:
+            kernel_ready.serve(name, opener, capturing=True)
+        except Building:
+            return False
+        return True
+
+    try:
+        if kernel_ready.ready(name, opener) is not None:
+            raise RuntimeError("in a request it opens in the background")
+        if not entered.wait(5):
+            raise RuntimeError("the background opener did not start")
+        refused = not capture()
+        before = kernel_ready.epoch()
+        release.set()
+        background[0].join(5)
+        if background[0].is_alive():
+            raise RuntimeError("the background opener did not finish")
+        failure = kernel_ready.failed(name)
+        return {
+            "openers": 1,
+            "refused_while_building": refused,
+            "records_after": capture(),
+            "ready_after": kernel_ready.ready(name) is not None,
             "failure": type(failure).__name__ if failure else None,
             "epoch_before": before,
             "epoch_after": kernel_ready.epoch(),
@@ -158,7 +211,12 @@ def check(mode: str, seed: int) -> Facts:
     with tempfile.TemporaryDirectory(prefix="cozy-kernel-ready-") as tmp:
         missing = Path(tmp) / "never-written"
         product = partial(torch.mm, left, right)
-        facts = _dropped(name, product, missing) if mode == "dropped-slot" else _late(name, mode, product, missing)
+        if mode == "dropped-slot":
+            facts = _dropped(name, product, missing)
+        elif mode == "building-error":
+            facts = _building(name, product, missing)
+        else:
+            facts = _late(name, mode, product, missing)
     served: torch.Tensor | None = kernel_ready.ready(name)
     facts.update({
         "mode": mode,
@@ -176,6 +234,15 @@ def check(mode: str, seed: int) -> Facts:
     elif mode == "late-error":
         ok = not facts["ready_after"] and facts["failure"] == "FileNotFoundError" and grew == 1
         why = "a late real opener failure did not stop the kernel serving, or the epoch missed it"
+    elif mode == "building-error":
+        ok = (
+            facts["refused_while_building"]
+            and facts["records_after"]
+            and not facts["ready_after"]
+            and facts["failure"] == "FileNotFoundError"
+            and grew == 1
+        )
+        why = "a build that failed before it served left a capture refused, or the epoch missed its verdict"
     else:
         ok = (
             facts["first_waiter_failure"] == "FileNotFoundError"
