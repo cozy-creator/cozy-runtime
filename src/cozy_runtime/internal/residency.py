@@ -2470,7 +2470,8 @@ class Memory:
         """`leaf`'s own values on the card for one call the row stream can't take (an operand it
         is handed, an output view: MOSS-Image's LoRA layer passes its base layer's arguments), its
         host copies back after."""
-        tables = (leaf._parameters, leaf._buffers)
+        # torch types `_parameters` with Parameter; a host copy is bound there as a plain tensor too
+        tables = (cast(dict[str, Tensor | None], leaf._parameters), leaf._buffers)
         saved = [(table, name, value) for table in tables for name, value in table.items()]
         with torch.inference_mode(False):
             for table, name, value in saved:
