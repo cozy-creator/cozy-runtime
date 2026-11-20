@@ -27,7 +27,6 @@ import secrets
 import sys
 import threading
 import time
-import types
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, cast
 
@@ -291,15 +290,49 @@ def install_call_check(component: torch.nn.Module, name: str) -> None:
     kernels it has landed, and every GPU serves those landed on all of them from this call on
     (`kernel_ready.landed`): a sparse kernel built during the attempt serves its next steps.
     A sharded stage's first call chooses its degree (`_Choice`), so the check wraps the call
-    itself: at degree 1 the call's own CP hooks are off before torch reads its forward."""
+    itself: at degree 1 the call's own CP hooks are off before torch reads its forward. It wraps
+    the component's class call, outside a CUDA graph's region (`graphs`, installed first): a
+    replay skips the Python inside a region, and only a call that reaches no other GPU records one
+    (`local`), as one GPU's hosted call does."""
     if getattr(component, "_cozy_spmd_check", None) is not None:
         return
     object.__setattr__(component, "_cozy_spmd_check", name)
-    # A method of the component, so a copy of it checks the copy.
-    object.__setattr__(component, "_call_impl", types.MethodType(_checked_call, component))
+    component.__class__ = _checked_class(type(component))
 
 
-def _checked_call(module: torch.nn.Module, *args: object, **kwargs: object) -> object:
+#: Each component class with its calls through `_checked_call` first, made once.
+_CHECKED: dict[type, type] = {}
+
+
+def _checked_class(cls: type) -> type:
+    made = _CHECKED.get(cls)
+    if made is None:
+        call = cls.__call__
+
+        def __call__(self: torch.nn.Module, *args: object, **kwargs: object) -> object:
+            return _checked_call(self, call, args, kwargs)
+
+        made = _CHECKED[cls] = type(
+            cls.__name__,
+            (cls,),
+            {"__call__": __call__, "__module__": cls.__module__, "__qualname__": cls.__qualname__},
+        )
+    return made
+
+
+def local() -> bool:
+    """Whether this process's calls reach no other GPU of its group now: a stage running alone
+    whose `spread` calls stay here (`_alone(served=False)`), as one GPU's hosted sharded call."""
+    group = _group.CURRENT[0]
+    return isinstance(group, _Alone) and not group.served
+
+
+def _checked_call(
+    module: torch.nn.Module,
+    call: Callable[..., object],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> object:
     from cozy_runtime.internal import kernel_ready
 
     name = str(module._cozy_spmd_check)
@@ -307,7 +340,7 @@ def _checked_call(module: torch.nn.Module, *args: object, **kwargs: object) -> o
     if choice is not None:
         choice.called(module, name, args, kwargs)
         if choice.hosted:
-            return choice.hosted_call(module, args, kwargs)
+            return choice.hosted_call(module, call, args, kwargs)
     if not getattr(_ALONE, "unsharded", False):  # a stage at degree 1 runs on its own
         ranks = current()
         if ranks is None:
@@ -320,7 +353,7 @@ def _checked_call(module: torch.nn.Module, *args: object, **kwargs: object) -> o
         common = set.intersection(*states)
         if common:
             kernel_ready.boundary(common)
-    return type(module)._call_impl(module, *args, **kwargs)
+    return call(module, *args, **kwargs)
 
 
 _hosting = threading.local()
@@ -1107,7 +1140,11 @@ class _Choice:
         self.scope.enter_context(_unsharded())
 
     def hosted_call(
-        self, module: torch.nn.Module, args: tuple[object, ...], kwargs: dict[str, object]
+        self,
+        module: torch.nn.Module,
+        call: Callable[..., object],
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
     ) -> object:
         """One sharded call at one GPU: its home runs it unsharded, and its output crosses."""
         ranks, home, what = self.ranks, self.home, f"{self.what} hosted"
@@ -1119,10 +1156,10 @@ class _Choice:
                 why = f"{what}: {ranks.gpu(home)} failed: {told.get('why', '')}"
                 raise GroupRefusal(why[:900], code=ENDED)
             self._unhosted()
-            return type(module)._call_impl(module, *args, **kwargs)
+            return call(module, *args, **kwargs)
         try:
             with _alone(ranks, self.stages, home, what, served=False), _unsharded():
-                out = type(module)._call_impl(module, *args, **kwargs)
+                out = call(module, *args, **kwargs)
         except BaseException as exc:
             with contextlib.suppress(Exception):
                 why = f"{type(exc).__name__}: {exc}"[:600]

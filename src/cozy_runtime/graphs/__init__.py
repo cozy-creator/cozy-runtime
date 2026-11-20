@@ -1495,6 +1495,15 @@ def _region_call(
             recorder.reasons[code] = why
 
 
+def _on_its_own() -> bool:
+    """A group's call that reaches no other GPU (`spmd.local`: one GPU's hosted sharded call, a
+    stage every GPU runs on its own) records and replays as on one GPU. spmd's call check wraps
+    the root's class call outside this region, so a replay never skips it."""
+    from cozy_runtime.internal.parallel import spmd
+
+    return spmd.local()
+
+
 def _region_path(
     torch: ModuleType,
     module: Module,
@@ -1521,7 +1530,9 @@ def _region_path(
         else "under custom tensor dispatch"
         if torch.utils._python_dispatch._get_current_dispatch_mode() is not None
         else "across GPUs"
-        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+        if torch.distributed.is_initialized()
+        and torch.distributed.get_world_size() > 1
+        and not _on_its_own()
         # A dev-only attention capture sees every call with its own inputs and step.
         else "under an attention capture"
         if attention_ulysses.CAPTURE.get() is not None
