@@ -246,9 +246,10 @@ def decoded(torch: ModuleType, scheme: str, blocks: Tensor, dtype: Dtype) -> Ten
 
 
 def _probe(torch: ModuleType, index: int, ops: ModuleType) -> verify.Verdict:
-    """Each type at the rows each kernel serves (1, 6 and 48), against f64 over the exact decode."""
-    from cozy_runtime.internal.decode_schemes import BY_SCHEME
-    from cozy_runtime.internal.encoding.adapters import CoreDequant
+    """Each type at the rows each kernel serves (1, 6 and 48), against f64 over the exact decode:
+    the decode cores' reference on the card (small blocks, so no decode set is asked for)."""
+    from cozy_runtime.internal.decode_cores import Cores
+    from cozy_runtime.internal.decode_schemes import BY_SCHEME, run
 
     device = torch.device("cuda", index)
     generator = torch.Generator(device="cpu").manual_seed(0x6611)
@@ -258,8 +259,8 @@ def _probe(torch: ModuleType, index: int, ops: ModuleType) -> verify.Verdict:
         weight = torch.randn(n, k, generator=generator) * 0.05
         blocks = encode(torch, scheme, weight).to(device)
         exact = torch.empty(n, k, dtype=torch.float32, device=device)
-        core = CoreDequant(scheme, params_of(BY_SCHEME[scheme].probe_params))
-        core.decode(torch, {"blocks": blocks}, exact)
+        adapter = BY_SCHEME[scheme]
+        run(adapter, Cores(torch, None), {"blocks": blocks}, dict(adapter.probe_params), exact)
         for m in (1, 6, 48):
             x = (torch.randn(m, k, generator=generator) * 0.5).to(device)
             for dtype in (torch.float32, torch.bfloat16):

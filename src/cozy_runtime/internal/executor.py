@@ -168,6 +168,7 @@ from cozy_runtime.internal import (
     child_env,
     contract,
     crash,
+    decode_kernels,
     effect_interfaces,
     execution_evidence,
     fp8_linear,
@@ -4245,6 +4246,7 @@ class Executor:
                 self._emit_lora(record, member)
                 self._emit_compute(record, member)
             self._emit_fused(record)
+            self._emit_decode(record)
             for feature, instead in accel.unavailable(self.device_kind) if self.models else ():
                 record.emit(
                     "log", f"{feature} unavailable on {self.device_kind}", "info", instead=instead
@@ -4464,6 +4466,17 @@ class Executor:
                     "confession", "gemm.lora", bakes.serving, how=bakes.how or "",
                     component=prefix + component, linears=len(bakes.bakes),
                 )  # fmt: skip
+
+    @staticmethod
+    def _emit_decode(record: AuthorAttempt) -> None:
+        """`kernel.decode_cores`: the decode cores' GPU calls since the last attempt, per scheme and
+        the path that served them: `set` (its kernel set, with its probe's verdict), `host` (the
+        reference, copied in) or `device` (the reference while a graph records). A `kernel.` name,
+        so TensorD keeps it."""
+        for scheme, path, calls, probe in decode_kernels.served():
+            said = {"probe": probe} if probe else {}
+            name = "kernel.decode_cores"
+            record.emit("confession", name, path, scheme=scheme, calls=calls, **said)
 
     @staticmethod
     def _emit_fused(record: AuthorAttempt) -> None:

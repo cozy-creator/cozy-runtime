@@ -1,20 +1,18 @@
-"""The decode cores (cozytensors/1 spec §6, building blocks) on GPU and CPU: affine, table and
-block structs, each one generic Triton kernel and one eager torch reference that agree bit for
-bit with the spec's f32 arithmetic and with TensorFS's Rust decoder. Outside the `encoding`
-package, so it imports alone (Triton's interpreter cannot import the package's GEMM kernels).
+"""The decode cores (cozytensors/1 spec §6, building blocks): affine, table and block structs,
+each one generic Triton kernel and one eager torch reference that agree bit for bit with the
+spec's f32 arithmetic and with TensorFS's Rust decoder. The kernels launch only through their
+declared sets, one per scheme (`decode_kernels`), so a decode never compiles one.
 
-A scheme is an `Adapter` (`encoding/adapters.py`) that maps its parts and params onto one core
-call:
+A scheme is an `Adapter` (`decode_schemes.py`) that maps its parts and params onto core calls:
 - `affine`: `b`-bit codes unpacked from words (`Packing`), then `(q - z) x s`, `q x s + c` or
   `q x s` with the scale and term on a `Grid`;
 - `table`: `T[q] x s`, optionally then `x scale_2` or with `s / scale_2`;
-- `blocks`: fixed-size structs, each decoded by a scheme's `@triton.jit` function (on GPU) or
-  its torch function (eager).
+- `blocks`: fixed-size structs, each decoded by a scheme's struct kernel (on GPU) or its torch
+  function (eager).
 
 Every kernel rounds its f32 result once into the destination (`round_L`: nearest even, NaN
-canonical) with integer bit operations, so the GPU and Triton's interpreter round alike, and
-launches with `enable_fp_fusion=False`: a fused multiply-add would round once where the spec
-rounds twice.
+canonical) with integer bit operations, as the reference does, and compiles with
+`enable_fp_fusion=False`: a fused multiply-add would round once where the spec rounds twice.
 """
 
 from __future__ import annotations
@@ -28,6 +26,8 @@ if TYPE_CHECKING:
     from torch import Tensor
     from torch import device as Device
 
+    from cozy_runtime.accel.kernels import JitKernel, Launch
+
 try:
     import triton
     import triton.language as tl
@@ -36,7 +36,7 @@ except ImportError:  # a host without Triton decodes eagerly
     if TYPE_CHECKING:
         raise
 
-#: The kernels run here (CUDA, or Triton's interpreter on CPU).
+#: The kernels compile here.
 HAS_TRITON = triton is not None
 
 
@@ -122,13 +122,11 @@ class CodeOutsideTable(ValueError):
 
 
 class Cores:
-    """The three cores bound to torch and to a path: the Triton kernels (`kernel=True`: CUDA
-    tensors, or CPU tensors under Triton's interpreter) or the eager torch reference."""
+    """The three cores bound to torch and to a path: the kernels by `launch` (their set's, on the
+    destination's GPU), or the eager torch reference where `launch` is None."""
 
-    def __init__(self, torch: ModuleType, kernel: bool) -> None:
-        if kernel and not HAS_TRITON:
-            raise RuntimeError("Triton does not import here; decode with kernel=False")
-        self.torch, self.kernel = torch, kernel
+    def __init__(self, torch: ModuleType, launch: Launch | None) -> None:
+        self.torch, self.launch = torch, launch
 
     def affine(
         self,
@@ -153,7 +151,7 @@ class Cores:
         scale = scale.reshape(-1).to(torch.float32)
         stored = zero if zero is not None else bias
         term = None if stored is None else stored.reshape(-1).to(torch.float32)
-        if not self.kernel:
+        if self.launch is None:
             q = unpack(torch, words, packing, rows, cols).to(torch.float32)
             at = _grid_index(torch, grid, rows, cols, g_idx, scale.device)
             s = scale[at]
@@ -171,7 +169,9 @@ class Cores:
             dtype=torch.int32,
             device=out.device,
         )
-        _affine_kernel[_launch(rows * cols)](
+        self.launch(
+            _affine_kernel,
+            _launch(rows * cols),
             _bits(torch, out),
             _words(torch, words, packing.word),
             slots,
@@ -187,10 +187,9 @@ class Cores:
             *_packing_codes(packing),
             *_grid_codes(grid, g_idx),
             *_post_args(torch, post, cols, scale),
-            TERM=0 if term is None else (1 if zero is not None else 2),
-            OUT=_out_code(torch, out),
-            BLOCK=BLOCK,
-            enable_fp_fusion=False,
+            0 if term is None else (1 if zero is not None else 2),
+            _out_code(torch, out),
+            BLOCK,
         )
 
     def table(
@@ -215,7 +214,7 @@ class Cores:
         values = values.reshape(-1).to(torch.float32)
         scale = scale.reshape(-1).to(torch.float32)
         second = None if scale_2 is None else scale_2.reshape(1).to(torch.float32)
-        if not self.kernel:
+        if self.launch is None:
             q = unpack(torch, words, packing, rows, cols)
             if q.numel() and (int(q.min()) < 0 or int(q.max()) >= values.numel()):
                 raise CodeOutsideTable(f"a code is outside a table of {values.numel()}")
@@ -234,7 +233,9 @@ class Cores:
             device=out.device,
         )
         error = torch.zeros(1, dtype=torch.int32, device=out.device)
-        _table_kernel[_launch(rows * cols)](
+        self.launch(
+            _table_kernel,
+            _launch(rows * cols),
             _bits(torch, out),
             _words(torch, words, packing.word),
             slots,
@@ -253,10 +254,9 @@ class Cores:
             *_packing_codes(packing),
             *_grid_codes(grid, g_idx),
             *_post_args(torch, post, cols, scale),
-            SCALE_2=0 if second is None else (2 if divide else 1),
-            OUT=_out_code(torch, out),
-            BLOCK=BLOCK,
-            enable_fp_fusion=False,
+            0 if second is None else (2 if divide else 1),
+            _out_code(torch, out),
+            BLOCK,
         )
         if int(error.item()):
             raise CodeOutsideTable(f"a code is outside a table of {values.numel()}")
@@ -268,33 +268,36 @@ class Cores:
         size: int,
         out: Tensor,
         *,
-        kernel_fn: object = None,
+        kernel: JitKernel | None = None,
+        form: int = 0,
         eager_fn: Callable[[ModuleType, Tensor], Tensor] | None = None,
         post: Tensor | None = None,
     ) -> None:
         """`out` from `U8` structs of `size` bytes holding `n` elements each, in row order.
-        `kernel_fn(base, element, mask)` is a `@triton.jit` function returning one element's
-        f32 value from its struct's bytes at `base`; `eager_fn(torch, structs)` maps every
-        struct (`[count, size]` u8) to its `[count, n]` f32 values. `post`: a factor of one element
+        `kernel(out, data, total, post, POST, FORM, N, S, OUT, BLOCK)` is a scheme's struct
+        kernel, `form` the struct it decodes; `eager_fn(torch, structs)` maps every struct
+        (`[count, size]` u8) to its `[count, n]` f32 values. `post`: a factor of one element
         multiplying every value last."""
         torch = self.torch
         total = out.numel()
-        if not self.kernel:
+        if self.launch is None:
             assert eager_fn is not None, "an eager decode needs its struct function"
             structs = data.reshape(-1).view(torch.uint8).reshape(-1, size)
             round_into(torch, _post(torch, eager_fn(torch, structs).reshape(-1), post, total), out)
             return
-        _blocks_kernel[_launch(total)](
+        assert kernel is not None, "a launched decode needs its struct kernel"
+        self.launch(
+            kernel,
+            _launch(total),
             _bits(torch, out),
             data.reshape(-1).view(torch.uint8),
             total,
             *_post_args(torch, post, total, data),
-            N=n,
-            S=size,
-            DECODE=kernel_fn,
-            OUT=_out_code(torch, out),
-            BLOCK=BLOCK,
-            enable_fp_fusion=False,
+            form,
+            n,
+            size,
+            _out_code(torch, out),
+            BLOCK,
         )
 
 
@@ -705,25 +708,6 @@ if triton is not None:
         if SCALE_2 == 1:
             v = v * tl.load(scale_2)
         v = _by_post(post, j, v, valid, POST)
-        _store(out, e, v, valid, OUT)
-
-    @triton.jit  # type: ignore[untyped-decorator]
-    def _blocks_kernel(  # type: ignore[no-untyped-def]
-        out,
-        data,
-        total,
-        post,
-        POST: tl.constexpr,
-        N: tl.constexpr,
-        S: tl.constexpr,
-        DECODE: tl.constexpr,
-        OUT: tl.constexpr,
-        BLOCK: tl.constexpr,
-    ):
-        e = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-        valid = e < total
-        v = DECODE(data + (e // N) * S, e % N, valid)
-        v = _by_post(post, e, v, valid, POST)
         _store(out, e, v, valid, OUT)
 
     @triton.jit
