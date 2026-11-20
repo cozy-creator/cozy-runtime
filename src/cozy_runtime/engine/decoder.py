@@ -5,7 +5,8 @@ by one captured step a bucket of rows, replayed until every row stops.
 The step's graph runs as the body of the launcher's WHILE node (`_kernels._engine.Segment`): one
 launch runs steps until the step itself says stop (every row done, or a row's next step would
 write past the K/V its host committed), each step reporting what it made into a host ring the
-host reads `POLLS` times a second. Bring-up: a row's prompt is prefilled alone, text only.
+host reads `POLLS` times a second. A row's prompt is prefilled alone; a row with pictures or videos
+reads its embeddings and M-RoPE positions (`engine.vision`), its rope delta carried into decode.
 
 A call takes the step's weights (`_leased`) and every row's K/V at its start and holds them to its
 end. Refused room there, before anything ran, it raises `Short`: its caller serves the call
@@ -30,6 +31,7 @@ from cozy_runtime.engine.launcher import first
 from cozy_runtime.engine.qwen35 import Qwen35, layout_of, text_of
 from cozy_runtime.engine.sampling import Sampling
 from cozy_runtime.engine.step import Rows, Step, rows_for
+from cozy_runtime.engine.vision import Prompted
 
 if TYPE_CHECKING:
     from tensorfs.varena import _runtime as varena
@@ -54,7 +56,10 @@ class _Rotary(Protocol):
 class _Decoder(Protocol):
     rotary_emb: _Rotary
 
-    def __call__(self, *, input_ids: torch.Tensor, past_key_values: object, use_cache: bool) -> _Out: ...
+    def __call__(
+        self, *, input_ids: torch.Tensor | None = ..., inputs_embeds: torch.Tensor | None = ...,
+        position_ids: torch.Tensor | None = ..., past_key_values: object, use_cache: bool,
+    ) -> _Out: ...  # fmt: skip
 
 
 class _Call(Protocol):
@@ -134,7 +139,9 @@ class Short(Exception):
 
 @dataclass(frozen=True)
 class Request:
-    """One call's rows and decoding, as token ids."""
+    """One call's rows and decoding, as token ids; a row with pictures or videos read as its
+    `prompted` embeddings and M-RoPE positions (`engine.vision`; none for a row past its end, or
+    None), its prompt holding their tokens."""
 
     prompts: Sequence[Sequence[int]]
     max_new: int
@@ -147,6 +154,7 @@ class Request:
     frequency: float = 0.0
     repetition: float = 1.0
     seed: int = 0
+    prompted: Sequence[Prompted | None] = ()
 
 
 @dataclass
@@ -241,6 +249,10 @@ class Decoder:
         drafted = self.drafting
         made = Made(tokens=[[] for _ in range(rows)], kept=[[] for _ in range(rows)])
         admitted: list[int] = []
+        for row, given in enumerate(request.prompted):
+            if given is not None and int(given.embeds.shape[0]) != len(request.prompts[row]):
+                raise ValueError(f"row {row}: {len(request.prompts[row])} tokens, {given.embeds.shape[0]} embeddings")
+        prompted: list[Prompted | None] = [*request.prompted, *[None] * (rows - len(request.prompted))]
         caller = torch.cuda.current_stream(self.device)
         with torch.cuda.stream(self.stream), torch.inference_mode(), ExitStack() as call:
             # What the caller's stream made before the call (the decoding values just filled, a row's
@@ -259,7 +271,7 @@ class Decoder:
                     answered(exc)
                     raise Short(f"its weights and K/V don't fit at the call's start ({str(exc)[:200]})") from exc
                 for row, prompt in enumerate(request.prompts):
-                    made.tokens[row].append(self._prefill(row, prompt, request, sampling, drafted))
+                    made.tokens[row].append(self._prefill(row, prompt, request, sampling, drafted, prompted[row]))
                 self.stream.synchronize()
                 made.prefill_s = time.perf_counter() - began
                 if told is not None:
@@ -297,17 +309,23 @@ class Decoder:
 
     # ------------------------------------------------------------------ prefill
 
-    def _prefill(self, row: int, prompt: Sequence[int], request: Request, sampling: Sampling, drafted: bool) -> int:
+    def _prefill(
+        self, row: int, prompt: Sequence[int], request: Request, sampling: Sampling, drafted: bool,
+        prompted: Prompted | None = None,
+    ) -> int:  # fmt: skip
         """`row`'s prompt (admitted) through the model's own forward, `prefill_chunk` tokens at a
         time: each attention layer's K/V into the row's blocks as it is made (`_PagedLayer`), the
         gated-delta layers' states carried by Transformers' cache from chunk to chunk and into the
         row's slot at the end; the head's K/V for positions 1 to P chunk by chunk, and its state for
-        the first draft. Returns the first token."""
+        the first draft. A row with pictures or videos reads its `prompted` embeddings at its M-RoPE
+        positions (`[4, 1, n]`, the text row first, as `generate` passes them), and decodes after
+        them at its rope delta. Returns the first token."""
         from transformers import DynamicCache
 
         hf, kv, qwen, r = self.hf, self.kv, self.qwen, self.rows
         ids = torch.tensor([list(prompt)], dtype=torch.long, device=self.device)
         length = ids.shape[1]
+        everywhere = torch.arange(length, device=self.device)
         cache = DynamicCache(config=hf.config.get_text_config(decoder=True))  # type: ignore[arg-type]  # its own config type
         for layer, index in qwen.slot_of.items():
             cache.layers[layer] = cast("CacheLayerMixin", _paged_layer(kv, row, index))
@@ -318,18 +336,33 @@ class Decoder:
         first = -1
         hidden: torch.Tensor | None = None
         for c0 in range(0, length, self.prefill_chunk):
-            chunk = ids[:, c0 : c0 + self.prefill_chunk]
-            y = hf.get_decoder()(input_ids=chunk, past_key_values=cache, use_cache=True).last_hidden_state[0]
-            last = c0 + chunk.shape[1] >= length
+            c1 = min(c0 + self.prefill_chunk, length)
+            if prompted is None:
+                y = hf.get_decoder()(input_ids=ids[:, c0:c1], past_key_values=cache, use_cache=True).last_hidden_state[0]
+            else:
+                at = torch.cat([everywhere[None, c0:c1], prompted.positions[:, c0:c1]])[:, None]
+                y = hf.get_decoder()(inputs_embeds=prompted.embeds[None, c0:c1], position_ids=at, past_key_values=cache,
+                                     use_cache=True).last_hidden_state[0]  # fmt: skip
+            last = c1 >= length
             if last:  # [n, hidden], final-normed: the prompt's last position gives the first token
                 logits = qwen.logits(y[-1:])
                 scores = sampling.penalties(logits, 1, r.counts[row : row + 1], r.prompt[row : row + 1])
                 first = int(sampling.pick(scores, 1, torch.zeros(1, dtype=torch.long, device=self.device))[0])
-            if head is not None:  # position p's head input is token p with the model's state at p - 1
-                after = ids[0, c0 + 1 : c0 + chunk.shape[1] + 1]
-                if last:
-                    after = torch.cat([after, torch.tensor([first], dtype=torch.long, device=self.device)])
-                hidden = self._draft_prompt(after, y, c0 + 1, head)
+            if head is not None:
+                # Slot p's head input is token p (a media token's: its feature, as vLLM 0.19.1's head reads
+                # it) with the model's state at p - 1, at token p - 1's position, every axis one on: vLLM's
+                # rotations shifted alike (a shift RoPE cancels), so a text slot sits at p, as decode's do.
+                if prompted is None:
+                    after = ids[0, c0 + 1 : c1 + 1]
+                    if last:
+                        after = torch.cat([after, torch.tensor([first], dtype=torch.long, device=self.device)])
+                    embeds, at = qwen.embed(after), (everywhere[c0:c1] + 1).expand(3, -1)
+                else:
+                    embeds, at = prompted.embeds[c0 + 1 : c1 + 1], prompted.positions[:, c0:c1] + 1
+                    if last:
+                        following = qwen.embed(torch.tensor([first], dtype=torch.long, device=self.device))
+                        embeds = torch.cat([embeds, following])
+                hidden = self._draft_prompt(embeds, y, at, head)
             del y
         slot = kv.slot(row)
         for layer, index in qwen.delta_of.items():
@@ -347,7 +380,7 @@ class Decoder:
         if stops:
             r.stops[row, : len(stops)] = torch.tensor(stops, dtype=torch.long, device=self.device)
         r.done[row] = first in stops or request.max_new <= 1
-        r.delta[row] = 0
+        r.delta[row] = 0 if prompted is None else prompted.delta
         r.counts[row, first] += 1.0
         r.budget[row] = kv.committed(row)
         return first
@@ -362,23 +395,23 @@ class Decoder:
         card = self.kv_card_bytes // max(len(request.prompts), 1) // layout.token_bytes
         return max(need - card, 0)
 
-    def _draft_prompt(self, tokens: torch.Tensor, y: torch.Tensor, at: int, head: _Paged) -> torch.Tensor:
-        """The head's K/V for positions `at` to `at + n - 1` (token p with the model's state at
-        p - 1: `tokens` and `y`, `[n]` and `[n, hidden]`) into its layer's blocks, attending to its
-        K/V so far; returns its state at the last of them: `lm`'s `_drafted_prompt`, one row."""
+    def _draft_prompt(self, embeds: torch.Tensor, y: torch.Tensor, at: torch.Tensor, head: _Paged) -> torch.Tensor:
+        """The head's K/V for its next `n` slots (token p with the model's state at p - 1: the
+        token's embedding and `y`, `[n, hidden]` each, at M-RoPE positions `at`, `[3, n]`) into its
+        layer's blocks, attending to its K/V so far; returns its state at the last of them: `lm`'s
+        `_drafted_prompt`, one row."""
         from transformers import DynamicCache
 
         hf, qwen, text = self.hf, self.qwen, self.text
         mtp = hf.mtp
-        n = int(tokens.shape[0])
+        n = int(embeds.shape[0])
         eps = text.eps
         from cozy_runtime.engine.qwen35 import _norm
 
-        e = _norm(qwen.embed(tokens[None]), mtp.pre_fc_norm_embedding.weight, eps, qwen.fused, qwen.run)
+        e = _norm(embeds[None], mtp.pre_fc_norm_embedding.weight, eps, qwen.fused, qwen.run)
         h = _norm(y[None], mtp.pre_fc_norm_hidden.weight, eps, qwen.fused, qwen.run)
         x = mtp.fc(torch.cat([e, h], -1))
-        positions = torch.arange(at, at + n, device=self.device)
-        rope = hf.get_decoder().rotary_emb(x, positions.view(1, 1, -1).expand(3, 1, -1))
+        rope = hf.get_decoder().rotary_emb(x, at[:, None])
         seen = head.get_seq_length()
         # Causal over the head's K/V so far and this chunk: query i sees keys up to seen + i.
         mask = None if not seen else (

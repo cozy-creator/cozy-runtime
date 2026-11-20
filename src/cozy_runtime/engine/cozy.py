@@ -4,7 +4,9 @@ platform, the model, the call), then the decoder's `Short` (its weights or K/V r
 call's start, before anything is told). Once a token is told nothing falls back. Each call says
 which engine served it, and why not this one, in the run record's `<model>.engine` note.
 
-It serves a CUDA Qwen3.5 text call: text-only questions, at most `ROWS` rows, no repeat-n-gram cut,
+It serves a CUDA Qwen3.5 call: questions of text, pictures and videos (a row with pictures or videos
+read as Transformers' engine reads it, its embeddings and positions by `engine.vision`), at most
+`ROWS` rows, no repeat-n-gram cut,
 on a dense model whose step linears are all of `LANES`, with a TensorFS that has the K/V cache, once
 the model's kernel set has landed (`install`: built while it loads, never on a request) and this
 driver's launch path is known (`engine.launcher`: the WHILE-node launcher, else the host replaying
@@ -26,6 +28,7 @@ from cozy_runtime.engine import launcher
 from cozy_runtime.engine.decoder import Decoder, Request, Short, answered, short_of_room
 from cozy_runtime.engine.launch import Run
 from cozy_runtime.engine.qwen35 import text_of
+from cozy_runtime.engine.vision import Media, Prompted, encode, media_of
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -156,7 +159,10 @@ class CozyEngine:
         if self.unserved:
             return self.unserved
         if any(not isinstance(p, str) for q in questions for p in q.everything()):
-            return "the engine's prefill reads text only"
+            if getattr(getattr(self.model, "model", None), "visual", None) is None:
+                return "the model has no vision tower to read its pictures and videos"
+            if "mm_token_type_ids" not in getattr(self.processor, "model_input_names", ()):
+                return "its processor gives no token kinds, which the pictures' M-RoPE positions read"
         if params.allowed is not None:
             return "the engine has no grammar-constrained decode"
         if len(questions) > ROWS:
@@ -202,8 +208,7 @@ class CozyEngine:
         from cozy_runtime.vlm import Final, Usage, _Told
 
         tokenizer = cast("_Tokenizer", self.processor.tokenizer)
-        texts = [self.fallback._chat(q, params.system, params.thinking, params.reasoning_effort) for q in questions]
-        prompts = [tokenizer.encode(t, add_special_tokens=False) for t in texts]
+        prompts, media = self._read(questions, params)
         configured = self.model.generation_config.eos_token_id
         stop = [] if params.thinking else params.stop
         single = [ids[0] for ids in (tokenizer.encode(s, add_special_tokens=False) for s in stop) if len(ids) == 1]
@@ -230,6 +235,8 @@ class CozyEngine:
                 f"prompt: clamped to {new}",
                 {"max_tokens": params.max_new_tokens, "clamped": new, "context": ceiling},
             ))  # fmt: skip
+        prompted = self._encoded(prompts, media)
+        del media  # the pictures' pixels go before the decoder takes its rows' K/V
         rows = len(prompts)
         made: list[list[int]] = [[] for _ in range(rows)]
         told = [_Told(params.thinking) for _ in range(rows)]
@@ -255,7 +262,7 @@ class CozyEngine:
         request = Request(
             prompts=prompts, max_new=new, stops=stops, temperature=params.temperature,
             top_p=params.top_p, top_k=params.top_k, min_p=params.min_p, presence=params.presence_penalty,
-            frequency=params.frequency_penalty, repetition=params.repetition_penalty, seed=params.seed,
+            frequency=params.frequency_penalty, repetition=params.repetition_penalty, seed=params.seed, prompted=prompted,
         )  # fmt: skip
         out = self.decoder(request, told=tokens)
         reasons: list[str] = []
@@ -279,6 +286,43 @@ class CozyEngine:
             usage=Usage(sum(len(p) for p in prompts), made_tokens),
             timings={"prefill": out.prefill_s, "decode": out.decode_s, "steps": float(out.steps), "captured": float(out.captured)},
         )
+
+    def _read(self, questions: list[Question], params: Params) -> tuple[list[list[int]], list[Media | None]]:
+        """Each row's tokens, and its pictures and videos: a text row through the tokenizer, a row with
+        pictures or videos as Transformers' engine reads it (its processor), a row at a time."""
+        tokenizer = cast("_Tokenizer", self.processor.tokenizer)
+        prompts: list[list[int]] = []
+        media: list[Media | None] = []
+        for question in questions:
+            if all(isinstance(p, str) for p in question.everything()):
+                text = self.fallback._chat(question, params.system, params.thinking, params.reasoning_effort)
+                prompts.append(tokenizer.encode(text, add_special_tokens=False))
+                media.append(None)
+            else:
+                inputs = self.fallback.inputs([question], params)
+                prompts.append([int(t) for t in inputs["input_ids"][0].tolist()])
+                media.append(media_of(inputs))
+        return prompts, media
+
+    def _encoded(self, prompts: list[list[int]], media: list[Media | None]) -> list[Prompted | None]:
+        """Each row's embeddings and M-RoPE positions where it has pictures or videos (`engine.vision`).
+        The vision tower runs here, before the decoder leases the step's weights; refused room, the
+        call is `Short`."""
+        made: list[Prompted | None] = []
+        try:
+            with torch.inference_mode():
+                for prompt, row in zip(prompts, media, strict=True):
+                    if row is None:
+                        made.append(None)
+                        continue
+                    ids = torch.tensor([prompt], dtype=torch.long, device=row.kinds.device)
+                    made.append(encode(self.model, ids, row))
+        except Exception as exc:
+            if not short_of_room(exc):
+                raise
+            answered(exc)
+            raise Short(f"its pictures' and videos' encoding doesn't fit ({str(exc)[:200]})") from exc
+        return made
 
     def _path(self) -> str:
         """The launch path the decoder serves on, and why where it is not the launcher."""
