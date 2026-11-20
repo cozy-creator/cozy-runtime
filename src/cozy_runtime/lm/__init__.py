@@ -3467,7 +3467,7 @@ class _Engine:
         before its capture (`_Judge`, `_check_bytes`). As a component graph's check (graphs'
         rule, cr-333), it is refused rather than given varena's last resort: refused, the graph
         goes and the token decodes eagerly from the state before it, the key judged again once the
-        card has more room. A difference discards the graph and explains itself (`_explain`)."""
+        card has the room the refused allocation was short of. A difference discards the graph and explains itself (`_explain`)."""
         domain = _set(self.domain)
         state, stream = self._token_state(key[2]), torch.cuda.current_stream(domain.device)
         start: _Before | None = None
@@ -3484,6 +3484,7 @@ class _Engine:
             except Exception as exc:
                 if not _short_of_room(exc):
                     raise
+                short = getattr(exc, "requested_bytes", 0) - self._room()
                 if start is not None:
                     start.restore()
                     start.release()
@@ -3492,7 +3493,7 @@ class _Engine:
                 why = no_room(domain.device, "its graph's check", 0, exc)
                 _unwind(exc)
                 _answered(exc)
-                self._eager_key(key, f"{why}: it decodes eagerly")
+                self._eager_key(key, f"{why}: it decodes eagerly", short)
                 self._eager(size, why)
                 return
             self.eager += 1
