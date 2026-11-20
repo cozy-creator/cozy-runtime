@@ -364,14 +364,15 @@ def _pack(
 
 class _Arriving:
     """A head group's Q, K, V crossing: its receivers (Q, K, V and their scales, each stacked in
-    one tensor), and the operands its unpacking writes (stacked too: one launch unpacks all)."""
+    one tensor). Plain batch-one receives already have the storage order attention needs.
+    Other calls allocate separate operands for transposing or widening the receive."""
 
     def __init__(
         self,
         wait: Wait,
         values: Tensor,
         scales: Tensor | None,
-        operands: Tensor,
+        operands: Tensor | None,
         mark: torch.cuda.Event | None,
     ) -> None:
         self.wait, self.values, self.scales, self.operands = wait, values, scales, operands
@@ -406,7 +407,7 @@ def _send(
         scales = [like.new_empty((world * rows, batch, local, 1)) for _ in sources]
         received = like.new_empty((3, total, batch, local, 1))
         receives += received.unbind()
-    operands = like.new_empty((3, batch, total, local, dim))
+    operands = None if batch == 1 and not narrow else like.new_empty((3, batch, total, local, dim))
     mark = packer.mark()
     with packer.on(packer.out, mark):
         for index in (0, 2, 1):  # K last: its shift may still be on its way
@@ -423,7 +424,11 @@ def _unpack(packer: _Packer, group: _Arriving) -> list[Tensor]:
     rows, scales, into = group.values.transpose(1, 2), group.scales, group.operands
     with packer.on(packer.inbound, group.mark):
         group.wait()
-        if scales is None:
+        if into is None:
+            # Reinsert the singleton batch dimension with the stride of a contiguous
+            # operand. The view retains the receive allocation through attention.
+            into = group.values.squeeze(2).unsqueeze(1)
+        elif scales is None:
             into.copy_(rows)
         else:
             turn.widen(packer.launch, rows, scales.transpose(1, 2), into)
@@ -722,12 +727,11 @@ def _exchange(
             return _send(handle, engines, packer, *args)
 
         # In flight: the next group's q, k, v, and the last group's output (`_need`).
-        arriving = send(*groups[0])
+        arriving: _Arriving | None = send(*groups[0])
         returning: tuple[Wait, list[Tensor], int] | None = None
         for index, (start, local) in enumerate(groups):
-            current = arriving
-            if index + 1 < len(groups):
-                arriving = send(*groups[index + 1])
+            current = cast(_Arriving, arriving)
+            arriving = send(*groups[index + 1]) if index + 1 < len(groups) else None
             before = _Clock.mark(query)
             operands = _unpack(packer, current)
             arrived.append((before, _Clock.mark(query)))
