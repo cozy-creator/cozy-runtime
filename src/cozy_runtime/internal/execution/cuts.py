@@ -314,12 +314,23 @@ def _screened(forward: object) -> bool:
     return True
 
 
+def _own_elementwise(module: nn.Module) -> bool:
+    """An activation whoever wrote it: a module of no weights (`_layout` asks first) whose own
+    forward names nothing that mixes tokens (`_screened`), such as a gated split of the last axis,
+    one half's activation times the other. Its children are read as any others."""
+    forward = type(module).forward
+    if forward is nn.Module.forward or not _screened(forward):
+        return False
+    return "forward" not in vars(module) or _screened(vars(module)["forward"])
+
+
 def _layout(module: nn.Module, width: int | None = None) -> tuple[int, int, tuple[int, int]] | None:
     """A feed-forward's widths from the linears under `module`: (din, projected, (inner, dout)),
     up projections from din (`width` where given; `projected` their outputs together) and one down
     projection from `inner`, which is `projected` or half of it (gated). None where anything else
-    holds weights or computes: any module but a linear, an elementwise activation, a container,
-    or a holder of those without parameters or a forward of its own (RelayVSR's `GELU`)."""
+    holds weights or computes: any module but a linear, an elementwise activation (a library's, or
+    one of no weights whose forward mixes no tokens: `_own_elementwise`), a container, or a holder
+    of those without parameters or a forward of its own (RelayVSR's `GELU`)."""
     linears: list[tuple[int, int]] = []
     stack = [module]
     while stack:
@@ -336,7 +347,11 @@ def _layout(module: nn.Module, width: int | None = None) -> tuple[int, int, tupl
         if sub is module:
             stack.extend(sub.children())
             continue
-        elementwise = isinstance(sub, _ELEMENTWISE) or type(sub).__module__ in _ACTIVATION_MODULES
+        elementwise = (
+            isinstance(sub, _ELEMENTWISE)
+            or type(sub).__module__ in _ACTIVATION_MODULES
+            or _own_elementwise(sub)
+        )
         if not (
             elementwise
             or isinstance(sub, nn.ModuleList | nn.Sequential)
