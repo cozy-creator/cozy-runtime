@@ -1,8 +1,9 @@
 """The values one GPU of a group hands the others (`spmd.Ranks.cross`): JSON for the structure,
 the tensors apart, each crossing by one broadcast from the GPU that holds it.
 
-A value is JSON scalars, lists, tuples, str-keyed dicts, tensors and model outputs
-(transformers' `ModelOutput`); anything else is refused by name.
+A value is JSON scalars, lists, tuples, str-keyed dicts, tensors, NumPy arrays (a host tensor
+that comes back an array) and model outputs (transformers' `ModelOutput`); anything else is
+refused by name.
 """
 
 from __future__ import annotations
@@ -33,12 +34,14 @@ class UncrossableArgument(GroupRefusal):
 
 
 class _Tensor(msgspec.Struct, frozen=True, tag_field=_TAG, tag="tensor"):
-    """The `v`th tensor of the value; `host`: it lives in host memory on the GPU that sent it."""
+    """The `v`th tensor of the value; `host`: it lives in host memory on the GPU that sent it;
+    `array`: it was a NumPy array there, and is one here."""
 
     v: int
     dtype: str
     shape: list[int]
     host: bool
+    array: bool = False
 
 
 class _Tuple(msgspec.Struct, frozen=True, tag_field=_TAG, tag="tuple"):
@@ -61,11 +64,19 @@ def marshal(value: object, tensors: list[torch.Tensor], *, path: str = "") -> Js
 
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    numpy = sys.modules.get("numpy")
+    array = numpy is not None and isinstance(value, numpy.ndarray)
+    if numpy is not None and array:
+        try:
+            value = torch.from_numpy(numpy.ascontiguousarray(value))
+        except TypeError as exc:  # an object or other array torch has no type for
+            raise UncrossableArgument(f"{path or 'value'}: {exc}") from exc
     if isinstance(value, torch.Tensor):
         tensors.append(value)
         dtype = str(value.dtype).removeprefix("torch.")
         host = value.device.type == "cpu"
-        return msgspec.to_builtins(_Tensor(len(tensors) - 1, dtype, list(value.shape), host))
+        shape = list(value.shape)
+        return msgspec.to_builtins(_Tensor(len(tensors) - 1, dtype, shape, host, array))
     if isinstance(value, OrderedDict) and dataclasses.is_dataclass(type(value)):
         kind = type(value)
         items = {k: marshal(v, tensors, path=f"{path}.{k}") for k, v in value.items()}
@@ -122,7 +133,7 @@ def unmarshal(value: Json, tensors: list[torch.Tensor]) -> object:
     except msgspec.ValidationError as exc:
         raise UncrossableArgument(f"malformed wire envelope: {exc}") from exc
     if isinstance(envelope, _Tensor):
-        return tensors[envelope.v]
+        return tensors[envelope.v].numpy() if envelope.array else tensors[envelope.v]
     if isinstance(envelope, _Tuple):
         return tuple(unmarshal(v, tensors) for v in envelope.v)
     module, _, qualname = envelope.kind.partition(":")
@@ -178,3 +189,5 @@ class RunReply(msgspec.Struct, frozen=True):
     exchange: dict[str, float] = {}
     steps: dict[str, list[tuple[int, float]]] = {}
     stages: dict[str, float] = {}
+    #: its crossings of stages one GPU ran (`spmd.taken`): bytes mapped, ms waited and mapping
+    crossed: dict[str, dict[str, float | str]] = {}

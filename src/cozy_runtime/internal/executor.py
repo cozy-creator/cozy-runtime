@@ -103,7 +103,7 @@ from cozy_runtime.accel import stepcache
 from cozy_runtime.accel.attention import _close as close_producer_states
 from cozy_runtime.accel.kernels import _SETS as KERNEL_SETS
 from cozy_runtime.accel.kernels import Launch, Plan, TritonKernels
-from cozy_runtime.author import _activity, _phases, _split, _watchers
+from cozy_runtime.author import _activity, _model, _phases, _split, _watchers
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._artifacts import ModelChoice
@@ -861,6 +861,7 @@ class _Ranks:
                 "exchange": reply.exchange,
                 "steps": reply.steps,
                 "stages": reply.stages,
+                "crossed": reply.crossed,
             }
         answered = list(zip(group.followers, replies, strict=True))
         ranks.clear({0: ranks.sequence, **{f.rank: r.meetings for f, r in answered}})
@@ -1511,7 +1512,13 @@ class Executor:
         if transport is not None:
             from cozy_runtime.internal.parallel import ulysses
 
-            crossing = {"transport": {**transport.document(), "exchange": ulysses.taken()}}
+            crossing = {
+                "transport": {
+                    **transport.document(),
+                    "exchange": ulysses.taken(),
+                    "stages": spmd.taken(),
+                }
+            }
         if self.group is not None:
             # each follower's exchanges, step points and stalls, by its GPU (`wire.RunReply`)
             crossing["followers"] = {
@@ -1648,6 +1655,7 @@ class Executor:
                 copy_engine.install(exchange, self.pg)
         except Exception as exc:
             return self._unformed(exc, "form")
+        spmd.formed()
         if self.comms is not None:
             self.comms.pg = self.pg
         return reply
@@ -1739,6 +1747,7 @@ class Executor:
             exchange=exchange,
             formed=self.host._formed if exchange else None,
         )
+        spmd.formed()
         if self.host.comms is not None:
             self.host.comms.pg = self.host.pg
 
@@ -1799,6 +1808,7 @@ class Executor:
         from cozy_runtime.internal.parallel import ulysses
 
         ulysses.taken()  # what an earlier attempt left uncounted is not this one's
+        spmd.taken()
         stage_memo.ENGINE.open(None, spool)
         if self.residency is not None:
             self.residency.open_attempt()
@@ -1887,6 +1897,7 @@ class Executor:
             ),
             memory=msgspec.to_builtins(rows[0]) if rows else None,
             exchange=exchange,
+            crossed=spmd.taken(),
             steps={
                 name: list(track.series or ())
                 for name, track in (record.attribution.steps if record else {}).items()
@@ -2004,6 +2015,9 @@ class Executor:
             )
         if hosted:
             object.__setattr__(model, "_cozy_placement", spmd.Placement(hosted, self.rank))
+        # A stage with no sharded component runs on one GPU of the group (`spmd.place`).
+        object.__setattr__(model, "_cozy_group_stages", spmd.Stages(sharded, hosted, roots))
+        _model.PLACE[0] = spmd.place
         self.facts["sequence_parallel"] = {
             "degree": self.world,
             "rank": self.rank,
@@ -2279,6 +2293,7 @@ class Executor:
                 if not command.import_only and cpu_group:
                     with _phases.phase("joining the group's GPUs"):
                         self.pg = self.group.form(cast("ModuleType", self.torch), _SEALED)
+                        spmd.formed()
                     stage("group_form")
                 elif not command.import_only:
                     with _phases.phase("measuring the links between GPUs"):
@@ -2300,6 +2315,7 @@ class Executor:
                             exchange=exchange,
                             formed=self._formed if exchange else None,
                         )
+                        spmd.formed()
                     stage("group_form")
         except GroupRefusal as exc:
             return self._group_refusal(exc)

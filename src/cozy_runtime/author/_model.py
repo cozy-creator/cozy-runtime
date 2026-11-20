@@ -676,6 +676,14 @@ class Sealed(Protocol):
 #: package may not move, a refusal it returned past), installed when the executor seals torch.
 CONTRACT: list[Sealed | None] = [None]
 
+#: Where a group runs a stage (`internal/parallel/spmd.place`): on one of its GPUs, its result
+#: crossing to the others, or on every GPU. Installed by the executor of a group; None: here.
+type Place = Callable[
+    [object, str, tuple[str, ...], tuple[object, ...], dict[str, object], Callable[[], object]],
+    object,
+]
+PLACE: list[Place | None] = [None]
+
 
 def deterministic(model: object, method: str) -> bool:
     """Whether `model.method` runs under deterministic cuDNN: it declares `deterministic=True`,
@@ -685,6 +693,11 @@ def deterministic(model: object, method: str) -> bool:
 
 def _declares_deterministic(model: object, method: str) -> bool:
     return getattr(getattr(type(model), method, None), "__deterministic__", False) is True
+
+
+def open_stage() -> bool:
+    """Whether a component-use scope (a stage) is open in this context."""
+    return bool(_LOCAL_SCOPES.get() or _REMOTE_SCOPES.get())
 
 
 def remote_scope(model: object) -> tuple[str, tuple[str, ...]] | None:
@@ -724,6 +737,8 @@ def uses_components(
         wrapper = _async_wrapper(fn, components) if _is_async(fn) else _sync_wrapper(fn, components)
         if memo:
             wrapper = memoized(fn, wrapper, components, is_async=_is_async(fn))
+        if not _is_async(fn):
+            wrapper = _placed(fn, wrapper, components)
         declared: _Declared = cast("_Declared", wrapper)
         declared.__uses_components__ = components
         declared.__deterministic__ = deterministic
@@ -836,6 +851,25 @@ def _sync_wrapper[M: _ScopedModel, **P, R](
             return result
 
     return wrapper
+
+
+def _placed[M: _ScopedModel, **P, R](
+    fn: Callable[Concatenate[M, P], R],
+    wrapper: Callable[Concatenate[M, P], R],
+    components: tuple[str, ...],
+) -> Callable[Concatenate[M, P], R]:
+    """The stage, where its group runs it (`PLACE`): outside every lookup and scope, so a GPU
+    that receives its result fetches, holds and computes nothing for it."""
+
+    @functools.wraps(wrapper)
+    def placed(self: M, /, *args: P.args, **kwargs: P.kwargs) -> R:
+        place = PLACE[0]
+        if place is None:
+            return wrapper(self, *args, **kwargs)
+        run = functools.partial(wrapper, self, *args, **kwargs)
+        return cast("R", place(self, fn.__name__, components, args, kwargs, run))
+
+    return placed
 
 
 def _async_wrapper[M: _ScopedModel, **P, R](
