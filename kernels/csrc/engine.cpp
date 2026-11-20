@@ -79,6 +79,68 @@ std::vector<cudaGraphNode_t> nodes(cudaGraph_t graph) {
 // The first node the step graph holds that a WHILE body's child graph may not: a body holds kernel,
 // empty, memcpy, memset, child graph and conditional nodes (programming guide, conditional node body
 // graph requirements), and a child graph no conditional (`cudaChildGraphNodeParams`).
+// A memcpy node's direction, from its kind or, where it is cudaMemcpyDefault, its pointers.
+const char* direction(cudaGraphNode_t node) {
+    cudaMemcpy3DParms p = {};
+    if (cudaGraphMemcpyNodeGetParams(node, &p) != cudaSuccess) return "memcpy";
+    cudaMemcpyKind kind = p.kind;
+    if (kind == cudaMemcpyDefault) {
+        auto on_card = [](const void* ptr) {
+            cudaPointerAttributes at = {};
+            if (cudaPointerGetAttributes(&at, ptr) != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+            return at.type == cudaMemoryTypeDevice || at.type == cudaMemoryTypeManaged;
+        };
+        const void* src = p.srcArray ? nullptr : static_cast<const char*>(p.srcPtr.ptr) + p.srcPos.x;
+        const void* dst = p.dstArray ? nullptr : static_cast<const char*>(p.dstPtr.ptr) + p.dstPos.x;
+        const bool from = p.srcArray || on_card(src), to = p.dstArray || on_card(dst);
+        kind = from ? (to ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost)
+                    : (to ? cudaMemcpyHostToDevice : cudaMemcpyHostToHost);
+    }
+    switch (kind) {
+        case cudaMemcpyHostToDevice: return "memcpy host-to-device";
+        case cudaMemcpyDeviceToDevice: return "memcpy device-to-device";
+        case cudaMemcpyDeviceToHost: return "memcpy device-to-host";
+        case cudaMemcpyHostToHost: return "memcpy host-to-host";
+        default: return "memcpy";
+    }
+}
+
+// Every node kind of `graph`, a child graph's as its own nodes', a memcpy by its direction.
+void kinds_of(cudaGraph_t graph, std::vector<std::string>& found) {
+    for (cudaGraphNode_t node : nodes(graph)) {
+        cudaGraphNodeType type;
+        check("cudaGraphNodeGetType", cudaGraphNodeGetType(node, &type));
+        if (type == cudaGraphNodeTypeGraph) {
+            cudaGraph_t child;
+            check("cudaGraphChildGraphNodeGetGraph", cudaGraphChildGraphNodeGetGraph(node, &child));
+            kinds_of(child, found);
+            continue;
+        }
+        const std::string name = type == cudaGraphNodeTypeMemcpy ? direction(node) : kind(type);
+        bool seen = false;
+        for (const std::string& had : found) seen = seen || had == name;
+        if (!seen) found.push_back(name);
+    }
+}
+
+nb::list kinds(uintptr_t graph) {
+    if (!graph) throw std::invalid_argument("kinds: no graph");
+    std::vector<std::string> found;
+    kinds_of(reinterpret_cast<cudaGraph_t>(graph), found);
+    nb::list out;
+    for (const std::string& name : found) out.append(nb::str(name.c_str()));  // no stl caster is included
+    return out;
+}
+
+void memset_async(uintptr_t ptr, int value, size_t nbytes, uintptr_t stream) {
+    if (!ptr) throw std::invalid_argument("memset: no pointer");
+    check("cudaMemsetAsync", cudaMemsetAsync(reinterpret_cast<void*>(ptr), value, nbytes,
+                                             reinterpret_cast<cudaStream_t>(stream)));
+}
+
 const char* refused(cudaGraph_t graph) {
     for (cudaGraphNode_t node : nodes(graph)) {
         cudaGraphNodeType type;
@@ -95,12 +157,146 @@ const char* refused(cudaGraph_t graph) {
     return nullptr;
 }
 
+// A body's 1-D copy, lowered to a `copy_rows` kernel node (`lower`): its node, and its operands as captured.
 struct Copy {
     cudaGraphNode_t node;
     uintptr_t dst, src;
     size_t bytes;
-    cudaMemcpyKind direction;
 };
+
+// The address a kernel reads or writes `pointer` at: its own on this card, a mapped host range's device
+// address (the K/V host tier registers its blocks so: CU_MEMHOSTREGISTER_DEVICEMAP; pinned memory under
+// unified addressing is mapped too). Anything else (pageable memory, another card's) the lowering refuses.
+const void* on_card(const void* pointer, int device) {
+    cudaPointerAttributes at = {};
+    if (cudaPointerGetAttributes(&at, pointer) != cudaSuccess) {
+        cudaGetLastError();
+        at = {};
+    }
+    if ((at.type == cudaMemoryTypeDevice || at.type == cudaMemoryTypeManaged) && at.device == device) return pointer;
+    if (at.type == cudaMemoryTypeHost && at.devicePointer) return at.devicePointer;
+    throw std::invalid_argument("Segment: a copy in the step reads or writes memory this card does not address");
+}
+
+unsigned blocks(size_t units) {
+    const size_t n = (units + 255) / 256;
+    return static_cast<unsigned>(n < 1 ? 1 : n > 4096 ? 4096 : n);
+}
+
+// One 1-D copy of `bytes` as `copy_rows`'s kernel parameters (`args` holds what they point at).
+struct Row1D {
+    unsigned char* dst;
+    const unsigned char* src;
+    size_t dst_pitch, dst_slice, src_pitch, src_slice, width, height = 1, depth = 1;
+    bool wide;
+    void* args[10];
+    cudaKernelNodeParams params = {};
+
+    Row1D(const void* to, const void* from, size_t bytes)
+        : dst(static_cast<unsigned char*>(const_cast<void*>(to))), src(static_cast<const unsigned char*>(from)),
+          dst_pitch(bytes), dst_slice(bytes), src_pitch(bytes), src_slice(bytes), width(bytes),
+          wide(((reinterpret_cast<uintptr_t>(to) | reinterpret_cast<uintptr_t>(from) | bytes) & 15) == 0),
+          args{&dst, &src, &dst_pitch, &dst_slice, &src_pitch, &src_slice, &width, &height, &depth, &wide} {
+        params.func = const_cast<void*>(cozy_engine::copy_rows_kernel());
+        params.gridDim = dim3(blocks(wide ? bytes / 16 : bytes));
+        params.blockDim = dim3(256);
+        params.kernelParams = args;
+    }
+};
+
+// cozy-runtime #1860's lowering, the one in Cozy (its ResidentRepeat is gone): each memset and memcpy node of
+// a WHILE body, through child graphs, replaced by a `fill_rows`/`copy_rows` kernel node on the same edges, so
+// the body holds kernel, empty and child-graph nodes only. A 1-D copy is kept in `copies` for its edits.
+void lower(cudaGraph_t graph, int device, std::vector<Copy>& copies, unsigned depth = 0) {
+    if (depth > 32) throw std::invalid_argument("Segment: the step's graphs nest deeper than 32");
+    for (cudaGraphNode_t node : nodes(graph)) {
+        cudaGraphNodeType type;
+        check("cudaGraphNodeGetType", cudaGraphNodeGetType(node, &type));
+        if (type == cudaGraphNodeTypeGraph) {
+            cudaGraph_t child;
+            check("cudaGraphChildGraphNodeGetGraph", cudaGraphChildGraphNodeGetGraph(node, &child));
+            lower(child, device, copies, depth + 1);
+            continue;
+        }
+        if (type != cudaGraphNodeTypeMemset && type != cudaGraphNodeTypeMemcpy) continue;
+        unsigned char* dst = nullptr;
+        const unsigned char* src = nullptr;
+        size_t dst_pitch = 0, dst_slice = 0, src_pitch = 0, src_slice = 0, width = 0, height = 0, depth_rows = 1,
+               units = 0;
+        unsigned word = 0;
+        bool wide = false;
+        void* fill_args[] = {&dst, &dst_pitch, &width, &height, &word, &wide};
+        void* copy_args[] = {&dst, &src, &dst_pitch, &dst_slice, &src_pitch, &src_slice, &width, &height, &depth_rows,
+                             &wide};
+        cudaKernelNodeParams kernel = {};
+        bool one_d = false;
+        uintptr_t captured_dst = 0, captured_src = 0;
+        if (type == cudaGraphNodeTypeMemset) {
+            cudaMemsetParams set = {};
+            check("cudaGraphMemsetNodeGetParams", cudaGraphMemsetNodeGetParams(node, &set));
+            if (set.elementSize != 1 && set.elementSize != 2 && set.elementSize != 4)
+                throw std::invalid_argument("Segment: a memset of " + std::to_string(set.elementSize) + "-byte elements");
+            dst = static_cast<unsigned char*>(const_cast<void*>(on_card(set.dst, device)));
+            width = set.width * set.elementSize;
+            height = set.height ? set.height : 1;
+            dst_pitch = height > 1 ? set.pitch : width;
+            word = set.elementSize == 1   ? (set.value & 0xffu) * 0x01010101u
+                   : set.elementSize == 2 ? (set.value & 0xffffu) * 0x00010001u
+                                          : set.value;
+            wide = ((reinterpret_cast<uintptr_t>(dst) | dst_pitch | width) & 15) == 0;
+            units = (wide ? width / 16 : width) * height;
+            kernel.func = const_cast<void*>(cozy_engine::fill_rows_kernel());
+            kernel.kernelParams = fill_args;
+        } else {
+            cudaMemcpy3DParms copy = {};
+            check("cudaGraphMemcpyNodeGetParams", cudaGraphMemcpyNodeGetParams(node, &copy));
+            if (copy.srcArray || copy.dstArray || !copy.srcPtr.ptr || !copy.dstPtr.ptr)
+                throw std::invalid_argument("Segment: a copy of a CUDA array, which a WHILE body's kernel cannot make");
+            width = copy.extent.width;
+            height = copy.extent.height ? copy.extent.height : 1;
+            depth_rows = copy.extent.depth ? copy.extent.depth : 1;
+            src_pitch = height > 1 || depth_rows > 1 ? copy.srcPtr.pitch : width;
+            dst_pitch = height > 1 || depth_rows > 1 ? copy.dstPtr.pitch : width;
+            src_slice = src_pitch * copy.srcPtr.ysize;
+            dst_slice = dst_pitch * copy.dstPtr.ysize;
+            const auto* from = static_cast<const unsigned char*>(copy.srcPtr.ptr) + copy.srcPos.z * src_slice +
+                               copy.srcPos.y * src_pitch + copy.srcPos.x;
+            auto* to = static_cast<unsigned char*>(copy.dstPtr.ptr) + copy.dstPos.z * dst_slice +
+                       copy.dstPos.y * dst_pitch + copy.dstPos.x;
+            captured_dst = reinterpret_cast<uintptr_t>(to);
+            captured_src = reinterpret_cast<uintptr_t>(from);
+            src = static_cast<const unsigned char*>(on_card(from, device));
+            dst = static_cast<unsigned char*>(const_cast<void*>(on_card(to, device)));
+            wide = ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst) | width |
+                     (height > 1 || depth_rows > 1 ? src_pitch | dst_pitch | src_slice | dst_slice : 0)) &
+                    15) == 0;
+            units = (wide ? width / 16 : width) * height * depth_rows;
+            kernel.func = const_cast<void*>(cozy_engine::copy_rows_kernel());
+            kernel.kernelParams = copy_args;
+            one_d = height == 1 && depth_rows == 1;
+        }
+        kernel.gridDim = dim3(blocks(units));
+        kernel.blockDim = dim3(256);
+        size_t inputs = 0, outputs = 0;
+        check("cudaGraphNodeGetDependencies", cudaGraphNodeGetDependencies(node, nullptr, nullptr, &inputs));
+        check("cudaGraphNodeGetDependentNodes", cudaGraphNodeGetDependentNodes(node, nullptr, nullptr, &outputs));
+        std::vector<cudaGraphNode_t> before(inputs), after(outputs);
+        std::vector<cudaGraphEdgeData> before_data(inputs), after_data(outputs);
+        check("cudaGraphNodeGetDependencies", cudaGraphNodeGetDependencies(node, before.data(), before_data.data(), &inputs));
+        check("cudaGraphNodeGetDependentNodes",
+              cudaGraphNodeGetDependentNodes(node, after.data(), after_data.data(), &outputs));
+        for (const auto* edges : {&before_data, &after_data})
+            for (const auto& edge : *edges)
+                if (edge.type != cudaGraphDependencyTypeDefault || edge.from_port || edge.to_port)
+                    throw std::invalid_argument("Segment: a copy or memset on a programmatic edge");
+        cudaGraphNode_t replacement;
+        check("cudaGraphAddKernelNode", cudaGraphAddKernelNode(&replacement, graph, before.data(), inputs, &kernel));
+        for (size_t i = 0; i < outputs; ++i)
+            check("cudaGraphAddDependencies", cudaGraphAddDependencies(graph, &replacement, &after[i], nullptr, 1));
+        check("cudaGraphDestroyNode", cudaGraphDestroyNode(node));
+        if (one_d) copies.push_back({replacement, captured_dst, captured_src, width});
+    }
+}
 
 class Segment {
   public:
@@ -153,9 +349,9 @@ class Segment {
         const Copy& copy = body_copy(index);
         const OnDevice guard(device_);
         check("cudaSetDevice", guard.error());
-        check("cudaGraphExecMemcpyNodeSetParams1D",
-              cudaGraphExecMemcpyNodeSetParams1D(exec_, copy.node, reinterpret_cast<void*>(dst),
-                                                 reinterpret_cast<const void*>(src), nbytes, copy.direction));
+        const Row1D row(on_card(reinterpret_cast<const void*>(dst), device_),
+                        on_card(reinterpret_cast<const void*>(src), device_), nbytes);
+        check("cudaGraphExecKernelNodeSetParams", cudaGraphExecKernelNodeSetParams(exec_, copy.node, &row.params));
     }
 
     void enable_copy(size_t index, bool on) {
@@ -203,16 +399,7 @@ class Segment {
 
         cudaGraph_t cloned;
         check("cudaGraphChildGraphNodeGetGraph", cudaGraphChildGraphNodeGetGraph(stepped, &cloned));
-        for (cudaGraphNode_t each : nodes(cloned)) {
-            cudaGraphNodeType type;
-            check("cudaGraphNodeGetType", cudaGraphNodeGetType(each, &type));
-            if (type != cudaGraphNodeTypeMemcpy) continue;
-            cudaMemcpy3DParms p = {};
-            check("cudaGraphMemcpyNodeGetParams", cudaGraphMemcpyNodeGetParams(each, &p));
-            if (p.srcArray || p.dstArray || p.extent.height > 1 || p.extent.depth > 1) continue;
-            copies_.push_back({each, reinterpret_cast<uintptr_t>(p.dstPtr.ptr) + p.dstPos.x,
-                               reinterpret_cast<uintptr_t>(p.srcPtr.ptr) + p.srcPos.x, p.extent.width, p.kind});
-        }
+        lower(cloned, device_, copies_);  // the body as kernels only: one path on every driver
 
         cudaGraphInstantiateParams params = {};
         const cudaError_t code = cudaGraphInstantiateWithParams(&exec_, parent_, &params);
@@ -341,6 +528,8 @@ NB_MODULE(_engine, m) {
         .def("set_copy", &Segment::set_copy, "index"_a, "dst"_a, "src"_a, "nbytes"_a)
         .def("enable_copy", &Segment::enable_copy, "index"_a, "on"_a);
     m.def("report", &report, "ring"_a, "slots"_a, "slot_bytes"_a, "counter"_a, "src"_a, "nbytes"_a, "stream"_a);
+    m.def("kinds", &kinds, "graph"_a);
+    m.def("memset", &memset_async, "ptr"_a, "value"_a, "nbytes"_a, "stream"_a);
     nb::class_<Reader>(m, "Reader")
         .def(nb::init<uintptr_t, int64_t, int64_t>(), "ring"_a, "slots"_a, "slot_bytes"_a)
         .def("poll", &Reader::poll)

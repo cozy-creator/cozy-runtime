@@ -328,6 +328,8 @@ class CozyEngine:
         """The launch path the decoder serves on, and why where it is not the launcher."""
         if self.decoder is None or self.decoder.launcher:
             return "launched"
+        if self.decoder.unlaunched:
+            return f"host-replayed: {self.decoder.unlaunched}"
         paths = launcher.judged(self.index)
         return f"host-replayed: the launcher {paths.launcher if paths is not None else 'unchecked'}"
 
