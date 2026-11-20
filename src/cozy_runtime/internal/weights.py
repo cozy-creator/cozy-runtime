@@ -1122,13 +1122,18 @@ class _Bakes:
     def ahead(self) -> dict[LoRASource, Factors]:
         """What this component's overlay hooks would serve in the forward that arms them, read off the loaded models
         (cl-1318), so their merge needs no request: the factors of the one other model of this construction whose
-        factor modules (`lora.Factors`) each sit at a path of this root, one of them at a baked hook's. Empty where
-        no model, or more than one, does (H3's two trunks' overlays beside both DiTs): its merge then waits for the
-        forward that arms it. A page is served only to a use wanting the overlay it was made under (`overlay`), so a
-        reading this got wrong costs its merge, never an output."""
-        if not self.hooked_at:
+        factor modules (`lora.Factors`) each sit at a path of this root, one of them at a baked hook's, armed on the
+        root's first set of overlay sites (`lora.Sites`: a component that takes several arms its own overlay on the
+        first, as Qwen-Image's Turbo `sites` before its `adapters`). Empty where no model, or more than one, fits
+        (H3's two trunks' overlays beside both DiTs): its merge then waits for the forward that arms it. A page is
+        served only to a use wanting the overlay it was made under (`overlay`), so a reading this got wrong costs its
+        merge, never an output."""
+        first = next((bake.hooks[0] for bake in self.bakes.values() if bake.hooks), None)
+        if first is None:
             return {}
-        paths = set(self.hooked_at.values())
+        sites = getattr(first, "sites", first)
+        hooked = {hook: path for hook, path in self.hooked_at.items() if getattr(hook, "sites", hook) is sites}
+        paths = set(hooked.values())
         modules = {path for path, _ in self.root.named_modules()}
         found: list[dict[str, Factors]] = []
         for model in list(self.memory.models.values()):
@@ -1143,7 +1148,7 @@ class _Bakes:
                 found.append(factors)
         if len(found) != 1:
             return {}
-        return {hook: found[0][path] for hook, path in self.hooked_at.items() if path in found[0]}
+        return {hook: found[0][path] for hook, path in hooked.items() if path in found[0]}
 
     def merges(self) -> bool:
         """Whether a fill of this component bakes without its forward: a LoRA its construction declared."""
