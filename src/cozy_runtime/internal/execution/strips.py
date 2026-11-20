@@ -18,7 +18,9 @@ within a few units of its own last place, so a halo short by one row fails. A bl
 across rows (an attention) fails it and runs whole from then on. A strip reads
 its rows of each cache entry and writes its own rows of the entry's next value; the entries go to
 host memory once a block cuts (they are saved inputs, read back a strip at a time). Nothing is
-committed until every strip is done, so a refused strip runs again finer. A block that keeps
+committed until every strip is done, so a refused strip runs again finer. A block holding blocks
+whose finest strip finds no room runs as those blocks, each cut by its own rows, never on varena's
+last resort (pinned host memory the card computes over). A block that keeps
 tensors between calls, on itself or a module under it, as an attribute or in a list or dict (a
 causal conv holding its last frames) runs whole: strips see only the caches handed to them.
 PAN2's 5 s decode at a 6 GiB cap ran out in a causal pad (`up_blocks.3.resnets.0.conv1`, 1.36 GB
@@ -79,12 +81,14 @@ class _Cache(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class Block:
-    """A block's reach in input rows and columns either side, and its output rows per input row."""
+    """A block's reach in input rows and columns either side, its output rows per input row, and
+    whether blocks lie under it (it can run as them, each cut by its own rows)."""
 
     rows: int
     columns: int
     scale: int
     signature: inspect.Signature = field(compare=False)
+    composite: bool = False
 
 
 def install(module: nn.Module) -> int:
@@ -102,7 +106,9 @@ def install(module: nn.Module) -> int:
     return count
 
 
-def _block(module: nn.Module) -> Block | None:
+def _candidate(module: nn.Module) -> inspect.Signature | None:
+    """A module's forward's signature where it takes Diffusers' causal cache, or it is a conv
+    subclass whose forward wraps its conv: what may be a block."""
     kind = type(module)
     try:
         signature = inspect.signature(kind.forward)
@@ -113,7 +119,12 @@ def _block(module: nn.Module) -> Block | None:
         nn.Conv2d.forward,
         nn.Conv3d.forward,
     )
-    if not (cached or padded):
+    return signature if cached or padded else None
+
+
+def _block(module: nn.Module) -> Block | None:
+    signature = _candidate(module)
+    if signature is None:
         return None
     rows = columns = 0
     scale = 1
@@ -142,7 +153,8 @@ def _block(module: nn.Module) -> Block | None:
             sub, nn.ZeroPad2d | nn.ConstantPad2d | nn.ReflectionPad2d | nn.ReplicationPad2d
         ):
             return None  # an asymmetric pad ahead of a strided conv: the encoder's downsample
-    return Block(rows, columns, scale, signature)
+    composite = any(sub is not module and _candidate(sub) is not None for sub in module.modules())
+    return Block(rows, columns, scale, signature, composite)
 
 
 def _reach(conv: nn.Conv2d | nn.Conv3d) -> tuple[int, int]:
@@ -317,6 +329,20 @@ def _keeps(module: nn.Module, names: Iterable[str]) -> str:
     return f"it keeps {', '.join(sorted(set(names)))} between calls"
 
 
+def _record(site: str, **facts: str | int | float | bool | None) -> None:
+    """What a block's probe or its cut found, in its request's record (`Request.strips`): a probe's
+    proof that it refuses a wrong strip reads it."""
+    request = catch.CURRENT.get()
+    if request is not None:
+        request.strips.setdefault(site, {}).update(facts)
+
+
+def _runs_whole(site: str, why: str) -> None:
+    """`site` runs whole, and why: on stderr, and in the record."""
+    print(f"cozy-runtime: {site} runs whole: {why}", file=sys.stderr)
+    _record(site, cuts=False, why=why[:300])
+
+
 def _records(module: nn.Module, values: Iterable[object]) -> bool:
     """Whether autograd records this call: grad mode on, and an input or a parameter needs grad."""
     return torch.is_grad_enabled() and (
@@ -357,7 +383,7 @@ def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) 
         ):
             return forward(*args, **kwargs)
         if held := _state(module):
-            print(f"cozy-runtime: {site} runs whole: {_keeps(module, held)}", file=sys.stderr)
+            _runs_whole(site, _keeps(module, held))
             return forward(*args, **kwargs)
         height = int(x.shape[-2])
         reach = max(block.rows, 1)
@@ -374,7 +400,7 @@ def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) 
                 seen.fits[key] = call.fit()
             except _Mismatch as exc:
                 seen.verdicts[key] = False
-                print(f"cozy-runtime: {site} runs whole: {exc}", file=sys.stderr)
+                _runs_whole(site, str(exc))
                 return forward(*args, **kwargs)
         fit = seen.fits.get(key)
 
@@ -389,21 +415,35 @@ def _strips(site: str, module: nn.Module, block: Block, forward: catch.Forward) 
             if level and key not in seen.verdicts and not catch._capturing():
                 seen.verdicts[key] = call.probe()
             measured = _MEASURED.set(fit is not None and not level)
+            # a composite's allocations refuse rather than take the last resort: refused at its
+            # finest, it runs as its blocks (below)
             try:
-                if not level or not seen.verdicts.get(key):
-                    return call.strips([(0, height)], host=False)
-                n = sizing.pieces(height, level)
-                spans = [(a, min(height, a + n)) for a in range(0, height, n)]
-                return call.strips(spans, host=True)
+                with catch.fallback(block.composite):
+                    if not level or not seen.verdicts.get(key):
+                        return call.strips([(0, height)], host=False)
+                    n = sizing.pieces(height, level)
+                    spans = [(a, min(height, a + n)) for a in range(0, height, n)]
+                    return call.strips(spans, host=True)
             finally:
                 _MEASURED.reset(measured)
 
         finest = sizing.levels(-(-height // reach))
         try:
-            return catch.cut(site, finest, need, run, covered=_MEASURED.get())
+            # a composite no strip of which fits runs as its blocks, each cut by its own rows,
+            # never on the last resort's host memory (`behind`: the refusal comes back here)
+            return catch.cut(
+                site, finest, need, run, covered=_MEASURED.get(), behind=block.composite
+            )
         except _Mismatch as exc:
             seen.verdicts[key] = False
-            print(f"cozy-runtime: {site} runs whole: {exc}", file=sys.stderr)
+            _runs_whole(site, str(exc))
+            return forward(*args, **kwargs)
+        except catch.Unplaced as exc:
+            if not block.composite:
+                raise
+            unwind(exc)
+            print(f"cozy-runtime: {site} runs as its blocks: {exc}", file=sys.stderr)
+            _record(site, children=str(exc)[:300])
             return forward(*args, **kwargs)
 
     return cut
@@ -601,33 +641,25 @@ class _Call:
                             writes.get(index), value, tall, a, b, lo, hi, None, 2
                         )
         except _Mismatch as exc:
-            print(f"cozy-runtime: {site} runs whole: {exc}", file=sys.stderr)
+            _runs_whole(site, str(exc))
             return False
         stripped = torch.cat(parts, dim=-2)
         pairs = [(whole, stripped)]
         if whole_rows is not None:
             if set(whole_rows.written) != set(writes):
-                print(
-                    f"cozy-runtime: {site} runs whole: strips write other cache entries",
-                    file=sys.stderr,
-                )
+                _runs_whole(site, "strips write other cache entries")
                 return False
             for i, v in whole_rows.written.items():
                 w = writes[i]
                 if isinstance(v, Tensor) and isinstance(w, Tensor):
                     pairs.append((v, w))
                 elif isinstance(v, Tensor) or isinstance(w, Tensor) or v != w:
-                    print(
-                        f"cozy-runtime: {site} runs whole: strips write another entry",
-                        file=sys.stderr,
-                    )
+                    _runs_whole(site, "strips write another entry")
                     return False
         worst = 0.0
         for expected, got in pairs:
             if expected.shape != got.shape:
-                print(
-                    f"cozy-runtime: {site} runs whole: strips make another shape", file=sys.stderr
-                )
+                _runs_whole(site, "strips make another shape")
                 return False
             if torch.equal(expected, got):
                 continue
@@ -641,11 +673,22 @@ class _Call:
             eps = 2.0**-10  # a float32 conv computes in TF32's 10 bits
         bound = 8 * eps
         verdict = worst <= bound
+        share = worst / bound if bound and math.isfinite(worst) else None  # None: no bound or apart
+        said = "beyond any bound" if share is None else f"{share:.3g} of the bound"
         how = "exact" if worst == 0 else f"within {worst:.2g} of each element's size"
         print(
             f"cozy-runtime: {site} {'cuts by rows' if verdict else 'runs whole'}: strips of a "
-            f"{tall}x{wide} crop are {how} (halo {block.rows}, scale {block.scale})",
+            f"{tall}x{wide} crop are {how}, {said} (halo {block.rows}, scale {block.scale})",
             file=sys.stderr,
+        )
+        _record(
+            site,
+            cuts=verdict,
+            share=share,
+            crop=f"{tall}x{wide}",
+            halo=block.rows,
+            scale=block.scale,
+            why=None if verdict else f"strips differ by {said}",
         )
         return verdict
 

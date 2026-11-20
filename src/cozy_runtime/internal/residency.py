@@ -3082,6 +3082,8 @@ class RequestStats(TypedDict):
     retries: int
     #: `Request.hosted`
     hosted: dict[str, str]
+    #: `Request.strips`
+    strips: dict[str, dict[str, str | int | float | bool | None]]
     #: `Request.first_blocks`
     first_blocks: list[FirstBlock]
     regrown: int
@@ -3394,6 +3396,9 @@ class Request:
         #: the package's estimate of it or its measure (`execution.cuts._hosted`); and blocks cut
         #: by rows, for their cache entries or a refused whole output (`execution.strips`)
         self.hosted: dict[str, str] = {}
+        #: blocks cut by rows (`execution.strips`), by site: their probe's verdict and its worst
+        #: difference as a share of its bound, or why a block runs whole or as its children
+        self.strips: dict[str, dict[str, str | int | float | bool | None]] = {}
         #: refusals a CUDA graph capture answered by recording again with room for them
         #: (`graphs.capture`): what runs is the same
         self.regrown = 0
@@ -3565,6 +3570,7 @@ class Request:
             "escaped": list(self.escaped),
             "retries": self.retries,
             "hosted": dict(self.hosted),
+            "strips": {site: dict(facts) for site, facts in self.strips.items()},
             "first_blocks": list(self.first_blocks),
             "regrown": self.regrown,
             "swallowed_ooms": self.swallowed_ooms,
