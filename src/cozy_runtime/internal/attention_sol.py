@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 
 from cozy_runtime.accel.attention import _ACTIVE_LAYOUT, AttentionLayout, _request
 from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author._errors import CudaStatusError
 from cozy_runtime.author._observations import Scalar
 from cozy_runtime.internal import (
     accel,
@@ -162,6 +163,7 @@ COUNTS = (
     "sparse",
     "dense_step",
     "dense_building",
+    "dense_launch_refused",
     "dense_path",
     "dense_prefix",
     "prefix_heavy",
@@ -575,16 +577,32 @@ class _Function(Protocol):
     def __call__(self, *arguments: object) -> object: ...
 
 
+class _LaunchRefused(RuntimeError):
+    """The compiled function rejected its host arguments before returning output."""
+
+
 class Loaded:
     """Upstream's call convention over a loaded object: `stream` is positional in TVM-FFI."""
 
-    __slots__ = ("function",)
+    __slots__ = ("function", "refused")
 
     def __init__(self, function: _Function) -> None:
         self.function = function
+        self.refused: set[tuple[int | None, int, int, int, int, int]] = set()
 
     def __call__(self, *arguments: object, stream: object = None) -> object:
-        return self.function(*arguments, stream)
+        try:
+            return self.function(*arguments, stream)
+        except RuntimeError as error:
+            # TVM-FFI only exports a RuntimeError for this CUDA status. Recognize
+            # the exact invalid-value status here, before it reaches the group.
+            message = str(error)
+            if message in {"CUDA Error Code: 1", "CUDA Error: cudaErrorInvalidValue"}:
+                raise _LaunchRefused(message) from error
+            status = message.removeprefix("CUDA Error Code: ")
+            if status != message and status.isascii() and status.isdecimal():
+                raise CudaStatusError(int(status), message) from error
+            raise
 
 
 def load(data: bytes) -> Loaded:
@@ -1104,6 +1122,7 @@ def _execute(
             ready, waiting = None, unbuilt
         if layout.sparse:
             loaded, instead = ready, waiting
+    live_output: Tensor | None
     if dense_path or not layout.sparse or (sparse is None and loaded is None):
         # A dense step, a dense path, or a sparse step whose variant is not ready: the dense
         # reference serves it.
@@ -1128,31 +1147,57 @@ def _execute(
     else:
         if sparse is not None:
             live_output = sparse(q, k, v, scale, layout.protected_prefix, layout.tau)
-        elif start:
-            assert loaded is not None and keys is not None
-            live_output = _native_from(
-                q, k, v, scale, layout.protected_prefix, start, layout.tau,
-                cast("Loaded", loaded), keys,
-            )  # fmt: skip
-            _count("prefix_keys")
         else:
             assert loaded is not None
-            live_output = _native(
-                q, k, v, scale, layout.protected_prefix, layout.tau, cast("Loaded", loaded)
-            )
-        _validate_result(live_output, q)
-        if any(
-            live_output.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
-            for t in (query, key, value)
-        ):
-            raise ValueError("Sol returned output sharing input storage")
-        _count("sparse")
-        if layout.protected_prefix:
-            prefix = dense if prefix_dense is None else prefix_dense
-            live_output[:, : layout.protected_prefix] = prefix(
-                query=q[:, : layout.protected_prefix], key=k, value=v, scale=scale
-            )
-            _count("dense_prefix")
+            native = cast("Loaded", loaded)
+            batch, tokens, heads, _ = q.shape
+            shape = (q.device.index, batch, tokens, heads, start, layout.protected_prefix)
+            live_output = None
+            if shape not in native.refused:
+                try:
+                    if start:
+                        assert keys is not None
+                        live_output = _native_from(
+                            q, k, v, scale, layout.protected_prefix, start, layout.tau, native, keys
+                        )
+                        _count("prefix_keys")
+                    else:
+                        live_output = _native(
+                            q, k, v, scale, layout.protected_prefix, layout.tau, native
+                        )
+                except _LaunchRefused as error:
+                    native.refused.add(shape)
+                    _kernel_row(
+                        {
+                            "source": "launch_refused",
+                            "tokens": tokens,
+                            "start": start,
+                            "prefix": layout.protected_prefix,
+                            "heads": heads,
+                            "device": str(q.device),
+                            "site": site.path,
+                            "error": str(error),
+                        }
+                    )
+        if live_output is None:
+            # Ulysses already exchanged the operands. The same rank can serve
+            # its own head shard through the existing dense implementation.
+            live_output = dense(query=q, key=k, value=v, scale=scale)
+            _count("dense_launch_refused")
+        else:
+            _validate_result(live_output, q)
+            if any(
+                live_output.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
+                for t in (query, key, value)
+            ):
+                raise ValueError("Sol returned output sharing input storage")
+            _count("sparse")
+            if layout.protected_prefix:
+                prefix = dense if prefix_dense is None else prefix_dense
+                live_output[:, : layout.protected_prefix] = prefix(
+                    query=q[:, : layout.protected_prefix], key=k, value=v, scale=scale
+                )
+                _count("dense_prefix")
     _validate_result(live_output, q)
     if layout.live_tokens == query.shape[1]:
         return live_output
