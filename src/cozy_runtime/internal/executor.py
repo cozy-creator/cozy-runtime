@@ -5234,7 +5234,9 @@ class Executor:
         """TensorD's warming: one loaded construction's models at `command.level`, on every GPU
         of a group; the on-demand ones `command.build` names built first, as a call's first read
         of each would build them (cl-1123: a predicted request's, so its first step builds
-        nothing). A TensorFS whose `Map` names none builds none."""
+        nothing), and its LoRAs merged ahead (`Backend.merge_ahead`): a call that comes meanwhile
+        waits for this command, as for any process-wide one, and merges nothing again. A
+        TensorFS whose `Map` names none builds none."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         child = self.constructions.get(command.construction)
@@ -5251,7 +5253,15 @@ class Executor:
                     proxy._cozy_build()
             if self.memory is not None:
                 members = [m for m in child.model_executors or [child] if m.backend is not None]
+                # Its LoRAs merged first, at any level, the merged pages to disk (cl-1318).
+                for member in members:
+                    for merged in cast("Backend", member.backend).merge_ahead():
+                        print(f"[merge] ahead {json.dumps(merged)}", file=sys.stderr, flush=True)
                 if command.level == "ram":
+                    if self.memory.pages is not None:
+                        # What it merged reaches the disk before its pages go. A newer TensorFS's,
+                        # which the pinned stubs do not know yet.
+                        getattr(self.memory.pages, "flush")()  # noqa: B009
                     # Map is ordered after every preceding invocation. Join its remaining
                     # consumer streams before retiring owners and returning allocator storage.
                     accel.drain(self.torch, self.device_kind)  # type: ignore[arg-type]  # torch is imported before a request reaches here
