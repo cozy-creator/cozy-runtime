@@ -124,6 +124,8 @@ _DTYPES = {
     )
 }
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
+#: The bakes a merge ahead runs (`Memory.fill_each`), on its thread, where no request holds them.
+_MERGING: ContextVar[list[Bake] | None] = ContextVar("cozy_residency_merging", default=None)
 #: The shape key of the component forward running now (`execution.catch.passing`), its passes'
 #: shape where its blocks mark them (`_entered`): 0 where none runs.
 PASS_SHAPE: ContextVar[int] = ContextVar("cozy_pass_shape", default=0)
@@ -155,7 +157,10 @@ class Weights:
 class Filling(Protocol):
     """A model's fill. `identity` names what every page's fill shares (None: never kept);
     `overlay` names what a fill of one block would add to it now (a LoRA a package arms per
-    forward). A block's page serves only a use wanting the overlay it was filled with."""
+    forward). A block's page serves only a use wanting the overlay it was filled with.
+    `factors_ns`: its host time binding factors another model holds, so far (a bake's split)."""
+
+    factors_ns: int
 
     @property
     def identity(self) -> str | None: ...
@@ -1868,6 +1873,40 @@ class Memory:
         allocated, reserved = self._figures()
         return max(before_allocated - allocated, before_reserved - reserved, 0)
 
+    def fill_each(self, model: Model) -> dict[str, object]:
+        """Each of `model`'s blocks filled once and let go, under the fill this thread asks: a LoRA
+        merged ahead of its request (`weights.Backend.merge_ahead`, cl-1318). A block bakes on the
+        GPU as a request's would, its page stays the host tier's and goes to disk behind it
+        (`Pages`), and its Region is the core's to keep or evict for the next. Outside any request,
+        and never beside one: the executor's `map` runs alone. What it filled, and in what time:
+        in all, and the bakes' on the host clock and on the GPU's."""
+        bakes: list[Bake] = []
+        token = _MERGING.set(bakes)
+        began, blocks, nbytes = time.perf_counter_ns(), 0, 0
+        model._claim()
+        try:
+            self._declare(model)
+            for block in model.groups():
+                if not block.storage_bytes or block.final_only():
+                    continue
+                self._enter(block)
+                self._exit(block)
+                blocks, nbytes = blocks + 1, nbytes + block.storage_bytes
+        finally:
+            model._release()
+            _MERGING.reset(token)
+        if self.cuda:
+            self._cuda_stream().synchronize()
+        return {
+            "blocks": blocks,
+            "bytes": nbytes,
+            "baked": len(bakes),
+            "ns": time.perf_counter_ns() - began,
+            "bake_host_ns": sum(bake.host_ns for bake in bakes),
+            "bake_device_ns": sum(bake.device_ns() or 0 for bake in bakes),
+            "bake_factors_ns": sum(bake.factors_ns for bake in bakes),
+        }
+
     def release_host(self) -> None:
         """A controller's `ram` level: this executor's host tier goes too. Its pages are pinned, so
         no other process can reclaim them, and the call the machine offloads this executor for
@@ -3022,6 +3061,8 @@ class BakeTotals(TypedDict):
     blocks: int
     host_ns: int
     device_ns: int
+    #: of `host_ns`, binding the factors another model holds (an overlay's, read from its store)
+    factors_ns: int
 
 
 class FinalBindings(TypedDict):
@@ -3308,6 +3349,8 @@ class Bake:
     start: torch.cuda.Event | None = None
     host_ns: int = 0
     stop: torch.cuda.Event | None = None
+    #: of `host_ns`, binding factors another model holds (`Filling.factors_ns`)
+    factors_ns: int = 0
 
     @classmethod
     def begin(cls, stream: torch.cuda.Stream | None) -> Bake:
@@ -3484,13 +3527,15 @@ class Request:
     def _bakes(self) -> BakeTotals:
         """The bakes this request ran after a store read: each one's host and device time onto
         its trace entry, and their sums."""
-        host = device = 0
+        host = device = factors = 0
         for entry, bake in self.bakes:
             on_device = bake.device_ns()
             entry["bake_ns"], entry["bake_device_ns"] = bake.host_ns, on_device
             host += bake.host_ns
             device += on_device or 0
-        return {"blocks": len(self.bakes), "host_ns": host, "device_ns": device}
+            factors += bake.factors_ns
+        blocks = len(self.bakes)
+        return {"blocks": blocks, "host_ns": host, "device_ns": device, "factors_ns": factors}
 
     def split_times(self) -> None:
         """Finished split calls' spans into their sites' `time`, oldest first, up to the first the
@@ -3703,10 +3748,13 @@ def _bake(block: _Block, view: Tensor) -> bool:
     """A block's stored bytes through its model's fill: whether they changed."""
     memory, model = block.model.memory, block.model
     assert model.fill is not None
-    baking = Bake.begin(memory.stream())
+    baking, factors = Bake.begin(memory.stream()), model.fill.factors_ns
     changed = model.fill(block.path, _data(block, view))
+    baking.factors_ns = model.fill.factors_ns - factors
     if changed and (request := _REQUEST.get()) is not None:
         request.bakes.append(({}, baking.end(memory.stream())))
+    elif changed and (merging := _MERGING.get()) is not None:
+        merging.append(baking.end(memory.stream()))
     return changed
 
 

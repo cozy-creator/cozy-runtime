@@ -835,6 +835,21 @@ def serving(torch: ModuleType, device: int) -> How | None:
     return "eager" if kernel_ready.failed(name) else None
 
 
+def served(torch: ModuleType, device: int) -> How:
+    """How a bake on GPU `device` runs once its kernels' build has ended, waited for here: a merge
+    ahead of any request (cl-1318) bakes as that request will, never per step for a build still
+    running."""
+    if triton is None or not kernel_ready.TRITON:
+        return "eager"
+    gpu = torch.device("cuda", device)
+    opener = partial(kernel_ready.TRITON[0], KERNELS, partial(probe, torch, gpu), device=gpu)
+    try:
+        kernel_ready.wait(f"{KERNELS.name} cuda:{device}", opener)
+    except Exception:  # its failure is on the machine's record; the request bakes eagerly too
+        return "eager"
+    return "fused"
+
+
 def _launch(device: int) -> Launch:
     """GPU `device`'s bake launcher: the attempt chose `fused` once it served."""
     launch: Launch | None = kernel_ready.ready(f"{KERNELS.name} cuda:{device}")
