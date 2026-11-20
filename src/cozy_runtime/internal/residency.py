@@ -2048,18 +2048,28 @@ class Memory:
         for block, use in zip(wanted, uses, strict=True):
             block.prefilled = use
 
-    def place(self, model: Model, *, ahead: bool = False) -> int:
+    def place(self, model: Model, *, ahead: bool = False, need: int | None = None) -> int:
         """`model`'s absent blocks onto the card together, before a forward reaches them: one
         `varena.fill`, at the read primitive's rate, where its forward filled a block at a time
         between its blocks' compute (cl-1318, RTX 4090: SDXL's second text encoder, 34 fills of
         18 MB at about 1 GB/s; Qwen-Image's transformer, 33 fills across 1.2 s of its first step).
         Each stays the core's cache, unpinned. Only when all of it fits beside the live working
-        memory and its forward's need (`block_need`, else an eighth of the card's capacity):
-        a model that pages streams its blocks as before. `ahead`: off a request's path, into free
-        room alone (a follower's shards before its group's first call). Not a block that is in
-        use, nor one whose fill writes (a LoRA armed on it bakes as its forward reaches it), nor
-        one that wants another overlay than its page's. The bytes it read."""
+        memory and `need`, a forward's measured working need (default: its first block's, as
+        `_end_probe` measured it at this pass shape): with none measured nothing is placed, and a
+        model that pages streams its blocks as before. `ahead`: off a request's path, into free
+        room alone (a follower's shards before its group's first call). Not a block in use, nor
+        one whose fill writes (a LoRA armed on it bakes as its forward reaches it), nor one that
+        wants another overlay than its page's. The bytes it read; the request's record says what
+        it did and why (`Request.placements`)."""
+        request = _REQUEST.get()
+        noted = request if request is not None and not request.idle else None
         if self.native is None or self.capturing():
+            return 0
+        if need is None:
+            need = self._probed.get((model.name, PASS_SHAPE.get()))
+        if need is None:
+            if noted is not None:
+                noted.placed_note(model, ahead, skipped="no measured working need")
             return 0
         with self.lock:
             blocks: list[_Block] = []
@@ -2089,41 +2099,46 @@ class Memory:
                 return 0
             room = vt.room(self.device.index or 0)
             missing = sum(block.allocation_bytes for block in blocks)
-            need = self.block_need(PASS_SHAPE.get()) or room["capacity"] // 8
             if ahead:
-                if missing + need > room["free"]:
-                    return 0
+                short = missing + need - room["free"]
             else:
                 kept = sum(
                     b.allocation_bytes
                     for b in model.groups()
                     if b.cached() and not (b.count or b.retained)
                 )
-                if missing + kept + need > room["capacity"] - room["working_live"] - room["pinned"]:
-                    return 0
+                held = room["capacity"] - room["working_live"] - room["pinned"]
+                short = missing + kept + need - held
+            if short > 0:
+                if noted is not None:
+                    noted.placed_note(model, ahead, need=need, skipped=f"{_gib(short)} short")
+                return 0
             regions = [self._native_region(block) for block in blocks]
             sources = [self._sources.get(region) for region in regions]
         if any(source is None for source in sources):
             return 0
-        request = _REQUEST.get()
-        if request is not None and not ahead:
+        if noted is not None and not ahead:
             for block in blocks:
-                request.first_read(block)
+                noted.first_read(block)
         nbytes = sum(block.nbytes for block in blocks)
         told = (
             nullcontext()
             if ahead
             else _phases.loading(model.component, nbytes, functools.partial(self._unread, model))
         )
+        began = time.perf_counter_ns()
         with told:
             try:
                 uses = varena.fill(
                     regions, cast("list[varena.Source]", sources), self._cuda_stream().cuda_stream
                 )
             except Exhausted:
-                return 0  # the room went: its forward fills them as it reaches them
+                uses = [None] * len(blocks)  # the room went: its forward fills them as it goes
         filled = sum(b.nbytes for b, use in zip(blocks, uses, strict=True) if use is not None)
         del uses  # each the core's cache: the next use on this stream finds it filled
+        if noted is not None:
+            spent = time.perf_counter_ns() - began
+            noted.placed_note(model, ahead, need=need, blocks=len(blocks), nbytes=filled, ns=spent)
         return filled
 
     def _note_phase_plan(self, status: str, reason: str = "", **facts: Unpack[_PlanNote]) -> None:
@@ -2593,10 +2608,12 @@ class Memory:
             and model.name not in request.placed
             and model.users
             and model.thread == threading.get_ident()
+            and self._probe is None
+            and (model.name, PASS_SHAPE.get()) in self._probed
         ):
-            # The request's first entry of one of its blocks, past its common's at its forward's
-            # start: an overlay its forward arms (H3's Turbo) is armed by now, and a block it bakes
-            # is not placed with the rest (`place`).
+            # Its first block's working need is measured (`_end_probe`: in this process, else at
+            # the block just run), and an overlay its forward arms (H3's Turbo) is armed by now:
+            # the rest of it comes with this block, but a block it bakes (`place`).
             request.placed.add(model.name)
             with self.lock:
                 beside = self._active_beside(request)
@@ -3157,6 +3174,8 @@ class RequestStats(TypedDict):
     hosted: dict[str, str]
     #: `Request.first_blocks`
     first_blocks: list[FirstBlock]
+    #: `Request.placements`
+    placements: list[PlaceRecord]
     regrown: int
     swallowed_ooms: int
     #: refusals a cheaper step answered, by the package scope they came in (`contract._Scopes`)
@@ -3174,6 +3193,20 @@ class RequestStats(TypedDict):
     #: "completed", the core's ahead-of-demand counters (`_ahead`) and "scope"
     prefetch: NotRequired[dict[str, int | str]]
     measurement: NotRequired[str]
+
+
+class PlaceRecord(TypedDict):
+    """One `Memory.place` of a model: its blocks read together, the bytes, the time it took and the
+    working need it was judged against; or, with none read, why (`skipped`). Its reader: cl-1318's
+    cold-load attribution of a load before its first step."""
+
+    model: str
+    ahead: bool
+    need_bytes: NotRequired[int]
+    blocks: NotRequired[int]
+    bytes: NotRequired[int]
+    ns: NotRequired[int]
+    skipped: NotRequired[str]
 
 
 class FirstBlock(TypedDict):
@@ -3455,8 +3488,10 @@ class Request:
         self.heads: dict[Model, tuple[set[int], int]] = {}
         #: the models whose phases this request entered: what it has not is read ahead
         self.entered: set[str] = set()
-        #: the models it placed whole at their first block's entry (`Memory.place`)
+        #: the models it placed whole once a block of theirs was measured (`Memory.place`), and
+        #: what each placement did
         self.placed: set[str] = set()
+        self.placements: list[PlaceRecord] = []
         #: the blocks it read (`Memory._read_told`), by identity: one read again is paging
         self.read_blocks: set[int] = set()
         #: the attempt failed (its executor says): a refused allocation in its last pass is learned
@@ -3510,6 +3545,27 @@ class Request:
         known = id(block) in self.read_blocks
         self.read_blocks.add(id(block))
         return not known
+
+    def placed_note(
+        self,
+        model: Model,
+        ahead: bool,
+        *,
+        need: int | None = None,
+        blocks: int = 0,
+        nbytes: int = 0,
+        ns: int = 0,
+        skipped: str = "",
+    ) -> None:
+        """One `Memory.place` of `model`: what it read and in how long, or why it read nothing."""
+        row: PlaceRecord = {"model": model.component, "ahead": ahead}
+        if need is not None:
+            row["need_bytes"] = need
+        if skipped:
+            row["skipped"] = skipped
+        else:
+            row.update({"blocks": blocks, "bytes": nbytes, "ns": ns})
+        self.placements.append(row)
 
     def sample(self) -> None:
         if self.memory.cuda:
@@ -3640,6 +3696,7 @@ class Request:
             "retries": self.retries,
             "hosted": dict(self.hosted),
             "first_blocks": list(self.first_blocks),
+            "placements": list(self.placements),
             "regrown": self.regrown,
             "swallowed_ooms": self.swallowed_ooms,
             "answered": dict(self.answered),
