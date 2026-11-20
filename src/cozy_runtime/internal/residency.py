@@ -2443,12 +2443,14 @@ class Memory:
                 _streaming(leaf, path, block, self)
         return True
 
+    @torch.inference_mode(False)
     def _rest_on_card(
         self, block: _Block, assigned: list[tuple[_Site, Tensor]]
     ) -> list[tuple[_Site, Tensor]]:
         """A block run from its host copy (`_streams`): its linear layers read their rows there
         (`_streamed`), and each value it binds that no such layer owns (a norm's scale, a table its
-        ops read) is copied to the card for its forward."""
+        ops read) is copied to the card for its forward, outside inference mode as `_assign` makes
+        its values: RelayVSR's `scale_shift_table[None]` failed on an inference copy."""
         owned = {id(t) for _, leaf in block.leaves for t in (leaf._parameters, leaf._buffers)}
         moved: dict[int, Tensor] = {}
         placed: list[tuple[_Site, Tensor]] = []
@@ -2462,6 +2464,26 @@ class Memory:
                 value = moved[id(value)]
             placed.append((site, value))
         return placed
+
+    @contextmanager
+    def _leaf_on_card(self, leaf: nn.Module) -> Iterator[None]:
+        """`leaf`'s own values on the card for one call the row stream can't take (an operand it
+        is handed, an output view: MOSS-Image's LoRA layer passes its base layer's arguments), its
+        host copies back after."""
+        tables = (leaf._parameters, leaf._buffers)
+        saved = [(table, name, value) for table in tables for name, value in table.items()]
+        with torch.inference_mode(False):
+            for table, name, value in saved:
+                if value is not None and value.device.type == "cpu":
+                    copy = value.detach().to(self.device, non_blocking=True)
+                    if isinstance(value, nn.Parameter):
+                        copy = nn.Parameter(copy, requires_grad=False)
+                    table[name] = copy
+        try:
+            yield
+        finally:
+            for table, name, value in saved:
+                table[name] = value
 
     def _streamed(self, block: _Block, leaf: nn.Module, path: str, x: Tensor) -> Tensor:
         """`leaf`, a layer of `block`, over `x` from its host copy (`_gather`): in windows of its
@@ -4160,8 +4182,6 @@ def _streaming(module: nn.Module, path: str, block: _Block, memory: Memory) -> N
     )
 
     def forward(x: Tensor, *args: object, **kwargs: object) -> object:
-        if args or kwargs or not isinstance(x, Tensor):
-            return previous(x, *args, **kwargs)
         # Entered as its block's forward would enter it: a layer called outside that forward
         # (RelayVSR's keyframe calls a block's FFN itself) is otherwise entered by its weight's
         # read inside the op, after this choice, and multiplied by its host copy.
@@ -4171,7 +4191,10 @@ def _streaming(module: nn.Module, path: str, block: _Block, memory: Memory) -> N
             memory._enter(block)
             try:
                 if block.gathered is None:
-                    return previous(x)
+                    return previous(x, *args, **kwargs)
+                if args or kwargs or not isinstance(x, Tensor):
+                    with memory._leaf_on_card(module):
+                        return previous(x, *args, **kwargs)
                 return memory._streamed(block, module, path, x)
             finally:
                 memory._exit(block)
