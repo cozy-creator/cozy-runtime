@@ -79,7 +79,9 @@ def norm(rows: int, row: int, itemsize: int, intermediate: int) -> Per:
 @dataclass(frozen=True, slots=True)
 class Attention:
     """Attention over [batch, rows, heads, dim] queries and `keys` keys of `kv_heads`, with one
-    K/V layout copy made inside the kernel."""
+    K/V layout copy made inside the kernel. `staged`: which of Q, K and V a piece copies onto the
+    card first (an operand in host memory the card addresses, which a kernel would read across the
+    link once a query block)."""
 
     batch: int
     rows: int
@@ -88,12 +90,15 @@ class Attention:
     keys: int
     dim: int
     itemsize: int
+    staged: tuple[bool, bool, bool] = (False, False, False)
 
     def need(self, heads: int, rows: int) -> tuple[int, ...]:
         """A piece of `heads` query heads by `rows` query rows."""
         b, group = self.itemsize, max(self.heads // self.kv_heads, 1)
         kv = self.batch * self.keys * max(heads // group, 1) * self.dim * b
+        q = self.batch * rows * heads * self.dim * b
+        copies = tuple(n for n, on in zip((q, kv, kv), self.staged, strict=True) if on)
         return peak(
             self.batch * self.rows * self.heads * self.dim * b,
-            (self.batch * rows * heads * self.dim * b, self.batch * heads * rows * 4, kv, kv),
+            (q, self.batch * heads * rows * 4, kv, kv, *copies),
         )
