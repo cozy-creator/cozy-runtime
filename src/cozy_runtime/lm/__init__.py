@@ -23,18 +23,20 @@ otherwise than the one-token step, which can turn a near tie (greedy Qwen3.5-9B 
 0.125), and two plain sampled calls at one seed have split on a 4090 while greedy calls and eager
 forwards repeated exactly (cr-346).
 
-A cached graph keeps only its weights' addresses; a driver's lease (`_hold`) brings their pages
-back. Offload retires the graph before those addresses change; a later call can refill and capture
-anew. If the full set cannot be prepared before execution, the call uses Transformers' loop. A
-call's keys and state for its prompt and `max_new_tokens`, sized from the config, and the graphs'
-pool are decided before its prefill (`_Engine._enter`): allocated or mapped then, else it waits for
-decoding rows to leave. Running short never ends a call while a lever remains: graphs whose pool
-has no room go (decode runs eagerly, captured again where room allows), a draft head's keys go,
-and slots or a prefill that still do not fit beside the leased weights decode through
-Transformers' loop, its weights streamed and its cache only as long as its tokens. Short is one
-rule for every such lever (`_short_of_room`): an allocation refused, or a native refusal
-(`DoesNotFit`). Only slots larger than the whole card are `DoesNotFit` up front, naming what would
-fit. Errors after execution starts are final; package code is never restarted.
+A step key's first step runs eagerly with nothing leased, its weights entering as any forward's
+do, and is measured. Its graph is admitted (`_Judge`) only where the weights it reads, its pool,
+what is live, one more eager step and its check's copies fit the card; otherwise the key stays
+eager, and the record says why with the numbers. The lease belongs to an admitted graph alone
+(`_lease`): taken for its capture and replays, let go before any eager step and any prefill. A
+cached graph keeps only its weights' addresses; its lease brings their pages back. Offload retires
+the graph before those addresses change; a later call can refill and capture anew. If the decode
+set cannot be prepared at all, the call uses Transformers' loop. A call's keys and state for its
+prompt and `max_new_tokens`, sized from the config, are decided before its prefill
+(`_Engine._enter`): allocated then, else it waits for decoding rows to leave. A draft head's keys,
+or slots or a prefill that still do not fit, decode through Transformers' loop, its weights
+streamed and its cache only as long as its tokens (`_short_of_room`: an allocation refused, or a
+native refusal, `DoesNotFit`). Only slots larger than the whole card are `DoesNotFit` up front,
+naming what would fit. Errors after execution starts are final; package code is never restarted.
 On a CPU, or after a safe capture refusal (a run warning), the same step runs eagerly. A model this
 does not serve (a layer type other than full or linear attention, an attention other than SDPA or
 eager, a generation config that adds logits processors) generates through Transformers, said once.
@@ -84,6 +86,7 @@ from cozy_runtime.graphs import (
     BYPASS,
     DECODERS,
     _measured,
+    _OverCard,
     capture,
     capture_domain,
     close_pool,
@@ -103,6 +106,8 @@ if TYPE_CHECKING:
     from torch.utils.hooks import RemovableHandle
     from transformers import PreTrainedConfig, PreTrainedModel
     from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
+
+    from tensorfs.varena._facts import Room
 
     from cozy_runtime.author._model import Residency, WarningRow
     from cozy_runtime.graphs.domain import Domain
@@ -338,17 +343,6 @@ class _Generating(Protocol):
 def _lm(model: PreTrainedModel) -> _Generating:
     """`model`'s generation methods, typed."""
     return cast("_Generating", model)  # cast: `generate` serves causal LMs (GenerationMixin's)
-
-
-#: The room a decode step takes beside its held weights: its live tensors, graph pool and one
-#: eager step. Qwen3.6 measured: 27B int8 on a 5090 0.8 GiB live + 1.3 GiB pool, out of memory
-#: with 2.2 GiB left (44080295662); 27B w4a8 on a 4090 1.1 + 0.6, out at 1.9 (44077054825);
-#: 35B-A3B on an A6000 0.4 + 0.9, out at 1.3 (cl-1119).
-STEP_ROOM = 5 << 29
-
-
-class NoStepRoom(RuntimeError):
-    """The held weights leave a decode step too little of the card (`_Engine._short`)."""
 
 
 def _decoding(model: torch.nn.Module, drafting: bool) -> tuple[str, ...]:
@@ -1242,7 +1236,7 @@ class _Keeper:
         self.decoded = 0.0
         self.kept = self.read = 0
         #: the held blocks' own lease, which a refusal beside them ends (`_shed`)
-        self.lease: ExitStack | None = None
+        self.lease: ExitStack[bool | None] | None = None
         #: bytes each keep leaves free past its reserve: the refused blocks' (`_shed`), measured
         self.less = 0
         self.sheds = 0
@@ -1862,6 +1856,8 @@ class _Request:
         self.at: tuple[float, ...] = (0, 0.0, 0)
         #: its steps, the drafted ones among them, and its rows summed over them
         self.steps = self.drafted = self.live = 0
+        #: its steps by the rung each ran on: "graph", or why it ran eagerly
+        self.rungs: dict[str, int] = {}
         self.warnings: list[WarningRow] = []
         #: the attempt it serves (cancellation), and whether its rows left for it
         self.context: Context | None = CURRENT.get()
@@ -1959,7 +1955,17 @@ class _Engine:
         self.pending: deque[_Request] = deque()
         #: calls taken from `pending` that the driver is prefilling or splicing
         self.incoming: list[_Request] = []
-        self.rehold = False
+        #: another head: the bindings are made again with it (`_bind`)
+        self.rebind = False
+        #: the leases of the weights an admitted graph reads and the graphs' pool (`_lease`), and
+        #: the modules they cover
+        self.lease: ExitStack[bool | None] | None = None
+        self.leased: frozenset[int] = frozenset()
+        #: the rung the last step ran on (`_Request.rungs`)
+        self.rung = ""
+        #: a key judged eager -> the room it was judged in and what it lacked: judged again once
+        #: the room covers that
+        self.judged: dict[_Key, tuple[int, int]] = {}
         #: heads whose blocks did not fit at home beside the model's
         self.unfit: set[int] = set()
         #: a drafted step could not be captured: drafting pays only replayed, so steps go plain
@@ -2099,11 +2105,13 @@ class _Engine:
             some = "" if request.drafted == request.steps else f" in {request.drafted} of its steps"
             mode += f", drafting {DEPTH}{some}: {looped / max(request.steps, 1):.2f} tokens a step"
         mode += f", {request.live / max(request.steps, 1):.1f} rows a step"
+        rungs = "; ".join(f"{rung}: {n}" for rung, n in request.rungs.items())
         facts = (
             f"prefill {request.prefill_s:.3f} s",
             f"then {per:.2f} ms/token over {looped:.0f} ({mode})",
             f"{captures} captures {capture_s:.3f} s",
             f"gated-delta kernels {'on' if _LAUNCHED[0] else 'off'}",
+            f"steps by rung: {rungs or 'none'}",
         )
         text = f"{tokens} tokens after {request.prompt}: " + ", ".join(facts)
         print(f"[lm] {text}", file=sys.stderr)
@@ -2118,7 +2126,7 @@ class _Engine:
             held_region = self.region_use is not None
             self.region_use = None
             try:
-                # The KV pin lasts through reholds and failure unwinding. Only weight
+                # The KV pin lasts through rebinds and failure unwinding. Only weight
                 # bindings below may be replaced while this driver owns live rows.
                 if self.region is None and (placed := PLACED.get(self.model)) is not None:
                     self.region = placed[0].region(
@@ -2134,55 +2142,49 @@ class _Engine:
                     and lifetime.enter_context(self.region.pin())
                 ):
                     self._drop()
-                with ExitStack() as stack:
-                    held = self._hold(stack)
-                    while True:
-                        if self.rehold:  # another head: its blocks are held instead
-                            stack.close()
-                            held, self.rehold = self._hold(stack), False
-                        if held is False and self.draft is not None and not self._occupied():
-                            # The head's weights and keys cost room the model's own decode set may
-                            # need: the graphed decode without drafts beats Transformers' loop.
-                            say(
-                                f"lm:{type(self.model).__name__}:undrafted",
-                                "[lm] drafting does not fit at home",
-                            )
-                            self.unfit.add(id(self.draft))
-                            self._drop()
-                            self.draft = None
-                            stack.close()
-                            held = self._hold(stack)
-                        with self.cond:
-                            self.incoming = list(self.pending)
-                            self.pending.clear()
-                        if held is False:
-                            if self._occupied():
-                                raise self.unprepared or RuntimeError("decode residency was lost")
-                            why = "its decode set does not fit at home" + (
-                                f" ({str(self.unprepared)[:200]})" if self.unprepared else ""
-                            )
-                            if isinstance(self.unprepared, NoStepRoom):
-                                why = str(self.unprepared)
-                            for request in self.incoming:
-                                request.fallback = why
-                            self.incoming = []
-                        if self.incoming or self.retire:
-                            self._settle(self.incoming)
-                            self.incoming = []
-                        occupied = sum(row is not None for row in self.slots)
-                        with self.cond:
-                            if not occupied and not self.pending:
-                                break
-                            if mine.finished and (occupied or self.pending):
-                                break  # a waiting caller drives on
-                        if occupied:
-                            self._steps()
+                home = self._bind()
+                while True:
+                    if self.rebind:  # another head: its blocks are bound instead
+                        home, self.rebind = self._bind(), False
+                    if not home and self.draft is not None and not self._occupied():
+                        # The head's weights and keys cost room the model's own decode set may
+                        # need: the decode without drafts beats Transformers' loop.
+                        say(
+                            f"lm:{type(self.model).__name__}:undrafted",
+                            "[lm] drafting does not fit at home",
+                        )
+                        self.unfit.add(id(self.draft))
+                        self._drop()
+                        self.draft = None
+                        home = self._bind()
+                    with self.cond:
+                        self.incoming = list(self.pending)
+                        self.pending.clear()
+                    if not home:
+                        if self._occupied():
+                            raise self.unprepared or RuntimeError("decode residency was lost")
+                        why = "its decode set does not fit at home" + (
+                            f" ({str(self.unprepared)[:200]})" if self.unprepared else ""
+                        )
+                        for request in self.incoming:
+                            request.fallback = why
+                        self.incoming = []
+                    if self.incoming or self.retire:
+                        self._settle(self.incoming)
+                        self.incoming = []
+                    occupied = sum(row is not None for row in self.slots)
+                    with self.cond:
+                        if not occupied and not self.pending:
+                            break
+                        if mine.finished and (occupied or self.pending):
+                            break  # a waiting caller drives on
+                    if occupied:
+                        self._steps()
             except BaseException as exc:  # post-start failures never restart package generation
                 self._fail(exc)
                 raise
             finally:
-                if not self._occupied():
-                    self._pool(False)  # no row decodes: its graphs' pool may go idle
+                self._unlease()  # no step runs: its graphs' weights and pool may go idle
                 with self.cond:
                     if self.region is not None and (self._occupied() or self.pending):
                         # A waiting caller takes the driver next. These rows are still live;
@@ -2207,18 +2209,19 @@ class _Engine:
     def _targets(self) -> list[tuple[torch.nn.Module, tuple[Residency, str]]]:
         return [(m, PLACED[m]) for m in (self.model, self.draft) if m is not None and m in PLACED]
 
-    def _hold(self, stack: ExitStack) -> bool:
-        """Prepare the retained weight tensors while this driver runs.
-
-        A full decode that cannot prepare its dependencies refuses before model execution;
-        Transformers can then stream the blocks eagerly. The KV pin has a separate lifetime
-        so changing these bindings cannot make live decode rows reclaimable.
-        """
+    def _bind(self) -> bool:
+        """The bindings a step's graph reads, its addresses retained and nothing leased: the
+        model's decode set and, while it drafts, its head's. One whose storage changed goes, with
+        the graphs that read it. Whether the decode set can be held at all, prepared once and let
+        go: one that can't decodes through Transformers' loop, which streams it, before any of it
+        ran. A key judged eager in less room than the card has now is judged again. The KV pin has
+        a separate lifetime so changing these bindings cannot make live decode rows reclaimable."""
+        self._unlease()
         self.unprepared = None
         derived = _derived(m for m in (self.model, self.draft) if m is not None)
         built = tuple(t.data_ptr() for t in derived)
         identities: list[object] = []
-        with ExitStack() as leases:
+        with ExitStack() as once:
             for module, (residency, name) in self._targets():
                 drafting = self.draft is not None
                 reads = _decoding(module, drafting) if module is self.model else ("",)
@@ -2232,37 +2235,62 @@ class _Engine:
                     binding = self.addresses[id(module)] = residency.retain(name, reads)
                     self.reads[id(module)] = reads
                 try:
-                    leases.enter_context(binding.prepare())
+                    once.enter_context(binding.prepare())
                 except Exception as exc:
                     if not _short_of_room(exc) and getattr(exc, "code", None) != "STALE_BINDING":
                         raise
                     self.unprepared = exc
                     return False
                 identities.append(binding.identity)
-            if (short := self._short()) is not None:
-                self.unprepared = short  # its leases go as this returns
-                return False
-            self.where = (*identities, built)
-            stack.enter_context(leases.pop_all())
+        self.where = (*identities, built)
+        if self.judged and self.domain is not None:
+            room = self._room()
+            grown = [key for key, (then, short) in self.judged.items() if room >= then + short]
+            for key in grown:
+                del self.judged[key]
+                self.unrecorded.pop(key, None)
+                self.undrafted = self.undrafted and not key[2]
         return True
 
-    def _short(self) -> NoStepRoom | None:
-        """Whether the weights just leased leave a step too little of the card: then the driver
-        drops the draft head, and short still, decodes through Transformers' streamed loop before
-        any step runs, never out of memory after it (cr-319). Rows decoding now decode on."""
-        if self._occupied() or PLACED.get(self.model) is None or not torch.cuda.is_initialized():
-            return None
-        device = torch.cuda.current_device()
-        room = vt.room(device)
-        left = room["capacity"] - room["pinned"] - room["working_live"]
-        if left >= STEP_ROOM:
-            return None
-        name = getattr(self.model.config, "_name_or_path", "") or type(self.model).__name__
-        return NoStepRoom(
-            f"{name} doesn't fit {_gib(room['capacity'])} with room to decode "
-            f"({_gib(room['pinned'])} of weights held, {_gib(left)} left; a step takes about "
-            f"{_gib(STEP_ROOM)}): running the slower streamed path"
-        )
+    def _room(self) -> int:
+        """What the card leaves a graph beside what is pinned and live now (`vt.room`)."""
+        room = vt.room(_set(self.domain).device)
+        return room["capacity"] - room["pinned"] - room["working_live"]
+
+    def _lease(self, drafted: bool) -> str:
+        """The weights a graph of the step reads (`_read`) and the graphs' pool, held for its
+        capture and replays until an eager step or a prefill (`_unlease`): "" once held, else why
+        not: a refusal of them (room, or a binding whose storage changed), before anything of
+        the step ran. Anything else ends the lease and is raised."""
+        reads = frozenset(id(m) for m in self._read(drafted))
+        if self.lease is not None and reads <= self.leased:
+            return ""
+        self._unlease()
+        lease: ExitStack[bool | None] = ExitStack()
+        try:
+            for module in self._read(drafted):
+                if (binding := self.addresses.get(id(module))) is not None:
+                    lease.enter_context(binding.prepare())
+            self.lease, self.leased = lease, reads
+            self._pool(True)
+        except BaseException as exc:
+            if self.lease is None:
+                lease.close()
+            self._unlease()
+            if not (_short_of_room(exc) or getattr(exc, "code", None) == "STALE_BINDING"):
+                raise
+            _unwind(exc)
+            return no_room(_set(self.domain).device, "its graph's weights and pool", 0, exc)
+        return ""
+
+    def _unlease(self) -> None:
+        """An admitted graph's lease ends (`_lease`): its weights and pool may go idle, their
+        pages leaving at varena's choice and their addresses kept."""
+        if self.lease is None:
+            return
+        self._pool(False)
+        lease, self.lease, self.leased = self.lease, None, frozenset()
+        lease.close()
 
     #: The retained bindings' fill generations and derived tensor addresses.
     where: tuple[object, ...] = ()
@@ -2307,13 +2335,16 @@ class _Engine:
                 self.completions[stream] = event
                 event.record(stream)  # instantiate before any accepted step can run
             self.unfenced.add(stream)
+        seen: list[str] = []
         try:
             for part in range(DEPTH + 1) if drafting and constrained else (-1,):
                 self.part = part
                 if constrained:
                     self._fill(size, max(part, 0))
+                self.rung = "eager" if stream is None else ""
                 with _set(self.domain).using() if stream is not None else nullcontext():
                     self._replay(size, cuda)
+                seen.append(self.rung)
                 if part < 0 or part == DEPTH or not self._drafting(size):
                     break  # the whole step, its verify, or a plain step for a part not recorded
                 if stream is not None:
@@ -2326,7 +2357,9 @@ class _Engine:
                 self.unfenced.discard(stream)
         for row in rows:
             row.reach = min(row.reach + per, self.capacity)
+        rung = next((rung for rung in seen if rung != "graph"), "graph")
         for request in {id(row.request): row.request for row in rows}.values():
+            request.rungs[rung] = request.rungs.get(rung, 0) + 1
             request.steps += 1
             request.drafted += drafting
             request.live += len(rows)
@@ -2364,7 +2397,7 @@ class _Engine:
         self.debt = time.perf_counter() - started if admitted else 0.0
         with self.cond:
             self.pending.extendleft(reversed(waiting))
-            if waiting and not self._occupied() and not admitted and not self.rehold:
+            if waiting and not self._occupied() and not admitted and not self.rebind:
                 for request in waiting:  # nothing decodes that could leave: never spin on it
                     request.error = RuntimeError("[lm] decode admission made no progress")
                 self.pending.clear()
@@ -2449,8 +2482,8 @@ class _Engine:
             if len(free) < len(self.slots):
                 return False  # another head's rows decode: it waits for them
             self._drop()  # the engine takes this head (its keys' shapes) when idle
-            self.draft, self.rehold = request.draft, True
-            return False  # admitted once its blocks are held
+            self.draft, self.rebind = request.draft, True
+            return False  # admitted once its blocks are bound
         try:
             first = None if request.allowed is None else _ids(request.allowed, [], self.vocab)
             if request.ngram and not request.banned:  # admission may ask again
@@ -2466,13 +2499,14 @@ class _Engine:
             return False
         if request.fallback:
             return True
+        self._unlease()  # a prefill runs as every forward does, nothing of the decode leased
         try:
             fresh = self._prefill(request, kwargs, mask, position, first)
         except Exception as exc:
             if not _short_of_room(exc) or request.inputs["input_ids"].device.type != "cuda":
                 raise
             # Nothing of the engine's changed: the prompt went into a cache of its own. Its slots
-            # and leased weights go, and Transformers' loop streams the weights beside its prompt.
+            # go, and Transformers' loop streams the weights beside its prompt.
             _unwind(exc)
             self._shed(request, f"its prefill of {request.prompt} tokens", exc)
             return True
@@ -2485,12 +2519,13 @@ class _Engine:
 
     def _enter(self, request: _Request, position: torch.Tensor | None) -> bool:
         """Whether `request`'s rows have their decode memory, decided before its prefill, the one
-        place it is: the slots held now where they can take it (the decode graphs' pool mapped
-        back for them), else slots for every row's prompt and `max_new_tokens` allocated now
-        (`_buffers`; `_need` is what they take). False: it waits for the rows decoding now to
-        leave. `DoesNotFit` before anything of it ran: up front only where the slots exceed the
-        whole card (`_never`), else where their allocation, which asks idle executors for their
-        memory, evicts and waits as every allocation does, was refused after all of that."""
+        place it is: the slots held now where they can take it, else slots for every row's prompt
+        and `max_new_tokens` allocated now (`_buffers`; `_need` is what they take). False: it
+        waits for the rows decoding now to leave. `DoesNotFit` before anything of it ran: up front
+        only where the slots exceed the whole card (`_never`), else where their allocation, which
+        asks idle executors for their memory, evicts and waits as every allocation does, was
+        refused after all of that. The graphs' pool is no part of it: it is held with an admitted
+        graph's lease (`_lease`)."""
         rows = len(request.tokens)
         reach = request.prompt + request.max_new + DEPTH * (LAG + 2)
         free = sum(row is None for row in self.slots)
@@ -2502,17 +2537,6 @@ class _Engine:
             and reach <= self.capacity
             and len(request.stops) <= self.width
         ):
-            try:
-                self._pool(True)
-            except Exhausted as exc:  # nothing of it ran
-                if occupied:  # the pool is held while rows decode: a refusal here waits for them
-                    request.waits = True
-                    return False
-                # The graphs are only speed: they go, the call decodes eagerly, and a later step
-                # captures again where its pool finds room.
-                why = no_room(_set(self.domain).device, "its graphs' pool", 0, exc)
-                safeguard("no_room", f"{type(self.model).__name__}: {why}")
-                self._forget()
             return True
         if occupied + rows > BUCKETS[-1]:
             request.waits = True  # slots free up as rows leave
@@ -2559,16 +2583,15 @@ class _Engine:
         say(f"lm:{type(self.model).__name__}:undrafted", f"[lm] drafting stops: {why}")
         self.unfit.add(id(self.draft))
         self._drop()
-        self.draft, self.rehold = None, True
+        self.draft, self.rebind = None, True
         request.draft = None
         request.warnings.append(recovered("decoded without drafting", why=why))
         return True
 
     def _shed(self, request: _Request, what: str, exc: BaseException) -> None:
-        """`request` decodes through Transformers' loop: `what` was refused beside the weights
-        this engine holds with everything else evictable gone. Its slots go now (no row decodes)
-        and the driver's leases when it hands over, so that loop streams the weights and keeps a
-        cache only as long as its tokens. A refusal there stands, with its numbers."""
+        """`request` decodes through Transformers' loop: `what` was refused with everything else
+        evictable gone. Its slots go now (no row decodes), so that loop streams the weights and
+        keeps a cache only as long as its tokens. A refusal there stands, with its numbers."""
         device = request.inputs["input_ids"].device.index or 0
         request.fallback = (
             f"{no_room(device, what, 0, exc)}: decoding through Transformers' loop, its weights "
@@ -3155,17 +3178,14 @@ class _Engine:
         return (self.model, _set(self.draft)) if drafted else (self.model,)
 
     @contextmanager
-    def _graph_memory(self, drafted: bool) -> Iterator[None]:
-        """The leases of the weights the step reads and the domain's side stream, joined back
-        before a lease can end."""
+    def _on_domain(self) -> Iterator[None]:
+        """The domain's side stream, where a step is captured and its first step measured, joined
+        back before the step's weights can go idle."""
         current = torch.cuda.current_stream()
         side = None
         domain = _set(self.domain)
         try:
             with ExitStack() as stack:
-                for module in self._read(drafted):
-                    if (binding := self.addresses.get(id(module))) is not None:
-                        stack.enter_context(binding.prepare(current))
                 domain.initialize()
                 side = cast("torch.cuda.Stream", domain.stream)  # initialize() sets it
                 side.wait_stream(current)
@@ -3224,103 +3244,209 @@ class _Engine:
         if cuda and reason:
             if key not in self.unrecorded:
                 self._unrecorded(key, reason, None if reason == fixed else "capture_refused")
-            self._advance(size)
-            self.eager += 1
-            return
+            return self._eager(size, reason)
         graph = self.graphs.get(key)
-        if graph is None and cuda and key not in self.unrecorded and self._opens():
-            domain = _set(self.domain)  # a CUDA step's (`_one`)
-            if key not in self.warmed:
-                # This is the caller's actual next token, never an extra speculative warmup; its
-                # working peak, as varena measured it, is its capture pool's first guess.
-                with self._graph_memory(drafted), _measured(domain.device) as peak:
-                    self._advance(size)
-                self.warmed.add(key)
-                if peak:
-                    self.peaks[key] = peak[0]
-                self.eager += 1
-                return
-            if key not in self.peaks:  # a step never measured is never recorded
-                self._unrecorded(key, "its warm-up's working memory was not measured")
+        if graph is not None:
+            why = self._lease(drafted)
+            if not why:  # its weights and pool are held: the replay maps nothing
+                vt.replay(graph, stream=torch.cuda.current_stream(_set(self.domain).device))
+                self.replayed += 1
+                self.rung = "graph"
+                return None
+            # varena refused them before anything ran: the key is eager, judged again later
+            self._discard(key, graph, torch.cuda.current_stream(_set(self.domain).device))
+            self._eager_key(key, why)
+            return self._eager(size, why)
+        if not cuda:
+            return self._eager(size)
+        if key in self.unrecorded:
+            return self._eager(size, self.unrecorded[key])
+        if not self._opens():
+            return self._eager(size, "a kernel is building")
+        domain = _set(self.domain)  # a CUDA step's (`_one`)
+        if key not in self.warmed:
+            # The caller's actual next token, run as written with nothing leased (its weights
+            # enter as any forward's do): its working peak, as varena measured it, is what the
+            # key's graph is judged by and its capture pool's first guess.
+            self._unlease()
+            with self._on_domain(), _measured(domain.device) as peak:
                 self._advance(size)
-                self.eager += 1
-                return
-            capturing = time.perf_counter()
-            reserve, why = vt.pool_bytes(self.peaks[key]), ""
-            # Its ops and kernels, set beside the step as written's when its check differs, and
-            # what it writes in place, which its check puts back (cr-283).
-            writes: list[torch.Tensor] = []
-            traced, ops = observe.trace(torch, writes)
-            launch = _STEPS[0]
+            self.warmed.add(key)
+            if peak:
+                self.peaks[key] = peak[0]
+            self.eager += 1
+            self.rung = "first step, measured"
+            return None
+        if key not in self.peaks:  # a step never measured is never recorded
+            why = "its first step's working memory was not measured"
+            self._unrecorded(key, why)
+            return self._eager(size, why)
+        return self._record(key, size, drafted, placed)
 
-            def step() -> None:
-                with cast("AbstractContextManager[object]", traced):
-                    self._advance(size)
+    def _eager(self, size: int, why: str = "") -> None:
+        """One step as written, nothing of it leased: its weights enter as any forward's do."""
+        self._unlease()
+        self._advance(size)
+        self.eager += 1
+        self.rung = f"eager ({why})" if why else "eager"
 
-            try:
-                with (
-                    self._graph_memory(drafted),
-                    request_path.known("cozy_runtime.lm._Engine._replay"),
-                ):
-                    if self.pool is None:
-                        self.pool = (
-                            placed[0].graph_pool(placed[1])
-                            if placed is not None
-                            else Pool(torch.cuda.graph_pool_handle())
+    def _eager_key(self, key: _Key, why: str, short: int = 1) -> None:
+        """`key`'s graph does not fit (`_Judge`: by `short` bytes), or varena refused its lease:
+        it decodes eagerly, said in the record with the numbers, and is judged again once the card
+        has that much more room, measured with nothing of the decode leased."""
+        self._unlease()
+        self.judged[key] = (self._room(), max(short, 1))
+        self._unrecorded(key, why, None)
+
+    def _record(
+        self, key: _Key, size: int, drafted: bool, placed: tuple[Residency, str] | None
+    ) -> None:
+        """`key`'s graph, judged before it is captured (`_Judge`): its weights leased, then judged
+        with what the lease pinned, and its step captured, then checked against this token's
+        eager step, which serves. A graph that does not fit leaves the key eager. A capture that
+        fails otherwise is the recording's, never the call's (as a component's graph): the key
+        decodes eagerly, and the record says why."""
+        from cozy_runtime.internal.execution import rungs  # with Torch
+
+        domain = _set(self.domain)
+        self._unlease()
+        before = vt.room(domain.device)
+        if why := self._lease(drafted):
+            self._eager_key(key, why)
+            return self._eager(size, why)
+        pool_key = self._pool_key(key)
+        reserve = max(vt.pool_bytes(self.peaks[key]), rungs.pool(pool_key) if pool_key else 0)
+        check = self._check_bytes(size, drafted, None)
+        judge = _Judge(self, before, self.peaks[key], check, pool_key)
+        if why := judge(reserve):
+            self._eager_key(key, why, judge.short)
+            return self._eager(size, why)
+        capturing = time.perf_counter()
+        # Its ops and kernels, set beside the step as written's when its check differs, and
+        # what it writes in place, which its check puts back (cr-283).
+        writes: list[torch.Tensor] = []
+        traced, ops = observe.trace(torch, writes)
+        launch = _STEPS[0]
+
+        def step() -> None:
+            with cast("AbstractContextManager[object]", traced):
+                self._advance(size)
+
+        graph: torch.cuda.CUDAGraph | None = None
+        why, judged = "", False
+        try:
+            with self._on_domain(), request_path.known("cozy_runtime.lm._Engine._replay"):
+                if self.pool is None:
+                    self.pool = (
+                        placed[0].graph_pool(placed[1])
+                        if placed is not None
+                        else Pool(torch.cuda.graph_pool_handle())
+                    )
+                pool = self.pool
+                try:
+                    # Refused, an allocation comes back here (`capture` regrows a short pool),
+                    # never from varena's last resort.
+                    with _fallback():
+                        graph, why = capture(
+                            torch, step, pool, domain, reserve, alone=not self.graphs, fits=judge
                         )
-                    pool = self.pool
-                    try:
-                        with _fallback():  # refused, this token decodes eagerly
-                            graph, why = capture(
-                                torch,
-                                step,
-                                pool,
-                                domain,
-                                reserve,
-                                alone=not self.graphs,
-                            )
-                        if graph is not None and pool.prepared > reserve:
-                            self.regrown.append((reserve, pool.prepared))
-                    except Exception as exc:  # no room for its pool, or short outside it
-                        if not _short_of_room(exc):
-                            raise
-                        why = no_room(domain.device, "its pool", pool.prepared, exc)
-                        _answered(exc)  # this token decodes eagerly
-            except Building:  # eager until a kernel lands
-                graph, why, self.building = None, "", LANDED[0]
-            finally:
-                if graph is None:
-                    writes.clear()  # no graph to check: none of the step's state stays held
-                    if not self.graphs and self.pool is not None:
-                        close_pool(self.pool, domain.device)
-                        self.pool = None
-            if graph is not None:
-                self.graphs[key] = graph
-            # A capture's end, recorded or not, ends the pool's use: held again for the rows
-            # decoding while its pages are still mapped, so no replay maps.
+                except (_OverCard, Exhausted) as no:  # its pool, judged or prepared, has no room
+                    why, judged = str(no), True
+                except Exception as exc:  # the recording's, never the call's
+                    if isinstance(exc, (Cancelled, Yielded)) or fault(exc) in (
+                        Fault.STICKY,
+                        Fault.DEVICE,
+                    ):
+                        raise
+                    _unwind(exc)
+                    if is_capacity(exc) or isinstance(exc, DoesNotFit):
+                        _answered(exc)
+                    why = f"its capture failed: {type(exc).__name__}: {exc}".splitlines()[0][:300]
+                    self._unrecorded(key, why)  # a safeguard: said once, counted in the record
+                    why = ""
+                if graph is not None and pool.prepared > reserve:
+                    self.regrown.append((reserve, pool.prepared))
+        except Building:  # eager until a kernel lands
+            graph, why, self.building = None, "a kernel is building", LANDED[0]
+        finally:
+            if graph is None:
+                writes.clear()  # no graph to check: none of the step's state stays held
+                if not self.graphs and self.pool is not None:
+                    close_pool(self.pool, domain.device)
+                    self.pool = None
+        self.captured[0] += 1
+        self.captured[1] += time.perf_counter() - capturing
+        if graph is not None:
+            self.graphs[key] = graph
+            # A capture's end ends the pool's use: held again for its replays while its pages
+            # are still mapped, so no replay maps.
             self.pooled = False
             self._pool(True)
-            self.captured[0] += 1
-            self.captured[1] += time.perf_counter() - capturing
-            if graph is not None:
-                self.recorded += 1
-                try:
-                    vt.pool_scratch(_set(self.pool).handle, (), domain.device)
-                except (RuntimeError, ValueError) as exc:  # A live allocation: it stays mapped.
-                    safeguard("scratch_declined", str(exc))
-                try:
-                    self._verify(key, graph, size, ops, launch, writes)
-                finally:
-                    writes.clear()  # its check is over, however it ended
-                return
-            elif why:
-                self._unrecorded(key, why)
-        if graph is not None:  # its pool is held (`_pool`): the replay maps nothing
-            vt.replay(graph, stream=torch.cuda.current_stream(_set(self.domain).device))
-            self.replayed += 1
+            self.recorded += 1
+            if pool_key:  # the measured pool: the next process judges by it
+                rungs.put(pool_key, _set(self.pool).mapped)
+            try:
+                vt.pool_scratch(_set(self.pool).handle, (), domain.device)
+            except (RuntimeError, ValueError) as exc:  # A live allocation: it stays mapped.
+                safeguard("scratch_declined", str(exc))
+            # What its check holds beside the pool, now that its writes are known.
+            judge.check = self._check_bytes(size, drafted, writes)
+            if why := judge(_set(self.pool).mapped):
+                self._discard(key, graph, torch.cuda.current_stream(domain.device))
+                writes.clear()
+                self._eager_key(key, why, judge.short)
+                return self._eager(size, why)
+            try:
+                self._verify(key, graph, size, ops, launch, writes)
+            finally:
+                writes.clear()  # its check is over, however it ended
+            if key in self.graphs:
+                self.rung = "graph, captured and checked"
+            elif key in self.unrecorded:
+                self.rung = f"eager ({self.unrecorded[key]})"
+            return None
+        if judged:
+            self._eager_key(key, why, judge.short)
+        elif why and self.building != LANDED[0]:
+            self._unrecorded(key, why)
+        return self._eager(size, why or self.unrecorded.get(key, ""))
+
+    def _pool_key(self, key: _Key) -> str:
+        """Where this machine keeps the pool `key`'s graph measured (`execution.rungs`): the
+        model, the slots' layout and the key, and the request's models ("" outside a request)."""
+        from cozy_runtime.internal.execution import rungs  # with Torch
+        from cozy_runtime.internal.execution.catch import CURRENT as REQUEST
+
+        request = REQUEST.get()
+        if request is None:
+            return ""
+        site = f"lm:{type(self.model).__name__}:{self.capacity}:{self.width}:{key}"
+        return rungs.key(site, sorted(request.current), _set(self.domain).device)
+
+    def _check_bytes(self, size: int, drafted: bool, writes: list[torch.Tensor] | None) -> int:
+        """What a new graph's check holds beside its pool (`_verify`): the state its step writes,
+        saved and replayed (`_Before`), and of the key buffers the positions it reaches. Before
+        its capture (`writes` None) every key buffer it may write, and no other tensor."""
+        state = self._token_state(drafted)
+        others: list[torch.Tensor] = []
+        if writes is None:
+            keyed = self._keyed()
         else:
-            self._advance(size)
-            self.eager += 1
+            keyed, others = _beyond(writes, state, self._keyed())
+        whole = sum(t.nbytes for t in state)
+
+        def position(buffer: torch.Tensor) -> int:  # `[rows, heads, positions, width]`
+            return buffer.nbytes // max(int(buffer.shape[0]) * int(buffer.shape[2]), 1)
+
+        model_keys = [
+            buffer
+            for layer in _layers(_set(self.cache))
+            if isinstance(layer, _Keys)
+            for buffer in (layer.keys, layer.values)
+        ]
+        kept = sum(size * STEP_SLOTS * position(buffer) for buffer in keyed)
+        written = sum(size * position(buffer) for buffer in model_keys)
+        return 2 * whole + sum(t.nbytes for t in others) + kept + written
 
     def _token_state(self, drafted: bool) -> list[torch.Tensor]:
         """What a step writes but its keys, each slot of which it writes before reading; a drafted
@@ -3375,15 +3501,18 @@ class _Engine:
         on the device (`writes`, its capture's), not only `_token_state`: the draft head's keys and
         values, which a replay writes ahead of the eager step, made Klein's check fail a sound
         graph (cr-283). Of a key buffer that is the slots a step reaches, never the buffer
-        (`_Before`), and all of it goes as the check ends. A difference discards the graph and
-        explains itself (`_explain`)."""
+        (`_Before`), and all of it goes as the check ends. What it holds beside the pool was judged
+        before its capture (`_Judge`, `_check_bytes`). As a component graph's check (graphs'
+        rule, cr-333), it is refused rather than given varena's last resort: refused, the graph
+        goes and the token decodes eagerly from the state before it, the key judged again once the
+        card has more room. A difference discards the graph and explains itself (`_explain`)."""
         domain = _set(self.domain)
         state, stream = self._token_state(key[2]), torch.cuda.current_stream(domain.device)
         start: _Before | None = None
         replayed: list[torch.Tensor] = []
         try:
             try:
-                with _fallback():  # refused, the graph goes and the token decodes eagerly
+                with _fallback():
                     at = self.length[:size].clone()
                     start = self._before(state, writes, at)
                     vt.replay(graph, stream=stream)  # its pool is held since its capture
@@ -3393,9 +3522,6 @@ class _Engine:
             except Exception as exc:
                 if not _short_of_room(exc):
                     raise
-                # No room to check it beside its held pool (cr-319: Qwen3.6-27B on a 4090 failed
-                # the run here): the graph and its pool go, and this token and its key's later
-                # ones decode eagerly, from the state before it.
                 if start is not None:
                     start.restore()
                     start.release()
@@ -3404,16 +3530,14 @@ class _Engine:
                 why = no_room(domain.device, "its graph's check", 0, exc)
                 _unwind(exc)
                 _answered(exc)
-                self._unrecorded(key, f"{why}: it decodes eagerly")
-                self._advance(size)
-                self.eager += 1
+                self._eager_key(key, f"{why}: it decodes eagerly")
+                self._eager(size, why)
                 return
             self.eager += 1
             why = vt.replay_differs([*state, *self._written(size, at)], replayed)
             if why:
-                why += "; " + self._explain(
-                    key[2], size, state, start, at, replayed, ops, launch, graph
-                )
+                said = self._explain(key, size, state, start, at, replayed, ops, launch, graph)
+                why += "; " + said
                 self._discard(key, graph, stream)
                 self._unrecorded(key, why, "replay_mismatch")
             elif _graphs.AUDIT and start.beyond(len(state))[0]:
@@ -3461,7 +3585,7 @@ class _Engine:
 
     def _explain(
         self,
-        drafted: bool,
+        key: _Key,
         size: int,
         state: list[torch.Tensor],
         start: _Before,
@@ -3475,17 +3599,23 @@ class _Engine:
         cuda-graph-correctness.md §5.3, cr-283): the step as written again from the same state,
         then on its capture's stream and leases, its ops and kernels beside its capture's, and its
         graph replayed again (a replay that repeats froze something at capture; one that doesn't
-        reads memory that changed). The last run is the check's eager step again, which serves."""
+        reads memory that changed). The last run is the check's eager step again, which serves.
+        It runs only where the card holds its four copies of the step's state and one more step
+        beside what is live; else the check's eager step serves, unexplained."""
 
         def run(on_capture: bool, mode: object = None) -> list[torch.Tensor]:
             start.restore()
             with (
-                self._graph_memory(drafted) if on_capture else nullcontext(),
+                self._on_domain() if on_capture else nullcontext(),
                 cast("AbstractContextManager[object]", mode or nullcontext()),
             ):
                 self._advance(size)
             return [*(value.clone() for value in state), *self._written(size, at)]
 
+        copy = sum(t.nbytes for t in replayed)
+        need = 4 * copy + self.peaks.get(key, 0)
+        if (room := self._room()) < need:
+            return f"no room to run the step again: {_gib(need)} beside {_gib(room)} left"
         here = [*(value.clone() for value in state), *self._written(size, at)]
         mode, written = observe.trace(torch)
         served = False
@@ -3531,7 +3661,7 @@ class _Engine:
         """A recorded graph goes, and its pool with the last of them."""
         stream.synchronize()
         if len(self.graphs) == 1:
-            self._pool(False)  # the pool's last graph goes: its use ends while it owns it
+            self._unlease()  # the pool's last graph goes: its use ends while it owns it
         del self.graphs[key]
         graph.reset()
         if not self.graphs:
@@ -3548,21 +3678,23 @@ class _Engine:
             for event in self.completions.values():
                 event.synchronize()
             self.completions.clear()
-            self._pool(False)
+            self._unlease()
             self.retired_graphs += len(self.graphs)
             for graph in self.graphs.values():
                 graph.reset()
             if self.pool is not None:
                 close_pool(self.pool, _set(self.domain).device)
-            self.graphs, self.warmed, self.unrecorded, self.peaks = {}, set(), {}, {}
-            self.undrafted = False
-            self.pool = None
+            self.graphs, self.pool = {}, None
+        self._unlease()
+        # What each key measured and was judged by goes with them: the next step measures again.
+        self.warmed, self.unrecorded, self.peaks, self.judged = set(), {}, {}, {}
+        self.undrafted = False
 
     def _pool(self, hold: bool) -> None:
-        """Hold the graphs' pool mapped for the rows decoding (`vt.prepare_pool(pool, 0)`), or
-        end that use so it may go idle (`vt.record_pool_stream`). Taken at a call's admission,
-        before its prefill, and after a capture; let go when no row decodes. Only an admission's
-        take can need room: it refuses there (`Exhausted`), never at a replay."""
+        """Hold the graphs' pool mapped for an admitted graph's replays (`vt.prepare_pool(pool,
+        0)`), or end that use so it may go idle (`vt.record_pool_stream`): taken with its lease
+        (`_lease`) and after a capture, let go with the lease before an eager step or a prefill.
+        Only the lease's take can need room: it refuses there (`Exhausted`), never at a replay."""
         if hold == self.pooled or self.pool is None:
             return
         if not self.graphs:  # nothing recorded owns it: no use to take or end
@@ -3945,6 +4077,39 @@ class _Before:
 
     def release(self) -> None:
         self.whole, self.keyed, self.saved, self.kept = [], [], [], []
+
+
+class _Judge:
+    """A key's graph rung (cr-305's rule, the one diffusion's graphs take through `capture`'s
+    `fits`): the weights its step reads, as its lease pinned them, its pool, what is live, one
+    more eager step (its check's, beside the pool: the key's first step, measured) and the copies
+    its check holds (`_check_bytes`), against the card less what else was pinned before the lease,
+    what is live read then too (a pool the lease maps is the pool's). "" when they fit, else why,
+    with the numbers; a pool found too large is remembered for the machine (`execution.rungs`), so
+    the next process judges by it."""
+
+    def __init__(self, engine: _Engine, before: Room, step: int, check: int, pool_key: str) -> None:
+        pinned = vt.room(_set(engine.domain).device)["pinned"]
+        #: what the step's lease pinned: the weights its graph reads, as the card holds them
+        self.weights = max(pinned - before["pinned"], 0)
+        self.card = before["capacity"] - before["pinned"]
+        self.live, self.step, self.check, self.key = before["working_live"], step, check, pool_key
+        #: by how much the last pool judged didn't fit
+        self.short = 0
+
+    def __call__(self, pool: int) -> str:
+        from cozy_runtime.internal.execution import rungs  # with Torch
+
+        need = self.weights + pool + self.live + self.step + self.check
+        if need <= self.card:
+            return ""
+        self.short = need - self.card
+        if self.key and pool > rungs.pool(self.key):
+            rungs.put(self.key, pool)
+        return (
+            f"its graph's {_gib(self.weights)} of weights + {_gib(pool)} pool + {_gib(self.live)} "
+            f"live + {_gib(self.step)} step + {_gib(self.check)} check exceed {_gib(self.card)}"
+        )
 
 
 def _unwind(exc: BaseException) -> None:
