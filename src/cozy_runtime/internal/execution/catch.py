@@ -321,12 +321,14 @@ def cut[T](
     *,
     pure: bool = True,
     behind: bool = False,
+    covered: bool = False,
 ) -> T:
     """`run(level)` for a call that cuts itself into 2^level pieces down to `finest` (FFN tokens,
     attention pieces, a norm's or a conv's bands, a package's split). Without native memory, or
     small, it runs whole; inside a capture, at this key's last level; inside another site's leaf,
-    at the level the card's free room takes now (`nested`). `behind`: a cheaper step stands behind
-    a level refused before it runs (a split's whole on host), so selection refuses for it."""
+    at the level the card's free room takes now (`nested`), or whole where that leaf's need was
+    measured with this call whole in it (`covered`). `behind`: a cheaper step stands behind a level
+    refused before it runs (a split's whole on host), so selection refuses for it."""
     checkpoint()
     request = CURRENT.get()
     native = request is not None and request.memory.cuda
@@ -340,7 +342,7 @@ def cut[T](
         return run(LEVELS.get(key, 0))
     if not LEAF.acquire(blocking=False):
         assert request is not None
-        return nested(request, key, name, menu, run, pure)
+        return nested(request, key, name, menu, run, pure, covered)
     assert request is not None
     try:
         device = request.memory.device.index or 0
@@ -382,14 +384,16 @@ def nested[T](
     menu: Sequence[tuple[str, Sequence[int]]],
     run: Callable[[int], T],
     pure: bool,
+    covered: bool = False,
 ) -> T:
     """A cut inside another site's leaf (an FFN or attention in a split's window), where native
     selection can't open a second leaf: the coarsest level whose need the card's room holds now,
     no coarser than one refused before. The room is the card less what is live and the weights in
-    use: what is unmapped, cached or held by idle weights, which varena reclaims for it. A pure op
-    refused there runs again a level finer, the windows of the leaf around it kept (cr-305: H3's
-    upscale ran its MLP whole inside a window and ran out). The last level's refusal stands."""
-    level = max(_fitting(request, menu), _NESTED.get(key, 0))
+    use: what is unmapped, cached or held by idle weights, which varena reclaims for it. A call the
+    leaf's measured need held whole (`covered`: a block inside a measured block) starts whole. A
+    pure op refused there runs again a level finer, the windows of the leaf around it kept (cr-305:
+    H3's upscale ran its MLP whole inside a window and ran out). The last level's refusal stands."""
+    level = max(0 if covered else _fitting(request, menu), _NESTED.get(key, 0))
     while True:
         LEVELS[key] = level
         note(request, key, name, level)

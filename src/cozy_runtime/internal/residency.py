@@ -81,7 +81,36 @@ __all__ = [
 def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
     """Working allocation demand/backing/peak; native weight bytes are counted separately."""
     stats = vt.stats(device.index or 0)
-    return int(stats["allocated_bytes"]), int(stats["mapped_bytes"]), int(stats["allocated_peak"])
+    peak = working_peak(device.index or 0, stats)
+    return int(stats["allocated_bytes"]), int(stats["mapped_bytes"]), peak
+
+
+#: By device, the working peak a measurement nested in another (`peak_within`) took from it.
+_CARRIED: dict[int, int] = {}
+
+
+def reset_peak(device: int) -> None:
+    """varena's working peak starts over at what is live, and so does what nested measurements
+    carried."""
+    vt.reset_peak(device)
+    _CARRIED[device] = 0
+
+
+def working_peak(device: int, stats: WorkingStats | None = None) -> int:
+    """The working peak since `reset_peak`, a nested measurement's included."""
+    read = vt.stats(device) if stats is None else stats
+    return max(int(read["allocated_peak"]), _CARRIED.get(device, 0))
+
+
+def peak_within[T](device: int, run: Callable[[], T]) -> tuple[T, int]:
+    """`run()` and varena's working peak over it alone. Measuring resets varena's peak, so the
+    peak before it is carried for whatever measures around it (`working_peak`)."""
+    outer = working_peak(device)
+    vt.reset_peak(device)
+    try:
+        return run(), int(vt.stats(device)["allocated_peak"])
+    finally:
+        _CARRIED[device] = max(outer, int(vt.stats(device)["allocated_peak"]))
 
 
 #: Other overlays' pages a block keeps parked: base and a LoRA alternate with one.
@@ -2595,7 +2624,7 @@ class Memory:
         device = self.device.index or 0
         request.sample()  # the request keeps its peak so far
         stats, room = vt.stats(device), vt.room(device)
-        vt.reset_peak(device)
+        reset_peak(device)
         self._probe = _Probe(
             block,
             key,
@@ -2613,7 +2642,7 @@ class Memory:
         if request is None:
             return
         stats, room = vt.stats(device), vt.room(device)
-        peak, allocated = int(stats["allocated_peak"]), int(stats["allocated_bytes"])
+        peak, allocated = working_peak(device, stats), int(stats["allocated_bytes"])
         self._probed[probe.key] = peak - probe.allocated
         request.first_blocks.append(
             {
@@ -3053,6 +3082,8 @@ class RequestStats(TypedDict):
     retries: int
     #: `Request.hosted`
     hosted: dict[str, str]
+    #: `Request.strips`
+    strips: dict[str, dict[str, str | int | float | bool | None]]
     #: `Request.first_blocks`
     first_blocks: list[FirstBlock]
     regrown: int
@@ -3362,8 +3393,12 @@ class Request:
         self.retries = 0
         #: split sites whose whole output the card had no room for, kept in host memory (cr-305):
         #: the card's room when its allocation was refused there, else whether selection judged
-        #: the package's estimate of it or its measure (`execution.cuts._hosted`)
+        #: the package's estimate of it or its measure (`execution.cuts._hosted`); and blocks cut
+        #: by rows, for their cache entries or a refused whole output (`execution.strips`)
         self.hosted: dict[str, str] = {}
+        #: blocks cut by rows (`execution.strips`), by site: their probe's verdict and its worst
+        #: difference as a share of its bound, or why a block runs whole or as its children
+        self.strips: dict[str, dict[str, str | int | float | bool | None]] = {}
         #: refusals a CUDA graph capture answered by recording again with room for them
         #: (`graphs.capture`): what runs is the same
         self.regrown = 0
@@ -3398,7 +3433,7 @@ class Request:
         if memory.cuda and torch.cuda.is_initialized() and not memory.requests:
             # The working peak is process-wide since its reset: alone, a request starts its own,
             # or its floor is the largest decode the process ever ran (sieg: SDXL gave nothing)
-            vt.reset_peak(memory.device.index or 0)
+            reset_peak(memory.device.index or 0)
         self.sample()
 
     def first_read(self, block: _Block) -> bool:
@@ -3535,6 +3570,7 @@ class Request:
             "escaped": list(self.escaped),
             "retries": self.retries,
             "hosted": dict(self.hosted),
+            "strips": {site: dict(facts) for site, facts in self.strips.items()},
             "first_blocks": list(self.first_blocks),
             "regrown": self.regrown,
             "swallowed_ooms": self.swallowed_ooms,
