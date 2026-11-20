@@ -34,6 +34,7 @@ from cozy_runtime.bench import (
     attention_quality,
     attention_speed,
     child_wire,
+    engine_recapture,
     gemm_speed,
     gemm_tiles,
     ggml_batch_shapes,
@@ -338,6 +339,7 @@ app.entrypoint(kernels_inventory, accelerator=True)
 app.entrypoint(kernel_check, accelerator=True)
 app.entrypoint(kernel_ready, accelerator=False)
 app.entrypoint(lm_opening_kernel, accelerator=True)
+app.entrypoint(engine_recapture, accelerator=True)
 app.entrypoint(child_wire, accelerator=False)
 app.entrypoint(varena_core, accelerator=True)
 app.entrypoint(offload_in_executor, accelerator=True)

@@ -73,6 +73,10 @@ class KernelReadyRequest(msgspec.Struct, kw_only=True):
     seed: int = 202610270201
 
 
+class EngineRecaptureRequest(msgspec.Struct, kw_only=True):
+    mode: str
+
+
 class VarenaCoreRequest(msgspec.Struct, kw_only=True):
     case: str
 
@@ -170,6 +174,15 @@ def lm_opening_kernel(payload: EmptyRequest, ctx: Context) -> Measured:
     from cozy_runtime.internal.bench import lm_opening
 
     return Measured(json.dumps(lm_opening.measure(), sort_keys=True))
+
+
+def engine_recapture(payload: EngineRecaptureRequest, ctx: Context) -> Measured:
+    """The engine's decoder records a bucket's graph again once a kernel its capture waited on lands or fails
+    (`internal/bench/engine_recapture.py`): a small random-weight Qwen3.5 built in the call, its first call eager while
+    a primed probe opens, the next captured. Needs Transformers in the caller's environment. Raises where it doesn't."""
+    from cozy_runtime.internal.bench import engine_recapture as check
+
+    return Measured(json.dumps(check.measure(payload.mode), sort_keys=True))
 
 
 def kernels_inventory(payload: EmptyRequest, ctx: Context) -> Measured:
