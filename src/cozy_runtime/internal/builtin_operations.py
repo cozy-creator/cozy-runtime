@@ -16,6 +16,7 @@ EXPORTS = {
         "gemm_speed",
         "gemm_tiles",
         "ggml_batch_shapes",
+        "ggml_probe",
         "host_calibrate",
         "kernels_inventory",
         "kernel_check",

@@ -292,7 +292,32 @@ def decoded(torch: ModuleType, scheme: str, blocks: Tensor, dtype: Dtype) -> Ten
 
 
 def _probe(torch: ModuleType, index: int, ops: ModuleType) -> verify.Verdict:
-    """Each type at the rows each kernel serves (1, 6 and 48), against f64 over the exact decode."""
+    """Each type at the rows each kernel serves (1, 6 and 48), against f64 over the exact decode; and MUL_MAT_ID's
+    cases (`_probe_ids`) where the module has it. A failure names each failing case."""
+    errors, unfinite = _cases(torch, index, ops)
+    found = verify.within(errors, BUDGET)
+    failing = [f"{case} {errors[case]:.2g}{unfinite.get(case, '')}" for case in errors if errors[case] > BUDGET]
+    return found if found.ok else verify.Verdict(False, f"{found.detail}; failing: {'; '.join(failing[:16])}")
+
+
+def probe_detail(torch: ModuleType, index: int) -> dict[str, object]:
+    """`_probe` on GPU `index` and the wheel's `_ggml` as they stand, off `kernel_ready`: the verdict, every case's
+    error, and the non-finite rows of a MUL_MAT_ID case (`bench.ggml_probe`)."""
+    from cozy_runtime._kernels import _ggml
+
+    if why := carried(capability(torch, index)):
+        return {"ok": False, "detail": why}
+    with torch.cuda.device(index):
+        errors, unfinite = _cases(torch, index, _ggml)
+        torch.cuda.synchronize(index)
+    verdict = verify.within(errors, BUDGET)
+    return {"ok": verdict.ok, "detail": verdict.detail, "ids": hasattr(_ggml, "matmul_ids"),
+            "errors": {case: (round(e, 6) if e != float("inf") else "inf") for case, e in errors.items()},
+            "unfinite": unfinite}  # fmt: skip
+
+
+def _cases(torch: ModuleType, index: int, ops: ModuleType) -> tuple[dict[str, float], dict[str, str]]:
+    """`_probe`'s cases: each one's relative L2 error, and the rows a MUL_MAT_ID case left not finite."""
     from cozy_runtime.internal.decode_schemes import BY_SCHEME
     from cozy_runtime.internal.encoding.adapters import CoreDequant
 
@@ -319,9 +344,7 @@ def _probe(torch: ModuleType, index: int, ops: ModuleType) -> verify.Verdict:
                 )
         if hasattr(ops, "matmul_ids"):
             errors.update(_probe_ids(torch, ops, index, generator, scheme, blocks, exact, unfinite))
-    found = verify.within(errors, BUDGET)
-    failing = [f"{case} {errors[case]:.2g}{unfinite.get(case, '')}" for case in errors if errors[case] > BUDGET]
-    return found if found.ok else verify.Verdict(False, f"{found.detail}; failing: {'; '.join(failing[:16])}")
+    return errors, unfinite
 
 
 def _probe_ids(

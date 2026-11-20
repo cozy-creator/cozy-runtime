@@ -163,6 +163,17 @@ def ggml_batch_shapes(payload: EmptyRequest, ctx: Context) -> Measured:
     return _run(ggml_ordered.measure)
 
 
+def ggml_probe(payload: EmptyRequest, ctx: Context) -> Measured:
+    """The ggml matmuls' probe on GPU 0 as a card runs it before its ggml leaves serve (`ggml_linear`, xs-213), on
+    the wheel's `_ggml` directly: its verdict and each case's error (dense rows, MUL_MAT_ID over a table and a stack),
+    and which output rows a case left not finite."""
+    import torch
+
+    from cozy_runtime.internal import ggml_linear
+
+    return _run(lambda: ggml_linear.probe_detail(torch, 0))
+
+
 def lm_opening_kernel(payload: EmptyRequest, ctx: Context) -> Measured:
     """cr-342's cell: a cold decode whose first steps meet a kernel still building completes, its first steps eager
     (`internal/bench/lm_opening.py`): a probe that takes 20 s is primed, then a small random-weight Qwen3.5 built in the
