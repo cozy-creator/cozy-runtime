@@ -40,7 +40,7 @@ class Done(msgspec.Struct):
 async def render(ctx: Context, *, shot: Shot, refs: References) -> Done:
     video = shot.clip.read(fps=24)  # at most 15 s, on a 24 fps clock
     for item in refs:
-        item.probe()  # header facts only
+        item.probe()  # no decode
     return Done(video.frame_count)
 ```
 
@@ -65,8 +65,11 @@ async def render(ctx: Context, *, shot: Shot, refs: References) -> Done:
 - `fps` maps frames onto a constant clock starting at 0: each frame shows until the next
   starts, rounded to the nearest slot. A frame filling several slots is the same `bytes`
   object. Video pixels are never resized; sample-rate conversion stays in the package.
-- `probe()` reads headers only. A container without a recorded duration (live WebM) is
-  measured from its packets without decoding.
+- `probe()` decodes nothing. Its `frame_rate` is the clock the video's packets keep, not the
+  header's average: a join copied by ffmpeg can average 24.06 with every frame 1/24 long. A
+  time base too coarse for the rate (Matroska's milliseconds) keeps the stated rate its frames
+  are within a tick of. Frames on no clock give their average. A container without a recorded
+  duration (live WebM) is measured from its packets.
 - Reads refuse inside an active component-use scope and after the attempt closes. Each
   `read()` decodes again; keep the value. A refused read returns what it charged, so a
   shorter `end` can follow. `read_bytes()` still returns the whole file.

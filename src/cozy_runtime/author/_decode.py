@@ -17,11 +17,11 @@ import struct
 import sys
 import threading
 from array import array
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, replace
 from fractions import Fraction
-from itertools import chain
+from itertools import chain, pairwise
 from numbers import Integral
 from pathlib import Path
 from types import ModuleType
@@ -147,9 +147,10 @@ class MediaDecodeError(InvalidRequest):
     default_code = "media_decode"
 
 
-#: The demuxers an input is read with, Calcifer's (`calcifer/tools.rs` DEMUXERS): pictures, videos and
-#: sounds, none that reads what a file names (an HLS playlist, a DASH manifest, a `concat` script) or a
-#: sequence (`image2`). An input reads its own bytes alone, through no protocol but `file`.
+#: The demuxers an input is read with, Calcifer's (`calcifer/tools.rs` DEMUXERS): pictures, videos
+#: and sounds, none that reads what a file names (an HLS playlist, a DASH manifest, a `concat`
+#: script) or a sequence (`image2`). An input reads its own bytes alone, through no protocol but
+#: `file`.
 _DEMUXERS = (
     "mov,matroska,avi,asf,mpeg,mpegts,flv,png_pipe,apng,jpeg_pipe,webp_pipe,gif,bmp_pipe,tiff_pipe,"
     "jpegxl_pipe,jpegxl_anim,psd_pipe,ico,mp3,ogg,flac,wav,aac,aiff,amr,ape,dsf"
@@ -165,9 +166,9 @@ def _open_input(av: ModuleType, source: BinaryIO) -> InputContainer:
         if getattr(exc, "errno", None) != errno.EINVAL:
             raise
         raise MediaDecodeError(
-            "the file is not a video or audio container this runtime reads (MP4/MOV, Matroska/WebM, "
-            "AVI, MPEG-TS, Ogg, MP3, FLAC, WAV and the like): a playlist, a DASH manifest or a "
-            "concat list names other files, and is refused",
+            "the file is not a video or audio container this runtime reads (MP4/MOV, "
+            "Matroska/WebM, AVI, MPEG-TS, Ogg, MP3, FLAC, WAV and the like): a playlist, a DASH "
+            "manifest or a concat list names other files, and is refused",
             code="media_format_refused",
         ) from exc
 
@@ -331,7 +332,11 @@ class AudioProbe:
 
 @dataclass(frozen=True, slots=True)
 class VideoProbe:
-    """Header facts of a video input: display-oriented geometry, clock and soundtrack."""
+    """Header facts of a video input: display-oriented geometry, clock and soundtrack.
+
+    `frame_rate` is the frame clock its packets' times keep (`frame_clock`); on none, their
+    average rate.
+    """
 
     width: int
     height: int
@@ -340,6 +345,62 @@ class VideoProbe:
     frame_rate: Fraction | None
     pixel_aspect_ratio: Fraction
     soundtrack: DecodedAudioFormat | None
+
+
+@dataclass(frozen=True, slots=True)
+class FrameClock:
+    """A video track's frame clock, as `frame_clock` reads it from its packets."""
+
+    #: Each frame lasts 1/rate, or on average when they keep no one clock. None: no rate known.
+    rate: Fraction | None
+    #: Time-base ticks per frame when every frame lasts exactly that: the clock packet copy keeps.
+    step: int | None
+
+
+def frame_clock(stream: VideoStream, times: Iterable[int]) -> FrameClock:
+    """`stream`'s frame clock from its packets' presentation times, in any order.
+
+    The packets decide: a stream whose frames all last the same ticks is on that clock, whatever
+    rate its header averages (a join copied by ffmpeg can average 24.06 at 1/24 a frame). On a
+    time base too coarse for the rate (Matroska's milliseconds at 30000/1001), the clock is the
+    stated rate (guessed, `r_frame_rate`, average) every frame is within a tick of. Frames on no
+    clock are a variable frame rate at the header's average, else theirs, never a rounded rate.
+    One frame has the stated rate.
+    """
+    base = _fraction(stream.time_base, "video time base") if stream.time_base else Fraction(0)
+    rates = (stream.guessed_rate, stream.base_rate, stream.average_rate)
+    stated = [
+        rate
+        for rate in dict.fromkeys(_fraction(r, "video frame rate") for r in rates if r)
+        if rate > 0
+    ]
+    order = sorted(times)
+    if len(order) < 2 or base <= 0:
+        rate = stated[0] if stated else None
+        slot = 1 / (rate * base) if rate and base > 0 else None
+        return FrameClock(rate, int(slot) if slot and slot.denominator == 1 else None)
+    steps = {later - earlier for earlier, later in pairwise(order)}
+    if len(steps) == 1 and (step := steps.pop()) > 0:
+        return FrameClock(1 / (step * base), step)
+    first, span = order[0], order[-1] - order[0]
+    for rate in stated:
+        slot = 1 / (rate * base)
+        ticks, per = slot.numerator, slot.denominator
+        if all(abs(per * (t - first) - i * ticks) < per for i, t in enumerate(order)):
+            return FrameClock(rate, None)
+    average = _fraction(stream.average_rate, "video frame rate") if stream.average_rate else None
+    if not (average and average > 0):
+        average = (len(order) - 1) / (span * base) if span > 0 else None
+    return FrameClock(average, None)
+
+
+def _packet_times(container: InputContainer, stream: VideoStream) -> list[int]:
+    """The presentation time of each of `stream`'s packets, read without decoding."""
+    return [
+        int(packet.pts)
+        for packet in container.demux(stream)
+        if packet.size and packet.pts is not None
+    ]
 
 
 Probe = ImageProbe | VideoProbe | AudioProbe
@@ -677,6 +738,7 @@ class _VideoClock:
         limits: DecodeLimits,
         end: Fraction | None,
         note: _Note,
+        rate: Fraction | None,
         *,
         start: Fraction | None = None,
         origin: Fraction | None = None,
@@ -701,8 +763,8 @@ class _VideoClock:
         self.width = 0
         self.height = 0
         self.stopped = False
-        rate = stream.average_rate or stream.guessed_rate
-        self.nominal_frame_rate = _positive_fraction(rate, "video average rate") if rate else None
+        #: The probe's frame clock (`frame_clock`).
+        self.nominal_frame_rate = rate
         ratio = stream.sample_aspect_ratio
         # PyAV 19 represents unspecified ratios as a falsy AVRational rather
         # than None. The unspecified pixel aspect ratio means square pixels.
@@ -959,6 +1021,7 @@ def _media_events(
     limits: DecodeLimits,
     budget: _Budget,
     note: _Note,
+    rate: Callable[[], Fraction | None],
     *,
     end: Fraction | None,
     retained: bool,
@@ -972,7 +1035,7 @@ def _media_events(
     `end`. A soundtrack is cut at the first decoded video frame's time plus `start` and
     `end`, with or without its pictures. With `start`, the pictures decode from the keyframe
     at or before it (`_seek`), else from the first; the soundtrack always decodes from its
-    first sample, so its cut is exact.
+    first sample, so its cut is exact. `rate` is the video's frame clock, as its probe reads it.
     """
     with ExitStack() as stack:
         source = stack.enter_context(path.open("rb"))
@@ -997,7 +1060,10 @@ def _media_events(
             return
         video_stream = container.streams.video[0]
         origin = None if start is None else _first_picture_time(av, path)
-        clock = _VideoClock(av, video_stream, limits, end, note, start=start, origin=origin)
+        frame_rate = rate()
+        clock = _VideoClock(
+            av, video_stream, limits, end, note, frame_rate, start=start, origin=origin
+        )
         frames = None
         if origin is not None and start is not None:
             frames = _seek(av, container, video_stream, origin + start, note)
@@ -1005,7 +1071,9 @@ def _media_events(
                 source = stack.enter_context(path.open("rb"))
                 container = stack.enter_context(_open_input(av, source))
                 video_stream = container.streams.video[0]
-                clock = _VideoClock(av, video_stream, limits, end, note, start=start, origin=origin)
+                clock = _VideoClock(
+                    av, video_stream, limits, end, note, frame_rate, start=start, origin=origin
+                )
         video = clock.pictures(frames or _decoded(av, container, video_stream, note))
         next_video: _Picture | None = next(video)
         assert next_video is not None and clock.time_base is not None
@@ -1297,6 +1365,7 @@ class MediaReads:
             self._limits,
             budget,
             self._noting(asset),
+            lambda: self._frame_rate(asset, av, path),
             start=begin,
             end=cut,
             retained=True,
@@ -1316,8 +1385,9 @@ class MediaReads:
         budget, path = self._start(asset, "AudioFile.read")
         av = _av()
         events = _media_events(
-            av, path, "audio", self._limits, budget, self._noting(asset), end=cut, retained=True
-        )
+            av, path, "audio", self._limits, budget, self._noting(asset), lambda: None,
+            end=cut, retained=True,
+        )  # fmt: skip
         try:
             with _reading(asset, av, "audio"):
                 header = next(events)
@@ -1359,6 +1429,7 @@ class MediaReads:
                 self._limits,
                 budget,
                 self._noting(asset),
+                lambda: self._frame_rate(asset, av, path),
                 start=begin,
                 end=cut,
                 retained=False,
@@ -1367,8 +1438,18 @@ class MediaReads:
             ),
         )
 
+    def _frame_rate(self, asset: File, av: ModuleType, path: Path) -> Fraction | None:
+        """A video's frame clock for its decode's header: its probe's, cached on the handle."""
+        if asset.kind != "video":
+            return None
+        if asset._probed is None:
+            asset._probed = _probe_video(av, path, self._limits)
+        assert isinstance(asset._probed, VideoProbe)
+        return asset._probed.frame_rate
+
     def probe(self, asset: File) -> Probe:
-        """Source header facts, cached on the handle. Never decodes a picture or sample."""
+        """Source facts, cached on the handle: its header's, and its frame clock from its packets'
+        times. Never decodes a picture or sample."""
         budget, path = self._start(asset, f"{type(asset).__name__}.probe", decode=False)
         fitted = _within(_image_preparation(asset), self._limits, budget, "RGB")
         if asset._probed is None:
@@ -1645,15 +1726,18 @@ def _probe_video(av: ModuleType, path: Path, limits: DecodeLimits) -> VideoProbe
         aspect = _positive_fraction(ratio, "video pixel aspect ratio") if ratio else Fraction(1)
         if rotation % 180:
             width, height, aspect = height, width, 1 / aspect
-        rate = stream.average_rate or stream.guessed_rate
         audio_format = _stream_audio_format(soundtrack, limits) if soundtrack is not None else None
         duration = _stream_duration(av, container, stream)
+    # Its own open: a live WebM's duration may have read the demux to its end.
+    with path.open("rb") as source, _open_input(av, source) as container:
+        stream = container.streams.video[0]
+        clock = frame_clock(stream, _packet_times(container, stream))
     return VideoProbe(
         width=width,
         height=height,
         duration=duration,
         source_duration=duration,
-        frame_rate=_positive_fraction(rate, "video average rate") if rate else None,
+        frame_rate=clock.rate,
         pixel_aspect_ratio=aspect,
         soundtrack=audio_format,
     )
@@ -1832,7 +1916,9 @@ def _image(
             if image.size != source_geometry:
                 raise MediaDecodeError("image header geometry changed", code="media_geometry")
             width, height = image_target_size(*source_geometry, fitted)
-            if note is not None and (width, height) != image_target_size(*source_geometry, preparation):
+            if note is not None and (width, height) != image_target_size(
+                *source_geometry, preparation
+            ):
                 note(
                     f"this {source_geometry[0]}x{source_geometry[1]} image was read at "
                     f"{width}x{height}, the most this read holds"
