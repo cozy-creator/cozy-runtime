@@ -413,8 +413,9 @@ class Residency(Protocol):
 #: A component's root module -> the residency that places it and the component's name, so a
 #: Runtime mechanism handed the module (`cozy_runtime.lm`) reaches its placement.
 PLACED: weakref.WeakKeyDictionary[object, tuple[Residency, str]] = weakref.WeakKeyDictionary()
-#: Kernel builds this process loaded after it started (a boot build landing): calls may take a
-#: faster path from each on, so graphs record them again. None loads while a graph records.
+#: Kernel builds this process loaded after it started (a boot build landing), and builds that
+#: ended failed: calls may take a faster path from each on, or the fallback a graph refused while
+#: the build ran, so graphs record them again. None loads while a graph records.
 LANDED: list[int] = [0]
 #: The attribute Runtime sets on a forward wrapper that calls the class's forward unchanged.
 TRANSPARENT = "_cozy_transparent"
