@@ -1371,6 +1371,9 @@ class Executor:
         something else picked a device first.
         """
         owner = self.host
+        from cozy_runtime.internal import _trace_sampler  # proof-only (cl-1318)
+
+        _trace_sampler.start()
         if not owner._startup_reported:
             # Observe before the explicit boundary on every rank, including a
             # previously adopted context. Stderr survives even a pre-reply crash.
