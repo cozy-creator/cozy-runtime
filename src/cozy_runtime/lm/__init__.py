@@ -1266,7 +1266,7 @@ def _transformers(
     own: dict[str, float] = {} if picking.repetition == 1 else {"repetition_penalty": 1.0}
     context = CURRENT.get()
     decoder = cast("torch.nn.Module", _lm(model).get_decoder())
-    _pieced(decoder)
+    _pieced(decoder, model)
     rows, device = int(inputs["input_ids"].shape[0]), inputs["input_ids"].device
     with _PLANE, torch.inference_mode(), ExitStack() as held:
         cache: dict[str, Cache] = {}
@@ -1640,7 +1640,7 @@ def _taking(model: PreTrainedModel) -> Iterator[list[torch.Tensor]]:
         handle.remove()
 
 
-def _pieced(decoder: torch.nn.Module) -> None:
+def _pieced(decoder: torch.nn.Module, model: torch.nn.Module) -> None:
     """A prompt's prefill as a cut site (`catch.cut`, cr-344): the model's decoder (after any
     picture's features are merged into its embeddings) over an empty cache, its prompt in 2^level
     pieces of `_unit` tokens a row, at the level native selection takes from each piece's need
@@ -1649,7 +1649,9 @@ def _pieced(decoder: torch.nn.Module) -> None:
     of a layer shrinks with the piece; a level starts from the empty cache (`_Cut`). The decoder
     goes in pieces once its probe found it computes them as it computes the whole (`_probe`),
     for each kind of call; a call it can't cut (a row padded, an input neither one per token, a
-    position nor a plain value) and a decoder its probe refused run whole."""
+    position nor a plain value) and a decoder its probe refused run whole. `model` is whose
+    placement's record notes the probe's verdict."""
+    vars(decoder)["_cozy_owner"] = weakref.ref(model)
     if vars(decoder).get("_cozy_pieced"):
         return
     forward = decoder.forward
@@ -1779,6 +1781,11 @@ class _Cut:
             proven, said = _probe(self.decoder, self.forward, self.kwargs, self.unit)
             why = self.proven[self.kind] = "" if proven else said
             say(f"lm:{name}:pieces:{self.kind}", f"[lm] {name}: {said}")
+            owner = vars(self.decoder).get("_cozy_owner")
+            model = owner() if isinstance(owner, weakref.ref) else None
+            placed = PLACED.get(model) if model is not None else None
+            if placed is not None:  # the record's: the probe's proof that it refuses a wrong cut
+                placed[0].note(f"{placed[1]}.prefill", f"{name}: {said}")
             if why:
                 row = recovered("a prompt's prefill ran whole", why=f"{name}: {why}")
                 if row not in WARNINGS:
@@ -3267,7 +3274,7 @@ class _Engine:
         first token, from what `first` (the constraint's ids for no tokens) allows."""
         started = time.perf_counter()
         model, ids = self.model, request.inputs["input_ids"]
-        _pieced(cast("torch.nn.Module", _lm(model).get_decoder()))
+        _pieced(cast("torch.nn.Module", _lm(model).get_decoder()), model)
         fresh = _StaticCache(self.text, request.prompt, request.prompt)
         prepared = _lm(model).prepare_inputs_for_generation(
             ids, past_key_values=fresh, use_cache=True, is_first_iteration=True, **kwargs
