@@ -1137,8 +1137,9 @@ def attend(
     group a piece, the rows halve: query rows on multiples of `rows` (the kernel's query block; 0:
     never), each beside every key."""
     site = catch.site("attention")
+    staged = (host_mapped(q), host_mapped(k), host_mapped(v))
     if site is None:
-        return call(q, k, v, mask)
+        return call(*_staged((q, k, v), staged), mask)
     count, length, kv = int(q.shape[2]), int(q.shape[1]), int(k.shape[2])
     group = max(count // kv, 1)
     if mask is not None and mask.dim() != 4:
@@ -1160,35 +1161,91 @@ def attend(
         int(k.shape[1]),
         int(q.shape[3]),
         q.element_size(),
+        staged,
     )
 
     def need(level: int) -> tuple[int, ...]:
         return shape.need(*cut(level))
 
     def piece(level: int) -> Tensor:
-        return _attend(call, q, k, v, mask, group, *cut(level))
+        return _attend(call, q, k, v, mask, staged, group, *cut(level))
 
     return catch.cut(site, by_heads + levels(blocks), need, piece)
 
 
+_CU_POINTER_ATTRIBUTE_MEMORY_TYPE, _CU_MEMORYTYPE_HOST = 2, 1
+
+
+@functools.cache
+def _pointer_attribute() -> Callable[..., int] | None:
+    """The driver's `cuPointerGetAttribute`, else None (no driver library: nothing is mapped)."""
+    import ctypes
+
+    try:
+        driver = ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        return None
+    get = driver.cuPointerGetAttribute
+    get.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64)
+    get.restype = ctypes.c_int
+    return cast(Callable[..., int], get)
+
+
+def host_mapped(t: Tensor) -> bool:
+    """Whether a CUDA tensor's bytes are host memory the card addresses (varena's last resort, or
+    any mapped host allocation), as the driver says: a kernel reads them across the link."""
+    if t.device.type != "cuda" or t.numel() == 0:
+        return False
+    get = _pointer_attribute()
+    if get is None:
+        return False
+    import ctypes
+
+    kind = ctypes.c_uint(0)
+    if get(ctypes.byref(kind), _CU_POINTER_ATTRIBUTE_MEMORY_TYPE, t.data_ptr()) != 0:
+        return False
+    return kind.value == _CU_MEMORYTYPE_HOST
+
+
+def _staged(operands: Sequence[Tensor], staged: Sequence[bool]) -> list[Tensor]:
+    """Each operand marked `staged` copied onto the card, read across the link once; the rest as
+    they are."""
+    return [
+        t.clone(memory_format=torch.contiguous_format) if on else t
+        for t, on in zip(operands, staged, strict=True)
+    ]
+
+
 def _attend(
-    call: Attention, q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None, *cut: int
+    call: Attention,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    mask: Tensor | None,
+    staged: tuple[bool, bool, bool],
+    *cut: int,
 ) -> Tensor:
-    """Query heads [h, h + hp) with the K/V heads they read, by query rows [s, s + rp)."""
+    """Query heads [h, h + hp) with the K/V heads they read, by query rows [s, s + rp). An operand
+    in host memory the card addresses (`staged`) is copied onto the card a piece at a time: its K/V
+    once a head group, its queries once a piece. In place, the kernel would read K/V across the
+    link once a query block of its own."""
     group, hp, rp = cut
     length, count = int(q.shape[1]), int(q.shape[2])
     if hp >= count and rp >= length:
-        return call(q, k, v, mask)
+        return call(*_staged((q, k, v), staged), mask)
     whole = mask.expand(-1, count, length, -1) if mask is not None else None
     out = q.new_empty(q.shape)
     for h in range(0, count, hp):
         n, lo, hi = min(hp, count - h), h // group, (min(h + hp, count) - 1) // group + 1
+        keys, values = _staged((k[:, :, lo:hi], v[:, :, lo:hi]), staged[1:])
         for s in range(0, length, rp):
             catch.checkpoint()
             part = whole[:, h : h + n, s : s + rp] if whole is not None else None
-            piece = call(q[:, s : s + rp, h : h + n], k[:, :, lo:hi], v[:, :, lo:hi], part)
+            (queries,) = _staged((q[:, s : s + rp, h : h + n],), staged[:1])
+            piece = call(queries, keys, values, part)
             out[:, s : s + rp, h : h + n].copy_(piece)
-            del piece
+            del piece, queries
+        del keys, values
     return out
 
 
