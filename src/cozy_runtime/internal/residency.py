@@ -162,6 +162,11 @@ class Filling(Protocol):
 
     def overlay(self, block: str, keys: Collection[str], /) -> Hashable: ...
 
+    def writes(self, block: str, keys: Collection[str], overlay: Hashable, /) -> bool:
+        """Whether a fill of `block` under `overlay` may change its stored bytes: False, and its
+        page is read as stored, with no call of this fill."""
+        ...
+
     def __call__(self, block: str, parts: Mapping[str, Mapping[str, Tensor]], /) -> bool:
         """Fill `block`'s parts in place; whether their bytes now differ from the stored ones."""
         ...
@@ -1971,7 +1976,7 @@ class Memory:
                 parts.append((name, offset, part.nbytes))
                 offset += (part.nbytes + 255) // 256 * 256
         derive, slot = None, None
-        if model.fill is not None:
+        if _writes(block, overlay):
             derive = functools.partial(_derive, owner, "region", _bake)
             if page is not None:
                 slot = _slot(block, identity, overlay)
@@ -2005,15 +2010,15 @@ class Memory:
         """`groups`' absent raw Regions filled together before their blocks bind (cr-318): one
         store read for all TensorFS can read so, pieces pipelined across Regions, where a block at a
         time read each alone, serialized (Qwen3.6's 10,541 expert blocks: 37.6 GB at ~1.3 GB/s).
-        Each one's Use waits on its block (`_use`). A model whose fill bakes (LoRAs) fills block by
-        block: its bake runs on the thread that binds it."""
+        Each one's Use waits on its block (`_use`). A block whose fill bakes (a LoRA armed on it)
+        fills alone: its bake runs on the thread that binds it."""
         request = _REQUEST.get()
         if not self.cuda or (request is not None and request.idle):
             return
         wanted = [
             block
             for block in groups
-            if block.model.fill is None
+            if not _writes(block, block.overlay)
             and block.data is None
             and block.prefilled is None
             and block.storage_bytes
@@ -2042,6 +2047,84 @@ class Memory:
             uses = varena.fill(regions, sources, self._cuda_stream().cuda_stream)
         for block, use in zip(wanted, uses, strict=True):
             block.prefilled = use
+
+    def place(self, model: Model, *, ahead: bool = False) -> int:
+        """`model`'s absent blocks onto the card together, before a forward reaches them: one
+        `varena.fill`, at the read primitive's rate, where its forward filled a block at a time
+        between its blocks' compute (cl-1318, RTX 4090: SDXL's second text encoder, 34 fills of
+        18 MB at about 1 GB/s; Qwen-Image's transformer, 33 fills across 1.2 s of its first step).
+        Each stays the core's cache, unpinned. Only when all of it fits beside the live working
+        memory and its forward's need (`block_need`, else an eighth of the card's capacity):
+        a model that pages streams its blocks as before. `ahead`: off a request's path, into free
+        room alone (a follower's shards before its group's first call). Not a block that is in
+        use, nor one whose fill writes (a LoRA armed on it bakes as its forward reaches it), nor
+        one that wants another overlay than its page's. The bytes it read."""
+        if self.native is None or self.capturing():
+            return 0
+        with self.lock:
+            blocks: list[_Block] = []
+            for block in model.groups():
+                if (
+                    block.data is not None
+                    or block.count
+                    or block.retained
+                    or block.loading
+                    or block.prefilled is not None
+                    or block.gathered is not None
+                    or not block.storage_bytes
+                    or block.final_only()
+                    or (block.table and model.gathers)
+                    or block.cached()
+                ):
+                    continue
+                fill = model.fill
+                overlay = None if fill is None else fill.overlay(block.path, block.parts)
+                if overlay != block.overlay:
+                    if block.paged() or block.parked:
+                        continue  # its own entry moves it (`_switch_overlay`)
+                    block.overlay = overlay
+                if not _writes(block, overlay):
+                    blocks.append(block)
+            if not blocks:
+                return 0
+            room = vt.room(self.device.index or 0)
+            missing = sum(block.allocation_bytes for block in blocks)
+            need = self.block_need(PASS_SHAPE.get()) or room["capacity"] // 8
+            if ahead:
+                if missing + need > room["free"]:
+                    return 0
+            else:
+                kept = sum(
+                    b.allocation_bytes
+                    for b in model.groups()
+                    if b.cached() and not (b.count or b.retained)
+                )
+                if missing + kept + need > room["capacity"] - room["working_live"] - room["pinned"]:
+                    return 0
+            regions = [self._native_region(block) for block in blocks]
+            sources = [self._sources.get(region) for region in regions]
+        if any(source is None for source in sources):
+            return 0
+        request = _REQUEST.get()
+        if request is not None and not ahead:
+            for block in blocks:
+                request.first_read(block)
+        nbytes = sum(block.nbytes for block in blocks)
+        told = (
+            nullcontext()
+            if ahead
+            else _phases.loading(model.component, nbytes, functools.partial(self._unread, model))
+        )
+        with told:
+            try:
+                uses = varena.fill(
+                    regions, cast("list[varena.Source]", sources), self._cuda_stream().cuda_stream
+                )
+            except Exhausted:
+                return 0  # the room went: its forward fills them as it reaches them
+        filled = sum(b.nbytes for b, use in zip(blocks, uses, strict=True) if use is not None)
+        del uses  # each the core's cache: the next use on this stream finds it filled
+        return filled
 
     def _note_phase_plan(self, status: str, reason: str = "", **facts: Unpack[_PlanNote]) -> None:
         request = _REQUEST.get()
@@ -2500,6 +2583,25 @@ class Memory:
         if overlay != block.overlay and (block.paged() or block.parked):
             self._switch_overlay(block, overlay)
             self._rearm(model)
+        request = _REQUEST.get()
+        if (
+            reclaim
+            and block is not model.common
+            and not block.count
+            and request is not None
+            and not request.idle
+            and model.name not in request.placed
+            and model.users
+            and model.thread == threading.get_ident()
+        ):
+            # The request's first entry of one of its blocks, past its common's at its forward's
+            # start: an overlay its forward arms (H3's Turbo) is armed by now, and a block it bakes
+            # is not placed with the rest (`place`).
+            request.placed.add(model.name)
+            with self.lock:
+                beside = self._active_beside(request)
+            if not beside:  # another call's room is not this one's to take
+                self.place(model)
         with self.lock:
             if not model.users or model.thread != threading.get_ident():
                 raise ResidencyError("weight preparation requires an active model scope")
@@ -3353,6 +3455,8 @@ class Request:
         self.heads: dict[Model, tuple[set[int], int]] = {}
         #: the models whose phases this request entered: what it has not is read ahead
         self.entered: set[str] = set()
+        #: the models it placed whole at their first block's entry (`Memory.place`)
+        self.placed: set[str] = set()
         #: the blocks it read (`Memory._read_told`), by identity: one read again is paging
         self.read_blocks: set[int] = set()
         #: the attempt failed (its executor says): a refused allocation in its last pass is learned
@@ -3697,6 +3801,13 @@ def _derive(
         block.model.memory._retire_phase_plan("weight_fill_failed", model=block.model)
         setattr(block, field, None)
         raise
+
+
+def _writes(block: _Block, overlay: Hashable) -> bool:
+    """Whether `block`'s fill under `overlay` may change its stored bytes (`Filling.writes`): its
+    raw Source runs a derive only then."""
+    fill = block.model.fill
+    return fill is not None and fill.writes(block.path, block.parts, overlay)
 
 
 def _bake(block: _Block, view: Tensor) -> bool:

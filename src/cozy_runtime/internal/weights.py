@@ -890,6 +890,13 @@ class _Bake:
     leaf: _Adopting | None = None
 
 
+class _Unmade:
+    """A value not made yet (`_Bakes.__call__`'s seed identity)."""
+
+
+_UNMADE = _Unmade()
+
+
 class _Bakes:
     """A component's LoRA'd linears, baked into their weights' bytes as the pages arrive
     (`Declared.fill`), so a resident page carries its delta and an evicted one bakes again on
@@ -1037,6 +1044,22 @@ class _Bakes:
             )
         return tuple(self._delta(hook) for hook in hooks)
 
+    def writes(self, block: str, keys: Collection[str], overlay: Hashable) -> bool:
+        """Whether a fill of `block` (its stored `keys`) under `overlay` may change its stored
+        bytes: a PEFT or LoKr factor of its own, an armed hook's (`overlay` names those), or a
+        DoRA's rows per step. False: its page is the stored bytes, filled with no call here, so
+        it reads with its model's other blocks (cl-1318: Qwen-Image's transformer, its LoRA sites
+        unarmed, called a no-op fill per block, 25 ms each, through its first step)."""
+        if self.serving != "bake":
+            return any(bake.dora for key in keys if (bake := self.bakes.get(key)) is not None)
+        if isinstance(overlay, tuple) and any(delta is not None for delta in overlay):
+            return True
+        return any(
+            bake.leaf is None and bool(bake.factors or bake.krons)
+            for key in keys
+            if (bake := self.bakes.get(key)) is not None
+        )
+
     def _delta(self, hook: LoRASource) -> object:
         """One hook's armed delta by its content: its factors' checkpoint and component (not the
         package that loaded them: a published package and its source installed locally bake the
@@ -1094,9 +1117,9 @@ class _Bakes:
         """A per-step fill of a DoRA's rows: each weight's rows times its gain and each DoRA pair's
         B times its scale, in the page, so its forward adds `B' @ A` at scale 1."""
         changed = False
-        for stored, bake in self.bakes.items():
-            weight = parts.get(stored)
-            if not bake.dora or weight is None or not all(n in parts for n in self._held(bake)):
+        for stored, weight in parts.items():
+            bake = self.bakes.get(stored)
+            if bake is None or not bake.dora or not all(n in parts for n in self._held(bake)):
                 continue
             gain, scales = self._dora(bake, weight, parts)
             lora_bake.gain_rows(self.torch, dict(weight), gain)
@@ -1118,10 +1141,10 @@ class _Bakes:
         if self.serving != "bake":
             return self._per_step(parts)
         baked = self.baked
-        identity = self._described(armed=True)
-        for stored, bake in self.bakes.items():
-            weight = parts.get(stored)
-            if bake.leaf is not None or weight is None:
+        identity: str | None | _Unmade = _UNMADE  # all its hooks' deltas, made where one bakes
+        for stored, weight in parts.items():
+            bake = self.bakes.get(stored)
+            if bake is None or bake.leaf is not None:
                 continue
             if any(n not in parts for n in self._held(bake)):
                 continue
@@ -1161,6 +1184,8 @@ class _Bakes:
                 del named, got, downs, ups, terms  # no view of a source outlives its piece's bind
             if not delta:
                 continue
+            if isinstance(identity, _Unmade):
+                identity = self._described(armed=True)
             lora_bake.bake(
                 torch,
                 dict(weight),
