@@ -9,8 +9,9 @@ service at load time, is a type error rather than a footnote (§1.3).
 (§1.1): (1) hands the factory a typed READ-ONLY config capability — never a path; (2) runs
 the SAME factory under derive and under serve; (3) censuses the returned object and asks
 the backend for the ONE fit verdict (`tensorfs.fit` over the census and the checkpoint
-header, model-code-fit §3) BEFORE allocating anything; (4) fills every destination through
-the single backend path. `load(T)` is sugar over a REGISTERED exact adapter and never
+header, model-code-fit §3) BEFORE allocating anything; (4) queues every destination for the
+single backend path, which fills and registers them once the package's `load()` has returned
+(`Loader._commit`). `load(T)` is sugar over a REGISTERED exact adapter and never
 duck-types `from_pretrained`. The runtime keeps no matcher of its own: a verdict that is
 not `ok` is the typed refusal `model_fit_refused`, carrying the Fit document verbatim.
 
@@ -67,12 +68,15 @@ Custody = Literal["canonical", "local"]
 #: destination it registered initializes rather than transforms checkpoint values (§1.1).
 CONSTRUCTION: ContextVar[object | None] = ContextVar("construction", default=None)
 
-#: Told each object the fill wrote. The weight plane installs its own tensors in place of the
-#: construction's placeholders, and those are the checkpoint destinations from then on (§1.1).
-FILLED: ContextVar[Callable[[object], None] | None] = ContextVar("filled", default=None)
-
 #: Told when a factory returned, before its census: the substrate's constants go weightless.
 BUILT: ContextVar[Callable[[], None] | None] = ContextVar("built", default=None)
+
+
+def authored[**P, R](call: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    """Package code the Runtime runs while it constructs: `load()` and each factory. A `torch.cuda`
+    probe whose nearest Runtime frame is this one is the package's, and sees the construction's
+    one card (`derive._capability`); the Runtime's own probes never do."""
+    return call(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------- tensor schema
@@ -586,11 +590,13 @@ class Backend(Protocol):
     package cannot observe which backend served it — that is the backend-blindness fence.
 
     Four calls, one transaction: `fit` judges the census against the checkpoint header
-    (`tensorfs.fit`, model-code-fit §3) with nothing reserved, `materialize` reserves the
-    destinations the census just agreed on, `fill` validates and claims each one, and
-    `commit` moves the bytes and fences the copies. `fill` is deliberately NOT the thing
-    that moves bytes — a plane that copies inside the walk cannot refuse a late
-    destination without a partial generation to undo.
+    (`tensorfs.fit`, model-code-fit §3) with nothing reserved, as each construction returns.
+    Once the package's `load()` has returned, `materialize` reserves the destinations each
+    census agreed on, `fill` validates and claims each one, and `commit` moves the bytes and
+    fences the copies. `fill` is deliberately NOT the thing that moves bytes — a plane that
+    copies inside the walk cannot refuse a late destination without a partial generation to
+    undo. None of the three runs inside the package's construction: placing bytes and reading
+    the real cards are the Runtime's, never under the construction's guard or one-card view.
 
     `encoded_leaves` is the model class's own `ENCODED_LEAVES` declaration, carried in
     rather than reached for. It rides `fit` (it is the `accepts` of every code row) and
@@ -905,6 +911,7 @@ class Loader:
         "_open",
         "_owner",
         "_records",
+        "_walks",
     )
 
     def __init__(
@@ -923,6 +930,8 @@ class Loader:
         self._open = True
         self._records: list[ConstructionRecord] = []
         self._objects: list[object] = []
+        #: each construction's census, filled by `_commit`
+        self._walks: list[Census] = []
         self._caches: list[DerivedCache] = []
 
     @property
@@ -940,9 +949,9 @@ class Loader:
         return self._assets
 
     def construct(self, factory: Callable[[Config], T]) -> T:
-        """Build one object from the bound artifact's config, then fill its tensors. `factory`
-        is a class or a function taking the `Config`; a function's return annotation, when it
-        names a class, is checked against what it returns."""
+        """Build one object from the bound artifact's config; its tensors fill once `load()`
+        returns. `factory` is a class or a function taking the `Config`; a function's return
+        annotation, when it names a class, is checked against what it returns."""
         self._require_open("loader.construct")
         t = factory_type(factory)
         _legs: list[tuple[str, float]] = []
@@ -963,7 +972,7 @@ class Loader:
             )
         construction = CONSTRUCTION.set(object())
         try:
-            obj = factory(config)
+            obj = authored(factory, config)
             if (built := BUILT.get()) is not None:
                 built()
         except Exception as exc:
@@ -998,15 +1007,12 @@ class Loader:
         unstored = tuple(str(k) for k in fit.get("unstored", ())) if fit else ()
         walked = walked.without(frozenset(k.replace("/", ".", 1) for k in unstored))
         _legs.append(("fit", round((time.perf_counter() - _t0) * 1000, 1)))
-        _t0 = time.perf_counter()
-        filled, filled_bytes = self._fill(walked, obj)
-        _legs.append(("fill", round((time.perf_counter() - _t0) * 1000, 1)))
         record = ConstructionRecord(
             destinations=walked.destinations,
             components=walked.components,
             schedulers=walked.schedulers,
-            filled=filled,
-            filled_bytes=filled_bytes,
+            filled=0,
+            filled_bytes=0,
             ignored_extras=ignored,
             ignored_warnings=warned,
             unstored=unstored,
@@ -1017,6 +1023,7 @@ class Loader:
         )
         self._records.append(record)
         self._objects.append(obj)
+        self._walks.append(walked)
         return obj
 
     def cache(self, name: str, *, max_entries: int = 64, max_bytes: int = 1 << 30) -> DerivedCache:
@@ -1061,31 +1068,38 @@ class Loader:
                 code="loader_closed",
             )
 
-    def _fill(self, walked: Census, obj: object) -> tuple[int, int]:
-        """The SINGLE fill path. Failure rolls the whole construction back (§1.1).
+    def _commit(self) -> None:
+        """The SINGLE fill path, run once the package's `load()` has returned: every
+        construction's destinations, then one commit. Failure rolls the whole load back (§1.1).
 
         The destinations filled are the ones `materialize` reserved, re-censused — never
         the meta placeholders the walk agreed on. That is the seam where placement enters:
         the construction names shapes and dtypes, and the runtime alone decides where they
-        live, so this loop can be identical under every backend.
+        live, so this loop can be identical under every backend. No package frame is on the
+        stack and the construction's guard is gone: the Runtime places and reads real cards.
         """
-        if self._mode == "derive":
-            return 0, 0
+        if self._mode == "derive" or not self._walks:
+            return
+        began = time.perf_counter()
         done: list[str] = []
-        total = 0
         try:
-            live = self._backend.materialize(obj, walked, encoded_leaves=self._consent())
-            for d in walked.destinations:
-                self._backend.fill(d.key, self._artifact.tensor_schema[d.key], live[d.key])
-                done.append(d.key)
-                total += self._artifact.tensor_schema[d.key].nbytes
+            for index, (obj, walked) in enumerate(zip(self._objects, self._walks, strict=True)):
+                live = self._backend.materialize(obj, walked, encoded_leaves=self._consent())
+                total = 0
+                for d in walked.destinations:
+                    self._backend.fill(d.key, self._artifact.tensor_schema[d.key], live[d.key])
+                    done.append(d.key)
+                    total += self._artifact.tensor_schema[d.key].nbytes
+                self._records[index] = dataclasses.replace(
+                    self._records[index], filled=len(walked.destinations), filled_bytes=total
+                )
             self._backend.commit()
         except Exception:
             self._backend.poison(done)
             raise
-        if (filled := FILLED.get()) is not None:
-            filled(obj)
-        return len(done), total
+        first = self._records[0]
+        ms = round((time.perf_counter() - began) * 1000, 1)
+        self._records[0] = dataclasses.replace(first, stage_ms=(*first.stage_ms, ("fill", ms)))
 
 
 @dataclass(frozen=True, slots=True)

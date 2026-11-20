@@ -21,22 +21,16 @@ a new author-declared fact — that is how v1's surface grew.
 
 from __future__ import annotations
 
+import os
 import sys
-import threading
-import weakref
-from collections.abc import Callable, Collection, Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from types import FrameType, ModuleType
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol
 
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._loader import (
-    BUILT,
-    CONSTRUCTION,
-    FILLED,
-    _members,
-)
+from cozy_runtime.author._loader import BUILT, CONSTRUCTION, authored
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -205,18 +199,26 @@ _NO_CUDA = ("cpu", "mps")
 
 @contextmanager
 def _capability(cap: _Capability) -> Iterator[None]:
+    """The construction's one card, answered to package code only (D3).
+
+    Package code calls `torch.cuda` itself, so these four names are swapped while it builds, but
+    the answer is decided per call by `_authored`: a call from package code gets the variant, and
+    every other caller gets torch's own answer. That is the Runtime on this thread, every other
+    thread (a group's kernels, residency, TensorFS), and torch's own `get_device_properties(i)`
+    reached from them, which checks `i` against `device_count` (cr-326). A reference kept past the
+    construction (Triton's driver keeps one) answers torch's from then on."""
     torch = torch_module()
     saved = {
         name: getattr(torch.cuda, name)
         for name in ("get_device_capability", "get_device_name", "is_available", "device_count")
     }
 
-    def mark(name: str, value: object, *, read: bool = True) -> _Answer:
+    def scoped(name: str, value: object, *, read: bool = True) -> _Answer:
+        real = saved[name]
+
         def answer(*args: object, **kwargs: object) -> object:
-            # The Runtime's own placement and kernel probes read the real card: under a count of
-            # 1, torch's `get_device_properties(1)` refused a group follower's probe.
-            if getattr(_PLACEMENT, "on", False):
-                return saved[name](*args, **kwargs)
+            if not _authored(sys._getframe(1)):
+                return real(*args, **kwargs)
             if read:
                 cap.read = True
             return value
@@ -224,15 +226,35 @@ def _capability(cap: _Capability) -> Iterator[None]:
         return answer
 
     cuda = cap.variant not in _NO_CUDA
-    torch.cuda.get_device_capability = mark("get_device_capability", cap.major_minor)
-    torch.cuda.get_device_name = mark("get_device_name", cap.variant)
-    torch.cuda.is_available = mark("is_available", cuda, read=False)
-    torch.cuda.device_count = mark("device_count", 1 if cuda else 0, read=False)
+    torch.cuda.get_device_capability = scoped("get_device_capability", cap.major_minor)
+    torch.cuda.get_device_name = scoped("get_device_name", cap.variant)
+    torch.cuda.is_available = scoped("is_available", cuda, read=False)
+    torch.cuda.device_count = scoped("device_count", 1 if cuda else 0, read=False)
     try:
         yield
     finally:
         for name, value in saved.items():
             setattr(torch.cuda, name, value)
+
+
+#: The Runtime's own source tree: a frame here is the Runtime's, unless it is the hand-off.
+_RUNTIME = os.path.dirname(os.path.dirname(__file__)) + os.sep
+_HANDOFF = authored.__code__
+
+
+def _authored(frame: FrameType | None) -> bool:
+    """Is this call package code's? Its nearest Runtime frame decides: `authored`, through which
+    the Runtime runs a package's `load()` and factories, says yes; any other Runtime frame says no,
+    as does a stack with none (a TensorFS or library thread). Library frames between (torch,
+    Diffusers) belong to whoever called them."""
+    while frame is not None:
+        code = frame.f_code
+        if code is _HANDOFF:
+            return True
+        if code.co_filename.startswith(_RUNTIME):
+            return False
+        frame = frame.f_back
+    return False
 
 
 def _author_site() -> str:
@@ -335,11 +357,9 @@ def _check_inplace(name: str, args: tuple[object, ...], seen: Observations) -> N
     # becomes a buffer), or inside the factory call that registered it (timm's
     # `_trunc_normal_` is `uniform_`, `erfinv_`, `mul_`, `add_`, `clamp_`). Once that call
     # returns, the same op transforms checkpoint values and remains storage territory, as
-    # it does on every weight-plane tensor the fill installed in a placeholder's stead.
+    # it does on every weight-plane tensor the fill installs after `load()` returns.
     held, construction = seen.registered.get(id(target), (None, None))
-    if seen.filled.get(id(target)) is target:
-        construction = None
-    elif held is not target:
+    if held is not target:
         return
     if construction is not None and construction is CONSTRUCTION.get():
         return
@@ -362,51 +382,16 @@ class Observations:
     mutations: dict[int, list[str]] = field(default_factory=dict)
     holds: list[object] = field(default_factory=list)
     registered: dict[int, tuple[object, object | None]] = field(default_factory=dict)
-    #: The plane's tensors the fill installed, held weakly: the plane unmaps them at will.
-    filled: weakref.WeakValueDictionary[int, object] = field(
-        default_factory=weakref.WeakValueDictionary
-    )
 
     def register(self, destination: object) -> None:
         """A checkpoint destination, and the factory call (if any) that registered it."""
         self.registered[id(destination)] = (destination, CONSTRUCTION.get())
 
-    def fill(self, obj: object) -> None:
-        """Every parameter and persistent buffer of the components the fill just wrote."""
-        nn = torch_module().nn
-        for _, member in _members(obj):
-            for module in member.modules() if isinstance(member, nn.Module) else ():
-                for tensor in module._parameters.values():
-                    if tensor is not None:
-                        self.filled[id(tensor)] = tensor
-                for name, tensor in module._buffers.items():
-                    if tensor is not None and name not in module._non_persistent_buffers_set:
-                        self.filled[id(tensor)] = tensor
-
-
-_PLACEMENT = threading.local()
-
-
-@contextmanager
-def placing() -> Iterator[None]:
-    """The RUNTIME is placing bytes — the guard steps aside for exactly this window.
-
-    The guard refuses a device pin because placement is platform policy derived from
-    measurement (§1), and the fill plane IS that policy: cr-005 reserves ordinary CUDA
-    destinations, stages through pinned host memory and copies on its own stream, all of
-    which are device-naming operations by definition. So the fence is on WHO, not on what:
-    author code cannot reach this context manager (it lives under `internal/`, outside the
-    author surface), and every allocation inside it is ledgered rather than stray.
-    """
-    prior = getattr(_PLACEMENT, "on", False)
-    _PLACEMENT.on = True
-    try:
-        yield
-    finally:
-        _PLACEMENT.on = prior
-
 
 def _guard_mode(seen: Observations) -> TorchFunctionMode:
+    """The construction's fence on this thread. The Runtime places bytes (the fill plane, kernel
+    probes) only once the package's `load()` has returned (`Loader._commit`), so nothing here
+    steps aside for it."""
     torch = torch_module()
 
     class DeriveGuard(torch.overrides.TorchFunctionMode):  # type: ignore[misc,name-defined]
@@ -417,8 +402,6 @@ def _guard_mode(seen: Observations) -> TorchFunctionMode:
             args: tuple[object, ...] = (),
             kwargs: Mapping[str, object] | None = None,
         ) -> object:
-            if getattr(_PLACEMENT, "on", False):
-                return func(*args, **(kwargs or {}))
             name = getattr(func, "__name__", "")
             if name in _MOVE:
                 raise ConstructionFault(
@@ -501,11 +484,9 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
     constants: list[tuple[Module, str, Parameter]] = []
 
     def weightless(module: Module, name: str, held: Parameter, made: dict[int, Parameter]) -> None:
-        # A device move, performed BY THE RUNTIME, so the guard steps aside exactly here —
-        # the fence is on WHO moves bytes, not on what (see `placing`).
+        # To meta, which names no device the guard fences.
         if id(held) not in made:
-            with placing():
-                made[id(held)] = type(held)(held.to("meta"), requires_grad=held.requires_grad)
+            made[id(held)] = type(held)(held.to("meta"), requires_grad=held.requires_grad)
         module._parameters[name] = made[id(held)]
         seen.register(made[id(held)])
 
@@ -546,7 +527,6 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         stack.callback(setattr, nn.Module, "register_parameter", original)
         nn.Module.register_buffer = register_buffer
         stack.callback(setattr, nn.Module, "register_buffer", original_buffer)
-        stack.callback(FILLED.reset, FILLED.set(seen.fill))
         stack.callback(built)  # constants a construction outside `loader.construct` made
         stack.callback(BUILT.reset, BUILT.set(built))
         stack.enter_context(refuse_compile())

@@ -19,8 +19,8 @@ so an upgrade or a driver update checks it again, and it names its boot: a probe
 interrupted says nothing of its kernel. A device that ran out of memory during the probe keeps
 nothing: the error raises for the memory manager.
 
-A kernel first opens at a leaf's bind, inside its model's construction: the probe runs with the
-construction guard stepped aside (`derive.placing`), as the runtime's own placement does.
+A kernel first opens at a leaf's bind, once its model's construction has ended (`Loader._commit`),
+or on a kernel thread: no construction guard or one-card view reaches a probe.
 """
 
 from __future__ import annotations
@@ -44,7 +44,6 @@ from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.internal import accel, filelock, kernel_cache
-from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding.formats import Tensor
 
 #: The unfinished-probe markers under the machine's kernel store.
@@ -221,8 +220,7 @@ def _run(probe: Callable[[], Verdict]) -> Verdict:
     """The probe's verdict; one that raises fails, except when the device ran out, which says
     nothing about the kernel and raises for the memory manager to answer."""
     try:
-        with placing():  # the runtime's own allocations, never an author's construction
-            return probe()
+        return probe()
     except Exception as exc:
         if is_capacity(exc):
             raise
