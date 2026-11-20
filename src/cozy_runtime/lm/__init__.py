@@ -1810,6 +1810,8 @@ def _through(
     last: MutableMapping[str, object] | None = None
     for at in range(0, length, piece):
         end = min(at + piece, length)
+        if at and isinstance(kwargs.get("past_key_values"), Cache):  # PROOF ONLY: the cache not carried
+            _emptied(cast("Cache", kwargs["past_key_values"]))
         out = cast("MutableMapping[str, object]", forward(**_window(kwargs, at, end)))
         hidden = cast("torch.Tensor", out[next(iter(out))])  # a model output's first, `out[0]`
         if states is None:
