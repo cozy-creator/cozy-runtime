@@ -353,7 +353,7 @@ def _ended(name: str, slot: _Slot, exc: Exception) -> None:
             if slot.state == "opening":
                 _SLOTS.pop(name)
             return
-        LANDED[0] += slot.state != "failed"
+        LANDED[0] += slot.state == "ready"
         slot.state, slot.error = "failed", exc
 
 
