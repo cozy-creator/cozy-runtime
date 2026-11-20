@@ -447,6 +447,15 @@ _TELLS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_tells", defa
 _TOLD: set[str] = set()
 
 
+def code_path(entrypoint: str, payload: object) -> str:
+    """The code path a call takes, as varena keeps the card's room for it (var-040): its function
+    and the names of the non-empty inputs it gave, never their values. A path's first run in a
+    process loads libraries its others never did (a Qwen Image 2 edit's references reach an FFT)."""
+    fields = cast("dict[str, object]", payload) if isinstance(payload, dict) else {}
+    given = sorted(name for name, value in fields.items() if value not in (None, "", [], {}))
+    return " ".join([entrypoint, *given])
+
+
 def _scratch(command: Invoke) -> Path | None:
     """The call's own folder in its project (`call_scope`); none: the executor's."""
     return Path(command.scratch) if command.scratch else None
@@ -1814,7 +1823,9 @@ class Executor:
             self.residency.open_attempt()
         try:
             with (
-                self._request(command.request_id, command.entrypoint) as rows,
+                self._request(
+                    command.request_id, code_path(asked.entrypoint, asked.payload)
+                ) as rows,
                 attention_sol.observing(held=states) as sol,
                 attention_ulysses.observing() as served,
                 spmd.attempt(ranks, entropy),
@@ -3991,7 +4002,10 @@ class Executor:
                     "detail": self.poisoned or "executor stopped during request preparation",
                 }
             self.prepared[command.request_id] = replace(
-                prepared, stages=waits.stages, asked=command if self.world > 1 else None
+                prepared,
+                stages=waits.stages,
+                asked=command if self.world > 1 else None,
+                work=code_path(command.entrypoint, command.payload),
             )
             self.awaiting.add(command.request_id)
             # A prepared request never dispatched must not survive for the generation.
@@ -4161,7 +4175,7 @@ class Executor:
             with (
                 WARNINGS.attempt() as warnings,
                 request_path.serving() as blocking,
-                self._request(command.request_id, command.entrypoint) as own_memory,
+                self._request(command.request_id, prepared.work) as own_memory,
                 attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
                 if pin
                 else contextlib.nullcontext(

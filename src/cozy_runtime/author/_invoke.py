@@ -206,6 +206,8 @@ class PreparedRequest:
     stages: Mapping[str, Track] = field(default_factory=dict)
     #: in a group, the command it was prepared from: every other GPU prepares it again
     asked: object = None
+    #: the code path it takes, for the card's room (`internal.executor.code_path`, var-040)
+    work: str = ""
 
     def digests(self) -> dict[str, str]:
         """What a worker can hold, record and price against — never the payload."""
