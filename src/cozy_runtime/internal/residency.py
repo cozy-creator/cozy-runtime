@@ -2127,6 +2127,7 @@ class Memory:
             else _phases.loading(model.component, nbytes, functools.partial(self._unread, model))
         )
         began = time.perf_counter_ns()
+        uses: list[varena.Use | None]
         with told:
             try:
                 uses = varena.fill(
@@ -2617,7 +2618,10 @@ class Memory:
             request.placed.add(model.name)
             with self.lock:
                 beside = self._active_beside(request)
-            if not beside:  # another call's room is not this one's to take
+                # Read inside another's forward (an overlay's factors, a bake binding one piece
+                # at a time), it is that forward's: it stays as that forward reads it.
+                inside = any(other is not model for other in self._executing)
+            if not (beside or inside):  # another call's room is not this one's to take
                 self.place(model)
         with self.lock:
             if not model.users or model.thread != threading.get_ident():
