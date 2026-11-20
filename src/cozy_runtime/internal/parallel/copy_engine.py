@@ -475,10 +475,11 @@ def form(
     world: int,
     name: str,
     pages: Pages | None = None,
-) -> tuple[Exchange | None, dict[str, bool]]:
+) -> tuple[Exchange | None, dict[str, bool | str]]:
     """Collective, on every GPU of a just-formed group: `name` (`links.Links.exchange`) mapped,
     and one all-to-all through it checked against the bytes NCCL lands. An exchange any GPU cannot
-    map, or whose bytes differ on any, goes on all of them alike and NCCL carries the group.
+    map, or whose bytes differ on any, goes on all of them alike and NCCL carries the group; the
+    check says why (`failed`: this GPU's exception, or what another GPU's agreement said).
     `pages`: the host tier of this GPU, which a host-staged inbox comes from."""
     from torch.distributed.distributed_c10d import _get_process_group_store
 
@@ -491,9 +492,11 @@ def form(
 
     # A formation again (after a call ran short of memory) frees the buffers of the last first.
     _drop()
-    exchange = _open(name, torch, pg, rank, world, agree, _get_process_group_store(pg), pages)
+    exchange, failed = _open(
+        name, torch, pg, rank, world, agree, _get_process_group_store(pg), pages
+    )
     if exchange is None:
-        return None, {"mapped": False, "exact": False}
+        return None, {"mapped": False, "exact": False, **({"failed": failed} if failed else {})}
     rows = _CHECK_BYTES // 2 // 1024 // world * world
     send = torch.randn(rows, 1024, dtype=torch.bfloat16, device="cuda")
     received = torch.empty_like(send)
@@ -504,13 +507,17 @@ def form(
         row = send[0].numel() * send.element_size()
         landed = exchange.all_to_all([send], [matrix], (rows // world // 2 + 1) * row)[0]
         exact = bool(torch.equal(received, landed))
-    except Exception:  # the whole group then drops it, every GPU alike
-        exact = False
-    exact = agree(exact)
-    if not exact:
+        failed = "" if exact else "its bytes differ from what NCCL lands"
+    except Exception as exc:  # the whole group then drops it, every GPU alike
+        exact, failed = False, _said(exc)
+    agreed = agree(exact)
+    if not agreed:
         exchange.close()
     torch.cuda.synchronize()
-    return (exchange if exact else None), {"mapped": True, "exact": exact}
+    check: dict[str, bool | str] = {"mapped": True, "exact": agreed}
+    if not agreed:
+        check["failed"] = failed or "another GPU of the group failed its check"
+    return (exchange if agreed else None), check
 
 
 def _open(
@@ -522,9 +529,11 @@ def _open(
     agree: Callable[[bool], bool],
     store: Store,
     pages: Pages | None,
-) -> Exchange | None:
-    """`name`'s exchange mapped on every GPU of the group, or None on every one alike."""
+) -> tuple[Exchange | None, str]:
+    """`name`'s exchange mapped on every GPU of the group, or None on every one alike, with why
+    (empty when no exchange was asked for)."""
     made: Exchange | None = None
+    failed = ""
     try:
         if name == "copy-engine":
             from torch.distributed import _symmetric_memory as symm
@@ -532,15 +541,23 @@ def _open(
             made = CopyEngineExchange(torch, symm, pg, rank, world)
         elif name == "host-staged":
             made = HostStagedExchange(torch, pg, rank, world, pages)
-    except Exception:  # an unsupported driver, no host room, no shared memory: NCCL stays
-        made = None
+    except Exception as exc:  # an unsupported driver, no host room, no shared memory: NCCL stays
+        made, failed = None, _said(exc)
     if not agree(made is not None):
         if made is not None:
             made.close()
-        return None
+        asked = name in ("copy-engine", "host-staged")
+        return None, failed or ("another GPU of the group could not map it" if asked else "")
     if isinstance(made, CopyEngineExchange):
         made.map()
-        return made
+        return made, ""
     assert isinstance(made, HostStagedExchange)
     prefixed = torch.distributed.PrefixStore(f"cozy.exchange/{pg.group_name}/", store)
-    return made if made.map(prefixed, agree) else None
+    if made.map(prefixed, agree):
+        return made, ""
+    return None, "an inbox did not map on every GPU of the group"
+
+
+def _said(exc: BaseException) -> str:
+    """An exception as a check keeps it: its type and the first line of its message."""
+    return f"{type(exc).__name__}: {str(exc).partition(chr(10))[0]}"[:300]

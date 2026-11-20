@@ -528,8 +528,8 @@ class Transport:
     route: str
     nccl: dict[str, str]
     links: Links
-    #: the formation check of `route` (`copy_engine.form`): mapped, exact
-    check: dict[str, bool] = field(default_factory=dict)
+    #: the formation check of `route` (`copy_engine.form`): mapped, exact, and why it failed
+    check: dict[str, bool | str] = field(default_factory=dict)
 
     def document(self) -> dict[str, object]:
         """GPUs by their nvidia-smi numbers; each pair's route is direct or through host memory."""
