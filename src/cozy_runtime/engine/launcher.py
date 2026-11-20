@@ -125,10 +125,15 @@ def _paths(index: int) -> Paths:
 
 
 def _child(index: int, sections: list[str]) -> tuple[dict[str, tuple[bool, str]], int]:
-    """Each of `sections` the child said, and its exit code (negative: the signal that ended it)."""
+    """Each of `sections` the child said, and its exit code (negative: the signal that ended it). The child runs in
+    the executor's own place, never a call's: a call's is removed when it ends, and a child that outlived one failed
+    its section on a missing working directory (engine-routes 44633999562)."""
+    from cozy_runtime.internal import call_scope
+
     command = [sys.executable, "-I", "-B", "-m", __name__, str(index), *sections]
     try:
-        done = subprocess.run(command, capture_output=True, text=True, timeout=CHILD_S, check=False)
+        done = subprocess.run(command, capture_output=True, text=True, timeout=CHILD_S, check=False,
+                              env=call_scope.process_environment(), cwd=call_scope.process_cwd())  # fmt: skip
     except subprocess.TimeoutExpired:
         return {}, 0
     said: dict[str, tuple[bool, str]] = {}
