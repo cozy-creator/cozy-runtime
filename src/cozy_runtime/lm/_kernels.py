@@ -38,16 +38,18 @@ if not TRITON_ABSENT:
         out_ptr,
         channels,
         x_stride,
+        state_stride,
         CONV: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         """`causal_conv1d_update` for one token, SiLU, bf16 weights: the window shifts left by
-        this token, the depthwise dot rounds to bf16 (the conv's output) and SiLU rounds again."""
+        this token, the depthwise dot rounds to bf16 (the conv's output) and SiLU rounds again.
+        A row's window is `state_stride` elements from the one before (its channels contiguous)."""
         b = tl.program_id(0)
         c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         ok = c < channels
         x = tl.load(x_ptr + b * x_stride + c, mask=ok, other=0.0)
-        window = state_ptr + (b * channels + c) * CONV
+        window = state_ptr + b * state_stride + c * CONV
         acc = tl.zeros([BLOCK], dtype=tl.float32)
         for j in tl.static_range(CONV - 1):
             held = tl.load(window + j + 1, mask=ok, other=0.0)
@@ -112,6 +114,9 @@ if not TRITON_ABSENT:
         v_stride_b,
         v_stride_t,
         v_stride_h,
+        state_stride,
+        states_stride_t,
+        states_stride_b,
         scale,
         DK: tl.constexpr,
         DV: tl.constexpr,
@@ -120,17 +125,17 @@ if not TRITON_ABSENT:
         """The gated delta rule for `tokens` tokens in turn, of one head and `BV` value columns:
         q and k L2-normalised (q then divided by `scale`), the state decayed by exp(g), corrected
         toward v by beta, then read by q. The state after each token goes to `states`
-        (`[T, B, H, DK, DV]`; `state` itself for one decoded token). g and beta are `[B, T, H]`,
-        out `[B, T, H, DV]`. Decoding and verifying both run it, so a token's bits do not depend
-        on how many come with it."""
+        (`[T, B, H, DK, DV]`; `state` itself for one decoded token), each row of either
+        `state_stride` / `states_stride_b` elements from the one before (its heads contiguous). g
+        and beta are `[B, T, H]`, out `[B, T, H, DV]`. Decoding and verifying both run it, so a
+        token's bits do not depend on how many come with it."""
         bh = tl.program_id(0)
         b = bh // heads
         h = bh % heads
         rk = tl.arange(0, DK)
         rv = tl.program_id(1) * BV + tl.arange(0, BV)
-        where = (bh * DK + rk[:, None]) * DV + rv[None, :]
-        state = tl.load(state_ptr + where)
-        every = tl.num_programs(0) * DK * DV
+        where = (h * DK + rk[:, None]) * DV + rv[None, :]
+        state = tl.load(state_ptr + b * state_stride + where)
         for t in range(tokens):
             q = tl.load(q_ptr + b * q_stride_b + t * q_stride_t + h * q_stride_h + rk)
             k = tl.load(k_ptr + b * k_stride_b + t * k_stride_t + h * k_stride_h + rk)
@@ -146,7 +151,7 @@ if not TRITON_ABSENT:
             state = state * tl.exp(g)
             delta = (v - tl.sum(state * k[:, None], axis=0)) * beta
             state = state + k[:, None] * delta[None, :]
-            tl.store(states_ptr + t * every + where, state)
+            tl.store(states_ptr + t * states_stride_t + b * states_stride_b + where, state)
             tl.store(out_ptr + at * DV + rv, tl.sum(state * q[:, None], axis=0).to(tl.bfloat16))
 
 

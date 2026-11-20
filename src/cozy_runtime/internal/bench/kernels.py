@@ -674,7 +674,7 @@ def _lm(index: int) -> Outcome:
     states = start.new_empty((tokens, *start.shape))
     out = v.new_empty((batch, tokens, heads, dv))
     scale = float(dk) ** 0.5
-    launch(lm_kernels.recurrent_steps_kernel, (batch * heads, dv // bv, 1), q, k, v, gate, beta, start, states, out, heads, tokens, *q.stride()[:3], *k.stride()[:3], *v.stride()[:3], scale, dk, dv, bv)
+    launch(lm_kernels.recurrent_steps_kernel, (batch * heads, dv // bv, 1), q, k, v, gate, beta, start, states, out, heads, tokens, *q.stride()[:3], *k.stride()[:3], *v.stride()[:3], start.stride(0), states.stride(0), states.stride(1), scale, dk, dv, bv)
     wants: list[torch.Tensor]
     state, wants = start.clone(), []
     for t in range(tokens):
