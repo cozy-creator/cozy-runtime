@@ -15,11 +15,11 @@ int ids_batch(int device, int type);
 
 // out[T * k, N] (f32) = each (token t, slot j) pair's product: x's row for it times the [N, K] `type` blocks of expert
 // ids[t * k + j], read at table[expert] (device memory, one address per expert), or, with `stride` (bytes), at
-// table + expert * stride (one stack of experts, llama.cpp's own layout). x is f32, `rows` rows a token: 1 (every
+// table + expert * stride (one stack of experts, llama.cpp's own layout); `experts` of them. x is f32, `rows` rows a token: 1 (every
 // slot reads the token's row) or k (slot j reads row t * k + j). By MMVQ, `ids_batch` tokens a launch; temporaries from
 // `allocate(bytes, context)`. A CUDA error code; a failure ggml itself raises is cudaErrorUnknown, its message in
 // `error()`.
-int matmul_ids(int device, int type, const void* table, int64_t stride, const float* x, int64_t rows,
+int matmul_ids(int device, int type, const void* table, int64_t stride, int64_t experts, const float* x, int64_t rows,
                const int32_t* ids, float* out, int64_t K, int64_t N, int64_t T, int64_t k,
                void* (*allocate)(size_t, void*), void* context, cudaStream_t stream);
 

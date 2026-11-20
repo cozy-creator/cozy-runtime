@@ -20,12 +20,12 @@ int ids_batch(int device, int type) {
     return std::min(MMVQ_MAX_BATCH_SIZE, get_mmvq_mmid_max_batch(ggml_type(type), cc));
 }
 
-int matmul_ids(int device, int type, const void* table, int64_t stride, const float* x, int64_t rows,
+int matmul_ids(int device, int type, const void* table, int64_t stride, int64_t experts, const float* x, int64_t rows,
                const int32_t* ids, float* out, int64_t K, int64_t N, int64_t T, int64_t k,
                void* (*allocate)(size_t, void*), void* context, cudaStream_t stream) {
     if (!runs(type) || K <= 0 || N <= 0 || T <= 0 || k <= 0 || K % MATRIX_ROW_PADDING) return cudaErrorInvalidValue;
     if (stride < 0 || stride % ggml_type_size(ggml_type(type))) return cudaErrorInvalidValue;
-    if (rows != 1 && rows != k) return cudaErrorInvalidValue;
+    if ((rows != 1 && rows != k) || experts <= 0) return cudaErrorInvalidValue;
     try {
         Allocate temporaries{allocate, context};
         Call call(device, stream, &temporaries);
@@ -37,7 +37,7 @@ int matmul_ids(int device, int type, const void* table, int64_t stride, const fl
             // out [N, k, n]. The weights' data is the table, which their channel stride 0 says; or one stack.
             ggml_tensor w{}, src1{}, chosen{}, dst{};
             w.type = ggml_type(type);
-            w.ne[0] = K, w.ne[1] = N, w.ne[2] = 1, w.ne[3] = 1;
+            w.ne[0] = K, w.ne[1] = N, w.ne[2] = experts, w.ne[3] = 1;
             w.nb[0] = ggml_type_size(w.type);
             w.nb[1] = ggml_row_size(w.type, K);
             w.nb[2] = size_t(stride), w.nb[3] = 0;

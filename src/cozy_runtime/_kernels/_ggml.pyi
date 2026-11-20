@@ -47,6 +47,7 @@ def matmul_ids(
     type: int,
     table: int,
     stride: int,
+    experts: int,
     x: int,
     rows: int,
     ids: int,

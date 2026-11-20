@@ -163,25 +163,28 @@ VERIFYING = "the ggml kernels are being verified on this card"
 
 def matmul_ids(
     ops: ModuleType, torch: ModuleType, x: Tensor, table: Tensor, ids: Tensor, scheme: str, n: int,
-    stride: int = 0,
+    stride: int = 0, experts: int = 0, out: Tensor | None = None,
 ) -> Tensor:
     """f32 `[T * k, n]`: each (token t, slot j) pair's product of its row of `x` (f32, `[T, K]`, a row a
     token, or `[T * k, K]`, a row a pair) by the `[n, K]` `scheme` blocks of expert `ids[t, j]` (int32),
     read at `table[expert]` (int64 addresses on the device), or with `stride` (bytes) at `table`'s address
-    plus `expert * stride` (one stack of experts, llama.cpp's layout): llama.cpp's MUL_MAT_ID by MMVQ (`ops`,
-    this card's `native`), a few tokens a launch. Raises what the module said; `ids_unserved` first."""
+    plus `expert * stride` (one stack of `experts`, llama.cpp's layout): llama.cpp's MUL_MAT_ID by MMVQ (`ops`,
+    this card's `native`), a few tokens a launch, into `out` (contiguous f32) where given. Raises what the module
+    said; `ids_unserved` first."""
     tokens, k = (int(s) for s in ids.shape)
     rows, width = (int(s) for s in x.shape)
     if rows not in (tokens, tokens * k):
         raise ValueError(f"{rows} rows of x for {tokens} tokens of {k} experts")
-    out: Tensor = torch.empty(tokens * k, n, dtype=torch.float32, device=x.device)
+    if out is None:
+        out = torch.empty(tokens * k, n, dtype=torch.float32, device=x.device)
+    count = experts or (int(table.numel()) if not stride else 0)
 
     def allocate(nbytes: int) -> Tensor:
         held: Tensor = torch.empty(nbytes, dtype=torch.uint8, device=x.device)
         return held
 
     code = ops.matmul_ids(
-        x.get_device(), TYPES[scheme], table.data_ptr(), stride, x.data_ptr(), rows // tokens, ids.data_ptr(),
+        x.get_device(), TYPES[scheme], table.data_ptr(), stride, count, x.data_ptr(), rows // tokens, ids.data_ptr(),
         out.data_ptr(), width, n, tokens, k, allocate, torch.cuda.current_stream(x.device).cuda_stream,
     )  # fmt: skip
     if code != 0:
@@ -379,12 +382,15 @@ def _probe_ids(
             weights = torch.stack([decoded[int(e)] for e in ids.reshape(-1).tolist()]).double()
             want = torch.einsum("pk,pnk->pn", rows, weights)
             for layout, base, stride in (("", table, 0), (" stacked", stack, int(stack[0].numel()))):
-                got = matmul_ids(ops, torch, x, base, ids, scheme, n, stride)
+                # NaN first: a row the kernel never wrote reads all NaN, one it computed from garbage seldom does.
+                filled = torch.full((tokens * 2, n), float("nan"), dtype=torch.float32, device=device)
+                got = matmul_ids(ops, torch, x, base, ids, scheme, n, stride, len(held), filled)
                 case = f"{scheme} ids t={tokens} rows={per}{layout}"
                 errors[case] = verify.error(torch, got, want)
                 bad = (~torch.isfinite(got)).any(-1).nonzero().reshape(-1).tolist()
                 if bad:
-                    unfinite[case] = f" (rows {bad} of {int(got.shape[0])} not finite)"
+                    untouched = [r for r in bad if bool(torch.isnan(got[r]).all())]
+                    unfinite[case] = f" (rows {bad} of {int(got.shape[0])} not finite; never written: {untouched})"
     return errors
 
 
