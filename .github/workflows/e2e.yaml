@@ -17,7 +17,7 @@ on:
 jobs:
   # cozy-creator's and packages' lines beside this change (cl-1186), named by no hard-coded RC: the line it is on or goes into (an
   # RC's `rc/<x>`, a patch release's `release/X.Y.Z` or its tag, a task branch's open PR's base, else the patch release it is cut
-  # from), else the open RC (one at a time, as OPEN.md names it: the newest `rc/*`), as for a merge into master; in each repo its
+  # from), or Runtime master's matching release line, else the open RC (the newest numeric `rc/*`); in each repo its
   # own branch of that line, else the release a patch release patches, else its newest RC, else master.
   siblings:
     if: github.event_name != 'merge_group' || !startsWith(github.event.merge_group.base_ref, 'refs/heads/rc/')
@@ -30,6 +30,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BASE: ${{ github.event.merge_group.base_ref || github.event.pull_request.base.ref || github.ref_name }}
+          HEAD: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha || github.sha }}
         run: |
           is_line() { [[ $1 == rc/* ]] || [[ $1 =~ ^release/[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
           line=${BASE#refs/heads/}
@@ -44,6 +45,22 @@ jobs:
               done
               [ -z "$cut" ] || line=$cut
             fi
+          fi
+          # Runtime master may still be on the last stable minor while the open RC's
+          # packages have advanced their Runtime and TensorFS floors.
+          if [ "$line" = master ]; then
+            runtime_minor() {
+              gh api "repos/$GITHUB_REPOSITORY/contents/pyproject.toml?ref=$1" --jq .content | base64 -d |
+                python3 -c 'import sys, tomllib; print(".".join(tomllib.load(sys.stdin.buffer)["project"]["version"].split(".")[:2]))'
+            }
+            wanted=$(runtime_minor "$HEAD")
+            while IFS= read -r release; do
+              if [ "$(runtime_minor "$release")" = "$wanted" ]; then
+                line=$release
+                break
+              fi
+            done < <(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/release/" -q '.[].ref' |
+              sed 's|^refs/heads/||' | grep -xE 'release/[0-9]+\.[0-9]+\.[0-9]+' | sort -Vr)
           fi
           is_line "$line" || line=$(gh api repos/cozy-creator/cozy-creator/git/matching-refs/heads/rc/ -q '.[].ref' | sed 's|^refs/heads/||' | grep -xE 'rc/[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1)
           sibling() {
@@ -64,11 +81,9 @@ jobs:
   e2e:
     needs: siblings
     if: github.event_name != 'merge_group' || !startsWith(github.event.merge_group.base_ref, 'refs/heads/rc/')
-    # The workflow is the open RC's branch, so it moves with the harness it runs (ci/, e2e/: fixtures, references), which is the
-    # line's own, as the stack and packages are. Renamed to the next RC's at each cut; left behind, it fails once the old RC's
-    # branch is deleted at its release, never runs stale. xs-217: pinned at 11-11's f85096b9d6, it judged the RC's packages by
-    # fixtures and references the RC had replaced.
-    uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@rc/0.28.0
+    # Use the harness on Runtime master's release line. The release branch keeps
+    # the matching workflow after its RC branch is retired.
+    uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@release/0.27.0
     secrets:
       TENSORHUB_READ_KEY: ${{ secrets.TENSORHUB_READ_KEY }}
     with:
