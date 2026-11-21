@@ -13,7 +13,7 @@
   <a class="skip-link" href="#main">Skip to content</a>
   <header class="site-header">
     <a class="wordmark" href="#top" aria-label="Cozy Creator benchmarks, top"><span class="brand-mark" aria-hidden="true">c</span>cozy<span class="wordmark-detail">benchmarks</span></a>
-    <nav aria-label="On this page"><a href="#results">Results</a><a href="#watch">Watch</a><a href="#how">How it works</a><a href="#method">Method</a></nav>
+    <nav aria-label="On this page"><a href="#results">Results</a><a href="#watch">Watch</a><a href="#how">How it works</a><a href="#plate-edit">Full-length edit</a><a href="#method">Method</a></nav>
   </header>
 
   <main id="main">
@@ -131,6 +131,26 @@
       <div class="data-banner"><div><h3>Inspect the measurements.</h3><p>Full means, individual timings, submitted prompts, seeds, software revisions and original clip hashes.</p></div><a class="button secondary" href="data.json" download>Download data.json <span aria-hidden="true">↓</span></a></div>
       <p class="source-links">Upstream references: <a href="https://github.com/Comfy-Org/ComfyUI/tree/b0b743566f65daafc423b4fea8a2fbda94b3384a">ComfyUI</a> · <a href="https://github.com/martonsagi/Comfy-H3-MultiStream/tree/4e4381ff2cdb061a4cd0065af5b9c3679ded379a">H3 MultiStream</a> · <a href="https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/multi-gpu-systems.html">CUDA peer access</a> · <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html">NCCL transport controls</a></p>
     </section>
+    <section class="section-shell section-space divided" id="plate-edit" aria-labelledby="plate-edit-heading">
+      <div class="section-heading"><div><p class="eyebrow">07 / November 2026 follow-up</p><h2 id="plate-edit-heading">A full-length character swap.</h2></div></div>
+      <p class="section-intro">Both workflows edited the same 53-second guide with two character references, the same shot instructions and seeds, and the same two H100 SXM GPUs. Each produced 1,280 frames at 1344 × 768 and 24 fps, with stereo audio.</p>
+      <div class="table-scroll" role="region" aria-label="Full-length Character Swap timing" tabindex="0">
+        <table>
+          <caption>One complete edit per workflow on the same host. Times are minutes and seconds.</caption>
+          <thead><tr><th scope="col">Workflow</th><th scope="col">Guide method</th><th scope="col" class="numeric">Render elapsed</th><th scope="col" class="numeric">Sampler</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Cozy Creator</th><td>Staged spatial and temporal merging</td><td class="numeric">15:28</td><td class="numeric">10:20</td></tr>
+            <tr><th scope="row">ComfyUI 0.43.0</th><td>Full aligned guide</td><td class="numeric">55:53</td><td class="numeric">49:12</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="article-columns">
+        <p>Both workflows used MiniMax H3 Ref2VA with eight PDD evaluations and made the last six eligible for sparse attention. Cozy held temporal guide reduction at 20% and moved spatial reduction from 20% to 50%. ComfyUI kept the full aligned guide and used MultiStream over NVLink, with PyTorch for dense attention and Sol for sparse attention.</p>
+        <p>Cozy elapsed time runs from project start to settlement. ComfyUI elapsed time sums four segment clocks, each from API submission to saved segment. The final join and transfer are separate. The sampler column sums all four segments. Model downloads and environment setup were outside both timing windows.</p>
+      </div>
+      <aside class="quality-note"><h3>Visual review</h3><p>The reviewer preferred Cozy’s result on this edit. ComfyUI retained more of the source details that the prompt asked to change.</p></aside>
+    </section>
+
   </main>
   <footer class="site-footer section-shell"><span>Cozy Creator · MiniMax H3 benchmarks</span><a href="#top">Back to top ↑</a></footer>
 </body>

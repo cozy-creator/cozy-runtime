@@ -586,5 +586,71 @@
       "extra_tokens": 256
     },
     "h100_kernel_selection": "Previously qualified settings; not an exhaustive H100 kernel comparison."
+  },
+  "full_length_character_swap": {
+    "visual_review": {
+      "reviewers": 1,
+      "preferred_workflow": "Cozy Creator",
+      "reason": "ComfyUI retained more source details that the edit was meant to change"
+    },
+    "date": "2026-11-20",
+    "sample_count_per_workflow": 1,
+    "mode": "MiniMax H3 Ref2VA Character Swap",
+    "hardware": {
+      "gpu": "NVIDIA H100 SXM 80 GB",
+      "count": 2,
+      "interconnect": "NVLink",
+      "same_host": true
+    },
+    "source_seconds": 53,
+    "resolution": [
+      1344,
+      768
+    ],
+    "fps": 24,
+    "output_frames": 1280,
+    "audio_channels": 2,
+    "segment_frames": [
+      362,
+      340,
+      323,
+      255
+    ],
+    "reference_images": 2,
+    "steps": {
+      "dense": 2,
+      "sparse_eligible": 6
+    },
+    "cozy": {
+      "total_s": 928.141,
+      "denoise_s": 619.847632,
+      "segment_sampler_s": [
+        144.622135,
+        189.530048,
+        163.678608,
+        122.016841
+      ],
+      "timing_boundary": "Project run start through settlement",
+      "guide": "Staged nearest-neighbor spatial and temporal merging",
+      "temporal_reduction": 0.2,
+      "early_spatial_reduction": 0.2,
+      "late_spatial_reduction": 0.5
+    },
+    "comfyui": {
+      "total_s": 3353.435029,
+      "denoise_s": 2952.064512026962,
+      "segment_sampler_s": [
+        787.3407229902223,
+        842.1828184751794,
+        821.9715726096183,
+        500.56939795194194
+      ],
+      "timing_boundary": "Sum of four segment clocks, each first API submission through that segment being saved",
+      "version": "0.43.0",
+      "guide": "Full aligned guide",
+      "parallel": "H3 MultiStream P2P",
+      "dense_attention": "PyTorch",
+      "sparse_attention": "Sol"
+    }
   }
 }
