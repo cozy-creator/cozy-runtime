@@ -68,7 +68,7 @@ jobs:
     # line's own, as the stack and packages are. Renamed to the next RC's at each cut; left behind, it fails once the old RC's
     # branch is deleted at its release, never runs stale. xs-217: pinned at 11-11's f85096b9d6, it judged the RC's packages by
     # fixtures and references the RC had replaced.
-    uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@rc/0.27.0
+    uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@rc/0.28.0
     secrets:
       TENSORHUB_READ_KEY: ${{ secrets.TENSORHUB_READ_KEY }}
     with:
