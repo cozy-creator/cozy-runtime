@@ -588,6 +588,11 @@
     "h100_kernel_selection": "Previously qualified settings; not an exhaustive H100 kernel comparison."
   },
   "full_length_character_swap": {
+    "visual_review": {
+      "reviewers": 1,
+      "preferred_workflow": "Cozy Creator",
+      "reason": "ComfyUI retained more source details that the edit was meant to change"
+    },
     "date": "2026-11-20",
     "sample_count_per_workflow": 1,
     "mode": "MiniMax H3 Ref2VA Character Swap",
